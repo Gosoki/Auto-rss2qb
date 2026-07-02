@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Auto-rss2qb
+log/
+torrent/
+autorss.db
+autorss.db-wal
+autorss.db-shm
