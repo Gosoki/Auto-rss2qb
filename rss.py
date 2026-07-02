@@ -9,7 +9,7 @@
 """
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import feedparser
 import opencc
@@ -55,6 +55,28 @@ def extract_episode(raw_title):
         return float(tail)  # 支持 11.5 这类小数集
     except ValueError:
         return -1 if "特别篇" in raw_title else -2
+
+
+# 倒推只在"一个 cour（约 12 话）之内"可靠。超过这个集数，说明这番已经跨季度播出
+# （连续 2cour 或分割 2cour），"从首播连续周更"的假设不再成立，倒推容易落到空档季度，
+# 这时直接用当集季度更稳。
+_ONE_COUR = 12
+
+
+def estimate_premiere(release_time, episode, season):
+    """用当前集倒推首播日期：周更番第 N 集约在首播后 (N-1) 周。
+
+    这样即使程序在某番已经播到第 11 话才第一次抓到，也能把它归到真正的首播季度，
+    而不是被算进当前季度。
+
+    倒推只在满足以下条件时才做，否则退回用当集发布时间：
+    - 只对第一季：第二季集数可能接着上一季连续编号（第二季第一集就是第 15 集），不可靠。
+    - 只在一个 cour 内（episode<=12）：分割 2cour 的后半（如从第 13 集起）倒推会落到中间空档季度。
+    - episode>=1：特别篇/未知（episode<1）无法倒推。
+    """
+    if season == 1 and 1 <= episode <= _ONE_COUR:
+        return release_time - timedelta(weeks=episode - 1)
+    return release_time
 
 
 def extract_quarter(release_time):
@@ -188,7 +210,7 @@ class NyaaSource(RssSource):
                 episode=episode,
                 season=season,
                 release_time=release_time,
-                quarter=extract_quarter(release_time),
+                quarter=extract_quarter(estimate_premiere(release_time, episode, season)),
                 rss_group=self.rss_group,
                 torrent_from=self.torrent_from,
             )
