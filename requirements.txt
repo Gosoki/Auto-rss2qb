@@ -1,5 +1,6 @@
-requests
-feedparser
-python-dotenv
-opencc-python-reimplemented   # 提供 import opencc；若你原来装的是官方 opencc，保留原包即可
-pymysql                       # 仅 DB_TYPE=mysql 或数据迁移时需要；纯 SQLite 用不到
+nicegui>=1.4
+sqlmodel>=0.0.14
+httpx>=0.27
+feedparser>=6.0
+python-dotenv>=1.0
+opencc-python-reimplemented   # 繁转简；没装也能跑（自动降级为不转换）

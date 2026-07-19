@@ -1,60 +1,59 @@
-"""qBittorrent Web UI 客户端。"""
-import os
+"""qBittorrent Web UI 客户端（异步）。"""
+import logging
 
-import requests
+import httpx
 
 from config import QB_PASSWORD, QB_URL, QB_USERNAME
-from logger import log
+
+log = logging.getLogger("autorss")
 
 
 class QBittorrent:
-    def _login(self):
-        """登录并返回带会话的 requests.Session；失败返回 None。"""
-        session = requests.Session()
+    async def _login(self) -> httpx.AsyncClient | None:
+        """返回已登录的 AsyncClient；失败返回 None（成功时由调用方负责 aclose）。"""
+        client = httpx.AsyncClient(base_url=QB_URL, timeout=30)
+        ok = False
         try:
-            resp = session.post(
-                f"{QB_URL}/api/v2/auth/login",
+            resp = await client.post(
+                "/api/v2/auth/login",
                 data={"username": QB_USERNAME, "password": QB_PASSWORD},
-                timeout=30,
+                headers={"Referer": QB_URL},
             )
-        except requests.RequestException as e:
-            log.error(f"qBittorrent 登录请求失败: {e}")
+            if resp.status_code == 200 and resp.text.strip().lower().startswith("ok"):
+                ok = True
+                return client
+            log.error("qBittorrent 登录失败: %s %s", resp.status_code, resp.text[:80])
             return None
-        if resp.status_code != 200:
-            log.error(f"qBittorrent 登录失败: {resp.status_code} {resp.text}")
+        except httpx.HTTPError as e:
+            log.error("qBittorrent 登录请求失败: %s", e)
             return None
-        return session
+        finally:
+            # 任何非成功路径（含 CancelledError 等向上抛的异常）都关掉连接，防泄漏
+            if not ok:
+                await client.aclose()
 
-    def add_torrent(self, save_path, torrent_file, quarter):
-        """把种子加入 qBittorrent。成功返回 True。"""
-        if not os.path.exists(save_path):
-            os.makedirs(save_path, exist_ok=True)
-            # 保留原行为：放开权限，便于以其它用户运行的 qB 写入（如需收紧可自行调整）
-            os.chmod(save_path, 0o777)
-
-        session = self._login()
-        if session is None:
+    async def add_torrent(self, torrent_bytes: bytes, save_path: str, category: str, tags: str) -> bool:
+        client = await self._login()
+        if client is None:
             return False
-
         try:
-            with open(torrent_file, "rb") as f:
-                resp = session.post(
-                    f"{QB_URL}/api/v2/torrents/add",
-                    data={
-                        "savepath": save_path,
-                        "autoTMM": "false",   # 禁用自动分类
-                        "paused": "false",     # 立即开始下载
-                        "category": f"autoRSS {quarter}",
-                        "tags": quarter,
-                    },
-                    files={"torrents": f},
-                    timeout=60,
-                )
-        except requests.RequestException as e:
-            log.error(f"添加下载任务请求失败: {e}")
+            files = {"torrents": ("t.torrent", torrent_bytes, "application/x-bittorrent")}
+            data = {
+                "savepath": save_path,
+                "autoTMM": "false",
+                "paused": "false",
+                "category": category,
+                "tags": tags,
+            }
+            resp = await client.post("/api/v2/torrents/add", data=data, files=files)
+        except httpx.HTTPError as e:
+            log.error("添加下载任务失败: %s", e)
             return False
+        finally:
+            await client.aclose()
 
-        if resp.status_code == 200:
+        # qB 的 add 失败时也返回 200，靠响应体区分（成功 "Ok."，失败 "Fails."）
+        if resp.status_code == 200 and "fail" not in resp.text.strip().lower():
             return True
-        log.error(f"添加下载任务失败: {resp.text}")
+        log.error("添加下载任务失败 %s: %s", resp.status_code, resp.text[:80])
         return False
