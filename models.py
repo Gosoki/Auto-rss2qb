@@ -22,6 +22,13 @@ class Anime(SQLModel, table=True):
     source_kind: str = Field(default="ani")     # 'ani' / 'other'
     created_at: datetime = Field(default_factory=datetime.now)
 
+    # ---- Bangumi 富集（P3，可空；富集失败/未开启则保持空） ----
+    bangumi_id: int | None = Field(default=None)   # bgm.tv subject id
+    display_name: str | None = Field(default=None)  # 规范番名（展示用，不改 title 身份键）
+    air_date: str | None = Field(default=None)      # 真实放送开始日 YYYY-MM-DD
+    enriched: bool = Field(default=False)           # 是否已尝试富集（尝试过即 True，不论成败，避免每集重刷）
+    merged_into: int | None = Field(default=None)   # 跨源重复时指向保留的那部；管理页隐藏、只用于聚合来源
+
 
 class Torrent(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("info_hash", name="uq_torrent_info_hash"),)

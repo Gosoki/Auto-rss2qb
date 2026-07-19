@@ -2,14 +2,17 @@
 import asyncio
 import logging
 
-from config import POLL_INTERVAL
+from config import MIKAN_ENABLED, POLL_INTERVAL
 from core import process_item
 from sources.ani import AniSource
 
 log = logging.getLogger("autorss")
 
-# 源顺序即优先级：ANi 排前面先处理（一旦接入 Mikan，同一集 ANi 先占，Mikan 版自然跳过）
+# 源顺序即优先级：ANi 排前面先处理（同一集 ANi 先占，Mikan 版靠逻辑集去重自然跳过）
 SOURCES = [AniSource()]
+if MIKAN_ENABLED:
+    from sources.mikan import MikanSource
+    SOURCES.append(MikanSource())
 
 
 async def poll_once() -> None:
