@@ -1,65 +1,184 @@
-"""配置：从 .env 读取，全部有默认值。改配置不用动代码。"""
+"""配置：默认值硬编码在 _SPEC；建库时写进数据库 settings 表，之后以数据库为唯一来源。
+
+读取一律走 `config.<KEY>`（经模块 __getattr__ 返回当前值），别再 `from config import KEY`
+（那样会在导入时绑死快照，改了不生效）。设置页保存 → 写库 + 更新内存 → 即时生效。
+例外：DB_PATH（开库前提）、WEB_PORT（绑端口）本质上就得重启，走 .env/硬编码默认，不进 settings 表。
+"""
 import os
+import re
+import tempfile
+import threading
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+_env_lock = threading.Lock()
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+    load_dotenv(ENV_PATH)
 except Exception:
     pass
 
-BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-
-def _bool(key, default=False):
-    v = os.getenv(key)
-    return default if v is None or v.strip() == "" else v.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _int(key, default):
-    v = os.getenv(key)
-    return default if v is None or v.strip() == "" else int(v)
-
-
-# ---- qBittorrent ----
-QB_URL = os.getenv("QB_URL", "http://127.0.0.1:8080")
-QB_USERNAME = os.getenv("QB_USERNAME", "")
-QB_PASSWORD = os.getenv("QB_PASSWORD", "")
-# False = 开发/无 qB 模式：照常采集元数据，但不发送种子给 qB（种子留在待下）
-QB_ENABLED = _bool("QB_ENABLED", True)
-
-# ---- 路径 ----
-DOWN_PATH = os.getenv("DOWN_PATH", "/media/upan/Anime")   # qB 保存根目录
+# ---- 结构性/绑定项：走 .env，改了需重启（DB_PATH 是启动 DB 的前提，WEB_PORT 绑端口）----
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "autorss.db"))
+try:
+    WEB_PORT = int(os.getenv("WEB_PORT", "8080") or "8080")
+except ValueError:
+    WEB_PORT = 8080
 
-# ---- 代理（OPEN_PROXY=true 才生效）----
-PROXY_URL = os.getenv("PROXY_URL", "")
-OPEN_PROXY = _bool("OPEN_PROXY", False)
-PROXY = PROXY_URL if (OPEN_PROXY and PROXY_URL) else None
+# ---- 可热改设置：{键: (类型, 默认值)}，类型 bool/int/str/list ----
+_SPEC = {
+    "QB_ENABLED": (bool, True),
+    "QB_URL": (str, "http://127.0.0.1:8080"),
+    "QB_USERNAME": (str, ""),
+    "QB_PASSWORD": (str, ""),
+    "DOWN_PATH": (str, "/media/upan/Anime"),
+    "SEASON_SUBFOLDER": (bool, True),
+    "QUARTER_FMT": (str, "{yy}{q} · {m}月 · {season}"),
+    "QUARTER_FMT_UI": (str, ""),            # 空 = 跟随 QUARTER_FMT（见 __getattr__）
+    "MANAGE_SHOW_PENDING": (bool, False),
+    "MANAGE_SHOW_REJECTED": (bool, False),
+    "POLL_ENABLED": (bool, True),           # 后台采集总开关（全新库首启默认关，见 load_from_db）
+    "POLL_INTERVAL": (int, 1200),
+    "DOWNLOAD_GRACE_MIN": (int, 120),
+    "TOP_PRIORITY_INSTANT": (bool, True),
+    "OPEN_PROXY": (bool, False),
+    "PROXY_URL": (str, ""),
+    "NOTIFY_URL": (str, ""),
+    "NOTIFY_TIMEOUT": (int, 10),
+    "ENRICH_TIMEOUT": (int, 15),
+    "ANI_RSS_URL": (str, "https://nyaa.si/?page=rss&u=ANiTorrent"),
+    "MIKAN_ENABLED": (bool, False),
+    "MIKAN_RSS_URL": (str, "https://mikanani.me/RSS/Classic"),
+    "MIKAN_BASE": (str, "https://mikanani.me"),
+    "MIKAN_SUBGROUPS": (list, ""),          # 逗号分隔 → list
+    "BGM_API": (str, "https://api.bgm.tv"),
+}
 
-# ---- 轮询 ----
-POLL_INTERVAL = _int("POLL_INTERVAL", 1200)   # 每轮抓取间隔（秒）
+# 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集
+_FRESH_OFF = {"POLL_ENABLED"}
 
-# ---- Web ----
-WEB_PORT = _int("WEB_PORT", 8080)
 
-# ---- 源 ----
-ANI_RSS_URL = os.getenv("ANI_RSS_URL", "https://nyaa.si/?page=rss&u=ANiTorrent")
+def _coerce(kind, raw):
+    """把字符串/原值按类型转换；转不动回该类型的空值。"""
+    if kind is bool:
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    if kind is int:
+        try:
+            return int(str(raw).strip())
+        except (ValueError, TypeError):
+            return 0
+    if kind is list:
+        return [s.strip() for s in str(raw).split(",") if s.strip()]
+    return str(raw)
 
-# ---- Mikan 发现（P2，默认关；开了才抓 Mikan 全站发现非 ANi 番）----
-MIKAN_ENABLED = _bool("MIKAN_ENABLED", False)
-MIKAN_RSS_URL = os.getenv("MIKAN_RSS_URL", "https://mikanani.me/RSS/Classic")
-MIKAN_BASE = os.getenv("MIKAN_BASE", "https://mikanani.me")
-# 只保留这些字幕组的发现（逗号分隔，留空=全部；用于压 Mikan 噪声）
-MIKAN_SUBGROUPS = [s.strip() for s in os.getenv("MIKAN_SUBGROUPS", "").split(",") if s.strip()]
 
-# ---- Bangumi 富集（P3，默认关；开了才用真实放送日定季度+规范名）----
-ENRICH_ENABLED = _bool("ENRICH_ENABLED", False)
-BGM_API = os.getenv("BGM_API", "https://api.bgm.tv")
-ENRICH_TIMEOUT = _int("ENRICH_TIMEOUT", 15)
+def _to_raw(kind, default) -> str:
+    """把 _SPEC 默认值转成存进 settings 表的字符串形式。"""
+    if kind is bool:
+        return "true" if default else "false"
+    if kind is list:
+        return ",".join(default) if isinstance(default, (list, tuple)) else str(default)
+    return str(default)
 
-# ---- 通知（NOTIFY_URL 留空即关闭）----
-NOTIFY_URL = os.getenv("NOTIFY_URL", "")
-NOTIFY_TIMEOUT = _int("NOTIFY_TIMEOUT", 10)
+
+# 内存当前值：先用硬编码默认值兜底；启动时 load_from_db() 再用数据库里的值覆盖
+_v = {k: _coerce(kind, default) for k, (kind, default) in _SPEC.items()}
+
+
+def __getattr__(name):
+    """动态读当前配置值：config.QB_ENABLED 等；PROXY / QUARTER_FMT_UI 为派生项。"""
+    if name == "PROXY":
+        return _v["PROXY_URL"] if (_v["OPEN_PROXY"] and _v["PROXY_URL"]) else None
+    if name == "QUARTER_FMT_UI":
+        return _v["QUARTER_FMT_UI"] or _v["QUARTER_FMT"]  # 空则跟随文件夹模板
+    if name in _v:
+        return _v[name]
+    raise AttributeError(f"module 'config' has no attribute {name!r}")
+
+
+def load_from_db() -> None:
+    """启动时（init_db 之后）加载配置，并把 settings 表缺的键补齐写入。
+
+    新库 = 写入全部默认值；老库/以后新加的设置项也会补上缺的键。
+    补齐时若 .env 里还留着该键的旧值，就采用它（一次性迁移旧配置，之后 .env 不再参与）。
+    """
+    from sqlmodel import select
+
+    from db import get_session
+    from models import Setting
+    with get_session() as s:
+        have = {r.key: r.value for r in s.exec(select(Setting))}
+        fresh = not have  # settings 表原本为空 = 全新库首启
+        for k, (kind, default) in _SPEC.items():
+            if k not in have:
+                env = os.getenv(k)
+                if env not in (None, ""):
+                    have[k] = env                       # 一次性迁移旧 .env 值
+                elif fresh and k in _FRESH_OFF:
+                    have[k] = "false"                   # 全新库首启：配置好前先别采集
+                else:
+                    have[k] = _to_raw(kind, default)
+                s.add(Setting(key=k, value=have[k]))
+        s.commit()
+    for k in _SPEC:
+        _v[k] = _coerce(_SPEC[k][0], have[k])
+
+
+def set_many(updates: dict) -> None:
+    """把设置写进数据库并即时更新内存（热生效）。updates: {键: 字符串值}，非 _SPEC 键忽略。"""
+    from db import get_session
+    from models import Setting
+    with get_session() as s:
+        for k, raw in updates.items():
+            if k not in _SPEC:
+                continue
+            row = s.get(Setting, k)
+            if row is None:
+                s.add(Setting(key=k, value=str(raw)))
+            else:
+                row.value = str(raw)
+                s.add(row)
+            _v[k] = _coerce(_SPEC[k][0], raw)
+        s.commit()
+
+
+def update_env(updates: dict) -> None:
+    """把 updates 写回 .env（原地改已有键、追加新键）。仅用于 WEB_PORT 等重启才生效的结构项。"""
+    def _fmt(v: str) -> str:
+        v = str(v)
+        if v and not re.search(r'[\s#"\']', v):
+            return v
+        return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    with _env_lock:
+        lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
+        seen, out = set(), []
+        for line in lines:
+            m = re.match(r"\s*([A-Za-z0-9_]+)\s*=", line)
+            if m and m.group(1) in updates:
+                out.append(f"{m.group(1)}={_fmt(updates[m.group(1)])}")
+                seen.add(m.group(1))
+            else:
+                out.append(line)
+        for k, v in updates.items():
+            if k not in seen:
+                out.append(f"{k}={_fmt(v)}")
+        text = "\n".join(out) + "\n"
+        fd, tmp = tempfile.mkstemp(dir=str(BASE_DIR), prefix=".env.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, ENV_PATH)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise

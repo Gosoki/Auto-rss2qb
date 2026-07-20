@@ -19,13 +19,13 @@ class ParsedItem:
     download_url: str       # 直接可下载 .torrent 的地址
     source: str             # 展示用来源名，如 'ANI'
     site: str               # 下载站点，如 'nyaa'
-    source_kind: str = "ani"  # 'ani' 自动下 / 'other' 需人工确认
+    source_kind: str = "auto"  # 组策略：'auto' 全下 / 'review' 需人工确认
+    priority: int = 0          # 组优先级（越大越优先）
     search_names: list[str] = field(default_factory=list)  # 候选名（搜 bgm 用）
 
 
 class Source:
     name = "base"
-    source_kind = "ani"
 
     async def fetch(self) -> list[ParsedItem]:
         raise NotImplementedError

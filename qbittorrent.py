@@ -3,7 +3,7 @@ import logging
 
 import httpx
 
-from config import QB_PASSWORD, QB_URL, QB_USERNAME
+import config
 
 log = logging.getLogger("autorss")
 
@@ -11,13 +11,13 @@ log = logging.getLogger("autorss")
 class QBittorrent:
     async def _login(self) -> httpx.AsyncClient | None:
         """返回已登录的 AsyncClient；失败返回 None（成功时由调用方负责 aclose）。"""
-        client = httpx.AsyncClient(base_url=QB_URL, timeout=30)
+        client = httpx.AsyncClient(base_url=config.QB_URL, timeout=30)
         ok = False
         try:
             resp = await client.post(
                 "/api/v2/auth/login",
-                data={"username": QB_USERNAME, "password": QB_PASSWORD},
-                headers={"Referer": QB_URL},
+                data={"username": config.QB_USERNAME, "password": config.QB_PASSWORD},
+                headers={"Referer": config.QB_URL},
             )
             if resp.status_code == 200 and resp.text.strip().lower().startswith("ok"):
                 ok = True
@@ -56,4 +56,27 @@ class QBittorrent:
         if resp.status_code == 200 and "fail" not in resp.text.strip().lower():
             return True
         log.error("添加下载任务失败 %s: %s", resp.status_code, resp.text[:80])
+        return False
+
+    async def delete(self, hashes: list[str], delete_files: bool = True) -> bool:
+        """按 info_hash 从 qB 删除种子；delete_files=True 连硬盘文件一起删。全空/成功返回 True。"""
+        hashes = [h for h in hashes if h]
+        if not hashes:
+            return True
+        client = await self._login()
+        if client is None:
+            return False
+        try:
+            resp = await client.post("/api/v2/torrents/delete", data={
+                "hashes": "|".join(hashes),
+                "deleteFiles": "true" if delete_files else "false",
+            })
+        except httpx.HTTPError as e:
+            log.error("删除下载任务失败: %s", e)
+            return False
+        finally:
+            await client.aclose()
+        if resp.status_code == 200:
+            return True
+        log.error("删除下载任务失败 %s: %s", resp.status_code, resp.text[:80])
         return False

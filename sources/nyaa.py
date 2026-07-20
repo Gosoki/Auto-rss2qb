@@ -1,7 +1,7 @@
-"""nyaa 上 ANi 字幕组的全量 RSS 源。
+"""通用 nyaa 源：一个字幕组一个实例。
 
-标题形如：[ANi] Romaji / 中文名 - 07 [1080P][Baha][WEB-DL][CHT][MP4]
-从 <nyaa:infoHash> 取种子 hash 作去重键；标题/季度解析交给 sources.parse。
+feed 可以是 nyaa 用户名（自动拼 RSS）或一条完整 RSS URL（应对按关键词搜的 feed）。
+每条种子打上所属组的策略(policy)+优先级(priority)，交给主流程决定下不下、下哪份。
 """
 import logging
 from datetime import datetime
@@ -9,30 +9,45 @@ from datetime import datetime
 import feedparser
 import httpx
 
-from config import ANI_RSS_URL, PROXY
+import config
 from sources.base import ParsedItem, Source
-from sources.parse import candidate_names, estimate_premiere, extract_quarter, parse_title
+from sources.parse import candidate_names, estimate_premiere, extract_quarter, is_batch, parse_title
 
 log = logging.getLogger("autorss")
 
 
-class AniSource(Source):
-    name = "ANI"
-    source_kind = "ani"
-    RSS_URL = ANI_RSS_URL
+def nyaa_feed_url(feed: str) -> str:
+    """用户名 → 拼 RSS；已是 http(s) URL → 原样用。"""
+    feed = (feed or "").strip()
+    if feed.startswith(("http://", "https://")):
+        return feed
+    return f"https://nyaa.si/?page=rss&u={feed}&c=1_2"
+
+
+class NyaaSource(Source):
+    site = "nyaa"
+
+    def __init__(self, name: str, rss_url: str, policy: str = "auto", priority: int = 0,
+                 subgroups: list | None = None, title_filter: list | None = None):
+        self.name = name
+        self.rss_url = rss_url
+        self.policy = policy
+        self.priority = priority
+        self.subgroups = subgroups or []      # 字幕组白名单（子串匹配组名，空=全部）
+        self.title_filter = title_filter or []  # 标题关键词过滤（标题需含其一，空=不限）
 
     async def fetch(self) -> list[ParsedItem]:
         kwargs = {"timeout": 30, "follow_redirects": True}
-        if PROXY:
-            kwargs["proxy"] = PROXY
+        if config.PROXY:
+            kwargs["proxy"] = config.PROXY
         async with httpx.AsyncClient(**kwargs) as client:
-            resp = await client.get(self.RSS_URL)
+            resp = await client.get(self.rss_url)
             resp.raise_for_status()
             content = resp.content
 
         feed = feedparser.parse(content)
         if feed.bozo:
-            log.warning("ANi Feed 解析异常（bozo），尽力处理已解析条目")
+            log.warning("%s Feed 解析异常（bozo），尽力处理已解析条目", self.name)
 
         items = []
         for entry in feed.entries:
@@ -47,8 +62,14 @@ class AniSource(Source):
             info_hash = (entry.get("nyaa_infohash") or "").strip().lower()
             if not info_hash:
                 return None  # 没有 hash 无法跨源去重，跳过
+            if is_batch(raw_title):
+                return None  # 合集/BDRip/连续集范围 整理帖
+            if self.title_filter and not any(k in raw_title for k in self.title_filter):
+                return None  # 标题不含所需关键词（如按语言 繁日/简日 过滤）
 
-            _group, anime_title, season, episode = parse_title(raw_title)
+            group, anime_title, season, episode = parse_title(raw_title)
+            if self.subgroups and not any(g in group for g in self.subgroups):
+                return None  # 不在白名单的字幕组
             if episode == -2:
                 log.warning("集数解析失败 - %s", raw_title)
 
@@ -75,9 +96,10 @@ class AniSource(Source):
                 quarter=quarter,
                 release_time=release_time,
                 download_url=entry.link,   # nyaa 的 link 就是 .torrent 下载地址
-                source="ANI",
+                source=(group or self.name),
                 site="nyaa",
-                source_kind="ani",
+                source_kind=self.policy,
+                priority=self.priority,
                 search_names=candidate_names(raw_title),
             )
         except Exception as e:

@@ -13,9 +13,9 @@ from datetime import datetime
 import feedparser
 import httpx
 
-from config import MIKAN_RSS_URL, MIKAN_SUBGROUPS, PROXY
+import config
 from sources.base import ParsedItem, Source
-from sources.parse import candidate_names, estimate_premiere, extract_quarter, parse_title
+from sources.parse import candidate_names, estimate_premiere, extract_quarter, is_batch, parse_title
 
 log = logging.getLogger("autorss")
 
@@ -35,22 +35,25 @@ def _enclosure(entry) -> str:
     return ""
 
 
-def _is_batch(title: str) -> bool:
-    """整理/搬运/合集这类批量帖（标题超长或含这些词）——直接丢。"""
-    return len(title) > 90 or any(m in title for m in ("整理", "搬运", "合集"))
-
-
 class MikanSource(Source):
-    name = "Mikan"
-    source_kind = "other"
-    RSS_URL = MIKAN_RSS_URL
+    site = "mikan"
+
+    def __init__(self, name: str = "Mikan", rss_url: str = "",
+                 policy: str = "review", priority: int = 0, subgroups: list | None = None,
+                 title_filter: list | None = None):
+        self.name = name
+        self.rss_url = rss_url or config.MIKAN_RSS_URL
+        self.policy = policy
+        self.priority = priority
+        self.subgroups = subgroups or []      # 字幕组白名单（子串匹配组名，空=全部）
+        self.title_filter = title_filter or []  # 标题关键词过滤（标题需含其一，空=不限）
 
     async def fetch(self) -> list[ParsedItem]:
         kwargs = {"timeout": 30, "follow_redirects": True}
-        if PROXY:
-            kwargs["proxy"] = PROXY
+        if config.PROXY:
+            kwargs["proxy"] = config.PROXY
         async with httpx.AsyncClient(**kwargs) as client:
-            resp = await client.get(self.RSS_URL)
+            resp = await client.get(self.rss_url)
             resp.raise_for_status()
             content = resp.content
 
@@ -69,12 +72,14 @@ class MikanSource(Source):
             if not re.fullmatch(r"[0-9a-f]{40}", info_hash):
                 return None  # 必须是 40 位 hex，才能与 nyaa 的 hash 精确对齐去重
 
-            if _is_batch(raw_title):
+            if is_batch(raw_title):
                 return None  # 批量/合集帖
+            if self.title_filter and not any(k in raw_title for k in self.title_filter):
+                return None  # 标题不含所需关键词（如按语言 繁日/简日 过滤）
 
             group, anime_title, season, episode = parse_title(raw_title)
             # 白名单：子串匹配，兼顾联合发布（如 "喵萌奶茶屋&LoliHouse"）
-            if MIKAN_SUBGROUPS and not any(g in group for g in MIKAN_SUBGROUPS):
+            if self.subgroups and not any(g in group for g in self.subgroups):
                 return None
             if not anime_title:
                 return None
@@ -99,9 +104,10 @@ class MikanSource(Source):
                 quarter=quarter,
                 release_time=release_time,
                 download_url=download_url,
-                source=group or "Mikan",
+                source=group or self.name,
                 site="mikan",
-                source_kind="other",
+                source_kind=self.policy,
+                priority=self.priority,
                 search_names=candidate_names(raw_title),
             )
         except Exception as e:
