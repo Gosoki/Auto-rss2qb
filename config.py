@@ -115,7 +115,7 @@ def load_from_db() -> None:
     from sqlmodel import select
 
     from db import get_session
-    from models import Setting
+    from db.models import Setting
     with get_session() as s:
         have = {r.key: r.value for r in s.exec(select(Setting))}
         fresh = not have  # settings 表原本为空 = 全新库首启
@@ -137,7 +137,7 @@ def load_from_db() -> None:
 def set_many(updates: dict) -> None:
     """把设置写进数据库并即时更新内存（热生效）。updates: {键: 字符串值}，非 _SPEC 键忽略。"""
     from db import get_session
-    from models import Setting
+    from db.models import Setting
     with get_session() as s:
         for k, raw in updates.items():
             if k not in _SPEC:

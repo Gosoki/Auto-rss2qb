@@ -25,7 +25,7 @@ def _sqlite_pragmas(dbapi_conn, _record):
 
 
 def init_db():
-    import models  # noqa: F401  确保表被注册
+    from . import models  # noqa: F401  确保表被注册
     SQLModel.metadata.create_all(engine)
     _migrate_add_columns()
 

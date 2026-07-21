@@ -1,4 +1,4 @@
-"""剧场版 / OVA 逻辑（与 TV 番剧 core.py 完全分离，只共用 engine 底层）。
+"""剧场版 / OVA 逻辑（与 TV 番剧 anime.py 完全分离，只共用 engine 底层）。
 
 来源仅 Mikan 季度浏览页的『剧场版/OVA 桶』——不碰 TV 那边的订阅源。识别用 bgm。
 『电影只抓电影的部分』：桶里若被 bgm 明确判成 TV 周更番，跳过它（不把番剧的周更集也抓进来）；
@@ -13,12 +13,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 import config
-import engine
-import enrich
+from core import engine
 from db import get_session
-from models import Movie, MovieTorrent, Torrent
-from notify import notify
-from sources import mikan_catalog
+from db.models import AnimeTorrent, Movie, MovieTorrent
+from services import enrich
+from services.notify import notify
+from sources import mikan
 
 log = logging.getLogger("autorss")
 
@@ -109,24 +109,24 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
     """
     seasons = seasons or ["A", "B", "C", "D"]
     added_movies = added_torrents = seen = errors = 0
-    async with mikan_catalog.make_client() as client:
+    async with mikan.make_client() as client:
         for letter in seasons:
             try:
-                bucket = await mikan_catalog.discover_movie_bucket(client, year, letter)
+                bucket = await mikan.discover_movie_bucket(client, year, letter)
             except Exception as e:
                 log.error("发现剧场版失败 %s%s: %s", year, letter, e)
                 errors += 1
                 continue
             log.info("Mikan %s年%s 剧场版/OVA 桶：%d 部",
-                     year, mikan_catalog.season_cn(letter), len(bucket))
+                     year, mikan.season_cn(letter), len(bucket))
             for mikan_id, title, mlabel in bucket:
                 try:
-                    bgm_id, _groups = await mikan_catalog.fetch_detail(client, mikan_id)
+                    bgm_id, _groups = await mikan.fetch_detail(client, mikan_id)
                     info = await enrich.fetch_by_id(bgm_id) if bgm_id is not None else None
                     movie_id, is_new = _upsert_movie(mikan_id, title, bgm_id, info, mlabel)
                     seen += 1
                     added_movies += 1 if is_new else 0
-                    items = await mikan_catalog.fetch_bangumi_torrents(client, mikan_id)
+                    items = await mikan.fetch_bangumi_torrents(client, mikan_id)
                     added_torrents += _store_movie_torrents(movie_id, items)
                 except Exception as e:
                     log.error("处理剧场版失败 mikan=%s(%s): %s", mikan_id, title, e)
@@ -423,7 +423,7 @@ async def delete_movie_torrent(mt_id: int) -> bool:
         if t is None or t.status not in ("downloaded", "downloading"):
             return False
         h = t.info_hash
-    if engine.hash_owned_elsewhere(h, Torrent):
+    if engine.hash_owned_elsewhere(h, AnimeTorrent):
         _set_status(mt_id, "skipped")  # TV 侧还持有同一种子 → 只脱手，不删文件
         return True
     if not await engine.qb.delete([h], delete_files=True):
@@ -445,7 +445,7 @@ async def delete_movie_files(movie_id: int) -> int:
         pairs = [(t.id, t.info_hash) for t in rows]
     if not pairs:
         return 0
-    exclusive = [h for _, h in pairs if not engine.hash_owned_elsewhere(h, Torrent)]
+    exclusive = [h for _, h in pairs if not engine.hash_owned_elsewhere(h, AnimeTorrent)]
     if exclusive and not await engine.qb.delete(exclusive, delete_files=True):
         return 0
     with get_session() as s:

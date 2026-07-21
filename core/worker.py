@@ -6,10 +6,10 @@
 import asyncio
 import logging
 
+from core import anime
 import config
-import core
-import movies
-from core import flush_ready_downloads, list_source_groups, process_item
+from core import movies
+from core.anime import flush_ready_downloads, list_source_groups, process_item
 from sources.mikan import MikanSource
 from sources.nyaa import NyaaSource, nyaa_feed_url
 
@@ -92,7 +92,7 @@ async def run_qb_sync() -> None:
     while True:
         try:
             if config.QB_ENABLED:
-                await core.sync_qb_status()
+                await anime.sync_qb_status()
                 await movies.sync_qb_status()
         except Exception as e:
             log.error("qB 状态同步异常: %s", e)

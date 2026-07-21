@@ -9,7 +9,7 @@ from datetime import datetime
 from nicegui import ui
 
 import config
-import movies as mov
+from core import movies as mov
 from .layout import frame, human_size, name_of, qb_live_text
 
 _SEASONS = {"A": "冬", "B": "春", "C": "夏", "D": "秋"}
@@ -20,8 +20,8 @@ _TABS = ("overview", "list", "fail", "reject", "sources")
 
 
 def _q_label(q: str) -> str:
-    import core
-    return core.quarter_label(q)
+    from core import anime
+    return anime.quarter_label(q)
 
 
 def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
@@ -339,7 +339,7 @@ def movies_page(t: str = "list"):
 
         @ui.refreshable
         def list_panel():
-            import core
+            from core import anime
             items = mov.list_movies()
             if not items:
                 ui.label("还没有剧场版/OVA。去『订阅源』tab 点『扫描』从 Mikan 拉取。").classes(
@@ -353,7 +353,7 @@ def movies_page(t: str = "list"):
                 quarters.append("未知")
             for i, q in enumerate(quarters):
                 grp = by_q[q]
-                with ui.expansion(f"{core.quarter_label(q)}   ·   {len(grp)} 部",
+                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(grp)} 部",
                                   value=(i == 0)).classes("w-full"):
                     for m in grp:
                         _movie_card(m)

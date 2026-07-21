@@ -1,8 +1,8 @@
 """番剧详情：可作为独立页 /anime/{id}，也可用 render_detail 渲染进悬浮框(dialog)。"""
 from nicegui import ui
 
+from core import anime
 import config
-import core
 from .layout import ep_str, frame, name_of, qb_live_text, season_label
 
 _STATUS = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
@@ -12,17 +12,17 @@ _WEEKDAY = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"
 
 def render_detail(anime_id: int, refresh_outer=None) -> None:
     """把某番详情渲染进当前容器。refresh_outer：改动数据后刷新外层列表（番剧列表/待确认/已忽略 等）。"""
-    if core.get_anime(anime_id) is None:
+    if anime.get_anime(anime_id) is None:
         ui.label("番剧不存在").classes("text-gray-400 p-4")
         return
 
     @ui.refreshable
     def body():
-        cur = core.get_anime(anime_id)
+        cur = anime.get_anime(anime_id)
         if cur is None:
             ui.label("番剧不存在").classes("text-gray-400 p-4")
             return
-        eps = core.list_episodes(anime_id)
+        eps = anime.list_episodes(anime_id)
         sources = sorted({t.source for t in eps})
         with ui.row().classes("items-center gap-2 flex-wrap"):
             ui.label(name_of(cur)).classes("text-2xl font-bold")
@@ -46,7 +46,7 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
                         def _kv(k, v):
                             ui.label(k).classes("text-xs text-gray-400")
                             ui.label(str(v) if v not in (None, "") else "—")
-                        _kv("季度", core.quarter_label(cur.quarter))
+                        _kv("季度", anime.quarter_label(cur.quarter))
                         _kv("放送", f"{cur.air_date or '—'}{wd}")
                         _kv("类型", cur.platform)
                         _kv("总集数", cur.total_episodes)
@@ -106,40 +106,40 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
 
     # ---- 事件 ----
     def _set_source(e):
-        core.set_pref_source(anime_id, e.value or "")
+        anime.set_pref_source(anime_id, e.value or "")
         body.refresh()
         ui.notify("下载源：" + (e.value or "按优先级"))
 
     async def _enrich():
-        ok = await core.enrich_anime(anime_id)
+        ok = await anime.enrich_anime(anime_id)
         _after()
         ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）")
 
     async def _confirm():
-        core.confirm_anime(anime_id)
-        n = await core.download_pending_for_anime(anime_id)
+        anime.confirm_anime(anime_id)
+        n = await anime.download_pending_for_anime(anime_id)
         _after()
         ui.notify(f"已确认，补下 {n} 集")
 
     def _reject():
-        core.reject_anime(anime_id)
+        anime.reject_anime(anime_id)
         _after()
         ui.notify("已忽略，移到『已忽略』页")
 
     async def _restore():
-        core.restore_anime(anime_id)
-        n = await core.download_pending_for_anime(anime_id)
+        anime.restore_anime(anime_id)
+        n = await anime.download_pending_for_anime(anime_id)
         _after()
         ui.notify(f"已恢复到『订阅中』，补下 {n} 集")
 
     async def _download():
-        n = await core.download_pending_for_anime(anime_id)
+        n = await anime.download_pending_for_anime(anime_id)
         _after()
         ui.notify(f"已触发补下 {n} 集")
 
     def _force(torrent_id):
         async def h():
-            ok = await core.download_torrent(torrent_id, force=True)
+            ok = await anime.download_anime_torrent(torrent_id, force=True)
             _after()
             if ok:
                 ui.notify("已强制下载到文件夹", type="positive")
@@ -160,7 +160,7 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
 
                     async def _do():
                         dlg.close()
-                        ok = await core.delete_torrent_file(torrent_id)
+                        ok = await anime.delete_anime_torrent(torrent_id)
                         _after()
                         ui.notify("已删除该集文件" if ok else "没删成（qB 未连上或该集无文件）",
                                   type="positive" if ok else "warning")

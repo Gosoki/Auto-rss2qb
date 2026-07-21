@@ -1,6 +1,6 @@
 """TV 番剧与剧场版/OVA 共用的底层引擎：下载原语 / qB 客户端与状态同步 / bgm 元数据落库 / 路径季度。
 
-core.py(TV) 与 movies.py(剧场版) 都依赖这里；本模块不含任何 TV/movie 业务分支，纯共用，
+anime.py(TV) 与 movies.py(剧场版) 都依赖这里；本模块不含任何 TV/movie 业务分支，纯共用，
 两条线因此互不相干又不重复造轮子。
 """
 import logging
@@ -13,7 +13,7 @@ from sqlmodel import select
 
 import config
 from db import get_session
-from qbittorrent import QBittorrent
+from services.qbittorrent import QBittorrent
 from sources.parse import format_quarter
 
 log = logging.getLogger("autorss")
@@ -132,7 +132,7 @@ async def add_to_qb(data: bytes, save_path: str, category: str, tags: str) -> bo
     return await qb.add_torrent(data, save_path, category, tags)
 
 
-# ---------------- qB 实时态（对 Torrent / MovieTorrent 通用） ----------------
+# ---------------- qB 实时态（对 AnimeTorrent / MovieTorrent 通用） ----------------
 
 # 含 qB 5.x 改名后的状态（forcedMetaDL / stoppedDL / stoppedUP）
 _QB_DOWNLOADING = {"downloading", "forcedDL", "metaDL", "forcedMetaDL", "stalledDL",
@@ -150,7 +150,7 @@ def qb_is_seeding(state: str) -> bool:
 
 
 async def sync_qb_status(model_cls) -> int:
-    """从 qB 拉取已交付种子的实时态写回某表（Torrent 或 MovieTorrent，qb_* 字段同名）。返回更新数。
+    """从 qB 拉取已交付种子的实时态写回某表（AnimeTorrent 或 MovieTorrent，qb_* 字段同名）。返回更新数。
 
     只查 downloaded/downloading（已交给 qB 的）；qB 里没有的清实时态；进度到 1 的把 downloading 收敛为
     downloaded；同步期间被删/忽略（→非跟踪态）的跳过，免得已删种子在面板复活。连不上 qB 安静返回 0。

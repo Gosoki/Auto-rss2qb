@@ -1,12 +1,12 @@
 """数据模型（SQLModel）。
 
-TV 番剧与剧场版/OVA 彻底分表、互不相干（各自独立的表 + 独立的 core.py / movies.py 逻辑）：
+TV 番剧与剧场版/OVA 彻底分表、互不相干（各自独立的表 + 独立的 anime.py / movies.py 逻辑）：
 
 Setting     —— 键值配置覆盖（设置页写、运行时读、即时生效）。
 SourceGroup —— 订阅的字幕组/源组（feed/策略/优先级/白名单）——只喂 TV 周更番。
 Anime       —— 一部 TV 番剧（唯一）。身份 = bangumi_id。含 bgm 元数据。下不下 = confirmed 且未 rejected。
 TitleAlias  —— 番名对照：(标题, 季) → 哪部 TV 番。命中即知是谁，不必再查 bgm。
-Torrent     —— 一条 TV 种子，按 info_hash 唯一；anime_id 关联到 TV 番。含 qB 实时态镜像（qb_*）。
+AnimeTorrent     —— 一条 TV 种子，按 info_hash 唯一；anime_id 关联到 TV 番。含 qB 实时态镜像（qb_*）。
 Movie       —— 一部剧场版/OVA（唯一）。来源仅 Mikan 季度剧场版/OVA 桶，识别用 bgm。与 Anime 无关。
 MovieTorrent—— 一条剧场版/OVA 种子，按 info_hash 唯一；movie_id 关联到 Movie。含 qB 实时态镜像。
 """
@@ -76,8 +76,8 @@ class TitleAlias(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
 
 
-class Torrent(SQLModel, table=True):
-    __table_args__ = (UniqueConstraint("info_hash", name="uq_torrent_info_hash"),)
+class AnimeTorrent(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("info_hash", name="uq_animetorrent_info_hash"),)
 
     id: int | None = Field(default=None, primary_key=True)
     info_hash: str = Field(index=True)          # 40位hex，小写；跨源去重键
@@ -148,7 +148,7 @@ class MovieTorrent(SQLModel, table=True):
     release_time: datetime | None = Field(default=None)
     priority: int = Field(default=0)
     created_at: datetime = Field(default_factory=datetime.now)
-    # ---- qB 实时状态（同 Torrent）----
+    # ---- qB 实时状态（同 AnimeTorrent）----
     qb_state: str = Field(default="")
     qb_progress: float = Field(default=0.0)
     qb_dlspeed: int = Field(default=0)

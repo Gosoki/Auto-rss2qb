@@ -5,8 +5,8 @@
 """
 from nicegui import ui
 
+from core import anime
 import config
-import core
 from sources.parse import format_quarter
 from .layout import frame
 
@@ -146,7 +146,7 @@ def settings():
 
         async def _reenrich():
             ui.notify("正在重新识别全部…（走 bgm，可能要一会儿）")
-            n = await core.reenrich_all()
+            n = await anime.reenrich_all()
             ui.notify(f"重新识别完成：{n} 部命中", type="positive")
 
         with ui.row().classes("items-center gap-2 mt-2"):

@@ -8,8 +8,8 @@ from urllib.parse import quote
 
 from nicegui import ui
 
+from core import anime
 import config
-import core
 from .layout import ep_str, frame, human_size, name_of, season_label
 from .sources import render_sources
 
@@ -61,7 +61,7 @@ def dashboard(t: str = "manage"):
         # ---- 刷新（页面局部，闭包内共享）----
         @ui.refreshable
         def overview_panel():
-            ov = core.overview()
+            ov = anime.overview()
             k = ov["kpi"]
 
             # ── KPI 卡片 ──
@@ -102,7 +102,7 @@ def dashboard(t: str = "manage"):
                         if not ov["by_quarter"]:
                             ui.label("—").classes("text-gray-500 text-sm")
                         for q, shows, done in ov["by_quarter"]:
-                            _barline(core.quarter_label(q), done, maxdl, lw="w-36", text=f"{done} / {shows}")
+                            _barline(anime.quarter_label(q), done, maxdl, lw="w-36", text=f"{done} / {shows}")
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
                     ui.label(f"种子来源（已下 / 种子）· {len(ov['by_source'])}").classes("text-sm font-bold")
                     with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
@@ -156,14 +156,14 @@ def dashboard(t: str = "manage"):
 
         @ui.refreshable
         def confirm_panel():
-            pend = core.pending_confirm()
+            pend = anime.pending_confirm()
             if not pend:
                 ui.label("没有待确认的番。（『审核』策略的源组发现的番会出现在这里）").classes("text-gray-400 p-4")
                 return
             for i, (q, items) in enumerate(_group_by_quarter(pend)):
-                with ui.expansion(f"{core.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
+                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
-                        srcs = core.sources_for(a.id)
+                        srcs = anime.sources_for(a.id)
                         with ui.card().classes("w-full"):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
                                 ui.badge("审核").props("color=orange")
@@ -184,12 +184,12 @@ def dashboard(t: str = "manage"):
 
         @ui.refreshable
         def reject_panel():
-            rej = core.list_rejected()
+            rej = anime.list_rejected()
             if not rej:
                 ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
                 return
             for i, (q, items) in enumerate(_group_by_quarter(rej)):
-                with ui.expansion(f"{core.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
+                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
                         with ui.row().classes("items-center gap-3 pl-2 py-1 flex-wrap"):
                             ui.badge("已忽略").props("color=grey")
@@ -199,11 +199,11 @@ def dashboard(t: str = "manage"):
                             sl = season_label(a)
                             if sl:
                                 ui.badge(sl).props("color=blue-grey")
-                            ui.label("来源: " + (" · ".join(core.sources_for(a.id)) or "—")).classes(
+                            ui.label("来源: " + (" · ".join(anime.sources_for(a.id)) or "—")).classes(
                                 "text-xs text-gray-400")
                             ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
                                 "size=sm flat color=primary")
-                            nf = core.downloaded_count(a.id)
+                            nf = anime.downloaded_count(a.id)
                             if nf:  # 只有确实下过文件才给『删除文件』
                                 ui.button("删除文件", icon="delete_forever",
                                           on_click=_del_files(a.id, name_of(a), nf)).props(
@@ -212,7 +212,7 @@ def dashboard(t: str = "manage"):
 
         @ui.refreshable
         def fail_panel():
-            items = core.list_unenriched()
+            items = anime.list_unenriched()
             if not items:
                 ui.label("没有待识别的番。（bgm 没自动匹配上的番会出现在这里，可重试或手动绑定）").classes(
                     "text-gray-400 p-4")
@@ -221,7 +221,7 @@ def dashboard(t: str = "manage"):
                      "可『重试识别』，或粘贴 bgm 链接/ID『绑定』，实在没有就『忽略』。").classes(
                 "text-xs text-gray-400 p-2")
             for a in items:
-                srcs = core.sources_for(a.id)
+                srcs = anime.sources_for(a.id)
                 with ui.card().classes("w-full"):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
                         ui.badge("未匹配").props("color=red")
@@ -256,7 +256,7 @@ def dashboard(t: str = "manage"):
                 "src": r["source"],
                 "raw": r["raw"] or "—",
                 "status": st.get(r["status"], r["status"]),
-            } for r in core.recent_rows(50)]
+            } for r in anime.recent_rows(50)]
             ui.table(
                 columns=[
                     {"name": "time", "label": "时间", "field": "time", "align": "left"},
@@ -272,7 +272,7 @@ def dashboard(t: str = "manage"):
         def manage_panel():
             # 当季 / 上季小结（数字大、标签小；零值审核项变灰）
             with ui.row().classes("w-full gap-3 flex-wrap mb-3 items-stretch"):
-                for b in core.quarter_brief():
+                for b in anime.quarter_brief():
                     stats = [
                         (b["shows"], "订阅中", "text-blue-300"),
                         (b["confirm"], "待确认", "text-orange-400" if b["confirm"] else "text-gray-600"),
@@ -283,7 +283,7 @@ def dashboard(t: str = "manage"):
                         with ui.row().classes("items-center gap-2"):
                             ui.badge(b["tag"]).props(
                                 f"color={'primary' if b['tag'] == '当季' else 'blue-grey'}")
-                            ui.label(core.quarter_label(b["key"])).classes("font-bold text-base")
+                            ui.label(anime.quarter_label(b["key"])).classes("font-bold text-base")
                         with ui.row().classes("gap-6"):
                             for num, lbl, color in stats:
                                 with ui.column().classes("items-center gap-0"):
@@ -302,14 +302,14 @@ def dashboard(t: str = "manage"):
                 if not a.confirmed:
                     return config.MANAGE_SHOW_PENDING
                 return True
-            animes = [a for a in core.list_all_anime() if _visible(a)]
+            animes = [a for a in anime.list_all_anime() if _visible(a)]
             if not animes:
                 ui.label("（还没有番剧，等采集）").classes("text-gray-400 p-4")
                 return
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
-            src_map = core.multi_source_map()
+            src_map = anime.multi_source_map()
             for i, (q, items) in enumerate(_group_by_quarter(animes)):
-                with ui.expansion(f"{core.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
+                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
                         _anime_row(a, src_map.get(a.id))
 
@@ -340,23 +340,23 @@ def dashboard(t: str = "manage"):
         def _confirm(anime_id, sel=None):
             async def h():
                 pref = (sel.value if sel is not None else "") or ""
-                core.confirm_anime(anime_id, pref)
-                n = await core.download_pending_for_anime(anime_id)
+                anime.confirm_anime(anime_id, pref)
+                n = await anime.download_pending_for_anime(anime_id)
                 refresh_all()
                 ui.notify(f"已确认，补下 {n} 集" + (f"（源：{pref}）" if pref else ""))
             return h
 
         def _reject(anime_id):
             def h():
-                core.reject_anime(anime_id)
+                anime.reject_anime(anime_id)
                 refresh_all()
                 ui.notify("已忽略，移到『已忽略』页")
             return h
 
         def _restore(anime_id):
             async def h():
-                core.restore_anime(anime_id)
-                n = await core.download_pending_for_anime(anime_id)
+                anime.restore_anime(anime_id)
+                n = await anime.download_pending_for_anime(anime_id)
                 refresh_all()
                 ui.notify(f"已恢复到『订阅中』，补下 {n} 集")
             return h
@@ -372,7 +372,7 @@ def dashboard(t: str = "manage"):
 
                         async def _do():
                             dlg.close()
-                            n = await core.delete_files(anime_id)
+                            n = await anime.delete_anime_files(anime_id)
                             refresh_all()
                             ui.notify(f"已删除 {n} 个文件" if n else "没删成（qB 未连上或已无文件）",
                                       type="positive" if n else "warning")
@@ -387,7 +387,7 @@ def dashboard(t: str = "manage"):
                 if not m:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
-                ok = await core.bind_bgm(anime_id, int(m.group(1)))
+                ok = await anime.bind_bgm(anime_id, int(m.group(1)))
                 refresh_all()
                 ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
                           type="positive" if ok else "negative")
@@ -395,14 +395,14 @@ def dashboard(t: str = "manage"):
 
         def _refail(anime_id):
             async def h():
-                ok = await core.enrich_anime(anime_id)
+                ok = await anime.enrich_anime(anime_id)
                 refresh_all()
                 ui.notify("识别成功 ✓" if ok else "还是没识别到（可手动粘贴 bgm 链接绑定）",
                           type="positive" if ok else "warning")
             return h
 
         async def _download_all():
-            n = await core.download_all_pending()
+            n = await anime.download_all_pending()
             refresh_dynamic()
             ui.notify(f"已触发补下 {n} 集")
 
@@ -410,7 +410,7 @@ def dashboard(t: str = "manage"):
             async def h():
                 scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
                 ui.notify(f"正在重新识别（{scope}）…走 bgm，可能要一会儿")
-                cnt = await core.reenrich_scope(seasons)
+                cnt = await anime.reenrich_scope(seasons)
                 overview_panel.refresh()
                 ui.notify(f"识别完成：{cnt} 部命中", type="positive")
             return h
