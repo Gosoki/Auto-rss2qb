@@ -64,6 +64,28 @@ def qb_live_text(t) -> str:
     return " ".join(parts)
 
 
+def paginate(seq: list, page: int, size: int):
+    """把 seq 按每页 size 切片。返回 (本页元素, 总页数, 收敛后的页码)。
+
+    页码越界时夹到合法范围（数据变少后停在最后一页而非空页）。
+    """
+    total = max(1, (len(seq) + size - 1) // size)
+    page = max(1, min(page, total))
+    return seq[(page - 1) * size:page * size], total, page
+
+
+def expand_collapse_bar(exps: list) -> None:
+    """一行『全部展开 / 全部收起』小按钮，统一开合传入的 ui.expansion 列表。
+
+    exps 传空列表进来、渲染分组时逐个 append；点按钮时列表已填满，故能全量操作。
+    """
+    with ui.row().classes("items-center gap-1 pl-1 pb-1"):
+        ui.button("全部展开", icon="unfold_more",
+                  on_click=lambda: [e.set_value(True) for e in exps]).props("flat dense size=sm")
+        ui.button("全部收起", icon="unfold_less",
+                  on_click=lambda: [e.set_value(False) for e in exps]).props("flat dense size=sm")
+
+
 @contextmanager
 def frame(active: str = ""):
     """页面骨架：暗色 + 顶栏（站名 + 导航 + 右侧动作位）。

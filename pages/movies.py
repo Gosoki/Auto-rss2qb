@@ -10,7 +10,7 @@ from nicegui import ui
 
 import config
 from core import movies as mov
-from .layout import frame, human_size, name_of, qb_live_text
+from .layout import expand_collapse_bar, frame, human_size, name_of, paginate, qb_live_text
 
 _SEASONS = {"A": "冬", "B": "春", "C": "夏", "D": "秋"}
 _STATUS = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
@@ -182,7 +182,12 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
 def movies_page(t: str = "list"):
     """t = 当前 tab（写在 URL ?t= 里），刷新后停在同一 tab。"""
     with frame("movies"):
+        list_page = {"n": 1}  # 列表分页：每页 20 个季度（5 年），当前页码
         detail_dlg = ui.dialog()
+
+        def _list_goto(e):
+            list_page["n"] = int(e.value)
+            list_panel.refresh()
 
         def open_detail(movie_id):
             detail_dlg.clear()
@@ -322,19 +327,19 @@ def movies_page(t: str = "list"):
                     ui.badge(f"做种 {q['seeding']}").props("color=teal").classes("text-sm")
                     if q["dlspeed"]:
                         ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=teal").classes("text-sm")
-            ui.label(f"各季度（电影数 / 已下）· {len(ov['by_quarter'])}").classes("text-sm font-bold mt-3 pl-1")
+            ui.label(f"各季度（电影数）· {len(ov['by_quarter'])}").classes("text-sm font-bold mt-3 pl-1")
             with ui.column().classes("w-full gap-0 pl-1"):
                 maxv = max((tot for _, tot, _ in ov["by_quarter"]), default=1) or 1
                 if not ov["by_quarter"]:
                     ui.label("—").classes("text-gray-500 text-sm")
-                for qk, tot, done in ov["by_quarter"]:
+                for qk, tot, _ in ov["by_quarter"]:
                     with ui.row().classes("items-center gap-3 w-full text-sm py-0.5"):
                         ui.label(_q_label(qk)).classes("w-36 shrink-0 truncate")
                         with ui.element("div").classes("grow rounded").style(
                                 "background:rgba(255,255,255,.07);height:12px"):
                             ui.element("div").style(
                                 f"width:{tot / maxv * 100:.1f}%;height:12px;background:#a855f7;border-radius:6px")
-                        ui.label(f"{done} / {tot}").classes("shrink-0 text-gray-400 text-right").style(
+                        ui.label(f"{tot}").classes("shrink-0 text-gray-400 text-right").style(
                             "min-width:5rem")
 
         @ui.refreshable
@@ -362,7 +367,7 @@ def movies_page(t: str = "list"):
                 <q-td :props="props">
                     <div>{{ props.row.name }}</div>
                     <div class="text-grey-6"
-                         style="font-size:11px;white-space:normal;word-break:break-all;max-width:26rem">
+                         style="font-size:11px;white-space:normal;word-break:break-all">
                         {{ props.row.raw }}
                     </div>
                 </q-td>
@@ -382,10 +387,21 @@ def movies_page(t: str = "list"):
             quarters = sorted((q for q in by_q if q != "未知"), reverse=True)
             if "未知" in by_q:
                 quarters.append("未知")
-            for i, q in enumerate(quarters):
+            shown, total_pages, page = paginate(quarters, list_page["n"], 20)
+            list_page["n"] = page
+            exps: list = []
+            with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
+                expand_collapse_bar(exps)
+                if total_pages > 1:
+                    ui.pagination(1, total_pages, direction_links=True, value=page,
+                                  on_change=_list_goto).props("size=sm")
+                    ui.label(f"共 {total_pages} 页 · 每页 5 年").classes("text-xs text-gray-500")
+            for q in shown:
                 grp = by_q[q]
-                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(grp)} 部",
-                                  value=(i == 0)).classes("w-full"):
+                exp = ui.expansion(f"{anime.quarter_label(q)}   ·   {len(grp)} 部",
+                                   value=True).classes("w-full")
+                exps.append(exp)
+                with exp:
                     for m in grp:
                         _movie_card(m)
 

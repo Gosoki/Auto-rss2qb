@@ -10,7 +10,7 @@ from nicegui import ui
 
 from core import anime
 import config
-from .layout import ep_str, frame, human_size, name_of, season_label
+from .layout import ep_str, expand_collapse_bar, frame, human_size, name_of, paginate, season_label
 from .sources import render_sources
 
 
@@ -58,6 +58,12 @@ _TAB_KEYS = ("overview", "manage", "confirm", "fail", "reject", "sources")
 def dashboard(t: str = "manage"):
     """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。"""
     with frame("manage"):  # 本页用 tab + 30s 定时刷新，不往顶栏右侧放自定义动作
+        manage_page = {"n": 1}  # 番剧表分页：每页 12 个季度（3 年），当前页码
+
+        def _manage_goto(e):
+            manage_page["n"] = int(e.value)
+            manage_panel.refresh()
+
         # ---- 刷新（页面局部，闭包内共享）----
         @ui.refreshable
         def overview_panel():
@@ -271,7 +277,7 @@ def dashboard(t: str = "manage"):
                 <q-td :props="props">
                     <div>{{ props.row.name }}</div>
                     <div class="text-grey-6"
-                         style="font-size:11px;white-space:normal;word-break:break-all;max-width:26rem">
+                         style="font-size:11px;white-space:normal;word-break:break-all">
                         {{ props.row.raw }}
                     </div>
                 </q-td>
@@ -317,8 +323,19 @@ def dashboard(t: str = "manage"):
                 return
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.multi_source_map()
-            for i, (q, items) in enumerate(_group_by_quarter(animes)):
-                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
+            groups, total_pages, page = paginate(_group_by_quarter(animes), manage_page["n"], 12)
+            manage_page["n"] = page
+            exps: list = []
+            with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
+                expand_collapse_bar(exps)
+                if total_pages > 1:
+                    ui.pagination(1, total_pages, direction_links=True, value=page,
+                                  on_change=_manage_goto).props("size=sm")
+                    ui.label(f"共 {total_pages} 页 · 每页 3 年").classes("text-xs text-gray-500")
+            for i, (q, items) in enumerate(groups):
+                exp = ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full")
+                exps.append(exp)
+                with exp:
                     for a in items:
                         _anime_row(a, src_map.get(a.id))
 
