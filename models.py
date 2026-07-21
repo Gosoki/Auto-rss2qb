@@ -1,10 +1,14 @@
 """数据模型（SQLModel）。
 
-Anime      —— 一部番剧，唯一一条。身份 = bangumi_id（拿不到则各自独立）。
-              含 bgm 抓来的元数据 + 下载总开关 if_down。
-TitleAlias —— 番名对照：各字幕组解析出的 (标题, 季) → 指向哪部番。命中即知是谁，不必再查 bgm。
-Torrent    —— 每条种子，按 info_hash 唯一；用 anime_id 关联到番。
-SourceGroup—— 订阅的字幕组/源。
+TV 番剧与剧场版/OVA 彻底分表、互不相干（各自独立的表 + 独立的 core.py / movies.py 逻辑）：
+
+Setting     —— 键值配置覆盖（设置页写、运行时读、即时生效）。
+SourceGroup —— 订阅的字幕组/源组（feed/策略/优先级/白名单）——只喂 TV 周更番。
+Anime       —— 一部 TV 番剧（唯一）。身份 = bangumi_id。含 bgm 元数据。下不下 = confirmed 且未 rejected。
+TitleAlias  —— 番名对照：(标题, 季) → 哪部 TV 番。命中即知是谁，不必再查 bgm。
+Torrent     —— 一条 TV 种子，按 info_hash 唯一；anime_id 关联到 TV 番。含 qB 实时态镜像（qb_*）。
+Movie       —— 一部剧场版/OVA（唯一）。来源仅 Mikan 季度剧场版/OVA 桶，识别用 bgm。与 Anime 无关。
+MovieTorrent—— 一条剧场版/OVA 种子，按 info_hash 唯一；movie_id 关联到 Movie。含 qB 实时态镜像。
 """
 from datetime import datetime
 
@@ -35,7 +39,7 @@ class SourceGroup(SQLModel, table=True):
 
 
 class Anime(SQLModel, table=True):
-    """一部番剧（唯一）。不同组的不同写法都经 TitleAlias 指到这一条。"""
+    """一部 TV 番剧（唯一）。不同组的不同写法都经 TitleAlias 指到这一条。剧场版/OVA 不在此，见 Movie。"""
     id: int | None = Field(default=None, primary_key=True)
     bangumi_id: int | None = Field(default=None, index=True)   # 身份键（可空）
     # ---- 名称 / 归档 ----
@@ -48,12 +52,11 @@ class Anime(SQLModel, table=True):
     air_date: str | None = Field(default=None)        # 放送开始日 YYYY-MM-DD
     air_weekday: int | None = Field(default=None)     # 放送星期 0=周一 … 6=周日
     total_episodes: int | None = Field(default=None)  # 总集数
-    platform: str | None = Field(default=None)        # 类型：TV / 剧场版 / OVA / WEB …
+    platform: str | None = Field(default=None)        # 类型：TV / WEB …（剧场版/OVA 归 Movie）
     cover_url: str | None = Field(default=None)       # 封面图 URL
     rating: float | None = Field(default=None)        # bgm 评分（0-10）
     summary: str | None = Field(default=None)         # 简介
     # ---- 下载控制 ----
-    if_down: bool = Field(default=True)               # (遗留列，已不再读取；下不下 = confirmed 且未 rejected)
     confirmed: bool = Field(default=True)             # 审核状态（审核源默认 False，等人工确认）；确认即自动下
     rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『拒绝』页恢复）
     source_kind: str = Field(default="auto")          # 引入它的策略（'auto'/'review'，徽章用）
@@ -82,11 +85,72 @@ class Torrent(SQLModel, table=True):
     source: str = Field(default="")             # 字幕组/来源
     site: str = Field(default="nyaa")           # 下载站点
     anime_title: str = Field(default="")        # 该种子解析出的原始番名（展示/调试）
+    raw_title: str = Field(default="")          # 原始种子完整标题（含语言/画质标签，用于区分同集不同版本）
     season: int = Field(default=1)
     episode: float = Field(default=-2)          # 支持 .5；-1特别篇 -2未知
     quarter: str = Field(default="")
-    status: str = Field(default="pending")      # pending/downloaded/error/skipped/downloading
+    status: str = Field(default="pending")      # 应用侧生命周期：pending/downloading/downloaded/error/skipped
     download_url: str = Field(default="")
     release_time: datetime | None = Field(default=None)
     priority: int = Field(default=0)            # 来源组优先级（缓冲窗口到点时按此选下哪一份）
     created_at: datetime = Field(default_factory=datetime.now)
+    # ---- qB 实时状态（后台每 QB_SYNC_INTERVAL 秒从 qBittorrent 同步；未接 qB 时留空/0）----
+    qb_state: str = Field(default="")           # qB 原始态：downloading/stalledUP/pausedDL/error…（空=qB 未跟踪）
+    qb_progress: float = Field(default=0.0)     # 完成度 0..1
+    qb_dlspeed: int = Field(default=0)          # 下载速度 B/s
+    qb_size: int = Field(default=0)             # 种子总大小 B
+    qb_eta: int = Field(default=0)              # 预计剩余秒（qB 用 8640000 表示 ∞）
+    qb_synced_at: datetime | None = Field(default=None)  # 最近一次从 qB 同步的时间
+
+
+class Movie(SQLModel, table=True):
+    """一部剧场版/OVA（唯一，身份 = bangumi_id）。来源仅 Mikan 季度剧场版/OVA 桶，识别用 bgm。
+
+    与 TV 番剧（Anime）完全分离：不进周更下载流，只在 /movies 页人工审批后逐版本下。
+    """
+    id: int | None = Field(default=None, primary_key=True)
+    bangumi_id: int | None = Field(default=None, index=True)   # 身份键（可空）
+    mikan_id: str | None = Field(default=None, index=True)     # Mikan 番组 id（刷新种子 RSS 用）
+    # ---- 名称 / 归档 ----
+    title: str = Field(default="")                    # Mikan/解析名（兜底）
+    display_name: str | None = Field(default=None)    # bgm 规范名（UI 显示）
+    jp_name: str | None = Field(default=None)         # bgm 日文原名（建下载文件夹用）
+    quarter: str = Field(default="")                  # 首播季（bgm 放送日），决定下载文件夹
+    # ---- bgm 元数据 ----
+    air_date: str | None = Field(default=None)
+    air_weekday: int | None = Field(default=None)
+    total_episodes: int | None = Field(default=None)
+    platform: str | None = Field(default=None)        # 剧场版 / OVA / OAD / WEB（bgm 类型，仅展示）
+    cover_url: str | None = Field(default=None)
+    rating: float | None = Field(default=None)
+    summary: str | None = Field(default=None)
+    # ---- 审批 / 下载控制 ----
+    confirmed: bool = Field(default=False)            # 人工审批（点下载即视作收藏）；剧场版从不自动下
+    rejected: bool = Field(default=False)             # 人工忽略（移出 /movies，可恢复）
+    pref_source: str | None = Field(default=None)     # 首选下载源
+    enriched: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class MovieTorrent(SQLModel, table=True):
+    """一条剧场版/OVA 种子，按 info_hash 唯一；movie_id 关联到 Movie。剧场版=一部作品，各条即不同版本。"""
+    __table_args__ = (UniqueConstraint("info_hash", name="uq_movietorrent_info_hash"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    info_hash: str = Field(index=True)          # 40位hex，小写；跨源去重键
+    movie_id: int = Field(default=0, index=True)  # → Movie.id
+    source: str = Field(default="")             # 字幕组/来源
+    site: str = Field(default="mikan")
+    raw_title: str = Field(default="")          # 原始种子完整标题（区分版本）
+    status: str = Field(default="pending")      # 应用侧生命周期：pending/downloading/downloaded/error/skipped
+    download_url: str = Field(default="")
+    release_time: datetime | None = Field(default=None)
+    priority: int = Field(default=0)
+    created_at: datetime = Field(default_factory=datetime.now)
+    # ---- qB 实时状态（同 Torrent）----
+    qb_state: str = Field(default="")
+    qb_progress: float = Field(default=0.0)
+    qb_dlspeed: int = Field(default=0)
+    qb_size: int = Field(default=0)
+    qb_eta: int = Field(default=0)
+    qb_synced_at: datetime | None = Field(default=None)

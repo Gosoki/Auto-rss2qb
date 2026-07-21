@@ -58,6 +58,31 @@ class QBittorrent:
         log.error("添加下载任务失败 %s: %s", resp.status_code, resp.text[:80])
         return False
 
+    async def torrents_info(self, hashes: list[str]) -> dict | None:
+        """按 info_hash 批量查 qB 实时态，返回 {hash(小写): 种子dict}。连不上返回 None、无结果返回 {}。
+
+        种子 dict 关键字段：state / progress(0..1) / dlspeed / size / eta / num_seeds…
+        """
+        hashes = [h for h in hashes if h]
+        if not hashes:
+            return {}
+        client = await self._login()
+        if client is None:
+            return None
+        try:
+            resp = await client.get("/api/v2/torrents/info",
+                                    params={"hashes": "|".join(hashes)})
+            resp.raise_for_status()
+            data = resp.json()
+        except (httpx.HTTPError, ValueError) as e:
+            log.error("查询种子状态失败: %s", e)
+            return None
+        finally:
+            await client.aclose()
+        if not isinstance(data, list):
+            return {}
+        return {str(t.get("hash", "")).lower(): t for t in data if t.get("hash")}
+
     async def delete(self, hashes: list[str], delete_files: bool = True) -> bool:
         """按 info_hash 从 qB 删除种子；delete_files=True 连硬盘文件一起删。全空/成功返回 True。"""
         hashes = [h for h in hashes if h]

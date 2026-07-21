@@ -33,6 +33,7 @@ except ValueError:
 # ---- 可热改设置：{键: (类型, 默认值)}，类型 bool/int/str/list ----
 _SPEC = {
     "QB_ENABLED": (bool, True),
+    "QB_SYNC_INTERVAL": (int, 20),          # 每隔多少秒从 qB 同步一次种子实时态
     "QB_URL": (str, "http://127.0.0.1:8080"),
     "QB_USERNAME": (str, ""),
     "QB_PASSWORD": (str, ""),

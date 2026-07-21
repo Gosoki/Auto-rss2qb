@@ -10,7 +10,8 @@ from nicegui import ui
 
 import config
 import core
-from .layout import ep_str, frame, name_of, season_label
+from .layout import ep_str, frame, human_size, name_of, season_label
+from .sources import render_sources
 
 
 def _state_rank(a):
@@ -37,8 +38,8 @@ _STATUS_CHIP = [("downloaded", "已下", "green"), ("downloading", "下载中", 
                 ("skipped", "跳过", "blue-grey")]
 
 
-def _barline(label, value, maxv, extra="", color="#3b82f6", lw="w-32"):
-    """一行『标签 + 比例条 + 数值』，用于概览里各季度/来源分布。min-w-0 防长名撑破列。"""
+def _barline(label, value, maxv, extra="", color="#3b82f6", lw="w-32", text=None):
+    """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认 value+extra）。"""
     pct = (value / maxv * 100) if maxv else 0
     with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
         ui.label(str(label)).classes(f"{lw} shrink-0 truncate").tooltip(str(label))
@@ -46,12 +47,17 @@ def _barline(label, value, maxv, extra="", color="#3b82f6", lw="w-32"):
                 "background:rgba(255,255,255,.07);height:12px"):
             ui.element("div").style(
                 f"width:{pct:.1f}%;height:12px;background:{color};border-radius:6px")
-        ui.label(f"{value}{extra}").classes("shrink-0 text-gray-400 text-right").style("min-width:5rem")
+        ui.label(text if text is not None else f"{value}{extra}").classes(
+            "shrink-0 text-gray-400 text-right").style("min-width:5rem")
+
+
+_TAB_KEYS = ("overview", "manage", "confirm", "fail", "reject", "sources")
 
 
 @ui.page("/")
-def dashboard():
-    with frame("manage") as header_right:
+def dashboard(t: str = "manage"):
+    """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。"""
+    with frame("manage"):  # 本页用 tab + 30s 定时刷新，不往顶栏右侧放自定义动作
         # ---- 刷新（页面局部，闭包内共享）----
         @ui.refreshable
         def overview_panel():
@@ -78,51 +84,75 @@ def dashboard():
                     ui.label("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）").classes(
                         "text-sm text-yellow-200")
 
-            # ── 种子状态分布 ──
-            ui.label("种子状态").classes("text-sm font-bold mt-3 pl-1")
-            with ui.row().classes("gap-2 flex-wrap pl-1"):
-                for key, txt, color in _STATUS_CHIP:
-                    ui.badge(f"{txt} {ov['status'][key]}").props(f"color={color}")
-
-            # ── 各季度 / 各来源（并排，窄屏自动堆叠；各自限高滚动，增多不撑爆）──
-            with ui.row().classes("w-full gap-6 flex-wrap mt-2"):
-                with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
-                    ui.label(f"各季度（番数 / 已下集）· {len(ov['by_quarter'])}").classes(
-                        "text-sm font-bold")
-                    with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
-                        maxq = max((sh for _, sh, _ in ov["by_quarter"]), default=1)
-                        if not ov["by_quarter"]:
-                            ui.label("—").classes("text-gray-500 text-sm")
-                        for q, shows, done in ov["by_quarter"]:
-                            _barline(core.quarter_label(q), shows, maxq,
-                                     extra=f" 番 · 下{done}", lw="w-36")
-                with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
-                    ui.label(f"各来源（种子 / 已下）· {len(ov['by_source'])}").classes(
-                        "text-sm font-bold")
-                    with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
-                        maxs = max((tot for _, tot, _ in ov["by_source"]), default=1)
-                        if not ov["by_source"]:
-                            ui.label("—").classes("text-gray-500 text-sm")
-                        for src, tot, done in ov["by_source"]:
-                            _barline(src, tot, maxs, extra=f" / {done}", color="#8b5cf6")
-
-            # ── 采集 / 源组 ──
-            enr, tot = ov["enriched"]
-            ui.label("采集").classes("text-sm font-bold mt-3 pl-1")
-            with ui.row().classes("gap-2 flex-wrap pl-1"):
-                ui.badge("采集开" if ov["config"]["poll_on"] else "采集已暂停").props(
-                    f"color={'green' if ov['config']['poll_on'] else 'red'}").tooltip(
-                    "后台是否在抓取（在设置页『采集』开关切换）")
-                ui.badge(f"已识别 {enr}/{tot}").props("color=indigo").tooltip("已匹配到 bgm 的番 / 全部")
-                ui.badge(f"轮询 {ov['config']['poll']}s").props("color=blue-grey")
-                ui.badge(f"缓冲窗口 {ov['config']['grace']}min").props("color=blue-grey")
-            ui.label("源组").classes("text-sm font-bold mt-2 pl-1")
+            # ── 订阅源组 ──
+            ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 for name, site, policy, priority, enabled in ov["groups"]:
                     pol = "全下" if policy == "auto" else "审核"
                     tail = "" if enabled else " · 停用"
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
-                        f"color={'green' if enabled else 'grey'}")
+                        f"color={'blue-grey' if enabled else 'grey'}").classes("text-sm")
+
+            # ── 下载番剧 / 种子来源（左右分开，窄屏自动堆叠）──
+            with ui.row().classes("w-full gap-6 flex-wrap mt-3"):
+                with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
+                    ui.label(f"下载番剧（下载 / 总番）· {len(ov['by_quarter'])}").classes("text-sm font-bold")
+                    with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
+                        maxdl = max((dn for _, _, dn in ov["by_quarter"]), default=1) or 1  # 按下载数缩放
+                        if not ov["by_quarter"]:
+                            ui.label("—").classes("text-gray-500 text-sm")
+                        for q, shows, done in ov["by_quarter"]:
+                            _barline(core.quarter_label(q), done, maxdl, lw="w-36", text=f"{done} / {shows}")
+                with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
+                    ui.label(f"种子来源（已下 / 种子）· {len(ov['by_source'])}").classes("text-sm font-bold")
+                    with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
+                        maxs = max((tot for _, tot, _ in ov["by_source"]), default=1)
+                        if not ov["by_source"]:
+                            ui.label("—").classes("text-gray-500 text-sm")
+                        for src, tot, done in ov["by_source"]:
+                            _barline(src, tot, maxs, color="#8b5cf6", text=f"{done} / {tot}")
+
+            # ── 种子状态 ──
+            with ui.row().classes("items-center gap-3 mt-3 pl-1"):
+                ui.label("种子状态").classes("text-sm font-bold")
+                ui.button("补下全部", icon="download", on_click=_download_all).props(
+                    "outline color=primary size=sm").tooltip("订阅中所有待下集立即下")
+            with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
+                for key, txt, color in _STATUS_CHIP:
+                    ui.badge(f"{txt} {ov['status'][key]}").props(f"color={color}").classes("text-sm")
+            # qB 实时态（接上 qB 后每 QB_SYNC_INTERVAL 秒刷新）
+            if ov["config"]["qb"]:
+                q = ov["qb"]
+                with ui.row().classes("gap-2 flex-wrap pl-1 items-center mt-1"):
+                    ui.badge(f"qB 跟踪 {q['tracked']}").props("color=teal").classes("text-sm").tooltip(
+                        "qB 里正在跟踪的种子数（已交付给 qB 的）")
+                    ui.badge(f"下载中 {q['downloading']}").props("color=teal").classes("text-sm")
+                    ui.badge(f"做种 {q['seeding']}").props("color=teal").classes("text-sm")
+                    if q["dlspeed"]:
+                        ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=teal").classes("text-sm")
+                    ui.badge(f"平均 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").classes(
+                        "text-sm").tooltip("已交付种子的平均完成度")
+
+            # ── 采集状态 / 源组 ──
+            enr, tot = ov["enriched"]
+            with ui.row().classes("items-center gap-3 mt-3 pl-1"):
+                ui.label("采集状态").classes("text-sm font-bold")
+                with ui.button("重新识别", icon="sync").props("outline color=primary size=sm"):
+                    with ui.menu():
+                        ui.menu_item("识别当季", on_click=_reident(1))
+                        ui.menu_item("识别半年（近 2 季）", on_click=_reident(2))
+                        ui.menu_item("识别 1 年（近 4 季）", on_click=_reident(4))
+                        ui.menu_item("识别全部", on_click=_reident(None))
+            with ui.row().classes("gap-2 flex-wrap pl-1"):
+                ui.badge("采集开启" if ov["config"]["poll_on"] else "采集暂停").props(
+                    f"color={'green' if ov['config']['poll_on'] else 'red'}").classes("text-sm").tooltip(
+                    "后台是否在抓取（在设置页『采集』开关切换）")
+                ui.badge(f"识别番数 {enr}/{tot}").props("color=indigo").classes("text-sm").tooltip(
+                    "已匹配到 bgm 的番 / 全部")
+                ui.badge(f"轮询间隔 {ov['config']['poll']}s").props("color=blue-grey").classes("text-sm").tooltip(
+                    "后台每隔这么久抓一次源（设置页可改）")
+                ui.badge(f"缓冲窗口 {ov['config']['grace']}min").props("color=blue-grey").classes("text-sm").tooltip(
+                    "一集首次发现后等这么久再下，给更高优先级的源补齐（设置页可改）")
 
         @ui.refreshable
         def confirm_panel():
@@ -216,18 +246,23 @@ def dashboard():
 
         @ui.refreshable
         def recent_panel():
+            ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
+            st = {"downloaded": "已下", "downloading": "下载中", "pending": "待下",
+                  "error": "失败", "skipped": "跳过"}
             rows = [{
-                "id": t.id,
-                "time": str(t.release_time or t.created_at)[:16],
-                "name": f"{t.anime_title} 第{t.season}季 第{ep_str(t.episode)}集",
-                "src": t.source,
-                "status": t.status,
-            } for t in core.list_torrents(50)]
+                "id": r["id"],
+                "time": r["time"],
+                "name": f'{r["name"]}  第{ep_str(r["episode"])}集',
+                "src": r["source"],
+                "raw": r["raw"] or "—",
+                "status": st.get(r["status"], r["status"]),
+            } for r in core.recent_rows(50)]
             ui.table(
                 columns=[
                     {"name": "time", "label": "时间", "field": "time", "align": "left"},
                     {"name": "name", "label": "番剧", "field": "name", "align": "left"},
                     {"name": "src", "label": "来源", "field": "src", "align": "left"},
+                    {"name": "raw", "label": "原始标题", "field": "raw", "align": "left"},
                     {"name": "status", "label": "状态", "field": "status", "align": "left"},
                 ],
                 rows=rows, row_key="id",
@@ -371,6 +406,15 @@ def dashboard():
             refresh_dynamic()
             ui.notify(f"已触发补下 {n} 集")
 
+        def _reident(seasons):
+            async def h():
+                scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
+                ui.notify(f"正在重新识别（{scope}）…走 bgm，可能要一会儿")
+                cnt = await core.reenrich_scope(seasons)
+                overview_panel.refresh()
+                ui.notify(f"识别完成：{cnt} 部命中", type="positive")
+            return h
+
         def _anime_row(a, sources=None):
             with ui.row().classes("items-center gap-3 pl-2 py-1"):
                 if a.rejected:                       # 状态徽标（互斥，最多一个）
@@ -389,22 +433,22 @@ def dashboard():
                 if sources:
                     ui.badge(f"多源 {len(sources)}").props("color=green").tooltip("来源: " + " · ".join(sources))
 
-        # ---- 顶栏右侧全局动作（补下全部 / 刷新）----
-        with header_right:
-            ui.button(icon="download", on_click=_download_all).props(
-                "flat round dense color=white").tooltip("补下全部：订阅中所有待下集立即下")
-            ui.button(icon="refresh", on_click=refresh_all).props(
-                "flat round dense color=white").tooltip("刷新页面数据")
-
         # ---- 页面布局 ----
         with ui.tabs().classes("w-full") as tabs:
-            ui.tab("manage", "番剧列表", "movie")
+            ui.tab("overview", "仪表盘", "dashboard")
+            ui.tab("manage", "番剧表", "movie")
             ui.tab("confirm", "待确认", "help_outline")
             ui.tab("fail", "待识别", "sync_problem")
             ui.tab("reject", "已忽略", "block")
-            ui.tab("recent", "新入库", "inventory_2")
-            ui.tab("overview", "仪表盘", "dashboard")
-        with ui.tab_panels(tabs, value="manage").classes("w-full"):
+            ui.tab("sources", "订阅源", "rss_feed")
+        # 切 tab 时把当前 tab 写进 URL（不重载），这样『刷新』重载后仍停在该 tab
+        tabs.on_value_change(lambda e: ui.run_javascript(
+            f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))"))
+        start = t if t in _TAB_KEYS else "manage"
+        with ui.tab_panels(tabs, value=start).classes("w-full"):
+            with ui.tab_panel("overview"):
+                overview_panel()
+                recent_panel()
             with ui.tab_panel("manage"):
                 manage_panel()
             with ui.tab_panel("confirm"):
@@ -413,9 +457,7 @@ def dashboard():
                 fail_panel()
             with ui.tab_panel("reject"):
                 reject_panel()
-            with ui.tab_panel("recent"):
-                recent_panel()
-            with ui.tab_panel("overview"):
-                overview_panel()
+            with ui.tab_panel("sources"):
+                render_sources()
 
         ui.timer(30.0, refresh_dynamic)  # 只刷动态区，不重建管理页（避免展开状态被重置）

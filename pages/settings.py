@@ -1,7 +1,7 @@
-"""设置页 `/settings`：读当前配置、改、写回 .env。
+"""设置页 `/settings`：读当前配置、改、即时生效。
 
-写回只改 .env 文件，本进程不热加载配置——所有项都需重启程序才生效。
-数字项做校验，避免把非数字写进 .env 导致下次启动解析崩溃。
+绝大多数项写进数据库 settings 表并热更新内存（config.set_many），保存即生效、不必重启。
+仅 WEB_PORT 这类绑定项仍走 .env（_RESTART_ONLY），改了要重启。数字项做校验，避免写入非数字。
 """
 from nicegui import ui
 
@@ -10,7 +10,7 @@ import core
 from sources.parse import format_quarter
 from .layout import frame
 
-_NUMERIC = {"POLL_INTERVAL", "DOWNLOAD_GRACE_MIN", "WEB_PORT"}
+_NUMERIC = {"POLL_INTERVAL", "DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL"}
 _PASSWORD = {"QB_PASSWORD"}
 _RESTART_ONLY = {"WEB_PORT"}  # 绑端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
@@ -84,6 +84,7 @@ def settings():
         with ui.card().classes("w-full"):
             ui.label("下载 / qBittorrent").classes("font-bold")
             _switch("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
+            _num("QB_SYNC_INTERVAL", "qB 状态同步间隔（秒，回拉下载进度/做种态）", config.QB_SYNC_INTERVAL)
             _text("QB_URL", "qB 地址", config.QB_URL)
             _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
             _password("QB_PASSWORD", "qB 密码（留空=不修改）")
@@ -102,12 +103,12 @@ def settings():
 
         with ui.card().classes("w-full"):
             ui.label("面板 / 显示").classes("font-bold")
-            ui.label("番剧列表默认只显示订阅中；下面两项各自决定要不要也带上（它们仍在各自标签页）。").classes(
+            ui.label("番剧表默认只显示订阅中；下面两项各自决定要不要也带上（它们仍在各自标签页）。").classes(
                 "text-xs text-gray-500")
-            _switch("MANAGE_SHOW_PENDING", "番剧列表里也显示『待确认』的番", config.MANAGE_SHOW_PENDING)
-            _switch("MANAGE_SHOW_REJECTED", "番剧列表里也显示『已忽略』的番", config.MANAGE_SHOW_REJECTED)
+            _switch("MANAGE_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.MANAGE_SHOW_PENDING)
+            _switch("MANAGE_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.MANAGE_SHOW_REJECTED)
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
-                             "页面上季度怎么显示：番剧列表季度标题 / 仪表盘 / 详情。", config.QUARTER_FMT_UI)
+                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。", config.QUARTER_FMT_UI)
 
         with ui.card().classes("w-full"):
             ui.label("网络 / 通知").classes("font-bold")

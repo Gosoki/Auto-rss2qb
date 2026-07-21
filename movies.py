@@ -1,0 +1,402 @@
+"""剧场版 / OVA 逻辑（与 TV 番剧 core.py 完全分离，只共用 engine 底层）。
+
+来源仅 Mikan 季度浏览页的『剧场版/OVA 桶』——不碰 TV 那边的订阅源。识别用 bgm。
+『电影只抓电影的部分』：桶里若被 bgm 明确判成 TV 周更番，跳过它（不把番剧的周更集也抓进来）；
+其余（剧场版/OVA/WEB/无类型）默认就是电影。剧场版一部作品只在 /movies 人工审批后下一个版本。
+"""
+import asyncio
+import logging
+
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import select
+
+import config
+import core
+import engine
+import enrich
+from db import get_session
+from models import Movie, MovieTorrent, Torrent
+from notify import notify
+from sources import mikan_catalog
+
+log = logging.getLogger("autorss")
+
+_dl_lock = asyncio.Lock()  # 串行化剧场版下载，防同一片并发重复交 qB
+
+
+def _has_downloads(s, movie_id: int) -> bool:
+    return s.exec(select(MovieTorrent).where(
+        MovieTorrent.movie_id == movie_id,
+        MovieTorrent.status.in_(["downloading", "downloaded"]))).first() is not None
+
+
+def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
+    """同一 bgm_id 裂成多条时合并：把 loser 的种子并到 keeper 并删 loser。"""
+    if loser_id == keeper_id:
+        return
+    for t in s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == loser_id)):
+        t.movie_id = keeper_id
+        s.add(t)
+    loser = s.get(Movie, loser_id)
+    if loser is not None:
+        s.delete(loser)
+    s.commit()
+
+
+# ---------------- 发现（Mikan 季度剧场版/OVA 桶 + bgm 识别） ----------------
+
+def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
+                  info: dict | None, label: str) -> tuple[int, bool]:
+    """按 bgm_id（无则 mikan_id）定位/新建 Movie，写入 bgm 元数据。返回 (movie_id, 是否新建)。"""
+    plat_label = ("剧场版" if ("剧场" in label or "劇場" in label)
+                  else "OVA" if ("OVA" in label or "OAD" in label or "OAV" in label) else None)
+    with get_session() as s:
+        movie = None
+        if bgm_id is not None:
+            movie = s.exec(select(Movie).where(Movie.bangumi_id == bgm_id)).first()
+        if movie is None:
+            movie = s.exec(select(Movie).where(Movie.mikan_id == mikan_id)).first()
+        is_new = movie is None
+        if movie is None:
+            movie = Movie(title=title, mikan_id=mikan_id, confirmed=False,
+                          enriched=bgm_id is not None, platform=plat_label)
+        movie.mikan_id = mikan_id
+        if not movie.display_name:
+            movie.display_name = title  # 无 bgm 时先用 Mikan 展示名兜底
+        engine.apply_bgm_meta(movie, info, keep_quarter=(not is_new and _has_downloads(s, movie.id)))
+        s.add(movie)
+        s.commit()
+        s.refresh(movie)
+        if movie.bangumi_id is not None:  # 身份守卫：同 bgm_id 合并
+            for other in list(s.exec(select(Movie).where(
+                    Movie.bangumi_id == movie.bangumi_id, Movie.id != movie.id))):
+                _merge_movie(s, other.id, movie.id)
+        return movie.id, is_new
+
+
+def _store_movie_torrents(movie_id: int, items: list) -> int:
+    """把某剧场版番组抓来的种子入库（按 hash 去重、逐条提交），全部 pending。返回新增数。"""
+    n = 0
+    with get_session() as s:
+        for item in items:
+            if s.exec(select(MovieTorrent).where(MovieTorrent.info_hash == item.info_hash)).first():
+                continue
+            s.add(MovieTorrent(
+                info_hash=item.info_hash, movie_id=movie_id, source=item.source,
+                site=item.site, raw_title=item.raw_title, download_url=item.download_url,
+                release_time=item.release_time, priority=item.priority, status="pending",
+            ))
+            try:
+                s.commit()
+                n += 1
+            except IntegrityError:
+                s.rollback()
+    return n
+
+
+async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
+    """扫描 Mikan 指定年份/季度的剧场版·OVA，识别(bgm)入库为 Movie 并抓其种子。
+
+    seasons：['A','B','C','D'] 子集（冬春夏秋），None=全年四季。
+    bgm 明确判成 TV 周更番的桶项『不当电影』——改喂给 TV 管线（core.process_item）进番剧那边的待确认，
+    而不是丢掉；其余（剧场版/OVA/WEB/无类型）默认判成电影入 Movie。
+    返回 {'movies','torrents','seen','to_tv_shows','to_tv_torrents','errors'}。
+    """
+    seasons = seasons or ["A", "B", "C", "D"]
+    added_movies = added_torrents = seen = to_tv_shows = to_tv_torrents = errors = 0
+    async with mikan_catalog.make_client() as client:
+        for letter in seasons:
+            try:
+                bucket = await mikan_catalog.discover_movie_bucket(client, year, letter)
+            except Exception as e:
+                log.error("发现剧场版失败 %s%s: %s", year, letter, e)
+                errors += 1
+                continue
+            log.info("Mikan %s年%s 剧场版/OVA 桶：%d 部",
+                     year, mikan_catalog.season_cn(letter), len(bucket))
+            for mikan_id, title, mlabel in bucket:
+                try:
+                    bgm_id, _groups = await mikan_catalog.fetch_detail(client, mikan_id)
+                    info = await enrich.fetch_by_id(bgm_id) if bgm_id is not None else None
+                    items = await mikan_catalog.fetch_bangumi_torrents(client, mikan_id)
+                    if info and info.get("platform") == "TV":
+                        # bgm 判成周更 TV → 不当电影，喂给 TV 管线进番剧那边（待确认），别白丢
+                        to_tv_shows += 1
+                        for it in items:
+                            it.source_kind = "review"  # Mikan 发现的 TV：进待确认，不自动下
+                            try:
+                                if await core.process_item(it):
+                                    to_tv_torrents += 1
+                            except Exception as e:
+                                log.error("剧场版桶转 TV 失败 %s: %s", it.anime_title, e)
+                        continue
+                    movie_id, is_new = _upsert_movie(mikan_id, title, bgm_id, info, mlabel)
+                    seen += 1
+                    added_movies += 1 if is_new else 0
+                    added_torrents += _store_movie_torrents(movie_id, items)
+                except Exception as e:
+                    log.error("处理剧场版失败 mikan=%s(%s): %s", mikan_id, title, e)
+                    errors += 1
+    log.info("剧场版发现完成 %s：电影命中 %d/新增 %d/种子 %d，转入TV %d部/%d集，出错 %d",
+             year, seen, added_movies, added_torrents, to_tv_shows, to_tv_torrents, errors)
+    return {"movies": added_movies, "torrents": added_torrents, "seen": seen,
+            "to_tv_shows": to_tv_shows, "to_tv_torrents": to_tv_torrents, "errors": errors}
+
+
+# ---------------- 查询（给 /movies 页） ----------------
+
+def list_movies() -> list[Movie]:
+    """未忽略的剧场版/OVA（/movies 页展示）。"""
+    with get_session() as s:
+        return list(s.exec(select(Movie).where(Movie.rejected.is_not(True))
+                           .order_by(Movie.quarter.desc(), Movie.id)))
+
+
+def get_movie(movie_id: int) -> Movie | None:
+    with get_session() as s:
+        return s.get(Movie, movie_id)
+
+
+def movie_torrents(movie_id: int) -> list[MovieTorrent]:
+    with get_session() as s:
+        return list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)
+                           .order_by(MovieTorrent.created_at.desc())))
+
+
+def movie_sources(movie_id: int) -> list[str]:
+    with get_session() as s:
+        rows = s.exec(select(MovieTorrent.source).where(MovieTorrent.movie_id == movie_id)).all()
+    return sorted({r for r in rows if r})
+
+
+def movie_downloaded_count(movie_id: int) -> int:
+    with get_session() as s:
+        return len(s.exec(select(MovieTorrent.id).where(
+            MovieTorrent.movie_id == movie_id,
+            MovieTorrent.status.in_(["downloaded", "downloading"]))).all())
+
+
+def qb_status_summary() -> dict:
+    return engine.qb_summary(MovieTorrent)
+
+
+# ---------------- 操作（给 /movies 页 + 详情） ----------------
+
+def reject_movie(movie_id: int) -> None:
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None:
+            return
+        m.rejected = True
+        s.add(m)
+        for t in s.exec(select(MovieTorrent).where(
+                MovieTorrent.movie_id == movie_id, MovieTorrent.status.in_(["pending", "error"]))):
+            t.status = "skipped"
+            s.add(t)
+        s.commit()
+
+
+def restore_movie(movie_id: int) -> None:
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None:
+            return
+        m.rejected = False
+        s.add(m)
+        rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)))
+        anydl = any(t.status in ("downloaded", "downloading") for t in rows)
+        for t in rows:  # 剧场版=一部作品：已有一版就别把 skipped 旧版翻出来
+            if t.status == "skipped" and not anydl:
+                t.status = "pending"
+                s.add(t)
+        s.commit()
+
+
+def set_movie_pref(movie_id: int, source: str) -> None:
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is not None:
+            m.pref_source = source or None
+            s.add(m)
+            s.commit()
+
+
+async def enrich_movie(movie_id: int) -> bool:
+    """手动重识别某剧场版：用已有名字 + 最近一条种子回退，重取 bgm 元数据覆盖。"""
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None:
+            return False
+        t = s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)
+                   .order_by(MovieTorrent.created_at.desc())).first()
+        names = [n for n in (m.display_name, m.jp_name, m.title) if n]
+        info_hash = t.info_hash if t else None
+        release_time = t.release_time if t else None
+    info = await enrich.resolve(names, release_time, None, info_hash)
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None:
+            return False
+        m.enriched = True
+        engine.apply_bgm_meta(m, info, keep_quarter=_has_downloads(s, movie_id))
+        s.add(m)
+        s.commit()
+        if m.bangumi_id is not None:
+            for other in list(s.exec(select(Movie).where(
+                    Movie.bangumi_id == m.bangumi_id, Movie.id != m.id))):
+                _merge_movie(s, other.id, m.id)
+    return bool(info)
+
+
+async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
+    """手动把剧场版绑定到指定 bgm subject id：取元数据覆盖 + 身份合并。"""
+    info = await enrich.fetch_by_id(bgm_id)
+    if not info:
+        return False
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None:
+            return False
+        m.enriched = True
+        engine.apply_bgm_meta(m, info, keep_quarter=_has_downloads(s, movie_id))
+        s.add(m)
+        s.commit()
+        for other in list(s.exec(select(Movie).where(
+                Movie.bangumi_id == bgm_id, Movie.id != m.id))):
+            _merge_movie(s, other.id, m.id)
+    return True
+
+
+# ---------------- 下载 ----------------
+
+def _set_status(mt_id: int, status: str) -> None:
+    with get_session() as s:
+        t = s.get(MovieTorrent, mt_id)
+        if t is not None:
+            t.status = status
+            s.add(t)
+            s.commit()
+
+
+def reset_downloading() -> None:
+    """启动时把上次遗留的 downloading 复位为 pending。"""
+    with get_session() as s:
+        for t in s.exec(select(MovieTorrent).where(MovieTorrent.status == "downloading")):
+            t.status = "pending"
+            s.add(t)
+        s.commit()
+
+
+async def download_movie_torrent(mt_id: int) -> bool:
+    """强制下某一版本到 qB（详情页逐条下用）。剧场版不建 Season 子目录。成功返回 True。"""
+    if not config.QB_ENABLED:
+        return False
+    async with _dl_lock:
+        with get_session() as s:
+            t = s.get(MovieTorrent, mt_id)
+            if t is None or t.status in ("downloading", "downloaded"):
+                return False  # 已在下/已下 → 幂等短路，防并发（含 download_movie 竞态）重复交 qB
+            m = s.get(Movie, t.movie_id)
+            t.status = "downloading"
+            s.add(t)
+            s.commit()
+            url = t.download_url
+            quarter = (m.quarter if m else "") or "unknown"
+            folder = (m and (m.jp_name or m.display_name)) or t.raw_title or "movie"
+
+    save_path = engine.build_save_path(quarter, folder)
+    if save_path is None:
+        log.error("拒绝越界保存路径 - movie torrent %s", mt_id)
+        _set_status(mt_id, "error")
+        return False
+    try:
+        data = await engine.fetch_torrent_bytes(url)
+        ok = await engine.add_to_qb(data, save_path, f"autoRSS-movie {quarter}", quarter)
+    except asyncio.CancelledError:
+        _set_status(mt_id, "pending")
+        raise
+    except Exception as e:
+        log.error("剧场版下载失败 - %s", e)
+        _set_status(mt_id, "error")
+        return False
+    _set_status(mt_id, "downloaded" if ok else "error")
+    if ok:
+        log.info("已加入qB（剧场版）- torrent=%s", mt_id)
+        await notify(f"{folder} 🎬📥")
+    return ok
+
+
+async def download_movie(movie_id: int) -> int:
+    """审批某剧场版/OVA 并下载一个最佳版本（一部作品只下一份；已有则不下）。返回触发的下载数。"""
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None or m.rejected:
+            return 0
+        if not m.confirmed:
+            m.confirmed = True  # 点下载即视作收藏（审批通过）
+            s.add(m)
+            s.commit()
+        pref = m.pref_source
+        rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)))
+    if any(t.status in ("downloaded", "downloading") for t in rows):
+        return 0
+    pending = [t for t in rows if t.status in ("pending", "error")]
+    if not pending:
+        return 0
+    cands = pending
+    if pref:
+        matched = [t for t in pending if pref in (t.source or "")]
+        cands = matched or pending
+    best = sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))[0]
+    return 1 if await download_movie_torrent(best.id) else 0
+
+
+async def delete_movie_torrent(mt_id: int) -> bool:
+    """删除单条剧场版种子在 qB 里的文件（走 qB 接口），标记回 skipped。
+
+    若同一 hash TV 管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。
+    """
+    with get_session() as s:
+        t = s.get(MovieTorrent, mt_id)
+        if t is None or t.status not in ("downloaded", "downloading"):
+            return False
+        h = t.info_hash
+    if engine.hash_owned_elsewhere(h, Torrent):
+        _set_status(mt_id, "skipped")  # TV 侧还持有同一种子 → 只脱手，不删文件
+        return True
+    if not await engine.qb.delete([h], delete_files=True):
+        return False
+    _set_status(mt_id, "skipped")
+    log.info("删除文件（剧场版单条）- torrent=%s", mt_id)
+    return True
+
+
+async def delete_movie_files(movie_id: int) -> int:
+    """删除某剧场版在 qB 里的已下/在下种子及硬盘文件。与 TV 共享 hash 的只脱手不删文件。
+
+    返回处理数；qB 未连上/无已下返回 0。
+    """
+    with get_session() as s:
+        rows = list(s.exec(select(MovieTorrent).where(
+            MovieTorrent.movie_id == movie_id,
+            MovieTorrent.status.in_(["downloaded", "downloading"]))))
+        pairs = [(t.id, t.info_hash) for t in rows]
+    if not pairs:
+        return 0
+    exclusive = [h for _, h in pairs if not engine.hash_owned_elsewhere(h, Torrent)]
+    if exclusive and not await engine.qb.delete(exclusive, delete_files=True):
+        return 0
+    with get_session() as s:
+        for tid, _ in pairs:
+            t = s.get(MovieTorrent, tid)
+            if t is not None:
+                t.status = "skipped"
+                s.add(t)
+        s.commit()
+    log.info("删除文件（剧场版）- movie=%s 共 %d 个（独占 %d 删文件）", movie_id, len(pairs), len(exclusive))
+    return len(pairs)
+
+
+async def sync_qb_status() -> int:
+    """从 qB 同步剧场版种子实时态。"""
+    return await engine.sync_qb_status(MovieTorrent)

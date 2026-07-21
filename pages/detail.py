@@ -3,7 +3,7 @@ from nicegui import ui
 
 import config
 import core
-from .layout import ep_str, frame, name_of, season_label
+from .layout import ep_str, frame, name_of, qb_live_text, season_label
 
 _STATUS = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
            "error": "失败", "skipped": "跳过"}
@@ -88,7 +88,11 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
                 ui.label(f"第{ep_str(t.episode)}集").classes("w-14")
                 ui.label(str(t.release_time or t.created_at)[:16]).classes("w-28 text-gray-400")
                 ui.label(t.source).classes("grow break-all")
-                ui.badge(_STATUS.get(t.status, t.status)).props("color=blue-grey")
+                live = qb_live_text(t)
+                if live:  # qB 实时态（下载中 45% ↓2MB/s / 做种 100%）优先展示
+                    ui.badge(live).props("color=teal").tooltip("qB 实时状态")
+                else:
+                    ui.badge(_STATUS.get(t.status, t.status)).props("color=blue-grey")
                 ui.button("下载", icon="download", on_click=_force(t.id)).props(
                     "size=sm flat dense").tooltip("强制下这一条到文件夹（无视去重/优先级）")
                 if t.status in ("downloaded", "downloading"):  # 下过才给按集删

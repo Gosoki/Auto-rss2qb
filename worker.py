@@ -7,6 +7,8 @@ import asyncio
 import logging
 
 import config
+import core
+import movies
 from core import flush_ready_downloads, list_source_groups, process_item
 from sources.mikan import MikanSource
 from sources.nyaa import NyaaSource, nyaa_feed_url
@@ -65,3 +67,16 @@ async def run_worker() -> None:
         except Exception as e:
             log.error("本轮异常: %s", e)
         await asyncio.sleep(config.POLL_INTERVAL)  # 每轮读当前值，改了下一轮生效
+
+
+async def run_qb_sync() -> None:
+    """独立协程：定期从 qB 拉取种子实时态（TV + 剧场版两张表）。比采集频率高，接近实时。"""
+    log.info("qB 状态同步启动，每 %d 秒一次（QB_ENABLED 关时空转）", config.QB_SYNC_INTERVAL)
+    while True:
+        try:
+            if config.QB_ENABLED:
+                await core.sync_qb_status()
+                await movies.sync_qb_status()
+        except Exception as e:
+            log.error("qB 状态同步异常: %s", e)
+        await asyncio.sleep(max(5, config.QB_SYNC_INTERVAL))

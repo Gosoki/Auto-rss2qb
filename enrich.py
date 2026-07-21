@@ -64,10 +64,15 @@ async def _search_one(client, name, est, release):
         )
         if r.status_code != 200:
             return None
-        results = r.json().get("data") or []
-    except (httpx.HTTPError, ValueError):
+        body = r.json()
+        # bgm 正常返回 {"data": [...]}；防它返回数组/非对象/data 非列表导致 AttributeError 逃逸
+        data = body.get("data") if isinstance(body, dict) else None
+        results = data if isinstance(data, list) else []
+    except (httpx.HTTPError, ValueError, TypeError):
         return None
     for d in results:
+        if not isinstance(d, dict):
+            continue
         dt = _parse_date(d.get("date"))
         if dt is None:
             continue

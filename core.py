@@ -1,4 +1,4 @@
-"""主流程编排 + 给 UI 用的查询/操作函数。
+"""TV 番剧主流程 + 给 UI 的查询/操作（剧场版/OVA 在 movies.py，两者只共用 engine 底层）。
 
 一条标准条目进来 → 按 info_hash 去重 → 用『番名对照(TitleAlias)』定位到唯一的番
 (命中即知；未命中则查一次 bgm，有对应番就复用、否则新建) → 入库种子(带 anime_id) →
@@ -7,68 +7,38 @@
 import asyncio
 import logging
 import os
-import re
 import shutil
 from collections import Counter
 from datetime import datetime, timedelta
 
-import httpx
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import func, select
 
-import enrich
 import config
+import engine
+import enrich
 from db import get_session
-from models import Anime, SourceGroup, TitleAlias, Torrent
+from models import Anime, MovieTorrent, SourceGroup, TitleAlias, Torrent
 from notify import notify
-from qbittorrent import QBittorrent
-from sources.parse import extract_quarter, format_quarter, season_from_name
+from sources.parse import extract_quarter, season_from_name
 
 log = logging.getLogger("autorss")
-qb = QBittorrent()
+
+# 页面按 core.quarter_label / quarter_folder 取用；底层在 engine（TV/剧场版共用），这里转出
+quarter_folder = engine.quarter_folder
+quarter_label = engine.quarter_label
 
 # 串行化『选集→占位下载』，防止 worker flush 与 UI 补下并发对同一集重复放行
 _download_lock = asyncio.Lock()
-
-_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-_BGM_FIELDS = ("bangumi_id", "display_name", "jp_name", "air_date", "air_weekday",
-               "total_episodes", "platform", "cover_url", "rating", "summary")
-
-
-def _safe(name: str) -> str:
-    """清洗成安全的单段文件夹名：去非法字符/控制符，并挡掉 '.'/'..' 路径穿越。"""
-    cleaned = _ILLEGAL.sub("_", name or "").strip().strip(".").strip()
-    return cleaned or "unknown"
-
-
-def quarter_folder(quarter: str) -> str:
-    """内部季度键(26C) → 下载文件夹用的季度目录名（config.QUARTER_FMT）。"""
-    return format_quarter(quarter, config.QUARTER_FMT)
-
-
-def quarter_label(quarter: str) -> str:
-    """内部季度键(26C) → 页面显示用的季度名（config.QUARTER_FMT_UI，与下载文件夹分开）。"""
-    return format_quarter(quarter, config.QUARTER_FMT_UI)
-
-
-def _prev_quarter(q: str) -> str:
-    """上一个季度键：26C→26B，26A→25D（A 是年内第一季）。解析不出回空串。"""
-    m = re.fullmatch(r"(\d{2})([A-D])", q or "")
-    if not m:
-        return ""
-    yy, letter = int(m.group(1)), m.group(2)
-    if letter == "A":
-        return f"{yy - 1:02d}D"
-    return f"{yy}{chr(ord(letter) - 1)}"
 
 
 def quarter_brief() -> list[dict]:
     """番剧列表页顶部小结：当季 + 上季 的番剧流水线分布 + 种子维度。"""
     cur = extract_quarter(datetime.now())
-    prev = _prev_quarter(cur)
+    prev = engine.prev_quarter(cur)
     with get_session() as s:
-        animes = list(s.exec(select(Anime.quarter, Anime.confirmed, Anime.rejected, Anime.bangumi_id)))
+        animes = list(s.exec(select(
+            Anime.quarter, Anime.confirmed, Anime.rejected, Anime.bangumi_id)))
         torrents = list(s.exec(select(Torrent.quarter, Torrent.status)))
     out = []
     for tag, q in (("当季", cur), ("上季", prev)):
@@ -76,7 +46,8 @@ def quarter_brief() -> list[dict]:
         tq = [st for tqk, st in torrents if (tqk or "") == q]
         out.append({
             "tag": tag, "key": q,
-            "shows": sum(1 for conf, rej, bid in aq if conf and not rej),      # 追番中
+            # 互斥四分：已忽略(rej) / 待识别(未匹配 bgm) / 待确认(有 bgm 未确认) / 追番中(有 bgm 已确认)
+            "shows": sum(1 for conf, rej, bid in aq if conf and not rej and bid),      # 追番中
             "confirm": sum(1 for conf, rej, bid in aq if not conf and not rej and bid),  # 待确认
             "fail": sum(1 for conf, rej, bid in aq if not rej and not bid),    # 待识别(未匹配)
             "ignored": sum(1 for conf, rej, bid in aq if rej),                 # 已忽略
@@ -92,19 +63,8 @@ def _is_auto(kind: str) -> bool:
 
 
 def _apply_bgm(a: Anime, info: dict | None, keep_quarter: bool = False) -> None:
-    """把 enrich.resolve 的结果写进 anime（只覆盖非空字段）。
-
-    keep_quarter=True（手动重富集时）不动已定的季度——季度是归档路径的一部分，
-    确定后应保持稳定，否则已下分集会散落到另一个季度目录。
-    """
-    if not info:
-        return
-    for k in _BGM_FIELDS:
-        v = info.get(k)
-        if v is not None:
-            setattr(a, k, v)
-    if info.get("quarter") and not (keep_quarter and a.quarter):
-        a.quarter = info["quarter"]
+    """把 enrich 结果写进 TV 番（engine 落库 + 按 bgm 规范名纠正季号）。"""
+    engine.apply_bgm_meta(a, info, keep_quarter)
     # 季号以 bgm 规范名为准：ANi 罗马音标题常写 "Season 3" 本地解析不到而回 1，
     # 而 bgm 规范名带『第三季』，能纠正（名字没季标记则保留本地解析值）。
     sn = season_from_name(a.display_name) or season_from_name(a.jp_name)
@@ -152,7 +112,7 @@ async def _resolve_anime(item) -> int:
             auto = _is_auto(item.source_kind) and bgm_id is not None
             anime = Anime(
                 title=item.anime_title, season=item.season, quarter=item.quarter,
-                if_down=auto, confirmed=auto, source_kind=item.source_kind, enriched=True,
+                confirmed=auto, source_kind=item.source_kind, enriched=True,
             )
             _apply_bgm(anime, info)
             s.add(anime)
@@ -196,6 +156,7 @@ async def process_item(item) -> bool:
             source=item.source,
             site=item.site,
             anime_title=item.anime_title,
+            raw_title=item.raw_title,
             season=item.season,
             episode=item.episode,
             quarter=a.quarter if a else item.quarter,
@@ -205,7 +166,12 @@ async def process_item(item) -> bool:
             status="pending",
         )
         s.add(torrent)
-        s.commit()
+        try:
+            s.commit()
+        except IntegrityError:
+            # 并发写入（如同时的剧场版发现）已插了同 hash → 视作已存在，跳过
+            s.rollback()
+            return False
         s.refresh(torrent)
         torrent_id = torrent.id
         should_download = bool(a and a.confirmed and not a.rejected)
@@ -258,35 +224,18 @@ async def download_torrent(torrent_id: int, force: bool = False) -> bool:
             a = s.get(Anime, anime_id) if anime_id else None
             # 文件夹名统一用 bgm 日语原名，没有再退中文规范名，最后退种子解析番名
             folder_name = (a and (a.jp_name or a.display_name)) or t.anime_title
+            if a is not None:
+                season = a.season  # 用 bgm 纠正后的季号建 Season 子目录（种子把续作季号常解析回 1）
 
-    # 组装保存路径并做包含校验，杜绝标题里的 '..' 等把种子写到 config.DOWN_PATH 之外
-    parts = [config.DOWN_PATH, _safe(quarter_folder(quarter)), _safe(folder_name)]
-    if config.SEASON_SUBFOLDER:
-        parts.append(f"Season {int(season)}")  # 二级子目录（可在设置里关）
-    save_path = os.path.join(*parts)
-    root = os.path.realpath(config.DOWN_PATH)
-    real = os.path.realpath(save_path)
-    if real != root and not real.startswith(root + os.sep):
-        log.error("拒绝越界保存路径 - %s -> %s", title, save_path)
+    # 组装保存路径（含越界校验），TV 按设置可加 Season N 子目录
+    save_path = engine.build_save_path(quarter, folder_name, season=season)
+    if save_path is None:
+        log.error("拒绝越界保存路径 - %s -> %s / %s", title, quarter, folder_name)
         _set_status(torrent_id, "error")
         return False
-
-    kwargs = {"timeout": 60, "follow_redirects": True}
-    if config.PROXY:
-        kwargs["proxy"] = config.PROXY
     try:
-        async with httpx.AsyncClient(**kwargs) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.content
-
-        try:  # 尽力创建目录（跨用户的 qB 需要），失败不阻断
-            os.makedirs(save_path, exist_ok=True)
-            os.chmod(save_path, 0o777)
-        except OSError:
-            pass
-
-        ok = await qb.add_torrent(data, save_path, f"autoRSS {quarter}", quarter)
+        data = await engine.fetch_torrent_bytes(url)
+        ok = await engine.add_to_qb(data, save_path, f"autoRSS {quarter}", quarter)
     except asyncio.CancelledError:
         _set_status(torrent_id, "pending")  # 被取消（关停等）→ 复位，别永久卡 downloading
         raise
@@ -344,7 +293,7 @@ async def flush_ready_downloads() -> int:
             for t in s.exec(select(Torrent).where(Torrent.status == "downloaded"))
         }
         groups: dict = {}
-        specials: list[int] = []
+        special_groups: dict = {}          # anime_id -> [特别篇(-1)种子]，按番去重只放一份
         # 只自动放行 pending：error 不在这里无限重试（高优先级失败→本组还有 pending 低优先级自然降级；
         # 全 error 则本轮不重试，留给人工补下）。
         for t in s.exec(select(Torrent).where(Torrent.status == "pending")):
@@ -352,9 +301,18 @@ async def flush_ready_downloads() -> int:
                 continue
             if t.episode is None or t.episode < 0:
                 if t.episode == -1:
-                    specials.append(t.id)  # 特别篇直接下；-2(未知/疑似批量) 不自动下，可人工补下
-                continue
+                    special_groups.setdefault(t.anime_id, []).append(t)  # 特别篇按番归组
+                continue  # -2(未知/疑似批量) 不自动下，可人工补下
             groups.setdefault((t.anime_id, t.episode), []).append(t)
+
+    def _pick(ts, aid):
+        cands = ts
+        pref = pref_map.get(aid)
+        if pref:
+            matched = [t for t in ts if pref in (t.source or "")]
+            if matched:
+                cands = matched              # 钉了首选源就只从它里选，没有才退回全部
+        return sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))[0]
 
     for key, ts in groups.items():
         if key in downloaded:
@@ -362,15 +320,15 @@ async def flush_ready_downloads() -> int:
         first_seen = min(t.created_at for t in ts)
         if now - first_seen < grace:
             continue  # 缓冲窗口未到，等偏好组
-        cands = ts
-        pref = pref_map.get(key[0])          # key = (anime_id, episode)
-        if pref:
-            matched = [t for t in ts if pref in (t.source or "")]
-            if matched:
-                cands = matched              # 钉了首选源就只从它里选，没有才退回全部
-        best = sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))[0]
-        chosen.append(best.id)
-    chosen.extend(specials)
+        chosen.append(_pick(ts, key[0]).id)  # key = (anime_id, episode)
+    # 特别篇：每番只放一份（多字幕组版本别全下），走同样的缓冲窗口，且该番未下过特别篇才放
+    have_special = {aid for (aid, ep) in downloaded if ep == -1}
+    for aid, ts in special_groups.items():
+        if aid in have_special:
+            continue
+        if now - min(t.created_at for t in ts) < grace:
+            continue
+        chosen.append(_pick(ts, aid).id)
 
     n = 0
     for tid in chosen:
@@ -389,19 +347,21 @@ def overview() -> dict:
                           .where(Anime.rejected == True)).one()  # noqa: E712
         torrents = list(s.exec(select(Torrent)))
         groups = list(s.exec(select(SourceGroup)))
+        all_aq = list(s.exec(select(Anime.id, Anime.quarter)))  # 所有 TV 番(含待确认/忽略)的 id+季度
 
     confirmed = [a for a in animes if a.confirmed]
     pending_c = [a for a in animes if not a.confirmed and a.bangumi_id]  # 待确认=已匹配未确认；未匹配的算『富集失败』
     status = Counter(t.status for t in torrents)
 
-    # 各季度：已确认番数 + 已下集
-    shows_by_q = Counter((a.quarter or "未知") for a in confirmed)
-    done_by_q = Counter((t.quarter or "未知") for t in torrents if t.status == "downloaded")
-    qkeys = set(shows_by_q) | set(done_by_q)
-    qs = sorted((q for q in qkeys if q != "未知"), reverse=True)
-    if "未知" in qkeys:
+    # 各季度：总番数（含待确认/待识别/已忽略）+ 有已下集的番数（真·比例，分子分母同为"部"）
+    total_by_q = Counter((q or "未知") for _, q in all_aq)
+    aid_q = {aid: (q or "未知") for aid, q in all_aq}
+    dl_ids = {t.anime_id for t in torrents if t.status == "downloaded" and t.anime_id}
+    dl_by_q = Counter(aid_q[aid] for aid in dl_ids if aid in aid_q)
+    qs = sorted((q for q in total_by_q if q != "未知"), reverse=True)
+    if "未知" in total_by_q:
         qs.append("未知")
-    by_quarter = [(q, shows_by_q.get(q, 0), done_by_q.get(q, 0)) for q in qs]
+    by_quarter = [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs]
 
     # 各来源：种子数 + 已下
     src_total = Counter((t.source or "?") for t in torrents)
@@ -415,7 +375,8 @@ def overview() -> dict:
             "confirm": len(pending_c), "rejected": rejected,
             "done": status.get("downloaded", 0),
             "pending": status.get("pending", 0) + status.get("error", 0),
-            "multi": len(multi_source_map()), "torrents": len(torrents),
+            "multi": len(multi_source_map()),
+            "torrents": len(torrents),
         },
         "status": {k: status.get(k, 0) for k in
                    ("downloaded", "downloading", "pending", "error", "skipped")},
@@ -426,6 +387,7 @@ def overview() -> dict:
                    for g in sorted(groups, key=lambda g: -g.priority)],
         "config": {"qb": config.QB_ENABLED, "poll_on": config.POLL_ENABLED,
                    "poll": config.POLL_INTERVAL, "grace": config.DOWNLOAD_GRACE_MIN},
+        "qb": engine.qb_summary(Torrent),
     }
 
 
@@ -433,7 +395,8 @@ def list_anime() -> list[Anime]:
     """番剧管理用：只列『已确认、未拒绝』的番；待审核的在『待确认』页，拒绝的在『拒绝』页。"""
     with get_session() as s:
         return list(s.exec(
-            select(Anime).where(Anime.rejected.is_not(True), Anime.confirmed == True)  # noqa: E712
+            select(Anime).where(  # noqa: E712
+                Anime.rejected.is_not(True), Anime.confirmed == True)
             .order_by(Anime.quarter.desc(), Anime.id)
         ))
 
@@ -454,10 +417,11 @@ def list_rejected() -> list[Anime]:
 
 
 def list_unenriched() -> list[Anime]:
-    """富集失败/未匹配 bgm 的番（bangumi_id 为空、未拒绝）——供『富集失败』页人工处理。"""
+    """未匹配 bgm 的番（bangumi_id 为空、未拒绝）——供『待识别』页人工处理。"""
     with get_session() as s:
         return list(s.exec(
-            select(Anime).where(Anime.bangumi_id.is_(None), Anime.rejected.is_not(True))
+            select(Anime).where(
+                Anime.bangumi_id.is_(None), Anime.rejected.is_not(True))
             .order_by(Anime.created_at.desc())
         ))
 
@@ -475,7 +439,7 @@ def multi_source_map() -> dict:
 
 
 def pending_confirm() -> list[Anime]:
-    """待确认：已匹配 bgm 但未确认、未拒绝的番。未匹配的在『富集失败』，绑定后才来这里。"""
+    """待确认：已匹配 bgm 但未确认、未拒绝的番。未匹配的在『待识别』，绑定后才来这里。"""
     with get_session() as s:
         return list(s.exec(select(Anime).where(
             Anime.confirmed == False, Anime.rejected.is_not(True),  # noqa: E712
@@ -485,6 +449,27 @@ def pending_confirm() -> list[Anime]:
 def list_torrents(limit: int = 50) -> list[Torrent]:
     with get_session() as s:
         return list(s.exec(select(Torrent).order_by(Torrent.created_at.desc()).limit(limit)))
+
+
+def recent_rows(limit: int = 50) -> list[dict]:
+    """新入库列表：种子 + 番的规范名（比原始解析名可读）+ 原始种子标题（区分同集不同版本）。
+
+    Torrent 表只含 TV 种子（剧场版/OVA 在 MovieTorrent），故无需再过滤。
+    """
+    with get_session() as s:
+        ts = list(s.exec(select(Torrent).order_by(Torrent.created_at.desc()).limit(limit)))
+        ids = {t.anime_id for t in ts if t.anime_id}
+        names = ({a.id: (a.display_name or a.title) for a in
+                  s.exec(select(Anime).where(Anime.id.in_(ids)))} if ids else {})
+    return [{
+        "id": t.id,
+        "time": str(t.release_time or t.created_at)[:16],
+        "name": names.get(t.anime_id) or (t.anime_title or "?"),
+        "episode": t.episode,
+        "source": t.source,
+        "status": t.status,
+        "raw": t.raw_title or "",
+    } for t in ts]
 
 
 def get_anime(anime_id: int) -> Anime | None:
@@ -525,7 +510,6 @@ def confirm_anime(anime_id: int, pref_source: str = "") -> None:
         a = s.get(Anime, anime_id)
         if a is not None:
             a.confirmed = True
-            a.if_down = True
             a.pref_source = pref_source or None
             s.add(a)
             s.commit()
@@ -549,7 +533,6 @@ def reject_anime(anime_id: int) -> None:
             return
         a.rejected = True
         a.confirmed = True
-        a.if_down = False
         s.add(a)
         for t in s.exec(select(Torrent).where(
             Torrent.anime_id == anime_id,
@@ -571,14 +554,14 @@ def restore_anime(anime_id: int) -> None:
             return
         a.rejected = False
         a.confirmed = True
-        a.if_down = True
         s.add(a)
-        for t in s.exec(select(Torrent).where(
-            Torrent.anime_id == anime_id,
-            Torrent.status == "skipped",
-        )):
-            t.status = "pending"
-            s.add(t)
+        all_rows = list(s.exec(select(Torrent).where(Torrent.anime_id == anime_id)))
+        have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading")}
+        for t in all_rows:
+            # 只放回『该集尚无下载』的 skipped：别把被集去重/删文件而 skipped 的旧版本翻出来重下
+            if t.status == "skipped" and t.episode not in have_eps:
+                t.status = "pending"
+                s.add(t)
         s.commit()
 
 
@@ -666,74 +649,135 @@ async def bind_bgm(anime_id: int, bgm_id: int) -> bool:
 
 async def reenrich_all() -> int:
     """对所有番重跑一次富集（回填 jp_name/规范名/简介/评分等新字段）。返回命中数。"""
+    return await reenrich_scope(None)
+
+
+async def reenrich_scope(seasons: int | None = None) -> int:
+    """按季度范围重新识别（bgm）：seasons=1 当季 / 2 近半年 / 4 近1年 / None 全部。返回命中数。
+
+    对范围内的番重跑一次识别——顺带把之前『待识别』(未匹配)的重试、已匹配的刷新元数据。
+    """
+    quarters = None
+    if seasons:
+        quarters, q = set(), extract_quarter(datetime.now())
+        for _ in range(seasons):
+            quarters.add(q)
+            q = engine.prev_quarter(q)
     with get_session() as s:
-        ids = [a.id for a in s.exec(select(Anime))]
+        if quarters is None:
+            ids = list(s.exec(select(Anime.id)))
+        else:
+            ids = list(s.exec(select(Anime.id).where(Anime.quarter.in_(quarters))))
     n = 0
     for aid in ids:
         try:
             if await enrich_anime(aid):
                 n += 1
         except Exception as e:
-            log.warning("重富集失败 anime=%s: %s", aid, e)
-    log.info("重新富集完成：%d/%d 命中", n, len(ids))
+            log.warning("重新识别失败 anime=%s: %s", aid, e)
+    log.info("重新识别（范围=%s）完成：%d/%d 命中", seasons or "全部", n, len(ids))
     return n
 
 
+def _select_downloads(rows: list, pref: str | None = None, have_eps: set | None = None) -> list:
+    """从一部番的待下种子里挑要下的：正集号每集选一份（首选源优先、其次优先级），
+    负集号（特别篇 -1 / 未知 -2）整组只选一份——同一集/同一作品的多字幕组版本别全拉。
+    have_eps 里的集（已在下/已下）跳过。返回选中的 Torrent 列表。
+    """
+    have = have_eps or set()
+
+    def _best(cands: list):
+        c = cands
+        if pref:
+            m = [t for t in cands if pref in (t.source or "")]
+            c = m or cands
+        return sorted(c, key=lambda t: (-(t.priority or 0), t.created_at))[0]
+
+    pos: dict = {}
+    neg: list = []
+    for t in rows:
+        if t.episode in have:
+            continue
+        if isinstance(t.episode, (int, float)) and t.episode >= 0:
+            pos.setdefault(t.episode, []).append(t)
+        else:
+            neg.append(t)
+    chosen = [_best(ts) for ts in pos.values()]
+    # 负集号整组只补一份；该番已下过负集内容(-1/-2)就不再补，免得同片各版本反复下
+    if neg and not any(isinstance(e, (int, float)) and e < 0 for e in have):
+        chosen.append(_best(neg))
+    return chosen
+
+
 async def download_pending_for_anime(anime_id: int) -> int:
-    """把某番剧下 status=pending/error 的种子补下（人工确认后放行）。返回补下数量。
+    """把某番剧下 status=pending/error 的种子补下（人工确认后放行）。返回触发的下载数。
 
     加番剧级授权闸门：只对『已确认且未拒绝』的番补下。
+    正集按集去重、负集整组一份（见 _select_downloads）——避免同一集/同片多版本被全部拉下。
     """
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is None or not (a.confirmed and not a.rejected):
             return 0
         pref = a.pref_source
-        rows = list(s.exec(
-            select(Torrent).where(
-                Torrent.anime_id == anime_id,
-                Torrent.status.in_(["pending", "error"]),
-            )
-        ))
-    # 首选源排前面，再按优先级——集去重会让排在前面的先占，从而按首选源下
-    rows.sort(key=lambda t: (0 if (pref and pref in (t.source or "")) else 1,
-                             -(t.priority or 0), t.created_at))
-    ids = [t.id for t in rows]
-    for tid in ids:
-        await download_torrent(tid)
-    return len(ids)
+        all_rows = list(s.exec(select(Torrent).where(Torrent.anime_id == anime_id)))
+    have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading")}
+    pending = [t for t in all_rows if t.status in ("pending", "error")]
+    chosen = _select_downloads(pending, pref, have_eps)
+    n = 0
+    for t in chosen:
+        if await download_torrent(t.id):
+            n += 1
+    return n
 
 
 async def download_all_pending() -> int:
-    """补下所有『已订阅且已确认』番剧的待下/失败种子。返回补下数量。"""
+    """补下所有『已订阅且已确认』番剧的待下/失败种子。返回触发数。
+
+    按番各自去重（正集每集一份、负集整组一份），避免多版本/多特别篇被一次全拉。
+    """
     with get_session() as s:
-        auto_ids = {
-            a.id for a in s.exec(
-                select(Anime).where(Anime.confirmed == True, Anime.rejected.is_not(True))  # noqa: E712
-            )
-        }
-        ids = [t.id for t in s.exec(select(Torrent).where(Torrent.status.in_(["pending", "error"])))
-               if t.anime_id in auto_ids]
-    for tid in ids:
-        await download_torrent(tid)
-    return len(ids)
+        auto = list(s.exec(select(Anime).where(  # noqa: E712
+            Anime.confirmed == True, Anime.rejected.is_not(True))))
+        pref_map = {a.id: a.pref_source for a in auto}
+        auto_ids = set(pref_map)
+        rows = list(s.exec(select(Torrent).where(Torrent.anime_id.in_(auto_ids)))) if auto_ids else []
+    by_anime: dict = {}
+    have_by_anime: dict = {}
+    for t in rows:
+        if t.status in ("pending", "error"):
+            by_anime.setdefault(t.anime_id, []).append(t)
+        elif t.status in ("downloaded", "downloading"):
+            have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
+    n = 0
+    for aid, pending in by_anime.items():
+        for t in _select_downloads(pending, pref_map.get(aid), have_by_anime.get(aid)):
+            if await download_torrent(t.id):
+                n += 1
+    return n
+
+
+async def sync_qb_status() -> int:
+    """从 qB 同步 TV 种子实时态（剧场版走 movies.sync_qb_status）。"""
+    return await engine.sync_qb_status(Torrent)
 
 
 async def delete_torrent_file(torrent_id: int) -> bool:
-    """删除单条种子在 qB 里的文件（走 qB 接口），标记回 skipped。详情页按集删用。"""
+    """删除单条种子在 qB 里的文件（走 qB 接口），标记回 skipped。详情页按集删用。
+
+    若同一 hash 剧场版管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。
+    """
     with get_session() as s:
         t = s.get(Torrent, torrent_id)
         if t is None or t.status not in ("downloaded", "downloading"):
             return False
         h = t.info_hash
-    if not await qb.delete([h], delete_files=True):
+    if engine.hash_owned_elsewhere(h, MovieTorrent):
+        _set_status(torrent_id, "skipped")  # 剧场版侧还持有同一种子 → 只脱手，不删文件
+        return True
+    if not await engine.qb.delete([h], delete_files=True):
         return False
-    with get_session() as s:
-        t = s.get(Torrent, torrent_id)
-        if t is not None:
-            t.status = "skipped"  # 文件已删，标记不再持有
-            s.add(t)
-            s.commit()
+    _set_status(torrent_id, "skipped")
     log.info("删除文件（单集）- torrent=%s", torrent_id)
     return True
 
@@ -742,7 +786,7 @@ async def delete_files(anime_id: int) -> int:
     """删除该番在 qB 里的已下/在下种子及其硬盘文件（走 qB 正规接口，非裸删文件系统）。
 
     显式、独立于『拒绝』的动作，需 UI 二次确认。成功后把这些种子标记回 skipped（不再持有）。
-    返回删除的种子数；qB 未连上/无已下则返回 0。
+    与剧场版共享 hash 的只脱手不删文件。返回处理的种子数；qB 未连上/无已下则返回 0。
     """
     with get_session() as s:
         rows = list(s.exec(select(Torrent).where(
@@ -752,17 +796,17 @@ async def delete_files(anime_id: int) -> int:
         pairs = [(t.id, t.info_hash) for t in rows]
     if not pairs:
         return 0
-    ok = await qb.delete([h for _, h in pairs], delete_files=True)
-    if not ok:
+    exclusive = [h for _, h in pairs if not engine.hash_owned_elsewhere(h, MovieTorrent)]
+    if exclusive and not await engine.qb.delete(exclusive, delete_files=True):
         return 0
     with get_session() as s:
         for tid, _ in pairs:
             t = s.get(Torrent, tid)
             if t is not None:
-                t.status = "skipped"  # 文件已删，标记不再持有
+                t.status = "skipped"  # 文件已删/或脱手，标记不再持有
                 s.add(t)
         s.commit()
-    log.info("删除文件 - anime=%s 共 %d 个种子", anime_id, len(pairs))
+    log.info("删除文件 - anime=%s 共 %d 个种子（独占 %d 个删文件）", anime_id, len(pairs), len(exclusive))
     return len(pairs)
 
 
@@ -871,7 +915,6 @@ def backfill_unmatched_review() -> int:
                 Anime.confirmed == True)):  # noqa: E712
             log.info("未匹配转待确认 - %s", a.title)
             a.confirmed = False
-            a.if_down = False
             s.add(a)
             n += 1
         if n:
