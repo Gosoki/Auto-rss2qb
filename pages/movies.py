@@ -360,7 +360,7 @@ def movies_page(t: str = "list"):
         @ui.refreshable
         def sources_panel():
             ui.label("剧场版/OVA 的来源固定为 Mikan 季度浏览页的『剧场版/OVA 桶』——非 RSS 订阅，"
-                     "不用像番剧那边配字幕组。识别走 bgm；判成周更 TV 的会自动转去番剧『待确认』。").classes(
+                     "不用像番剧那边配字幕组。识别走 bgm；是不是电影以 Mikan 桶为准（哪怕 bgm 识别成 TV 也留在这）。").classes(
                 "text-xs text-gray-400 mb-2")
 
             # 自动扫描（定期自动抓，无需手动）

@@ -29,6 +29,7 @@ def init_db():
     _migrate_rename_tables()   # 老表改名（必须在 create_all 前，免得建出空的新表、老数据留在旧表）
     SQLModel.metadata.create_all(engine)
     _migrate_add_columns()
+    _migrate_drop_columns()    # 删模型已移除、老库还残留的列（含 NOT NULL 会让新 INSERT 失败）
 
 
 _TABLE_RENAMES = {"titlealias": "anime_alias"}  # 旧表名 → 新表名（番剧番名对照加 anime 前缀）
@@ -64,6 +65,29 @@ def _migrate_add_columns():
                     f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {ddl_type}'
                 )
             log.info("数据库迁移：%s 加列 %s", table.name, col.name)
+
+
+# 模型已删、但老库可能还留着的列。含 NOT NULL 的残留列会让不带该列的新 INSERT 直接失败，故启动时必删。
+_DROPPED_COLUMNS = {
+    "anime": ["enriched", "source_kind"],
+    "movie": ["confirmed", "pref_source", "enriched"],
+    "animetorrent": ["qb_eta"],
+    "movietorrent": ["qb_eta"],
+}
+
+
+def _migrate_drop_columns():
+    """删掉模型里已移除、但老库还残留的列（SQLite 3.35+ 支持 DROP COLUMN）。幂等（删过就没了）。"""
+    inspector = sa.inspect(engine)
+    for table, cols in _DROPPED_COLUMNS.items():
+        if not inspector.has_table(table):
+            continue
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        for col in cols:
+            if col in existing:
+                with engine.begin() as conn:
+                    conn.exec_driver_sql(f'ALTER TABLE "{table}" DROP COLUMN "{col}"')
+                log.info("数据库迁移：%s 删列 %s", table, col)
 
 
 def get_session() -> Session:

@@ -108,6 +108,8 @@ async def fetch_torrent_bytes(url: str) -> bytes:
     采集循环；故再套一层 asyncio.timeout 对总传输时长封顶。取到返回 bytes；HTTP/超限/超时失败抛异常，
     由调用方回写 error。
     """
+    if not (url or "").lower().startswith(("http://", "https://")):
+        raise ValueError(f"拒绝非 http(s) 下载地址（防 SSRF）：{(url or '')[:80]}")
     kwargs = config.http_client_kwargs(60)
     async with asyncio.timeout(180):
         async with httpx.AsyncClient(**kwargs) as client:
