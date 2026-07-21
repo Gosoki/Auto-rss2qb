@@ -1,13 +1,10 @@
 """番剧详情：可作为独立页 /anime/{id}，也可用 render_detail 渲染进悬浮框(dialog)。"""
 from nicegui import ui
 
-from core import anime
+from core import anime, engine
 import config
-from .layout import confirm, ep_str, frame, name_of, qb_live_text, season_label
-
-_STATUS = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
-           "error": "失败", "skipped": "跳过"}
-_WEEKDAY = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+from .layout import (STATUS_CN, WEEKDAY_CN, confirm, ep_str, frame, meta_card, name_of,
+                     qb_live_text, season_label, source_options)
 
 
 def render_detail(anime_id: int, refresh_outer=None) -> None:
@@ -36,29 +33,15 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
                     f"color={'green' if cur.confirmed else 'orange'}")
 
         # 元信息卡（封面 + bgm 元数据 + 简介）
-        with ui.card().classes("w-full"):
-            with ui.row().classes("gap-4 items-start no-wrap w-full"):
-                if cur.cover_url:
-                    ui.image(cur.cover_url).classes("rounded").style("min-width:7rem;width:7rem")
-                with ui.column().classes("gap-1 grow"):
-                    wd = f"  {_WEEKDAY[cur.air_weekday]}" if cur.air_weekday is not None else ""
-                    with ui.grid(columns=2).classes("gap-x-8 gap-y-1"):
-                        def _kv(k, v):
-                            ui.label(k).classes("text-xs text-gray-400")
-                            ui.label(str(v) if v not in (None, "") else "—")
-                        _kv("季度", anime.quarter_label(cur.quarter))
-                        _kv("放送", f"{cur.air_date or '—'}{wd}")
-                        _kv("类型", cur.platform)
-                        _kv("总集数", cur.total_episodes)
-                        _kv("评分", cur.rating)
-                        _kv("来源", " · ".join(sources) or "—")
-                    if cur.bangumi_id:
-                        ui.link(f"bgm.tv/subject/{cur.bangumi_id}",
-                                f"https://bgm.tv/subject/{cur.bangumi_id}").props("target=_blank").classes("text-xs")
-                    ui.label(f"原始标题: {cur.title}").classes("text-xs text-gray-500")
-            if cur.summary:
-                ui.separator()
-                ui.label(cur.summary).classes("text-sm text-gray-300 whitespace-pre-wrap")
+        wd = f"  {WEEKDAY_CN[cur.air_weekday]}" if cur.air_weekday is not None else ""
+        meta_card(cur.cover_url, [
+            ("季度", anime.quarter_label(cur.quarter)),
+            ("放送", f"{cur.air_date or '—'}{wd}"),
+            ("类型", cur.platform),
+            ("总集数", cur.total_episodes),
+            ("评分", cur.rating),
+            ("来源", " · ".join(sources) or "—"),
+        ], cur.bangumi_id, cur.title, cur.summary)
 
         # 操作
         with ui.row().classes("items-center gap-3 flex-wrap"):
@@ -71,10 +54,7 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
                 ui.button("忽略", on_click=_reject).props("size=sm flat color=grey")
             ui.button("补下本番", on_click=_download).props("flat size=sm")
             if sources:  # 首选下载源（多源时选从哪个组下）
-                opts = {"": "按优先级"}
-                for sname in sources:
-                    opts[sname] = sname
-                ui.select(opts, value=(cur.pref_source or ""), label="下载源",
+                ui.select(source_options(sources), value=(cur.pref_source or ""), label="下载源",
                           on_change=_set_source).props("dense outlined").classes("min-w-40")
 
         # 分集 / 种子（每条可单独强制下载）
@@ -86,13 +66,13 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
             with ui.row().classes("items-center gap-2 w-full py-1 text-sm").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
                 ui.label(f"第{ep_str(t.episode)}集").classes("w-14")
-                ui.label(str(t.release_time or t.created_at)[:16]).classes("w-28 text-gray-400")
+                ui.label(engine.torrent_time(t)).classes("w-28 text-gray-400")
                 ui.label(t.source).classes("grow break-all")
                 live = qb_live_text(t)
                 if live:  # qB 实时态（下载中 45% ↓2MB/s / 做种 100%）优先展示
                     ui.badge(live).props("color=teal").tooltip("qB 实时状态")
                 else:
-                    ui.badge(_STATUS.get(t.status, t.status)).props("color=blue-grey")
+                    ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
                 ui.button("下载", icon="download", on_click=_force(t.id)).props(
                     "size=sm flat dense").tooltip("强制下这一条到文件夹（无视去重/优先级）")
                 if t.status in ("downloaded", "downloading"):  # 下过才给按集删

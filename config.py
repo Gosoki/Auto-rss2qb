@@ -106,6 +106,15 @@ def __getattr__(name):
     raise AttributeError(f"module 'config' has no attribute {name!r}")
 
 
+def http_client_kwargs(timeout: int = 30) -> dict:
+    """httpx.AsyncClient 的公共 kwargs：超时 + 跟随重定向 +（启用时）代理。各处抓取统一走它。"""
+    kwargs = {"timeout": timeout, "follow_redirects": True}
+    proxy = __getattr__("PROXY")
+    if proxy:
+        kwargs["proxy"] = proxy
+    return kwargs
+
+
 def load_from_db() -> None:
     """启动时（init_db 之后）加载配置，并把 settings 表缺的键补齐写入。
 

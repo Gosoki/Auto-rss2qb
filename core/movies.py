@@ -41,16 +41,7 @@ def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
     keeper = s.get(Movie, keeper_id)
     loser = s.get(Movie, loser_id)
     if keeper is not None and loser is not None:
-        # 同 anime：按『活跃(confirmed 且未拒)』并集合并，避免被拒片复活或活跃片被拒绝副本拖成隐藏。
-        active = (keeper.confirmed and not keeper.rejected) or (loser.confirmed and not loser.rejected)
-        if active:
-            keeper.confirmed = True
-            keeper.rejected = False
-        else:
-            keeper.confirmed = keeper.confirmed or loser.confirmed
-            keeper.rejected = keeper.rejected or loser.rejected
-        if not keeper.pref_source and loser.pref_source:
-            keeper.pref_source = loser.pref_source
+        engine.merge_subscription_state(keeper, loser)  # 与 anime 同一套『活跃并集』语义
         s.add(keeper)
     for t in s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == loser_id)):
         t.movie_id = keeper_id
@@ -137,7 +128,7 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
                      year, mikan.season_cn(letter), len(bucket))
             for mikan_id, title, mlabel in bucket:
                 try:
-                    bgm_id, _groups = await mikan.fetch_detail(client, mikan_id)
+                    bgm_id = await mikan.fetch_detail(client, mikan_id)
                     info = await enrich.fetch_by_id(bgm_id) if bgm_id is not None else None
                     movie_id, is_new = _upsert_movie(mikan_id, title, bgm_id, info, mlabel)
                     seen += 1
@@ -262,17 +253,6 @@ def torrents_by_movie(movie_ids: list[int]) -> dict[int, list[MovieTorrent]]:
     return out
 
 
-def movie_downloaded_count(movie_id: int) -> int:
-    with get_session() as s:
-        return len(s.exec(select(MovieTorrent.id).where(
-            MovieTorrent.movie_id == movie_id,
-            MovieTorrent.status.in_(["downloaded", "downloading"]))).all())
-
-
-def qb_status_summary() -> dict:
-    return engine.qb_summary(MovieTorrent)
-
-
 def recent_movie_rows(limit: int = 50) -> list[dict]:
     """新入库列表：剧场版/OVA 种子 + 片的规范名（比原始种子标题可读）+ 原始种子标题。
 
@@ -285,7 +265,7 @@ def recent_movie_rows(limit: int = 50) -> list[dict]:
                   s.exec(select(Movie).where(Movie.id.in_(ids)))} if ids else {})
     return [{
         "id": t.id,
-        "time": str(t.release_time or t.created_at)[:16],
+        "time": engine.torrent_time(t),
         "name": names.get(t.movie_id) or (t.raw_title or "?"),
         "source": t.source,
         "status": t.status,
@@ -383,21 +363,12 @@ async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
 # ---------------- 下载 ----------------
 
 def _set_status(mt_id: int, status: str) -> None:
-    with get_session() as s:
-        t = s.get(MovieTorrent, mt_id)
-        if t is not None:
-            t.status = status
-            s.add(t)
-            s.commit()
+    engine.set_torrent_status(MovieTorrent, mt_id, status)
 
 
 def reset_downloading() -> None:
     """启动时把上次遗留的 downloading 复位为 pending。"""
-    with get_session() as s:
-        for t in s.exec(select(MovieTorrent).where(MovieTorrent.status == "downloading")):
-            t.status = "pending"
-            s.add(t)
-        s.commit()
+    engine.reset_downloading(MovieTorrent)
 
 
 async def download_movie_torrent(mt_id: int) -> bool:
@@ -463,11 +434,7 @@ async def download_movie(movie_id: int) -> int:
     pending = [t for t in rows if t.status in ("pending", "error")]
     if not pending:
         return 0
-    cands = pending
-    if pref:
-        matched = [t for t in pending if pref in (t.source or "")]
-        cands = matched or pending
-    best = sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))[0]
+    best = engine.pick_best(pending, pref)
     return 1 if await download_movie_torrent(best.id) else 0
 
 
@@ -489,32 +456,6 @@ async def delete_movie_torrent(mt_id: int) -> bool:
     _set_status(mt_id, "skipped")
     log.info("删除文件（剧场版单条）- torrent=%s", mt_id)
     return True
-
-
-async def delete_movie_files(movie_id: int) -> int:
-    """删除某剧场版在 qB 里的已下/在下种子及硬盘文件。与 TV 共享 hash 的只脱手不删文件。
-
-    返回处理数；qB 未连上/无已下返回 0。
-    """
-    with get_session() as s:
-        rows = list(s.exec(select(MovieTorrent).where(
-            MovieTorrent.movie_id == movie_id,
-            MovieTorrent.status.in_(["downloaded", "downloading"]))))
-        pairs = [(t.id, t.info_hash) for t in rows]
-    if not pairs:
-        return 0
-    exclusive = [h for _, h in pairs if not engine.hash_owned_elsewhere(h, AnimeTorrent)]
-    if exclusive and not await engine.qb.delete(exclusive, delete_files=True):
-        return 0
-    with get_session() as s:
-        for tid, _ in pairs:
-            t = s.get(MovieTorrent, tid)
-            if t is not None:
-                t.status = "skipped"
-                s.add(t)
-        s.commit()
-    log.info("删除文件（剧场版）- movie=%s 共 %d 个（独占 %d 删文件）", movie_id, len(pairs), len(exclusive))
-    return len(pairs)
 
 
 async def sync_qb_status() -> int:

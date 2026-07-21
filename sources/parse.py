@@ -138,7 +138,8 @@ def extract_quarter(dt: datetime) -> str:
 
 
 # ABCD ↔ 季节 / 首月（与 extract_quarter 一致：A冬1月 B春4月 C夏7月 D秋10月）
-_Q_SEASON = {"A": "冬", "B": "春", "C": "夏", "D": "秋"}
+# 季度字母→季名的唯一来源；mikan.season_cn 与 /movies 季度选择器都复用它，避免各处各维护一份。
+SEASON_CN = {"A": "冬", "B": "春", "C": "夏", "D": "秋"}
 _Q_MONTH = {"A": 1, "B": 4, "C": 7, "D": 10}
 _QUARTER_KEY_RE = re.compile(r"(\d{2})([A-D])")
 
@@ -154,7 +155,7 @@ def format_quarter(quarter: str, fmt: str) -> str:
         return quarter or ""
     yy, q = m.group(1), m.group(2)
     ctx = {"yy": yy, "yyyy": f"20{yy}", "q": q,
-           "season": _Q_SEASON[q], "m": str(_Q_MONTH[q])}
+           "season": SEASON_CN[q], "m": str(_Q_MONTH[q])}
     try:
         return (fmt or "{yy}{q}").format(**ctx)
     except (KeyError, IndexError, ValueError):

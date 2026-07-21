@@ -19,19 +19,17 @@ import httpx
 
 import config
 from sources.base import ParsedItem, Source
-from sources.parse import candidate_names, estimate_premiere, extract_quarter, is_batch, parse_title
+from sources.parse import (SEASON_CN, candidate_names, estimate_premiere, extract_quarter,
+                           is_batch, parse_title)
 
 log = logging.getLogger("autorss")
 
-_SEASON_CN = {"A": "冬", "B": "春", "C": "夏", "D": "秋"}
 # 季度浏览页里『非星期』块的标签关键词 → 视作剧场版/OVA 桶
 _MOVIE_LABELS = ("剧场", "劇場", "OVA", "OAD", "OAV", "特别", "スペシャル", "SP")
 _DOW_SPLIT_RE = re.compile(r'<div class="sk-bangumi" data-dayofweek="\d+">')
 _ROW_LABEL_RE = re.compile(r'id="data-row-\d+"[^>]*>\s*(.*?)\s*</div>', re.S)
 _BANGUMI_RE = re.compile(r'/Home/Bangumi/(\d+)"[^>]*?title="([^"]*)"')
 _BGM_RE = re.compile(r'bgm\.tv/subject/(\d+)')
-_SUBGROUP_SPLIT_RE = re.compile(r'<div class="subgroup-text"\s+id="\d+">')
-_GROUP_RE = re.compile(r'/Home/PublishGroup/(\d+)"[^>]*>([^<]+)')
 _HASH_FROM_LINK_RE = re.compile(r'/Home/Episode/([0-9a-f]{40})')
 
 
@@ -69,10 +67,7 @@ class MikanSource(Source):
         self.title_filter = title_filter or []  # 标题关键词过滤（标题需含其一，空=不限）
 
     async def fetch(self) -> list[ParsedItem]:
-        kwargs = {"timeout": 30, "follow_redirects": True}
-        if config.PROXY:
-            kwargs["proxy"] = config.PROXY
-        async with httpx.AsyncClient(**kwargs) as client:
+        async with httpx.AsyncClient(**config.http_client_kwargs(30)) as client:
             resp = await client.get(self.rss_url)
             resp.raise_for_status()
             content = resp.content
@@ -137,21 +132,14 @@ class MikanSource(Source):
 
 # ---------------- ② 季度剧场版/OVA 发现（catalog） ----------------
 
-def _client_kwargs(timeout: int = 30) -> dict:
-    kwargs = {"timeout": timeout, "follow_redirects": True}
-    if config.PROXY:
-        kwargs["proxy"] = config.PROXY
-    return kwargs
-
-
 def make_client() -> httpx.AsyncClient:
     """给编排层用的共享 client（一次发现批量复用连接 + 代理设置）。"""
-    return httpx.AsyncClient(**_client_kwargs())
+    return httpx.AsyncClient(**config.http_client_kwargs())
 
 
 def season_cn(quarter_letter: str) -> str:
     """季度字母 A/B/C/D → Mikan 季名 冬/春/夏/秋。"""
-    return _SEASON_CN.get(quarter_letter, "")
+    return SEASON_CN.get(quarter_letter, "")
 
 
 async def _get_text(client: httpx.AsyncClient, url: str) -> str:
@@ -190,22 +178,11 @@ async def discover_movie_bucket(client, year: int, season_letter: str) -> list[t
     return _parse_movie_bucket(htm)
 
 
-async def fetch_detail(client, mikan_id: str) -> tuple[int | None, list[tuple[int, str]]]:
-    """Mikan 番组详情页 → (bgm_id, [(字幕组id, 字幕组名)])。取不到 bgm_id 返回 (None, groups)。"""
+async def fetch_detail(client, mikan_id: str) -> int | None:
+    """Mikan 番组详情页 → bgm_id（取不到返回 None）。剧场版只需 bgm 精确联动键，不接字幕组白名单。"""
     htm = await _get_text(client, f"{config.MIKAN_BASE}/Home/Bangumi/{mikan_id}")
     bm = _BGM_RE.search(htm)
-    bgm_id = int(bm.group(1)) if bm else None
-    groups, seen = [], set()
-    # 只认真实种子区块 <div class="subgroup-text" id="..."> 内的组，避免侧栏/兜底标签污染
-    for seg in _SUBGROUP_SPLIT_RE.split(htm)[1:]:
-        gm = _GROUP_RE.search(seg)
-        if not gm:
-            continue
-        gid = int(gm.group(1))
-        if gid not in seen:
-            seen.add(gid)
-            groups.append((gid, html.unescape(gm.group(2)).strip()))
-    return bgm_id, groups
+    return int(bm.group(1)) if bm else None
 
 
 async def fetch_bangumi_torrents(client, mikan_id: str, priority: int = 0,

@@ -2,12 +2,103 @@
 
 页面级组件放在自己的页面文件里；这里只放跨页面复用的东西。
 """
+import re
 from contextlib import contextmanager
 
 from nicegui import ui
 
 NAV = [("manage", "动漫番剧", "/"), ("movies", "OVA・剧场版", "/movies"),
        ("settings", "设置", "/settings")]
+
+# 应用侧种子状态 → 中文（番剧表/剧场版/详情/新入库共用）
+STATUS_CN = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
+             "error": "失败", "skipped": "跳过"}
+WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def parse_bgm_id(text: str) -> int | None:
+    """从用户输入里抠出 bgm subject id：优先 bgm.tv/subject/<id>，退而取任意数字。取不到返回 None。"""
+    m = re.search(r"subject/(\d+)", text or "") or re.search(r"(\d+)", text or "")
+    return int(m.group(1)) if m else None
+
+
+def source_options(sources, blank: str = "按优先级") -> dict:
+    """下载源下拉选项：{'': 占位(按优先级), 源: 源, ...}。blank 为空选项文案。"""
+    return {"": blank, **{s: s for s in sources}}
+
+
+def group_by_quarter(items):
+    """按季度分组，返回 [(季度, [item...]), ...]，季度倒序、未知垫底。items 需有 .quarter。"""
+    by_q: dict[str, list] = {}
+    for it in items:
+        by_q.setdefault(it.quarter or "未知", []).append(it)
+    quarters = sorted((q for q in by_q if q != "未知"), reverse=True)
+    if "未知" in by_q:
+        quarters.append("未知")
+    return [(q, by_q[q]) for q in quarters]
+
+
+def kpi_cards(cards) -> None:
+    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或''), ...]；值非零且给了色才染色。"""
+    with ui.row().classes("gap-3 flex-wrap p-1"):
+        for label, val, hi in cards:
+            with ui.card().classes("items-center px-5 py-2"):
+                cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
+                ui.label(str(val)).classes(cls)
+                ui.label(label).classes("text-xs text-gray-400")
+
+
+def qb_disabled_banner(text: str) -> None:
+    """qB 未启用时的黄色提醒横幅；text 为各页自定文案。"""
+    with ui.row().classes("items-center gap-2 p-2 rounded w-full").style(
+            "background:rgba(234,179,8,.12)"):
+        ui.icon("warning").classes("text-yellow-500")
+        ui.label(text).classes("text-sm text-yellow-200")
+
+
+def recent_table(rows, name_label: str) -> None:
+    """『新入库』表：rows 已构造好(id/time/name/src/raw/status)，name_label 为番名列标题；
+    番名下再压一行灰色原始种子名（长名换行、完整显示）。番剧表与剧场版共用。"""
+    tbl = ui.table(
+        columns=[
+            {"name": "time", "label": "时间", "field": "time", "align": "left"},
+            {"name": "name", "label": name_label, "field": "name", "align": "left"},
+            {"name": "src", "label": "来源", "field": "src", "align": "left"},
+            {"name": "status", "label": "状态", "field": "status", "align": "left"},
+        ],
+        rows=rows, row_key="id",
+    ).classes("w-full")
+    tbl.add_slot("body-cell-name", r'''
+        <q-td :props="props">
+            <div>{{ props.row.name }}</div>
+            <div class="text-grey-6"
+                 style="font-size:11px;white-space:normal;word-break:break-all">
+                {{ props.row.raw }}
+            </div>
+        </q-td>
+    ''')
+
+
+def meta_card(cover_url, kv_pairs, bangumi_id, title, summary) -> None:
+    """详情元信息卡：封面 + 两列 kv 网格 + bgm 链接 + 原始标题 + 简介。番剧/剧场版详情共用，
+    kv_pairs=[(标签, 值)...] 各页自备（字段集略不同）。"""
+    with ui.card().classes("w-full"):
+        with ui.row().classes("gap-4 items-start no-wrap w-full"):
+            if cover_url:
+                ui.image(cover_url).classes("rounded").style("min-width:7rem;width:7rem")
+            with ui.column().classes("gap-1 grow"):
+                with ui.grid(columns=2).classes("gap-x-8 gap-y-1"):
+                    for kk, vv in kv_pairs:
+                        ui.label(kk).classes("text-xs text-gray-400")
+                        ui.label(str(vv) if vv not in (None, "") else "—")
+                if bangumi_id:
+                    ui.link(f"bgm.tv/subject/{bangumi_id}",
+                            f"https://bgm.tv/subject/{bangumi_id}").props(
+                        "target=_blank").classes("text-xs")
+                ui.label(f"原始标题: {title}").classes("text-xs text-gray-500")
+        if summary:
+            ui.separator()
+            ui.label(summary).classes("text-sm text-gray-300 whitespace-pre-wrap")
 
 
 def name_of(a) -> str:
@@ -83,9 +174,11 @@ def expand_collapse_bar(state: dict, refresh) -> None:
     def _set(v):
         state["expand"] = v
         refresh()
-    with ui.row().classes("items-center gap-1 pl-1 pb-1"):
-        ui.button("全部展开", icon="unfold_more", on_click=lambda: _set(True)).props("flat dense size=sm")
-        ui.button("全部收起", icon="unfold_less", on_click=lambda: _set(False)).props("flat dense size=sm")
+    with ui.row().classes("items-center gap-4 pl-1 pb-2"):
+        for text, val in (("全部展开", True), ("全部收起", False)):
+            ui.label(text).classes(
+                "cursor-pointer text-sm text-gray-500 hover:text-gray-200 transition-colors").on(
+                "click", lambda v=val: _set(v))
 
 
 async def confirm(title: str, note: str = "", ok_label: str = "确定",

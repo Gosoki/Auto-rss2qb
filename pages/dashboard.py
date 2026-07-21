@@ -3,15 +3,15 @@
 刷新面板定义在 page 函数内部（每个浏览器连接各自一份），避免模块级
 单例 refreshable 在多页面/多客户端下互相串。
 """
-import re
 from urllib.parse import quote
 
 from nicegui import ui
 
 from core import anime
 import config
-from .layout import (confirm, ep_str, expand_collapse_bar, frame, human_size, name_of,
-                     paginate, season_label)
+from .layout import (STATUS_CN, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
+                     human_size, kpi_cards, name_of, paginate, parse_bgm_id, qb_disabled_banner,
+                     recent_table, season_label, source_options)
 from .sources import render_sources
 
 
@@ -20,17 +20,6 @@ def _state_rank(a):
     if a.rejected:
         return 2
     return 1 if not a.confirmed else 0
-
-
-def _group_by_quarter(animes):
-    """按季度分组，返回 [(季度, [番...]), ...]，季度倒序、未知垫底。"""
-    by_q: dict[str, list] = {}
-    for a in animes:
-        by_q.setdefault(a.quarter or "未知", []).append(a)
-    quarters = sorted((q for q in by_q if q != "未知"), reverse=True)
-    if "未知" in by_q:
-        quarters.append("未知")
-    return [(q, by_q[q]) for q in quarters]
 
 
 # 概览用：种子状态 → (文案, quasar 颜色)
@@ -72,24 +61,14 @@ def dashboard(t: str = "manage"):
             k = ov["kpi"]
 
             # ── KPI 卡片 ──
-            cards = [("订阅中", k["tracking"], ""), ("待识别", k["fail"], "red"),
-                     ("待确认", k["confirm"], "orange"), ("已忽略", k["rejected"], ""),
-                     ("已下集", k["done"], "green"), ("待下", k["pending"], "orange"),
-                     ("多源", k["multi"], ""), ("种子", k["torrents"], "")]
-            with ui.row().classes("gap-3 flex-wrap p-1"):
-                for label, val, hi in cards:
-                    with ui.card().classes("items-center px-5 py-2"):
-                        cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
-                        ui.label(str(val)).classes(cls)
-                        ui.label(label).classes("text-xs text-gray-400")
+            kpi_cards([("订阅中", k["tracking"], ""), ("待识别", k["fail"], "red"),
+                       ("待确认", k["confirm"], "orange"), ("已忽略", k["rejected"], ""),
+                       ("已下集", k["done"], "green"), ("待下", k["pending"], "orange"),
+                       ("多源", k["multi"], ""), ("种子", k["torrents"], "")])
 
             # ── qB 未启用提醒 ──
             if not ov["config"]["qb"]:
-                with ui.row().classes("items-center gap-2 p-2 rounded w-full").style(
-                        "background:rgba(234,179,8,.12)"):
-                    ui.icon("warning").classes("text-yellow-500")
-                    ui.label("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）").classes(
-                        "text-sm text-yellow-200")
+                qb_disabled_banner("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）")
 
             # ── 订阅源组 ──
             ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
@@ -167,7 +146,7 @@ def dashboard(t: str = "manage"):
             if not pend:
                 ui.label("没有待确认的番。（『审核』策略的源组发现的番会出现在这里）").classes("text-gray-400 p-4")
                 return
-            for i, (q, items) in enumerate(_group_by_quarter(pend)):
+            for i, (q, items) in enumerate(group_by_quarter(pend)):
                 with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
                         srcs = anime.sources_for(a.id)
@@ -182,10 +161,8 @@ def dashboard(t: str = "manage"):
                                     ui.badge(sl).props("color=blue-grey")
                                 ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
                             with ui.row().classes("items-center gap-2 flex-wrap"):
-                                opts = {"": "从哪下：按优先级"}
-                                for sname in srcs:
-                                    opts[sname] = sname
-                                sel = ui.select(opts, value="").props("dense outlined").classes("min-w-48")
+                                sel = ui.select(source_options(srcs, "从哪下：按优先级"),
+                                                value="").props("dense outlined").classes("min-w-48")
                                 ui.button("确认下载", on_click=_confirm(a.id, sel)).props("size=sm color=primary")
                                 ui.button("忽略", on_click=_reject(a.id)).props("size=sm flat color=grey")
 
@@ -195,7 +172,7 @@ def dashboard(t: str = "manage"):
             if not rej:
                 ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
                 return
-            for i, (q, items) in enumerate(_group_by_quarter(rej)):
+            for i, (q, items) in enumerate(group_by_quarter(rej)):
                 with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
                         with ui.row().classes("items-center gap-3 pl-2 py-1 flex-wrap"):
@@ -254,35 +231,15 @@ def dashboard(t: str = "manage"):
         @ui.refreshable
         def recent_panel():
             ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
-            st = {"downloaded": "已下", "downloading": "下载中", "pending": "待下",
-                  "error": "失败", "skipped": "跳过"}
             rows = [{
                 "id": r["id"],
                 "time": r["time"],
                 "name": f'{r["name"]}  第{ep_str(r["episode"])}集',
                 "src": r["source"],
                 "raw": r["raw"] or "—",
-                "status": st.get(r["status"], r["status"]),
+                "status": STATUS_CN.get(r["status"], r["status"]),
             } for r in anime.recent_rows(50)]
-            tbl = ui.table(
-                columns=[
-                    {"name": "time", "label": "时间", "field": "time", "align": "left"},
-                    {"name": "name", "label": "番剧", "field": "name", "align": "left"},
-                    {"name": "src", "label": "来源", "field": "src", "align": "left"},
-                    {"name": "status", "label": "状态", "field": "status", "align": "left"},
-                ],
-                rows=rows, row_key="id",
-            ).classes("w-full")
-            # 番名下压一行灰色原始种子名：长名自动换行、完整显示。
-            tbl.add_slot("body-cell-name", r'''
-                <q-td :props="props">
-                    <div>{{ props.row.name }}</div>
-                    <div class="text-grey-6"
-                         style="font-size:11px;white-space:normal;word-break:break-all">
-                        {{ props.row.raw }}
-                    </div>
-                </q-td>
-            ''')
+            recent_table(rows, "番剧")
 
         @ui.refreshable
         def manage_panel():
@@ -324,7 +281,7 @@ def dashboard(t: str = "manage"):
                 return
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.multi_source_map()
-            groups, total_pages, page = paginate(_group_by_quarter(animes), manage_page["n"], 12)
+            groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], 12)
             manage_page["n"] = page
             with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
                 expand_collapse_bar(manage_page, manage_panel.refresh)
@@ -409,12 +366,11 @@ def dashboard(t: str = "manage"):
 
         def _bind(anime_id, inp):
             async def h():
-                v = (inp.value or "").strip()
-                m = re.search(r"subject/(\d+)", v) or re.search(r"(\d+)", v)
-                if not m:
+                bid = parse_bgm_id(inp.value or "")
+                if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
-                ok = await anime.bind_bgm(anime_id, int(m.group(1)))
+                ok = await anime.bind_bgm(anime_id, bid)
                 refresh_all()
                 ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
                           type="positive" if ok else "negative")

@@ -99,9 +99,7 @@ async def fetch_torrent_bytes(url: str) -> bytes:
     采集循环；故再套一层 asyncio.timeout 对总传输时长封顶。取到返回 bytes；HTTP/超限/超时失败抛异常，
     由调用方回写 error。
     """
-    kwargs = {"timeout": 60, "follow_redirects": True}
-    if config.PROXY:
-        kwargs["proxy"] = config.PROXY
+    kwargs = config.http_client_kwargs(60)
     async with asyncio.timeout(180):
         async with httpx.AsyncClient(**kwargs) as client:
             async with client.stream("GET", url) as resp:
@@ -112,6 +110,58 @@ async def fetch_torrent_bytes(url: str) -> bytes:
                     if len(buf) > _TORRENT_CAP:
                         raise ValueError(f"种子文件超过 {_TORRENT_CAP} 字节，疑似非法下载地址")
                 return bytes(buf)
+
+
+def torrent_time(t) -> str:
+    """种子入库/发布时间的统一短显示：优先放送时间，退回创建时间，截到分钟。"""
+    return str(t.release_time or t.created_at)[:16]
+
+
+def set_torrent_status(model_cls, tid: int, status: str) -> None:
+    """把某条种子（AnimeTorrent/MovieTorrent 任一）的状态置为 status。"""
+    with get_session() as s:
+        t = s.get(model_cls, tid)
+        if t is not None:
+            t.status = status
+            s.add(t)
+            s.commit()
+
+
+def reset_downloading(model_cls) -> None:
+    """启动时把某种子表上次异常退出遗留的 downloading 复位为 pending，好被重新下。"""
+    with get_session() as s:
+        for t in s.exec(select(model_cls).where(model_cls.status == "downloading")):
+            t.status = "pending"
+            s.add(t)
+        s.commit()
+
+
+def pick_best(torrents, pref=None):
+    """从候选种子里挑一份：钉了首选源就优先它（没有才退回全部），再按（优先级降序, 入库时间升序）取第一。
+
+    调用方保证 torrents 非空（TV 选集 / 剧场版审批下载都先筛过 pending）。
+    """
+    cands = torrents
+    if pref:
+        cands = [t for t in torrents if pref in (t.source or "")] or torrents
+    return sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))[0]
+
+
+def merge_subscription_state(keeper, loser) -> None:
+    """身份合并时把 loser 的订阅态并进 keeper（只改对象、不碰 DB）。TV/剧场版共用。
+
+    追不追 = confirmed 且未 rejected，按两方『活跃』并集：任一方原本活跃就继续追；两者都不活跃时保留
+    『拒绝优先于待确认』——既不让活跃订阅被拒绝副本拖成隐藏，也不让被拒项复活自动下。pref_source 空则补。
+    """
+    active = (keeper.confirmed and not keeper.rejected) or (loser.confirmed and not loser.rejected)
+    if active:
+        keeper.confirmed = True
+        keeper.rejected = False
+    else:
+        keeper.confirmed = keeper.confirmed or loser.confirmed
+        keeper.rejected = keeper.rejected or loser.rejected
+    if not keeper.pref_source and loser.pref_source:
+        keeper.pref_source = loser.pref_source
 
 
 def hash_owned_elsewhere(info_hash: str, other_model) -> bool:

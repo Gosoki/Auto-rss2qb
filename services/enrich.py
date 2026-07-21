@@ -121,11 +121,8 @@ def _subject_to_info(bgm_id, meta: dict) -> dict:
 
 async def fetch_by_id(bgm_id: int) -> dict | None:
     """按明确的 bgm subject id 直接取元数据（『富集失败』页手动绑定用）。取不到返回 None。"""
-    kwargs = {"timeout": config.ENRICH_TIMEOUT, "follow_redirects": True}
-    if config.PROXY:
-        kwargs["proxy"] = config.PROXY
     try:
-        async with httpx.AsyncClient(**kwargs) as client:
+        async with httpx.AsyncClient(**config.http_client_kwargs(config.ENRICH_TIMEOUT)) as client:
             r = await client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA)
         if r.status_code != 200:
             return None
@@ -149,11 +146,8 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
     if release_time is not None and isinstance(episode, (int, float)) and 1 <= episode <= 30:
         est = release_time - timedelta(weeks=int(episode) - 1)
 
-    kwargs = {"timeout": config.ENRICH_TIMEOUT, "follow_redirects": True}
-    if config.PROXY:
-        kwargs["proxy"] = config.PROXY
     try:
-        async with httpx.AsyncClient(**kwargs) as client:
+        async with httpx.AsyncClient(**config.http_client_kwargs(config.ENRICH_TIMEOUT)) as client:
             # ① 多名搜 bgm，统计投票（被几个名字命中）+ 记录日期贴合度
             votes: Counter = Counter()
             gap: dict = {}

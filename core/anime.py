@@ -260,21 +260,12 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
 
 
 def _set_status(torrent_id: int, status: str) -> None:
-    with get_session() as s:
-        t = s.get(AnimeTorrent, torrent_id)
-        if t is not None:
-            t.status = status
-            s.add(t)
-            s.commit()
+    engine.set_torrent_status(AnimeTorrent, torrent_id, status)
 
 
 def reset_downloading() -> None:
     """启动时把上次异常退出遗留的 downloading 复位为 pending，好被重新下。"""
-    with get_session() as s:
-        for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.status == "downloading")):
-            t.status = "pending"
-            s.add(t)
-        s.commit()
+    engine.reset_downloading(AnimeTorrent)
 
 
 async def flush_ready_downloads() -> int:
@@ -314,13 +305,7 @@ async def flush_ready_downloads() -> int:
             groups.setdefault((t.anime_id, t.episode), []).append(t)
 
     def _pick(ts, aid):
-        cands = ts
-        pref = pref_map.get(aid)
-        if pref:
-            matched = [t for t in ts if pref in (t.source or "")]
-            if matched:
-                cands = matched              # 钉了首选源就只从它里选，没有才退回全部
-        return sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))[0]
+        return engine.pick_best(ts, pref_map.get(aid))
 
     for key, ts in groups.items():
         if key in downloaded:
@@ -399,16 +384,6 @@ def overview() -> dict:
     }
 
 
-def list_anime() -> list[Anime]:
-    """番剧管理用：只列『已确认、未拒绝』的番；待审核的在『待确认』页，拒绝的在『拒绝』页。"""
-    with get_session() as s:
-        return list(s.exec(
-            select(Anime).where(  # noqa: E712
-                Anime.rejected.is_not(True), Anime.confirmed == True)
-            .order_by(Anime.quarter.desc(), Anime.id)
-        ))
-
-
 def list_all_anime() -> list[Anime]:
     """管理页统一视图：所有番（含待确认、已拒绝）；组内排序（状态垫底）交给页面。"""
     with get_session() as s:
@@ -466,7 +441,7 @@ def recent_rows(limit: int = 50) -> list[dict]:
                   s.exec(select(Anime).where(Anime.id.in_(ids)))} if ids else {})
     return [{
         "id": t.id,
-        "time": str(t.release_time or t.created_at)[:16],
+        "time": engine.torrent_time(t),
         "name": names.get(t.anime_id) or (t.anime_title or "?"),
         "episode": t.episode,
         "source": t.source,
@@ -579,17 +554,7 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
     keeper = s.get(Anime, keeper_id)
     loser = s.get(Anime, loser_id)
     if keeper is not None and loser is not None:
-        # 追不追 = confirmed 且未 rejected。合并后是否继续追，取两方的『活跃』并集：任一方原本活跃就继续追；
-        # 两者都不活跃时保留『拒绝优先于待确认』——既不让活跃订阅被拒绝副本拖成隐藏，也不让被拒番复活自动下。
-        active = (keeper.confirmed and not keeper.rejected) or (loser.confirmed and not loser.rejected)
-        if active:
-            keeper.confirmed = True
-            keeper.rejected = False
-        else:
-            keeper.confirmed = keeper.confirmed or loser.confirmed
-            keeper.rejected = keeper.rejected or loser.rejected
-        if not keeper.pref_source and loser.pref_source:
-            keeper.pref_source = loser.pref_source                      # 保住下载源偏好
+        engine.merge_subscription_state(keeper, loser)  # 迁订阅态，别随 loser 删掉致停更/复活
         s.add(keeper)
     for al in s.exec(select(TitleAlias).where(TitleAlias.anime_id == loser_id)):
         al.anime_id = keeper_id
@@ -708,11 +673,7 @@ def _select_downloads(rows: list, pref: str | None = None, have_eps: set | None 
     have = have_eps or set()
 
     def _best(cands: list):
-        c = cands
-        if pref:
-            m = [t for t in cands if pref in (t.source or "")]
-            c = m or cands
-        return sorted(c, key=lambda t: (-(t.priority or 0), t.created_at))[0]
+        return engine.pick_best(cands, pref)
 
     pos: dict = {}
     neg: list = []

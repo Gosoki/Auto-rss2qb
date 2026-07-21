@@ -37,10 +37,7 @@ class NyaaSource(Source):
         self.title_filter = title_filter or []  # 标题关键词过滤（标题需含其一，空=不限）
 
     async def fetch(self) -> list[ParsedItem]:
-        kwargs = {"timeout": 30, "follow_redirects": True}
-        if config.PROXY:
-            kwargs["proxy"] = config.PROXY
-        async with httpx.AsyncClient(**kwargs) as client:
+        async with httpx.AsyncClient(**config.http_client_kwargs(30)) as client:
             resp = await client.get(self.rss_url)
             resp.raise_for_status()
             content = resp.content
