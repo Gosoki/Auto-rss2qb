@@ -242,6 +242,26 @@ def qb_status_summary() -> dict:
     return engine.qb_summary(MovieTorrent)
 
 
+def recent_movie_rows(limit: int = 50) -> list[dict]:
+    """新入库列表：剧场版/OVA 种子 + 片的规范名（比原始种子标题可读）+ 原始种子标题。
+
+    MovieTorrent 表只含剧场版/OVA 种子（TV 在 AnimeTorrent），故无需再过滤。
+    """
+    with get_session() as s:
+        ts = list(s.exec(select(MovieTorrent).order_by(MovieTorrent.created_at.desc()).limit(limit)))
+        ids = {t.movie_id for t in ts if t.movie_id}
+        names = ({m.id: (m.display_name or m.title) for m in
+                  s.exec(select(Movie).where(Movie.id.in_(ids)))} if ids else {})
+    return [{
+        "id": t.id,
+        "time": str(t.release_time or t.created_at)[:16],
+        "name": names.get(t.movie_id) or (t.raw_title or "?"),
+        "source": t.source,
+        "status": t.status,
+        "raw": t.raw_title or "",
+    } for t in ts]
+
+
 # ---------------- 操作（给 /movies 页 + 详情） ----------------
 
 def reject_movie(movie_id: int) -> None:

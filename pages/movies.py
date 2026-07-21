@@ -338,6 +338,37 @@ def movies_page(t: str = "list"):
                             "min-width:5rem")
 
         @ui.refreshable
+        def recent_panel():
+            ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
+            rows = [{
+                "id": r["id"],
+                "time": r["time"],
+                "name": r["name"],
+                "src": r["source"],
+                "raw": r["raw"] or "—",
+                "status": _STATUS.get(r["status"], r["status"]),
+            } for r in mov.recent_movie_rows(50)]
+            tbl = ui.table(
+                columns=[
+                    {"name": "time", "label": "时间", "field": "time", "align": "left"},
+                    {"name": "name", "label": "剧场版", "field": "name", "align": "left"},
+                    {"name": "src", "label": "来源", "field": "src", "align": "left"},
+                    {"name": "status", "label": "状态", "field": "status", "align": "left"},
+                ],
+                rows=rows, row_key="id",
+            ).classes("w-full")
+            # 剧场版名下压一行灰色原始种子名：长名自动换行、完整显示。
+            tbl.add_slot("body-cell-name", r'''
+                <q-td :props="props">
+                    <div>{{ props.row.name }}</div>
+                    <div class="text-grey-6"
+                         style="font-size:11px;white-space:normal;word-break:break-all;max-width:26rem">
+                        {{ props.row.raw }}
+                    </div>
+                </q-td>
+            ''')
+
+        @ui.refreshable
         def list_panel():
             from core import anime
             items = mov.list_movies()
@@ -435,6 +466,7 @@ def movies_page(t: str = "list"):
 
         def refresh_all():
             overview_panel.refresh()
+            recent_panel.refresh()
             list_panel.refresh()
             fail_panel.refresh()
             reject_panel.refresh()
@@ -453,6 +485,7 @@ def movies_page(t: str = "list"):
         with ui.tab_panels(tabs, value=start).classes("w-full"):
             with ui.tab_panel("overview"):
                 overview_panel()
+                recent_panel()
             with ui.tab_panel("list"):
                 list_panel()
             with ui.tab_panel("fail"):

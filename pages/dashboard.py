@@ -257,16 +257,25 @@ def dashboard(t: str = "manage"):
                 "raw": r["raw"] or "—",
                 "status": st.get(r["status"], r["status"]),
             } for r in anime.recent_rows(50)]
-            ui.table(
+            tbl = ui.table(
                 columns=[
                     {"name": "time", "label": "时间", "field": "time", "align": "left"},
                     {"name": "name", "label": "番剧", "field": "name", "align": "left"},
                     {"name": "src", "label": "来源", "field": "src", "align": "left"},
-                    {"name": "raw", "label": "原始标题", "field": "raw", "align": "left"},
                     {"name": "status", "label": "状态", "field": "status", "align": "left"},
                 ],
                 rows=rows, row_key="id",
             ).classes("w-full")
+            # 番名下压一行灰色原始种子名：长名自动换行、完整显示。
+            tbl.add_slot("body-cell-name", r'''
+                <q-td :props="props">
+                    <div>{{ props.row.name }}</div>
+                    <div class="text-grey-6"
+                         style="font-size:11px;white-space:normal;word-break:break-all;max-width:26rem">
+                        {{ props.row.raw }}
+                    </div>
+                </q-td>
+            ''')
 
         @ui.refreshable
         def manage_panel():
