@@ -1,6 +1,6 @@
 """TV 番剧主流程 + 给 UI 的查询/操作（剧场版/OVA 在 movies.py，两者只共用 engine 底层）。
 
-一条标准条目进来 → 按 info_hash 去重 → 用『番名对照(TitleAlias)』定位到唯一的番
+一条标准条目进来 → 按 info_hash 去重 → 用『番名对照(AnimeAlias)』定位到唯一的番
 (命中即知；未命中则查一次 bgm，有对应番就复用、否则新建) → 入库种子(带 anime_id) →
 由 flush_ready_downloads 按『缓冲窗口 + 优先级』对每集只下一份。
 """
@@ -17,7 +17,7 @@ from sqlmodel import func, select
 import config
 from core import engine
 from db import get_session
-from db.models import Anime, AnimeTorrent, MovieTorrent, SourceGroup, TitleAlias
+from db.models import Anime, AnimeTorrent, MovieTorrent, SourceGroup, AnimeAlias
 from services import enrich
 from services.notify import notify
 from sources.parse import extract_quarter, season_from_name
@@ -85,8 +85,8 @@ async def _resolve_anime(item) -> int:
     ② 未命中 → 富集拿 bgm_id：有对应番则复用，否则新建；无论如何登记一条对照。
     """
     with get_session() as s:
-        alias = s.exec(select(TitleAlias).where(
-            TitleAlias.title == item.anime_title, TitleAlias.season == item.season)).first()
+        alias = s.exec(select(AnimeAlias).where(
+            AnimeAlias.title == item.anime_title, AnimeAlias.season == item.season)).first()
         if alias is not None:
             return alias.anime_id
 
@@ -94,8 +94,8 @@ async def _resolve_anime(item) -> int:
     info = await enrich.resolve(item.search_names, item.release_time, item.episode, item.info_hash)
 
     with get_session() as s:
-        alias = s.exec(select(TitleAlias).where(  # 重入保护：再查一次
-            TitleAlias.title == item.anime_title, TitleAlias.season == item.season)).first()
+        alias = s.exec(select(AnimeAlias).where(  # 重入保护：再查一次
+            AnimeAlias.title == item.anime_title, AnimeAlias.season == item.season)).first()
         if alias is not None:
             return alias.anime_id
 
@@ -123,9 +123,9 @@ async def _resolve_anime(item) -> int:
                 if anime is None:
                     raise
         # 登记番名对照（并发/竞态下可能已存在则忽略）
-        if not s.exec(select(TitleAlias).where(
-                TitleAlias.title == item.anime_title, TitleAlias.season == item.season)).first():
-            s.add(TitleAlias(title=item.anime_title, season=item.season, anime_id=anime.id))
+        if not s.exec(select(AnimeAlias).where(
+                AnimeAlias.title == item.anime_title, AnimeAlias.season == item.season)).first():
+            s.add(AnimeAlias(title=item.anime_title, season=item.season, anime_id=anime.id))
             try:
                 s.commit()
             except IntegrityError:
@@ -174,7 +174,7 @@ async def process_item(item) -> bool:
 
     log.info("新增 - %s - %s 第%s季 第%s集", item.source, item.anime_title, item.season, item.episode)
     # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 → 入库就下，不等缓冲窗口
-    if config.TOP_PRIORITY_INSTANT and should_download and (item.priority or 0) >= _top_priority():
+    if config.ANIME_TOP_PRIORITY_INSTANT and should_download and (item.priority or 0) >= _top_priority():
         await download_anime_torrent(torrent_id)
     return True
 
@@ -269,10 +269,10 @@ async def flush_ready_downloads() -> int:
 
     对『自动下载且已确认』的番，把待下种子按 (anime_id, 集) 归组——因为按番的真实身份
     分组，不同组不同写法的同一集会算作同一集，天然只留一份。每集首次被发现后满
-    config.DOWNLOAD_GRACE_MIN 分钟才放行，到点从该集所有种子挑优先级最高的下一份（错误的排后，
+    config.ANIME_DOWNLOAD_GRACE_MIN 分钟才放行，到点从该集所有种子挑优先级最高的下一份（错误的排后，
     留作降级）。特别篇/未知集不做集去重，逐个下。返回实际触发下载的数量。
     """
-    grace = timedelta(minutes=config.DOWNLOAD_GRACE_MIN)
+    grace = timedelta(minutes=config.ANIME_DOWNLOAD_GRACE_MIN)
     now = datetime.now()
     chosen: list[int] = []
     with get_session() as s:
@@ -374,8 +374,8 @@ def overview() -> dict:
         "enriched": (sum(1 for a in animes if a.bangumi_id), len(animes)),
         "groups": [(g.name, g.site, g.policy, g.priority, g.enabled)
                    for g in sorted(groups, key=lambda g: -g.priority)],
-        "config": {"qb": config.QB_ENABLED, "poll_on": config.POLL_ENABLED,
-                   "poll": config.POLL_INTERVAL, "grace": config.DOWNLOAD_GRACE_MIN},
+        "config": {"qb": config.QB_ENABLED, "poll_on": config.ANIME_POLL_ENABLED,
+                   "poll": config.ANIME_POLL_INTERVAL, "grace": config.ANIME_DOWNLOAD_GRACE_MIN},
         "qb": engine.qb_summary(AnimeTorrent),
     }
 
@@ -386,7 +386,7 @@ def list_all_anime() -> list[Anime]:
         return list(s.exec(select(Anime).order_by(Anime.quarter.desc(), Anime.id)))
 
 
-def list_rejected() -> list[Anime]:
+def list_rejected_anime() -> list[Anime]:
     """已拒绝的番（『拒绝』页展示，可恢复）。"""
     with get_session() as s:
         return list(s.exec(
@@ -395,7 +395,7 @@ def list_rejected() -> list[Anime]:
         ))
 
 
-def list_unenriched() -> list[Anime]:
+def list_unmatched_anime() -> list[Anime]:
     """未匹配 bgm 的番（bangumi_id 为空、未拒绝）——供『待识别』页人工处理。"""
     with get_session() as s:
         return list(s.exec(
@@ -425,7 +425,7 @@ def pending_confirm() -> list[Anime]:
             Anime.bangumi_id.is_not(None))))
 
 
-def recent_rows(limit: int = 50) -> list[dict]:
+def recent_anime_rows(limit: int = 50) -> list[dict]:
     """新入库列表：种子 + 番的规范名（比原始解析名可读）+ 原始种子标题（区分同集不同版本）。
 
     AnimeTorrent 表只含 TV 种子（剧场版/OVA 在 MovieTorrent），故无需再过滤。
@@ -460,7 +460,7 @@ def list_episodes(anime_id: int) -> list[AnimeTorrent]:
         ))
 
 
-def sources_for(anime_id: int) -> list[str]:
+def anime_sources(anime_id: int) -> list[str]:
     """某番剧现有的所有来源（去重排序），供待确认/详情页展示与选源。"""
     with get_session() as s:
         rows = s.exec(select(AnimeTorrent.source).where(AnimeTorrent.anime_id == anime_id)).all()
@@ -561,7 +561,7 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
         if not keeper.pref_source and loser.pref_source:
             keeper.pref_source = loser.pref_source
         s.add(keeper)
-    for al in s.exec(select(TitleAlias).where(TitleAlias.anime_id == loser_id)):
+    for al in s.exec(select(AnimeAlias).where(AnimeAlias.anime_id == loser_id)):
         al.anime_id = keeper_id
         s.add(al)
     for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == loser_id)):
@@ -612,7 +612,7 @@ async def enrich_anime(anime_id: int) -> bool:
     return bool(info)
 
 
-async def bind_bgm(anime_id: int, bgm_id: int) -> bool:
+async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
     """把某番手动绑定到指定 bgm subject id：取元数据覆盖 + 身份合并。返回是否成功。
 
     自动匹配失败（罗马音/冷门名搜不到）时的人工兜底：用户给准确的 bgm id，直接取权威元数据。
@@ -923,7 +923,7 @@ def seed_source_groups() -> None:
 # ---------------- 迁移：旧模型(每写法一条 + merged_into) → 对照模型 ----------------
 
 def migrate_to_alias_model() -> None:
-    """把旧库迁到『唯一 Anime + TitleAlias』模型。幂等；旧库特征 = anime 有 merged_into 列。"""
+    """把旧库迁到『唯一 Anime + AnimeAlias』模型。幂等；旧库特征 = anime 有 merged_into 列。"""
     import sqlalchemy as sa
     from db import engine
 
@@ -956,12 +956,12 @@ def migrate_to_alias_model() -> None:
         return aid
 
     with get_session() as s:
-        existing = {(a.title, a.season) for a in s.exec(select(TitleAlias))}
+        existing = {(a.title, a.season) for a in s.exec(select(AnimeAlias))}
         losers = []
         for aid, title, season, merged in rows:
             target = _root(aid)
             if (title, season) not in existing:
-                s.add(TitleAlias(title=title, season=season, anime_id=target))
+                s.add(AnimeAlias(title=title, season=season, anime_id=target))
                 existing.add((title, season))
             if merged is not None:
                 losers.append(aid)
@@ -974,7 +974,7 @@ def migrate_to_alias_model() -> None:
                 s.delete(obj)
         s.commit()
 
-        alias_map = {(a.title, a.season): a.anime_id for a in s.exec(select(TitleAlias))}
+        alias_map = {(a.title, a.season): a.anime_id for a in s.exec(select(AnimeAlias))}
         valid = {a.id for a in s.exec(select(Anime))}
         for t in s.exec(select(AnimeTorrent)):
             if t.anime_id and t.anime_id in valid:

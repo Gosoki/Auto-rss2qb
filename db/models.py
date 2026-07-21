@@ -5,7 +5,7 @@ TV 番剧与剧场版/OVA 彻底分表、互不相干（各自独立的表 + 独
 Setting     —— 键值配置覆盖（设置页写、运行时读、即时生效）。
 SourceGroup —— 订阅的字幕组/源组（feed/策略/优先级/白名单）——只喂 TV 周更番。
 Anime       —— 一部 TV 番剧（唯一）。身份 = bangumi_id。含 bgm 元数据。下不下 = confirmed 且未 rejected。
-TitleAlias  —— 番名对照：(标题, 季) → 哪部 TV 番。命中即知是谁，不必再查 bgm。
+AnimeAlias  —— 番名对照：(标题, 季) → 哪部 TV 番。命中即知是谁，不必再查 bgm。
 AnimeTorrent     —— 一条 TV 种子，按 info_hash 唯一；anime_id 关联到 TV 番。含 qB 实时态镜像（qb_*）。
 Movie       —— 一部剧场版/OVA（唯一）。来源仅 Mikan 季度剧场版/OVA 桶，识别用 bgm。与 Anime 无关。
 MovieTorrent—— 一条剧场版/OVA 种子，按 info_hash 唯一；movie_id 关联到 Movie。含 qB 实时态镜像。
@@ -39,7 +39,7 @@ class SourceGroup(SQLModel, table=True):
 
 
 class Anime(SQLModel, table=True):
-    """一部 TV 番剧（唯一）。不同组的不同写法都经 TitleAlias 指到这一条。剧场版/OVA 不在此，见 Movie。"""
+    """一部 TV 番剧（唯一）。不同组的不同写法都经 AnimeAlias 指到这一条。剧场版/OVA 不在此，见 Movie。"""
     id: int | None = Field(default=None, primary_key=True)
     bangumi_id: int | None = Field(default=None, index=True)   # 身份键（可空）
     # ---- 名称 / 归档 ----
@@ -63,8 +63,9 @@ class Anime(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
 
 
-class TitleAlias(SQLModel, table=True):
+class AnimeAlias(SQLModel, table=True):
     """番名对照：某组解析出的 (标题, 季) → 番。命中即知是哪部番，无需再查 bgm。"""
+    __tablename__ = "anime_alias"   # 表名带 anime 前缀（旧名 titlealias，启动时自动改名迁移）
     __table_args__ = (UniqueConstraint("title", "season", name="uq_alias_title_season"),)
 
     id: int | None = Field(default=None, primary_key=True)

@@ -1,4 +1,4 @@
-"""番剧详情：可作为独立页 /anime/{id}，也可用 render_detail 渲染进悬浮框(dialog)。"""
+"""番剧详情：可作为独立页 /anime/{id}，也可用 render_anime_detail 渲染进悬浮框(dialog)。"""
 from nicegui import ui
 
 from core import anime, engine
@@ -7,7 +7,7 @@ from .layout import (STATUS_CN, WEEKDAY_CN, confirm, ep_str, frame, meta_card, n
                      qb_live_text, season_label, source_options)
 
 
-def render_detail(anime_id: int, refresh_outer=None) -> None:
+def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
     """把某番详情渲染进当前容器。refresh_outer：改动数据后刷新外层列表（番剧列表/待确认/已忽略 等）。"""
     if anime.get_anime(anime_id) is None:
         ui.label("番剧不存在").classes("text-gray-400 p-4")
@@ -148,4 +148,4 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
 def detail_page(anime_id: int):
     with frame():
         ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to("/")).props("flat round dense")
-        render_detail(anime_id)
+        render_anime_detail(anime_id)

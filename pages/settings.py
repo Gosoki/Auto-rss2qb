@@ -10,8 +10,8 @@ import config
 from sources.parse import format_quarter
 from .layout import frame
 
-_NUMERIC = {"POLL_INTERVAL", "DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
-            "MANAGE_PAGE_YEARS", "MOVIE_PAGE_YEARS"}
+_NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
+            "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS"}
 _PASSWORD = {"QB_PASSWORD"}
 _RESTART_ONLY = {"WEB_PORT"}  # 绑端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
@@ -72,11 +72,11 @@ def settings():
 
         with ui.card().classes("w-full"):
             ui.label("采集").classes("font-bold")
-            _switch("POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
-                    config.POLL_ENABLED)
-            _num("POLL_INTERVAL", "轮询间隔（秒）", config.POLL_INTERVAL)
-            _num("DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）", config.DOWNLOAD_GRACE_MIN)
-            _switch("TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）", config.TOP_PRIORITY_INSTANT)
+            _switch("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
+                    config.ANIME_POLL_ENABLED)
+            _num("ANIME_POLL_INTERVAL", "轮询间隔（秒）", config.ANIME_POLL_INTERVAL)
+            _num("ANIME_DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）", config.ANIME_DOWNLOAD_GRACE_MIN)
+            _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）", config.ANIME_TOP_PRIORITY_INSTANT)
             ui.label("Bangumi 识别：项目恒开（规范名/季度/日语文件夹名统一采用 bgm）。").classes(
                 "text-xs text-gray-500")
             ui.label("源组（feed/策略/优先级/字幕组白名单）都在『源管理』页配置，改完下一轮生效。").classes(
@@ -95,9 +95,9 @@ def settings():
 
             ui.separator()
             ui.label("目录结构").classes("font-bold text-sm")
-            _switch("SEASON_SUBFOLDER",
+            _switch("ANIME_SEASON_SUBFOLDER",
                     "番名目录下再建『Season N』二级子目录（关=番剧文件直接放番名目录）",
-                    config.SEASON_SUBFOLDER)
+                    config.ANIME_SEASON_SUBFOLDER)
             ui.label("番剧与剧场版分开归档：下载根 /『番剧』或『剧场版』/ 季度 / 名字 …").classes(
                 "text-xs text-gray-500")
             ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
@@ -108,14 +108,14 @@ def settings():
 
         with ui.card().classes("w-full"):
             ui.label("面板 / 显示").classes("font-bold")
-            _switch("MANAGE_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.MANAGE_SHOW_PENDING)
-            _switch("MANAGE_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.MANAGE_SHOW_REJECTED)
+            _switch("ANIME_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.ANIME_SHOW_PENDING)
+            _switch("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
             ui.label("番剧表默认只显示订阅中；上面两项各自决定要不要也带上（它们仍在各自标签页）。").classes(
                 "text-xs text-gray-500")
             ui.separator()
             ui.label("分页：一页显示多少年的季度（超出翻页）").classes("font-bold text-sm")
             with ui.row().classes("items-center gap-4 flex-wrap"):
-                f["MANAGE_PAGE_YEARS"] = ui.number("番剧表 · 年", value=config.MANAGE_PAGE_YEARS,
+                f["ANIME_PAGE_YEARS"] = ui.number("番剧表 · 年", value=config.ANIME_PAGE_YEARS,
                                                    min=1, max=5, format="%d").classes("w-32")
                 f["MOVIE_PAGE_YEARS"] = ui.number("剧场版 · 年", value=config.MOVIE_PAGE_YEARS,
                                                   min=1, max=5, format="%d").classes("w-32")

@@ -1,4 +1,4 @@
-"""后台轮询器：常驻协程，每 POLL_INTERVAL 秒抓一次所有源并处理。
+"""后台轮询器：常驻协程，每 ANIME_POLL_INTERVAL 秒抓一次所有源并处理。
 
 源不再写死——每轮从 DB 的 SourceGroup 表重建（在 UI 改了组，下一轮就生效）。
 抓取入库后，统一由 flush_ready_downloads 按『缓冲窗口 + 优先级』决定下哪些。
@@ -57,16 +57,16 @@ async def poll_once() -> None:
 
 async def run_worker() -> None:
     log.info("轮询器启动（采集%s），每 %d 秒一轮",
-             "开" if config.POLL_ENABLED else "关·在设置页开启", config.POLL_INTERVAL)
+             "开" if config.ANIME_POLL_ENABLED else "关·在设置页开启", config.ANIME_POLL_INTERVAL)
     while True:
-        if not config.POLL_ENABLED:
+        if not config.ANIME_POLL_ENABLED:
             await asyncio.sleep(15)  # 暂停中：短睡轮询采集开关，打开约 15s 内生效
             continue
         try:
             await poll_once()
         except Exception as e:
             log.error("本轮异常: %s", e)
-        await asyncio.sleep(config.POLL_INTERVAL)  # 每轮读当前值，改了下一轮生效
+        await asyncio.sleep(config.ANIME_POLL_INTERVAL)  # 每轮读当前值，改了下一轮生效
 
 
 async def run_movie_scan() -> None:

@@ -45,7 +45,7 @@ _TAB_KEYS = ("overview", "manage", "confirm", "fail", "reject", "sources")
 
 
 @ui.page("/")
-def dashboard(t: str = "manage"):
+def anime_page(t: str = "manage"):
     """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。"""
     with frame("manage"):  # 本页用 tab + 30s 定时刷新，不往顶栏右侧放自定义动作
         manage_page = {"n": 1, "expand": None}  # 番剧表：分页页码 + 一键展开/收起意图（None=按默认）
@@ -149,7 +149,7 @@ def dashboard(t: str = "manage"):
             for i, (q, items) in enumerate(group_by_quarter(pend)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
-                        srcs = anime.sources_for(a.id)
+                        srcs = anime.anime_sources(a.id)
                         with ui.card().classes("w-full"):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
                                 ui.badge("待确认").props("color=orange")
@@ -168,7 +168,7 @@ def dashboard(t: str = "manage"):
 
         @ui.refreshable
         def reject_panel():
-            rej = anime.list_rejected()
+            rej = anime.list_rejected_anime()
             if not rej:
                 ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
                 return
@@ -183,7 +183,7 @@ def dashboard(t: str = "manage"):
                             sl = season_label(a)
                             if sl:
                                 ui.badge(sl).props("color=blue-grey")
-                            ui.label("来源: " + (" · ".join(anime.sources_for(a.id)) or "—")).classes(
+                            ui.label("来源: " + (" · ".join(anime.anime_sources(a.id)) or "—")).classes(
                                 "text-xs text-gray-400")
                             ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
                                 "size=sm flat color=primary")
@@ -196,7 +196,7 @@ def dashboard(t: str = "manage"):
 
         @ui.refreshable
         def fail_panel():
-            items = anime.list_unenriched()
+            items = anime.list_unmatched_anime()
             if not items:
                 ui.label("没有待识别的番。（bgm 没自动匹配上的番会出现在这里，可重试或手动绑定）").classes(
                     "text-gray-400 p-4")
@@ -205,7 +205,7 @@ def dashboard(t: str = "manage"):
                      "可『重试识别』，或粘贴 bgm 链接/ID『绑定』，实在没有就『忽略』。").classes(
                 "text-xs text-gray-400 p-2")
             for a in items:
-                srcs = anime.sources_for(a.id)
+                srcs = anime.anime_sources(a.id)
                 with ui.card().classes("w-full"):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
                         ui.badge("未匹配").props("color=red")
@@ -238,7 +238,7 @@ def dashboard(t: str = "manage"):
                 "src": r["source"],
                 "raw": r["raw"] or "—",
                 "status": STATUS_CN.get(r["status"], r["status"]),
-            } for r in anime.recent_rows(50)]
+            } for r in anime.recent_anime_rows(50)]
             recent_table(rows, "番剧")
 
         @ui.refreshable
@@ -271,9 +271,9 @@ def dashboard(t: str = "manage"):
             # 面板设置：追番中恒显示；待确认/已拒绝各自按开关决定带不带上
             def _visible(a):
                 if a.rejected:
-                    return config.MANAGE_SHOW_REJECTED
+                    return config.ANIME_SHOW_REJECTED
                 if not a.confirmed:
-                    return config.MANAGE_SHOW_PENDING
+                    return config.ANIME_SHOW_PENDING
                 return True
             animes = [a for a in anime.list_all_anime() if _visible(a)]
             if not animes:
@@ -281,7 +281,7 @@ def dashboard(t: str = "manage"):
                 return
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.multi_source_map()
-            yrs = max(1, config.MANAGE_PAGE_YEARS)  # 防 0（每页 0 季会除零）
+            yrs = max(1, config.ANIME_PAGE_YEARS)  # 防 0（每页 0 季会除零）
             groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], yrs * 4)
             manage_page["n"] = page
             with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
@@ -320,12 +320,12 @@ def dashboard(t: str = "manage"):
         detail_dlg = ui.dialog()
 
         def open_detail(anime_id):
-            from .detail import render_detail
+            from .anime_detail import render_anime_detail
             detail_dlg.clear()
             with detail_dlg, ui.card().classes("w-full").style("max-width:860px"):
                 with ui.row().classes("w-full justify-end"):
                     ui.button(icon="close", on_click=detail_dlg.close).props("flat round dense")
-                render_detail(anime_id, refresh_outer=refresh_all)
+                render_anime_detail(anime_id, refresh_outer=refresh_all)
             detail_dlg.open()
 
         # ---- 事件处理（闭包，直接引用上面的刷新函数）----
@@ -371,7 +371,7 @@ def dashboard(t: str = "manage"):
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
-                ok = await anime.bind_bgm(anime_id, bid)
+                ok = await anime.bind_anime_bgm(anime_id, bid)
                 refresh_all()
                 ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
                           type="positive" if ok else "negative")

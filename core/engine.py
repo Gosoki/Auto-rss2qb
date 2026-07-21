@@ -71,7 +71,7 @@ def build_save_path(quarter: str, folder_name: str, season: int | None = None,
     if top and not root:
         parts.append(safe_name(top))
     parts += [safe_name(quarter_folder(quarter or "unknown")), safe_name(folder_name)]
-    if season is not None and config.SEASON_SUBFOLDER:
+    if season is not None and config.ANIME_SEASON_SUBFOLDER:
         parts.append(f"Season {int(season)}")
     save_path = os.path.join(*parts)
     base_real = os.path.realpath(base)

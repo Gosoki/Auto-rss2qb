@@ -26,8 +26,22 @@ def _sqlite_pragmas(dbapi_conn, _record):
 
 def init_db():
     from . import models  # noqa: F401  确保表被注册
+    _migrate_rename_tables()   # 老表改名（必须在 create_all 前，免得建出空的新表、老数据留在旧表）
     SQLModel.metadata.create_all(engine)
     _migrate_add_columns()
+
+
+_TABLE_RENAMES = {"titlealias": "anime_alias"}  # 旧表名 → 新表名（番剧番名对照加 anime 前缀）
+
+
+def _migrate_rename_tables():
+    """把旧表名改到新表名，保住老数据。幂等（改过一次旧表就没了）。"""
+    inspector = sa.inspect(engine)
+    for old, new in _TABLE_RENAMES.items():
+        if inspector.has_table(old) and not inspector.has_table(new):
+            with engine.begin() as conn:
+                conn.exec_driver_sql(f'ALTER TABLE "{old}" RENAME TO "{new}"')
+            log.info("数据库迁移：表 %s → %s", old, new)
 
 
 def _migrate_add_columns():

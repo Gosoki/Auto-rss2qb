@@ -39,17 +39,17 @@ _SPEC = {
     "QB_PASSWORD": (str, ""),
     "DOWN_PATH": (str, "/media/upan/Anime"),
     "MOVIE_DOWN_PATH": (str, ""),            # 电影独立下载根（空=用 DOWN_PATH/剧场版；填了=放这个独立目录，可另一块盘）
-    "SEASON_SUBFOLDER": (bool, True),
+    "ANIME_SEASON_SUBFOLDER": (bool, True),
     "QUARTER_FMT": (str, "{yy}{q} · {m}月 · {season}"),
     "QUARTER_FMT_UI": (str, ""),            # 空 = 跟随 QUARTER_FMT（见 __getattr__）
-    "MANAGE_SHOW_PENDING": (bool, False),
-    "MANAGE_SHOW_REJECTED": (bool, False),
-    "MANAGE_PAGE_YEARS": (int, 3),           # 番剧表一页显示几年的番（1~5，×4 得季度数）
+    "ANIME_SHOW_PENDING": (bool, False),
+    "ANIME_SHOW_REJECTED": (bool, False),
+    "ANIME_PAGE_YEARS": (int, 3),           # 番剧表一页显示几年的番（1~5，×4 得季度数）
     "MOVIE_PAGE_YEARS": (int, 5),            # 剧场版列表一页显示几年（1~5）
-    "POLL_ENABLED": (bool, True),           # 后台采集总开关（全新库首启默认关，见 load_from_db）
-    "POLL_INTERVAL": (int, 1200),
-    "DOWNLOAD_GRACE_MIN": (int, 120),
-    "TOP_PRIORITY_INSTANT": (bool, True),
+    "ANIME_POLL_ENABLED": (bool, True),           # 后台采集总开关（全新库首启默认关，见 load_from_db）
+    "ANIME_POLL_INTERVAL": (int, 1200),
+    "ANIME_DOWNLOAD_GRACE_MIN": (int, 120),
+    "ANIME_TOP_PRIORITY_INSTANT": (bool, True),
     "OPEN_PROXY": (bool, False),
     "PROXY_URL": (str, ""),
     "NOTIFY_URL": (str, ""),
@@ -68,7 +68,20 @@ _SPEC = {
 }
 
 # 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集
-_FRESH_OFF = {"POLL_ENABLED"}
+_FRESH_OFF = {"ANIME_POLL_ENABLED"}
+
+# 旧键 → 新键：番剧专属项加 ANIME_ 前缀（与 movie 侧 MOVIE_ 对齐）。启动时把老库 settings 里
+# 旧键的值搬到新键、删旧键，保住用户已存的配置。幂等（迁过一次旧键就没了）。
+_RENAMES = {
+    "POLL_ENABLED": "ANIME_POLL_ENABLED",
+    "POLL_INTERVAL": "ANIME_POLL_INTERVAL",
+    "DOWNLOAD_GRACE_MIN": "ANIME_DOWNLOAD_GRACE_MIN",
+    "TOP_PRIORITY_INSTANT": "ANIME_TOP_PRIORITY_INSTANT",
+    "MANAGE_SHOW_PENDING": "ANIME_SHOW_PENDING",
+    "MANAGE_SHOW_REJECTED": "ANIME_SHOW_REJECTED",
+    "MANAGE_PAGE_YEARS": "ANIME_PAGE_YEARS",
+    "SEASON_SUBFOLDER": "ANIME_SEASON_SUBFOLDER",
+}
 
 
 def _coerce(kind, raw):
@@ -130,6 +143,16 @@ def load_from_db() -> None:
     from db.models import Setting
     with get_session() as s:
         have = {r.key: r.value for r in s.exec(select(Setting))}
+        # 老库键改名迁移：旧键的值搬到新键、删旧键（保住用户已存的值；幂等）
+        for old, new in _RENAMES.items():
+            old_row = s.get(Setting, old)
+            if old_row is None:
+                continue
+            if new not in have:
+                have[new] = old_row.value
+                s.add(Setting(key=new, value=old_row.value))
+            s.delete(old_row)
+            have.pop(old, None)
         fresh = not have  # settings 表原本为空 = 全新库首启
         for k, (kind, default) in _SPEC.items():
             if k not in have:
