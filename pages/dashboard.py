@@ -74,7 +74,7 @@ def dashboard(t: str = "manage"):
             ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 for name, site, policy, priority, enabled in ov["groups"]:
-                    pol = "全下" if policy == "auto" else "审核"
+                    pol = "全下" if policy == "auto" else "待确认"
                     tail = "" if enabled else " · 停用"
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
                         f"color={'blue-grey' if enabled else 'grey'}").classes("text-sm")
@@ -144,7 +144,7 @@ def dashboard(t: str = "manage"):
         def confirm_panel():
             pend = anime.pending_confirm()
             if not pend:
-                ui.label("没有待确认的番。（『审核』策略的源组发现的番会出现在这里）").classes("text-gray-400 p-4")
+                ui.label("没有待确认的番。（『待确认』策略的源组发现的番会出现在这里）").classes("text-gray-400 p-4")
                 return
             for i, (q, items) in enumerate(group_by_quarter(pend)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
@@ -152,7 +152,7 @@ def dashboard(t: str = "manage"):
                         srcs = anime.sources_for(a.id)
                         with ui.card().classes("w-full"):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
-                                ui.badge("审核").props("color=orange")
+                                ui.badge("待确认").props("color=orange")
                                 ui.label(name_of(a)).classes(
                                     "cursor-pointer text-blue-400 hover:underline").on(
                                     "click", lambda aid=a.id: open_detail(aid))
@@ -243,7 +243,7 @@ def dashboard(t: str = "manage"):
 
         @ui.refreshable
         def manage_panel():
-            # 当季 / 上季小结（数字大、标签小；零值审核项变灰）
+            # 当季 / 上季小结（数字大、标签小；零值待确认项变灰）
             with ui.row().classes("w-full gap-3 flex-wrap mb-3 items-stretch"):
                 for b in anime.quarter_brief():
                     stats = [
@@ -405,8 +405,6 @@ def dashboard(t: str = "manage"):
                     ui.badge("已忽略").props("color=grey")
                 elif not a.confirmed:
                     ui.badge("待确认").props("color=orange")
-                elif a.source_kind == "review":
-                    ui.badge("审核").props("color=blue-grey")  # 已确认但来自审核源（区别 ANi 直下）
                 color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
                 ui.label(name_of(a)).classes(
                     f"cursor-pointer {color} hover:underline").on(

@@ -108,7 +108,7 @@ async def _resolve_anime(item) -> int:
             auto = _is_auto(item.source_kind) and bgm_id is not None
             anime = Anime(
                 title=item.anime_title, season=item.season, quarter=item.quarter,
-                confirmed=auto, source_kind=item.source_kind,
+                confirmed=auto,
             )
             _apply_bgm(anime, info)
             s.add(anime)
@@ -624,7 +624,7 @@ async def bind_bgm(anime_id: int, bgm_id: int) -> bool:
         a = s.get(Anime, anime_id)
         if a is None:
             return False
-        a.confirmed = False  # 绑定后进『审核/待确认』，等人工确认下载
+        a.confirmed = False  # 绑定后进『待确认』，等人工确认下载
         # 无已下集就采用 bgm 季度（纠正错季度）；有已下集才保留，避免散目录
         _apply_bgm(a, info, keep_quarter=_has_downloads(s, anime_id))
         s.add(a)
@@ -908,7 +908,7 @@ def backfill_unmatched_review() -> int:
 
 
 def seed_source_groups() -> None:
-    """首启种入现有的 ANi(全下) + Mikan(审核)，保持原行为，也给个可编辑的起点。"""
+    """首启种入现有的 ANi(全下) + Mikan(待确认)，保持原行为，也给个可编辑的起点。"""
     with get_session() as s:
         if s.exec(select(SourceGroup)).first() is not None:
             return

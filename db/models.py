@@ -30,7 +30,7 @@ class SourceGroup(SQLModel, table=True):
     name: str = Field(index=True)              # 展示名，唯一
     site: str = Field(default="nyaa")          # 'nyaa' | 'mikan'
     feed: str = Field(default="")              # nyaa: 用户名或完整RSS URL；mikan: RSS URL
-    policy: str = Field(default="auto")        # 'auto' 全下 | 'review' 需审核
+    policy: str = Field(default="auto")        # 'auto' 全下 | 'review' 进待确认队列
     priority: int = Field(default=0)           # 越大越优先（多源同一集选高的）
     subgroups: str = Field(default="")         # 字幕组白名单（逗号分隔，空=全部；子串匹配组名）
     title_filter: str = Field(default="")      # 标题关键词过滤（逗号分隔，空=不限；标题需含其一，如 繁日/简日）
@@ -57,9 +57,8 @@ class Anime(SQLModel, table=True):
     rating: float | None = Field(default=None)        # bgm 评分（0-10）
     summary: str | None = Field(default=None)         # 简介
     # ---- 下载控制 ----
-    confirmed: bool = Field(default=True)             # 审核状态（审核源默认 False，等人工确认）；确认即自动下
+    confirmed: bool = Field(default=True)             # 确认状态（待确认源默认 False，等人工确认）；确认即自动下
     rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『拒绝』页恢复）
-    source_kind: str = Field(default="auto")          # 引入它的策略（'auto'/'review'，徽章用）
     pref_source: str | None = Field(default=None)     # 首选下载源（子串匹配 torrent.source；空=按优先级）
     created_at: datetime = Field(default_factory=datetime.now)
 

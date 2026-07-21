@@ -1,4 +1,4 @@
-"""源管理：增删源组、切策略(全下/审核)、调优先级、开关。
+"""源管理：增删源组、切策略(全下/待确认)、调优先级、开关。
 
 worker 每轮从这里读，改完下一轮就生效，不用重启。
 render_sources() 抽出来复用：/sources 独立页 与 番剧列表『订阅源』tab 都调它。
@@ -9,7 +9,7 @@ from core import anime
 from .layout import frame
 
 SITE_OPTS = {"nyaa": "nyaa", "mikan": "mikan"}
-POLICY_OPTS = {"auto": "全下", "review": "审核"}
+POLICY_OPTS = {"auto": "全下", "review": "待确认"}
 
 
 def render_sources() -> None:
