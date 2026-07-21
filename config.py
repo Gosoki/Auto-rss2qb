@@ -58,6 +58,10 @@ _SPEC = {
     "MIKAN_BASE": (str, "https://mikanani.me"),
     "MIKAN_SUBGROUPS": (list, ""),          # 逗号分隔 → list
     "BGM_API": (str, "https://api.bgm.tv"),
+    # ---- 剧场版/OVA 自动扫描（来源固定为 Mikan 季度桶）----
+    "MOVIE_SCAN_ENABLED": (bool, False),    # 自动扫描开关（关=只在 /movies 手动点扫描）
+    "MOVIE_SCAN_INTERVAL": (int, 43200),    # 每隔多少秒自动扫一次剧场版（默认 12 小时）
+    "MOVIE_SCAN_LAST": (str, ""),           # 上次扫描时间（ISO，运行时更新；非用户填）
 }
 
 # 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集

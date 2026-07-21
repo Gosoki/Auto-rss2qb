@@ -6,12 +6,13 @@
 """
 import asyncio
 import logging
+from collections import Counter
+from datetime import datetime
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 import config
-import core
 import engine
 import enrich
 from db import get_session
@@ -47,9 +48,12 @@ def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
 
 def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
                   info: dict | None, label: str) -> tuple[int, bool]:
-    """按 bgm_id（无则 mikan_id）定位/新建 Movie，写入 bgm 元数据。返回 (movie_id, 是否新建)。"""
-    plat_label = ("剧场版" if ("剧场" in label or "劇場" in label)
-                  else "OVA" if ("OVA" in label or "OAD" in label or "OAV" in label) else None)
+    """按 bgm_id（无则 mikan_id）定位/新建 Movie，写入 bgm 元数据。返回 (movie_id, 是否新建)。
+
+    是不是电影以 Mikan 桶为准（mikan_type，列表徽标用）；platform 存 bgm 的类型（详情页展示，跟 bgm）。
+    """
+    mikan_type = ("剧场版" if ("剧场" in label or "劇場" in label)
+                  else "OVA" if ("OVA" in label or "OAD" in label or "OAV" in label) else "剧场版")
     with get_session() as s:
         movie = None
         if bgm_id is not None:
@@ -59,8 +63,9 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         is_new = movie is None
         if movie is None:
             movie = Movie(title=title, mikan_id=mikan_id, confirmed=False,
-                          enriched=bgm_id is not None, platform=plat_label)
+                          enriched=bgm_id is not None)
         movie.mikan_id = mikan_id
+        movie.mikan_type = mikan_type   # Mikan 桶判定（剧场版/OVA），列表徽标用
         if not movie.display_name:
             movie.display_name = title  # 无 bgm 时先用 Mikan 展示名兜底
         engine.apply_bgm_meta(movie, info, keep_quarter=(not is_new and _has_downloads(s, movie.id)))
@@ -95,15 +100,15 @@ def _store_movie_torrents(movie_id: int, items: list) -> int:
 
 
 async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
-    """扫描 Mikan 指定年份/季度的剧场版·OVA，识别(bgm)入库为 Movie 并抓其种子。
+    """扫描 Mikan 指定年份/季度的剧场版·OVA 桶，识别(bgm)入库为 Movie 并抓其种子。
 
     seasons：['A','B','C','D'] 子集（冬春夏秋），None=全年四季。
-    bgm 明确判成 TV 周更番的桶项『不当电影』——改喂给 TV 管线（core.process_item）进番剧那边的待确认，
-    而不是丢掉；其余（剧场版/OVA/WEB/无类型）默认判成电影入 Movie。
-    返回 {'movies','torrents','seen','to_tv_shows','to_tv_torrents','errors'}。
+    『是不是电影』以 Mikan 桶为准——桶里的一律当剧场版/OVA 收进 Movie（哪怕 bgm 把类型识别成 TV，
+    也只是详情页的 bgm 元数据，不改变它在剧场版列表里）。本函数只碰 Movie/MovieTorrent，不写 TV 表。
+    返回 {'movies','torrents','seen','errors'}。
     """
     seasons = seasons or ["A", "B", "C", "D"]
-    added_movies = added_torrents = seen = to_tv_shows = to_tv_torrents = errors = 0
+    added_movies = added_torrents = seen = errors = 0
     async with mikan_catalog.make_client() as client:
         for letter in seasons:
             try:
@@ -118,37 +123,94 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
                 try:
                     bgm_id, _groups = await mikan_catalog.fetch_detail(client, mikan_id)
                     info = await enrich.fetch_by_id(bgm_id) if bgm_id is not None else None
-                    items = await mikan_catalog.fetch_bangumi_torrents(client, mikan_id)
-                    if info and info.get("platform") == "TV":
-                        # bgm 判成周更 TV → 不当电影，喂给 TV 管线进番剧那边（待确认），别白丢
-                        to_tv_shows += 1
-                        for it in items:
-                            it.source_kind = "review"  # Mikan 发现的 TV：进待确认，不自动下
-                            try:
-                                if await core.process_item(it):
-                                    to_tv_torrents += 1
-                            except Exception as e:
-                                log.error("剧场版桶转 TV 失败 %s: %s", it.anime_title, e)
-                        continue
                     movie_id, is_new = _upsert_movie(mikan_id, title, bgm_id, info, mlabel)
                     seen += 1
                     added_movies += 1 if is_new else 0
+                    items = await mikan_catalog.fetch_bangumi_torrents(client, mikan_id)
                     added_torrents += _store_movie_torrents(movie_id, items)
                 except Exception as e:
                     log.error("处理剧场版失败 mikan=%s(%s): %s", mikan_id, title, e)
                     errors += 1
-    log.info("剧场版发现完成 %s：电影命中 %d/新增 %d/种子 %d，转入TV %d部/%d集，出错 %d",
-             year, seen, added_movies, added_torrents, to_tv_shows, to_tv_torrents, errors)
-    return {"movies": added_movies, "torrents": added_torrents, "seen": seen,
-            "to_tv_shows": to_tv_shows, "to_tv_torrents": to_tv_torrents, "errors": errors}
+    log.info("剧场版发现完成 %s：命中 %d/新增 %d/种子 %d，出错 %d",
+             year, seen, added_movies, added_torrents, errors)
+    return {"movies": added_movies, "torrents": added_torrents, "seen": seen, "errors": errors}
+
+
+async def scan_now(year: int, seasons: list[str] | None = None) -> dict:
+    """扫描一次并记下扫描时间（手动『立即扫描』与后台自动扫描共用）。只碰剧场版，不涉 TV。"""
+    res = await discover_movies(year, seasons)
+    config.set_many({"MOVIE_SCAN_LAST": datetime.now().isoformat(timespec="seconds")})
+    return res
+
+
+async def auto_scan_tick() -> bool:
+    """后台心跳调用：开了自动扫描且到点（距上次 ≥ MOVIE_SCAN_INTERVAL）就扫当年四季。扫了返回 True。"""
+    if not config.MOVIE_SCAN_ENABLED:
+        return False
+    last = config.MOVIE_SCAN_LAST
+    if last:
+        try:
+            if (datetime.now() - datetime.fromisoformat(last)).total_seconds() < config.MOVIE_SCAN_INTERVAL:
+                return False  # 还没到点
+        except ValueError:
+            pass
+    await scan_now(datetime.now().year)
+    return True
 
 
 # ---------------- 查询（给 /movies 页） ----------------
+
+def overview() -> dict:
+    """/movies 仪表盘的聚合数据：KPI + 各季度(电影数/已下) + qB 实时态。"""
+    with get_session() as s:
+        all_m = list(s.exec(select(Movie)))
+        pairs = list(s.exec(select(MovieTorrent.movie_id, MovieTorrent.status)))
+    active = [m for m in all_m if not m.rejected]
+    active_ids = {m.id for m in active}
+    q_of = {m.id: (m.quarter or "未知") for m in active}
+    dl_ids = {mid for mid, st in pairs if st == "downloaded"}
+    total_by_q = Counter(q_of[m.id] for m in active)
+    dl_by_q = Counter(q_of[mid] for mid in dl_ids if mid in q_of)
+    qs = sorted((q for q in total_by_q if q != "未知"), reverse=True)
+    if "未知" in total_by_q:
+        qs.append("未知")
+    status = Counter(st for _, st in pairs)
+    return {
+        "kpi": {
+            "total": len(active),
+            "matched": sum(1 for m in active if m.bangumi_id),
+            "unmatched": sum(1 for m in active if not m.bangumi_id),
+            "downloaded": len([mid for mid in dl_ids if mid in active_ids]),
+            "rejected": sum(1 for m in all_m if m.rejected),
+            "versions": len(pairs),
+        },
+        "by_quarter": [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs],
+        "status": {k: status.get(k, 0) for k in
+                   ("downloaded", "downloading", "pending", "error", "skipped")},
+        "qb": engine.qb_summary(MovieTorrent),
+        "config": {"qb": config.QB_ENABLED},
+    }
+
+
+def list_unmatched_movies() -> list[Movie]:
+    """未识别（bgm 没匹配上）的剧场版/OVA——供『待识别』tab 手动绑定。"""
+    with get_session() as s:
+        return list(s.exec(select(Movie).where(
+            Movie.bangumi_id.is_(None), Movie.rejected.is_not(True))
+            .order_by(Movie.created_at.desc())))
+
 
 def list_movies() -> list[Movie]:
     """未忽略的剧场版/OVA（/movies 页展示）。"""
     with get_session() as s:
         return list(s.exec(select(Movie).where(Movie.rejected.is_not(True))
+                           .order_by(Movie.quarter.desc(), Movie.id)))
+
+
+def list_rejected_movies() -> list[Movie]:
+    """已忽略的剧场版/OVA（/movies 页底部『已忽略』区展示，可恢复）。"""
+    with get_session() as s:
+        return list(s.exec(select(Movie).where(Movie.rejected == True)  # noqa: E712
                            .order_by(Movie.quarter.desc(), Movie.id)))
 
 

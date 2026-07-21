@@ -111,6 +111,7 @@ class Movie(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     bangumi_id: int | None = Field(default=None, index=True)   # 身份键（可空）
     mikan_id: str | None = Field(default=None, index=True)     # Mikan 番组 id（刷新种子 RSS 用）
+    mikan_type: str | None = Field(default=None)      # Mikan 桶判定：剧场版 / OVA（列表徽标；『是不是电影』以此为准）
     # ---- 名称 / 归档 ----
     title: str = Field(default="")                    # Mikan/解析名（兜底）
     display_name: str | None = Field(default=None)    # bgm 规范名（UI 显示）

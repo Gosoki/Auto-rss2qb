@@ -1,7 +1,7 @@
-"""OVA・剧场版页 `/movies`：扫描 Mikan 剧场版/OVA 桶 → bgm 识别 → 审批 / 逐版本下载。
+"""OVA・剧场版页 `/movies`：仿番剧那边的标签布局 —— 仪表盘 / 列表 / 待识别 / 已忽略 / 订阅源。
 
 剧场版数据（Movie/MovieTorrent）与 TV 番剧完全分离，逻辑在 movies.py；本页只管展示与交互。
-详情/下载复用统一的视觉 helper（name_of / qb_live_text），但走剧场版自己的操作。
+剧场版整个列表本身就是『待人工下载』，故不设『待确认』；订阅源=固定的 Mikan 季度扫描（非 RSS 订阅）。
 """
 import re
 from datetime import datetime
@@ -10,12 +10,18 @@ from nicegui import ui
 
 import config
 import movies as mov
-from .layout import frame, name_of, qb_live_text
+from .layout import frame, human_size, name_of, qb_live_text
 
 _SEASONS = {"A": "冬", "B": "春", "C": "夏", "D": "秋"}
 _STATUS = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
            "error": "失败", "skipped": "跳过"}
 _WEEKDAY = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+_TABS = ("overview", "list", "fail", "reject", "sources")
+
+
+def _q_label(q: str) -> str:
+    import core
+    return core.quarter_label(q)
 
 
 def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
@@ -34,13 +40,12 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
         sources = sorted({t.source for t in ts})
         with ui.row().classes("items-center gap-2 flex-wrap"):
             ui.label(name_of(cur)).classes("text-2xl font-bold")
-            ui.badge(cur.platform or "剧场版").props("color=deep-purple")
+            ui.badge(cur.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定
             if cur.rejected:
                 ui.badge("已忽略").props("color=grey")
             elif not cur.bangumi_id:
                 ui.badge("未识别").props("color=red")
 
-        # 元信息卡（封面 + bgm 元数据 + 简介）
         with ui.card().classes("w-full"):
             with ui.row().classes("gap-4 items-start no-wrap w-full"):
                 if cur.cover_url:
@@ -65,7 +70,6 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
                 ui.separator()
                 ui.label(cur.summary).classes("text-sm text-gray-300 whitespace-pre-wrap")
 
-        # 操作
         with ui.row().classes("items-center gap-3 flex-wrap"):
             ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat size=sm")
             if cur.rejected:
@@ -78,13 +82,12 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
                     opts[sname] = sname
                 ui.select(opts, value=(cur.pref_source or ""), label="下载源",
                           on_change=_set_source).props("dense outlined").classes("min-w-40")
-        if not cur.bangumi_id:  # 未识别 → 手动绑定 bgm
+        if not cur.bangumi_id:
             with ui.row().classes("items-center gap-2 flex-wrap"):
                 inp = ui.input(placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").props(
                     "dense outlined").classes("min-w-96")
                 ui.button("绑定", icon="link", on_click=lambda: _bind(inp)).props("size=sm color=primary")
 
-        # 版本 / 种子（剧场版=一部作品，各条即不同字幕组/画质版本；逐条可下/删）
         ui.label(f"版本 / 种子（{len(ts)}）").classes("text-sm font-bold mt-2")
         if not ts:
             ui.label("（还没有种子）").classes("text-gray-400")
@@ -175,18 +178,10 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
     body()
 
 
-def _q_label(q: str) -> str:
-    import core
-    return core.quarter_label(q)
-
-
 @ui.page("/movies")
-def movies_page():
+def movies_page(t: str = "list"):
+    """t = 当前 tab（写在 URL ?t= 里），刷新后停在同一 tab。"""
     with frame("movies"):
-        ui.label("OVA・剧场版").classes("text-2xl font-bold")
-        ui.label("从 Mikan 各季度『剧场版/OVA』发现，识别走 bgm；bgm 判成周更 TV 的会跳过（电影只抓电影）。").classes(
-            "text-xs text-gray-400 mb-2")
-
         detail_dlg = ui.dialog()
 
         def open_detail(movie_id):
@@ -194,19 +189,10 @@ def movies_page():
             with detail_dlg, ui.card().classes("w-full").style("max-width:860px"):
                 with ui.row().classes("w-full justify-end"):
                     ui.button(icon="close", on_click=detail_dlg.close).props("flat round dense")
-                render_movie_detail(movie_id, refresh_outer=movie_list.refresh)
+                render_movie_detail(movie_id, refresh_outer=refresh_all)
             detail_dlg.open()
 
-        with ui.card().classes("w-full"):
-            with ui.row().classes("items-end gap-3 flex-wrap"):
-                year = ui.number("年份", value=datetime.now().year, format="%d").classes("w-28")
-                seas = ui.select(_SEASONS, multiple=True, value=list(_SEASONS),
-                                 label="季度").props("dense outlined").classes("min-w-64")
-                ui.button("扫描剧场版/OVA", icon="travel_explore",
-                          on_click=lambda: _scan(year, seas)).props("color=primary")
-            ui.label("首次扫描要抓 Mikan 季度页 + 每部详情 + bgm，稍慢；抓到的种子默认待人工下载。").classes(
-                "text-xs text-gray-500")
-
+        # ---- 事件 ----
         async def _scan(year_in, seas_in):
             yr = int(year_in.value or datetime.now().year)
             letters = [x for x in (seas_in.value or []) if x in _SEASONS]
@@ -214,18 +200,17 @@ def movies_page():
                 ui.notify("至少选一个季度", type="warning")
                 return
             ui.notify(f"扫描 {yr} 年 {len(letters)} 个季度的剧场版/OVA…（走 Mikan+bgm，请稍候）")
-            res = await mov.discover_movies(yr, letters)
-            movie_list.refresh()
+            res = await mov.scan_now(yr, letters)
+            refresh_all()
             tail = f"，{res['errors']} 个出错" if res["errors"] else ""
-            tv = f"，转入 TV {res['to_tv_shows']} 部" if res["to_tv_shows"] else ""
             ui.notify(
-                f"扫描完成：电影命中 {res['seen']} 部，新增 {res['movies']}，种子 {res['torrents']}{tv}{tail}",
+                f"扫描完成：命中 {res['seen']} 部，新增 {res['movies']}，种子 {res['torrents']}{tail}",
                 type="positive")
 
         def _download(movie_id):
             async def h():
                 n = await mov.download_movie(movie_id)
-                movie_list.refresh()
+                refresh_all()
                 if n:
                     ui.notify("已触发下载（一个最佳版本；要别的版本点番名进详情逐条下）", type="positive")
                 elif not config.QB_ENABLED:
@@ -237,9 +222,51 @@ def movies_page():
         def _reject(movie_id):
             def h():
                 mov.reject_movie(movie_id)
-                movie_list.refresh()
-                ui.notify("已忽略")
+                refresh_all()
+                ui.notify("已忽略（『已忽略』tab 可恢复）")
             return h
+
+        def _restore(movie_id):
+            def h():
+                mov.restore_movie(movie_id)
+                refresh_all()
+                ui.notify("已恢复")
+            return h
+
+        def _bind(movie_id, inp):
+            async def h():
+                v = (inp.value or "").strip()
+                m = re.search(r"subject/(\d+)", v) or re.search(r"(\d+)", v)
+                if not m:
+                    ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
+                    return
+                ok = await mov.bind_movie_bgm(movie_id, int(m.group(1)))
+                refresh_all()
+                ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
+                          type="positive" if ok else "negative")
+            return h
+
+        def _refail(movie_id):
+            async def h():
+                ok = await mov.enrich_movie(movie_id)
+                refresh_all()
+                ui.notify("识别成功 ✓" if ok else "还是没识别到（可粘贴 bgm 链接绑定）",
+                          type="positive" if ok else "warning")
+            return h
+
+        def _save_scan(f):
+            try:
+                secs = max(3600, int(float(f["hours"].value or 12) * 3600))
+            except (ValueError, TypeError):
+                ui.notify("间隔要填数字（小时）", type="warning")
+                return
+            config.set_many({
+                "MOVIE_SCAN_ENABLED": "true" if f["enabled"].value else "false",
+                "MOVIE_SCAN_INTERVAL": str(secs),
+            })
+            sources_panel.refresh()
+            on = "开" if f["enabled"].value else "关"
+            ui.notify(f"已保存：自动扫描{on}，每 {secs // 3600} 小时一次", type="positive")
 
         def _movie_card(m):
             ts = mov.movie_torrents(m.id)
@@ -250,12 +277,12 @@ def movies_page():
                         ui.image(m.cover_url).classes("rounded").style("min-width:4rem;width:4rem")
                     with ui.column().classes("gap-1 grow min-w-0"):
                         with ui.row().classes("items-center gap-2 flex-wrap"):
-                            ui.badge(m.platform or "剧场版").props("color=deep-purple")
+                            ui.badge(m.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定
                             ui.label(name_of(m)).classes(
                                 "cursor-pointer text-blue-400 hover:underline font-bold").on(
                                 "click", lambda mid=m.id: open_detail(mid))
                             if not m.bangumi_id:
-                                ui.badge("未识别").props("color=red").tooltip("bgm 没匹配上，可进详情手动绑定")
+                                ui.badge("未识别").props("color=red").tooltip("bgm 没匹配上，去『待识别』手动绑定")
                         with ui.row().classes("gap-4 text-xs text-gray-400 flex-wrap"):
                             ui.label(f"放送 {m.air_date or '—'}")
                             ui.label(f"版本 {len(ts)}")
@@ -267,11 +294,55 @@ def movies_page():
                         ui.button("忽略", icon="block", on_click=_reject(m.id)).props(
                             "size=sm flat color=grey")
 
+        # ---- 面板 ----
         @ui.refreshable
-        def movie_list():
+        def overview_panel():
+            ov = mov.overview()
+            k = ov["kpi"]
+            cards = [("电影", k["total"], ""), ("已识别", k["matched"], ""),
+                     ("待识别", k["unmatched"], "red"), ("已下", k["downloaded"], "green"),
+                     ("已忽略", k["rejected"], ""), ("版本", k["versions"], "")]
+            with ui.row().classes("gap-3 flex-wrap p-1"):
+                for label, val, hi in cards:
+                    with ui.card().classes("items-center px-5 py-2"):
+                        cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
+                        ui.label(str(val)).classes(cls)
+                        ui.label(label).classes("text-xs text-gray-400")
+            if not ov["config"]["qb"]:
+                with ui.row().classes("items-center gap-2 p-2 rounded w-full").style(
+                        "background:rgba(234,179,8,.12)"):
+                    ui.icon("warning").classes("text-yellow-500")
+                    ui.label("qB 未启用：剧场版也只采集不下载（设置页开 QB_ENABLED 后生效）").classes(
+                        "text-sm text-yellow-200")
+            else:
+                q = ov["qb"]
+                with ui.row().classes("gap-2 flex-wrap pl-1 items-center mt-1"):
+                    ui.badge(f"qB 跟踪 {q['tracked']}").props("color=teal").classes("text-sm")
+                    ui.badge(f"下载中 {q['downloading']}").props("color=teal").classes("text-sm")
+                    ui.badge(f"做种 {q['seeding']}").props("color=teal").classes("text-sm")
+                    if q["dlspeed"]:
+                        ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=teal").classes("text-sm")
+            ui.label(f"各季度（电影数 / 已下）· {len(ov['by_quarter'])}").classes("text-sm font-bold mt-3 pl-1")
+            with ui.column().classes("w-full gap-0 pl-1"):
+                maxv = max((tot for _, tot, _ in ov["by_quarter"]), default=1) or 1
+                if not ov["by_quarter"]:
+                    ui.label("—").classes("text-gray-500 text-sm")
+                for qk, tot, done in ov["by_quarter"]:
+                    with ui.row().classes("items-center gap-3 w-full text-sm py-0.5"):
+                        ui.label(_q_label(qk)).classes("w-36 shrink-0 truncate")
+                        with ui.element("div").classes("grow rounded").style(
+                                "background:rgba(255,255,255,.07);height:12px"):
+                            ui.element("div").style(
+                                f"width:{tot / maxv * 100:.1f}%;height:12px;background:#a855f7;border-radius:6px")
+                        ui.label(f"{done} / {tot}").classes("shrink-0 text-gray-400 text-right").style(
+                            "min-width:5rem")
+
+        @ui.refreshable
+        def list_panel():
+            import core
             items = mov.list_movies()
             if not items:
-                ui.label("还没有剧场版/OVA。点上面『扫描剧场版/OVA』从 Mikan 拉取。").classes(
+                ui.label("还没有剧场版/OVA。去『订阅源』tab 点『扫描』从 Mikan 拉取。").classes(
                     "text-gray-400 p-4")
                 return
             by_q: dict[str, list] = {}
@@ -280,7 +351,6 @@ def movies_page():
             quarters = sorted((q for q in by_q if q != "未知"), reverse=True)
             if "未知" in by_q:
                 quarters.append("未知")
-            import core
             for i, q in enumerate(quarters):
                 grp = by_q[q]
                 with ui.expansion(f"{core.quarter_label(q)}   ·   {len(grp)} 部",
@@ -288,4 +358,106 @@ def movies_page():
                     for m in grp:
                         _movie_card(m)
 
-        movie_list()
+        @ui.refreshable
+        def fail_panel():
+            items = mov.list_unmatched_movies()
+            if not items:
+                ui.label("没有待识别的剧场版。（bgm 没自动匹配上的会出现在这里，可绑定或忽略）").classes(
+                    "text-gray-400 p-4")
+                return
+            ui.label("这些剧场版没自动匹配到 bgm：缺规范名/日语文件夹名/季度。可『重试识别』或粘贴 bgm 链接『绑定』。").classes(
+                "text-xs text-gray-400 p-2")
+            for m in items:
+                with ui.card().classes("w-full"):
+                    with ui.row().classes("items-center gap-3 flex-wrap"):
+                        ui.badge("未识别").props("color=red")
+                        ui.label(name_of(m)).classes(
+                            "cursor-pointer text-blue-400 hover:underline").on(
+                            "click", lambda mid=m.id: open_detail(mid))
+                        ui.label("来源: " + (" · ".join(mov.movie_sources(m.id)) or "—")).classes(
+                            "text-xs text-gray-400")
+                    with ui.row().classes("items-center gap-2 flex-wrap"):
+                        inp = ui.input(placeholder="bgm 链接或 ID").props("dense outlined").classes("min-w-96")
+                        ui.button("绑定", icon="link", on_click=_bind(m.id, inp)).props("size=sm color=primary")
+                        ui.button("重试识别", icon="refresh", on_click=_refail(m.id)).props("size=sm flat")
+                        ui.button("忽略", on_click=_reject(m.id)).props("size=sm flat color=grey")
+
+        @ui.refreshable
+        def reject_panel():
+            rej = mov.list_rejected_movies()
+            if not rej:
+                ui.label("没有已忽略的剧场版。（列表里点『忽略』会进这里，可随时恢复）").classes(
+                    "text-gray-400 p-4")
+                return
+            for m in rej:
+                with ui.row().classes("items-center gap-3 pl-2 py-1 flex-wrap"):
+                    ui.badge("已忽略").props("color=grey")
+                    ui.label(name_of(m)).classes(
+                        "cursor-pointer text-gray-400 line-through hover:underline").on(
+                        "click", lambda mid=m.id: open_detail(mid))
+                    ui.label("来源: " + (" · ".join(mov.movie_sources(m.id)) or "—")).classes(
+                        "text-xs text-gray-400")
+                    ui.button("恢复", icon="undo", on_click=_restore(m.id)).props("size=sm flat color=primary")
+
+        @ui.refreshable
+        def sources_panel():
+            ui.label("剧场版/OVA 的来源固定为 Mikan 季度浏览页的『剧场版/OVA 桶』——非 RSS 订阅，"
+                     "不用像番剧那边配字幕组。识别走 bgm；判成周更 TV 的会自动转去番剧『待确认』。").classes(
+                "text-xs text-gray-400 mb-2")
+
+            # 自动扫描（定期自动抓，无需手动）
+            with ui.card().classes("w-full"):
+                ui.label("自动扫描").classes("font-bold")
+                f = {}
+                f["enabled"] = ui.switch("开启自动扫描（后台定期扫『当年』四季的剧场版/OVA）",
+                                         value=config.MOVIE_SCAN_ENABLED).props("dense")
+                with ui.row().classes("items-center gap-3 flex-wrap"):
+                    f["hours"] = ui.number("扫描间隔（小时）",
+                                           value=round(config.MOVIE_SCAN_INTERVAL / 3600, 1),
+                                           min=1, format="%g").classes("w-40")
+                    ui.button("保存", icon="save", on_click=lambda: _save_scan(f)).props("color=primary")
+                last = config.MOVIE_SCAN_LAST or "从未"
+                ui.label(f"上次扫描：{last}").classes("text-xs text-gray-400")
+                ui.label("剧场版桶更新不频繁，间隔别设太小；改动即时生效，到点自动扫。").classes(
+                    "text-xs text-gray-500")
+
+            # 手动立即扫描（可指定年份/季度回填历史）
+            with ui.card().classes("w-full"):
+                ui.label("手动立即扫描").classes("font-bold")
+                with ui.row().classes("items-end gap-3 flex-wrap"):
+                    year = ui.number("年份", value=datetime.now().year, format="%d").classes("w-28")
+                    seas = ui.select(_SEASONS, multiple=True, value=list(_SEASONS),
+                                     label="季度").props("dense outlined").classes("min-w-64")
+                    ui.button("立即扫描", icon="travel_explore",
+                              on_click=lambda: _scan(year, seas)).props("color=primary")
+                ui.label("想补抓往年的剧场版就改年份手动扫；日常交给上面的自动扫描即可。").classes(
+                    "text-xs text-gray-500")
+
+        def refresh_all():
+            overview_panel.refresh()
+            list_panel.refresh()
+            fail_panel.refresh()
+            reject_panel.refresh()
+            sources_panel.refresh()
+
+        # ---- 标签 ----
+        with ui.tabs().classes("w-full") as tabs:
+            ui.tab("overview", "仪表盘", "dashboard")
+            ui.tab("list", "列表", "movie")
+            ui.tab("fail", "待识别", "sync_problem")
+            ui.tab("reject", "已忽略", "block")
+            ui.tab("sources", "订阅源", "rss_feed")
+        tabs.on_value_change(lambda e: ui.run_javascript(
+            f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))"))
+        start = t if t in _TABS else "list"
+        with ui.tab_panels(tabs, value=start).classes("w-full"):
+            with ui.tab_panel("overview"):
+                overview_panel()
+            with ui.tab_panel("list"):
+                list_panel()
+            with ui.tab_panel("fail"):
+                fail_panel()
+            with ui.tab_panel("reject"):
+                reject_panel()
+            with ui.tab_panel("sources"):
+                sources_panel()

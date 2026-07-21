@@ -13,7 +13,7 @@ import movies
 import pages  # noqa: F401  导入即注册页面
 from config import WEB_PORT
 from db import init_db
-from worker import run_qb_sync, run_worker
+from worker import run_movie_scan, run_qb_sync, run_worker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -46,7 +46,8 @@ async def _startup():
     core.reset_downloading()        # 复位上次遗留的 downloading（TV）
     movies.reset_downloading()      # 复位上次遗留的 downloading（剧场版）
     asyncio.create_task(run_worker())
-    asyncio.create_task(run_qb_sync())  # qB 种子实时态同步（独立频率）
+    asyncio.create_task(run_qb_sync())    # qB 种子实时态同步（独立频率）
+    asyncio.create_task(run_movie_scan())  # 剧场版/OVA 自动扫描（独立频率）
 
 
 if __name__ in {"__main__", "__mp_main__"}:

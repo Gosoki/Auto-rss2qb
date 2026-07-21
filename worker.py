@@ -69,6 +69,23 @@ async def run_worker() -> None:
         await asyncio.sleep(config.POLL_INTERVAL)  # 每轮读当前值，改了下一轮生效
 
 
+async def run_movie_scan() -> None:
+    """独立协程：按 MOVIE_SCAN_INTERVAL 自动扫描 Mikan 当年剧场版/OVA（开关在 /movies 订阅源）。
+
+    每 5 分钟心跳一次，是否真扫由 movies.auto_scan_tick 按『距上次扫描的间隔』判（跨重启也不会误重扫）。
+    只碰剧场版，与 TV 采集互不相干。
+    """
+    log.info("剧场版自动扫描协程启动（%s，每 %d 秒）",
+             "开" if config.MOVIE_SCAN_ENABLED else "关·在 /movies 订阅源开启", config.MOVIE_SCAN_INTERVAL)
+    while True:
+        try:
+            if await movies.auto_scan_tick():
+                log.info("剧场版自动扫描完成")
+        except Exception as e:
+            log.error("剧场版自动扫描异常: %s", e)
+        await asyncio.sleep(300)  # 5 分钟心跳，到点才真扫
+
+
 async def run_qb_sync() -> None:
     """独立协程：定期从 qB 拉取种子实时态（TV + 剧场版两张表）。比采集频率高，接近实时。"""
     log.info("qB 状态同步启动，每 %d 秒一次（QB_ENABLED 关时空转）", config.QB_SYNC_INTERVAL)
