@@ -41,12 +41,7 @@ for _h in logging.getLogger().handlers:
 async def _startup():
     init_db()
     config.load_from_db()           # 把数据库里的配置覆盖加载进内存（必须在建表之后）
-    anime.migrate_to_alias_model()   # 旧库 → 对照模型（幂等，迁移前自动备份）
     anime.seed_source_groups()       # 首启种入 ANi/Mikan 两个源组
-    anime.backfill_mikan_whitelist()  # 老库升级：回填 Mikan 白名单（必须在轮询前）
-    anime.backfill_seasons()          # 老库升级：用 bgm 规范名回填季号（纠正误判成第1季的存量）
-    anime.backfill_quarters()         # 老库升级：用 bgm 放送日回填季度（纠正种子时间推错的季度）
-    anime.backfill_unmatched_review()  # 老库升级：未匹配 bgm 却自动确认的番改回待确认（不该自动下）
     anime.reset_downloading()        # 复位上次遗留的 downloading（TV）
     movies.reset_downloading()      # 复位上次遗留的 downloading（剧场版）
     asyncio.create_task(run_worker())

@@ -6,8 +6,6 @@
 """
 import asyncio
 import logging
-import os
-import shutil
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -832,81 +830,6 @@ def delete_source_group(gid: int) -> None:
             s.commit()
 
 
-def backfill_mikan_whitelist() -> None:
-    """老库升级：Mikan 组的白名单若从未设过(NULL)，用全局 config.MIKAN_SUBGROUPS 回填一次。
-
-    必须在 worker 首轮轮询『之前』调用，否则首轮 Mikan 无白名单会漏进非目标字幕组。
-    """
-    if not config.MIKAN_SUBGROUPS:
-        return
-    with get_session() as s:
-        for g in s.exec(select(SourceGroup).where(SourceGroup.site == "mikan")):
-            if g.subgroups is None:  # 从未设过（新加列旧行为 NULL）；显式设成 '' 的不动
-                g.subgroups = ",".join(config.MIKAN_SUBGROUPS)
-                s.add(g)
-        s.commit()
-
-
-def backfill_seasons() -> int:
-    """老库升级：用已存的 bgm 规范名/日文名回填季号（第X季/Season N），纠正早先解析成第1季的存量。返回修正条数。"""
-    n = 0
-    with get_session() as s:
-        for a in s.exec(select(Anime)).all():
-            sn = season_from_name(a.display_name) or season_from_name(a.jp_name)
-            if sn and sn != a.season:
-                log.info("回填季号 - %s 第%s季 → 第%s季", a.display_name or a.title, a.season, sn)
-                a.season = sn
-                s.add(a)
-                n += 1
-        if n:
-            s.commit()
-    return n
-
-
-def backfill_quarters() -> int:
-    """老库升级：用 bgm 放送日回填季度。
-
-    季度早先可能来自种子发布时间（对长期连载/中途入库的番不准，如 50 集里抓到第 40 集）；
-    bgm 放送日才是首播季度。只纠正『有放送日、无已下集、且当前季度与放送日不符』的番，
-    连带把其未下种子的季度也一起对齐（决定下载目录）。返回修正条数。"""
-    n = 0
-    with get_session() as s:
-        for a in s.exec(select(Anime).where(Anime.air_date.is_not(None))):
-            try:
-                q = extract_quarter(datetime.strptime(a.air_date, "%Y-%m-%d"))
-            except (ValueError, TypeError):
-                continue
-            if q == a.quarter or _has_downloads(s, a.id):
-                continue
-            log.info("回填季度 - %s %s → %s", a.display_name or a.title, a.quarter or "?", q)
-            a.quarter = q
-            s.add(a)
-            for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == a.id)):
-                if t.status not in ("downloaded", "downloading"):
-                    t.quarter = q
-                    s.add(t)
-            n += 1
-        if n:
-            s.commit()
-    return n
-
-
-def backfill_unmatched_review() -> int:
-    """老库升级：未匹配 bgm(bangumi_id 为空)却已被自动确认的番，改回未确认——未富集的不该自动下。返回条数。"""
-    n = 0
-    with get_session() as s:
-        for a in s.exec(select(Anime).where(
-                Anime.bangumi_id.is_(None), Anime.rejected.is_not(True),
-                Anime.confirmed == True)):  # noqa: E712
-            log.info("未匹配转待确认 - %s", a.title)
-            a.confirmed = False
-            s.add(a)
-            n += 1
-        if n:
-            s.commit()
-    return n
-
-
 def seed_source_groups() -> None:
     """首启种入现有的 ANi(全下) + Mikan(待确认)，保持原行为，也给个可编辑的起点。"""
     with get_session() as s:
@@ -918,70 +841,3 @@ def seed_source_groups() -> None:
                           policy="review", priority=10, enabled=config.MIKAN_ENABLED,
                           subgroups=",".join(config.MIKAN_SUBGROUPS)))
         s.commit()
-
-
-# ---------------- 迁移：旧模型(每写法一条 + merged_into) → 对照模型 ----------------
-
-def migrate_to_alias_model() -> None:
-    """把旧库迁到『唯一 Anime + AnimeAlias』模型。幂等；旧库特征 = anime 有 merged_into 列。"""
-    import sqlalchemy as sa
-    from db import engine
-
-    insp = sa.inspect(engine)
-    if not insp.has_table("anime"):
-        return
-    cols = {c["name"] for c in insp.get_columns("anime")}
-    if "merged_into" not in cols:
-        return  # 已是新模型（或全新库）
-
-    bak = config.DB_PATH + ".bak"
-    if not os.path.exists(bak):  # 只在首次迁移时备份，别用已迁移数据覆盖原始备份
-        try:
-            shutil.copy(config.DB_PATH, bak)
-            log.info("迁移前已备份数据库 → %s", bak)
-        except Exception as e:
-            log.warning("备份失败（继续迁移）: %s", e)
-
-    with engine.connect() as conn:
-        rows = conn.exec_driver_sql("SELECT id, title, season, merged_into FROM anime").fetchall()
-
-    # 跟随 merged_into 合并链到根，避免 A→B→C 时别名指向中间的落败番（会被删成悬空）
-    merged_map = {aid: merged for aid, title, season, merged in rows}
-
-    def _root(aid):
-        seen = set()
-        while merged_map.get(aid) is not None and aid not in seen:
-            seen.add(aid)
-            aid = merged_map[aid]
-        return aid
-
-    with get_session() as s:
-        existing = {(a.title, a.season) for a in s.exec(select(AnimeAlias))}
-        losers = []
-        for aid, title, season, merged in rows:
-            target = _root(aid)
-            if (title, season) not in existing:
-                s.add(AnimeAlias(title=title, season=season, anime_id=target))
-                existing.add((title, season))
-            if merged is not None:
-                losers.append(aid)
-        s.commit()
-
-        # 先删落败番，再回填/修复种子 anime_id（valid 集据此判定，顺带修历史悬空引用）
-        for aid in losers:
-            obj = s.get(Anime, aid)
-            if obj is not None:
-                s.delete(obj)
-        s.commit()
-
-        alias_map = {(a.title, a.season): a.anime_id for a in s.exec(select(AnimeAlias))}
-        valid = {a.id for a in s.exec(select(Anime))}
-        for t in s.exec(select(AnimeTorrent)):
-            if t.anime_id and t.anime_id in valid:
-                continue  # 已正确关联（幂等）
-            aid = alias_map.get((t.anime_title, t.season))
-            if aid is not None and aid in valid:
-                t.anime_id = aid
-                s.add(t)
-        s.commit()
-    log.info("迁移到对照模型完成：对照 %d 条，删除落败番 %d 条", len(existing), len(losers))
