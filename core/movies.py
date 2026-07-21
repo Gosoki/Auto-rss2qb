@@ -32,13 +32,29 @@ def _has_downloads(s, movie_id: int) -> bool:
 
 
 def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
-    """同一 bgm_id 裂成多条时合并：把 loser 的种子并到 keeper 并删 loser。"""
+    """同一 bgm_id 裂成多条时合并：把 loser 的种子/审批状态并到 keeper 并删 loser。
+
+    keeper 恒为当前操作的片，loser 可能才是已审批/已下的主片；合并前先迁订阅状态，别随 loser 删掉。
+    """
     if loser_id == keeper_id:
         return
+    keeper = s.get(Movie, keeper_id)
+    loser = s.get(Movie, loser_id)
+    if keeper is not None and loser is not None:
+        # 同 anime：按『活跃(confirmed 且未拒)』并集合并，避免被拒片复活或活跃片被拒绝副本拖成隐藏。
+        active = (keeper.confirmed and not keeper.rejected) or (loser.confirmed and not loser.rejected)
+        if active:
+            keeper.confirmed = True
+            keeper.rejected = False
+        else:
+            keeper.confirmed = keeper.confirmed or loser.confirmed
+            keeper.rejected = keeper.rejected or loser.rejected
+        if not keeper.pref_source and loser.pref_source:
+            keeper.pref_source = loser.pref_source
+        s.add(keeper)
     for t in s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == loser_id)):
         t.movie_id = keeper_id
         s.add(t)
-    loser = s.get(Movie, loser_id)
     if loser is not None:
         s.delete(loser)
     s.commit()
@@ -139,7 +155,9 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
 async def scan_now(year: int, seasons: list[str] | None = None) -> dict:
     """扫描一次并记下扫描时间（手动『立即扫描』与后台自动扫描共用）。只碰剧场版，不涉 TV。"""
     res = await discover_movies(year, seasons)
-    config.set_many({"MOVIE_SCAN_LAST": datetime.now().isoformat(timespec="seconds")})
+    # 只有覆盖当年四季的完整扫描才刷新自动扫描时间基准；手动只扫单季(回填历史)不该顶掉它、推迟自动全年扫。
+    if seasons is None or set(seasons) >= {"A", "B", "C", "D"}:
+        config.set_many({"MOVIE_SCAN_LAST": datetime.now().isoformat(timespec="seconds")})
     return res
 
 
@@ -150,8 +168,9 @@ async def auto_scan_tick() -> bool:
     last = config.MOVIE_SCAN_LAST
     if last:
         try:
-            if (datetime.now() - datetime.fromisoformat(last)).total_seconds() < config.MOVIE_SCAN_INTERVAL:
-                return False  # 还没到点
+            elapsed = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+            if 0 <= elapsed < config.MOVIE_SCAN_INTERVAL:
+                return False  # 还没到点（elapsed<0=系统时钟被回拨，视作到点、照扫，自愈不停摆）
         except ValueError:
             pass
     await scan_now(datetime.now().year)
@@ -229,6 +248,18 @@ def movie_sources(movie_id: int) -> list[str]:
     with get_session() as s:
         rows = s.exec(select(MovieTorrent.source).where(MovieTorrent.movie_id == movie_id)).all()
     return sorted({r for r in rows if r})
+
+
+def torrents_by_movie(movie_ids: list[int]) -> dict[int, list[MovieTorrent]]:
+    """一次查出多部片的种子，按 movie_id 归组（列表页批量渲染用，免得每张卡片各查 2 次库=N+1）。"""
+    if not movie_ids:
+        return {}
+    out: dict[int, list[MovieTorrent]] = {}
+    with get_session() as s:
+        for t in s.exec(select(MovieTorrent).where(MovieTorrent.movie_id.in_(movie_ids))
+                        .order_by(MovieTorrent.created_at.desc())):
+            out.setdefault(t.movie_id, []).append(t)
+    return out
 
 
 def movie_downloaded_count(movie_id: int) -> int:
@@ -378,6 +409,13 @@ async def download_movie_torrent(mt_id: int) -> bool:
             t = s.get(MovieTorrent, mt_id)
             if t is None or t.status in ("downloading", "downloaded"):
                 return False  # 已在下/已下 → 幂等短路，防并发（含 download_movie 竞态）重复交 qB
+            # 跨表守卫：同一物理种子已被 TV 管线拿去下/下完 → 文件已在 qB，别用不同路径重复提交。
+            if engine.hash_owned_elsewhere(t.info_hash, AnimeTorrent):
+                t.status = "downloaded"
+                s.add(t)
+                s.commit()
+                log.info("跳过跨表重复种子（TV 已持有）- movie torrent=%s", mt_id)
+                return True
             m = s.get(Movie, t.movie_id)
             t.status = "downloading"
             s.add(t)

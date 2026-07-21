@@ -3,6 +3,7 @@
 anime.py(TV) 与 movies.py(剧场版) 都依赖这里；本模块不含任何 TV/movie 业务分支，纯共用，
 两条线因此互不相干又不重复造轮子。
 """
+import asyncio
 import logging
 import os
 import re
@@ -92,22 +93,25 @@ def apply_bgm_meta(obj, info: dict | None, keep_quarter: bool = False) -> None:
 # ---------------- 下载原语（取种子 + 交 qB） ----------------
 
 async def fetch_torrent_bytes(url: str) -> bytes:
-    """流式下载 .torrent 并封顶 32MB（download_url 源自 RSS 可被投毒 + 跟随重定向，防撑爆内存）。
+    """流式下载 .torrent，封顶 32MB + 整体 180s 超时（download_url 源自 RSS 可被投毒 + 跟随重定向）。
 
-    取到返回 bytes；HTTP/超限等失败抛异常，由调用方回写 error。
+    httpx 的 timeout=60 只是每次读的超时、逐块重置，慢速 trickle 连接能让它无限挂起并堵死整个下载/
+    采集循环；故再套一层 asyncio.timeout 对总传输时长封顶。取到返回 bytes；HTTP/超限/超时失败抛异常，
+    由调用方回写 error。
     """
     kwargs = {"timeout": 60, "follow_redirects": True}
     if config.PROXY:
         kwargs["proxy"] = config.PROXY
-    async with httpx.AsyncClient(**kwargs) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            buf = bytearray()
-            async for chunk in resp.aiter_bytes():
-                buf += chunk
-                if len(buf) > _TORRENT_CAP:
-                    raise ValueError(f"种子文件超过 {_TORRENT_CAP} 字节，疑似非法下载地址")
-            return bytes(buf)
+    async with asyncio.timeout(180):
+        async with httpx.AsyncClient(**kwargs) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > _TORRENT_CAP:
+                        raise ValueError(f"种子文件超过 {_TORRENT_CAP} 字节，疑似非法下载地址")
+                return bytes(buf)
 
 
 def hash_owned_elsewhere(info_hash: str, other_model) -> bool:

@@ -74,16 +74,36 @@ def paginate(seq: list, page: int, size: int):
     return seq[(page - 1) * size:page * size], total, page
 
 
-def expand_collapse_bar(exps: list) -> None:
-    """一行『全部展开 / 全部收起』小按钮，统一开合传入的 ui.expansion 列表。
+def expand_collapse_bar(state: dict, refresh) -> None:
+    """一行『全部展开 / 全部收起』小按钮：把展开意图记进 state['expand']（True/False）再刷新面板。
 
-    exps 传空列表进来、渲染分组时逐个 append；点按钮时列表已填满，故能全量操作。
+    通过持久状态 + 整体重建来生效，故即便分页翻页，展开/收起也对所有页一致，而非只影响当前页那几个。
+    渲染分组时用 state['expand']（None=各分组按自身默认）决定每个 ui.expansion 的初始开合。
     """
+    def _set(v):
+        state["expand"] = v
+        refresh()
     with ui.row().classes("items-center gap-1 pl-1 pb-1"):
-        ui.button("全部展开", icon="unfold_more",
-                  on_click=lambda: [e.set_value(True) for e in exps]).props("flat dense size=sm")
-        ui.button("全部收起", icon="unfold_less",
-                  on_click=lambda: [e.set_value(False) for e in exps]).props("flat dense size=sm")
+        ui.button("全部展开", icon="unfold_more", on_click=lambda: _set(True)).props("flat dense size=sm")
+        ui.button("全部收起", icon="unfold_less", on_click=lambda: _set(False)).props("flat dense size=sm")
+
+
+async def confirm(title: str, note: str = "", ok_label: str = "确定",
+                  ok_icon: str = "", ok_color: str = "negative") -> bool:
+    """弹一个确认框，等用户选择，用完即销毁自身（不残留隐藏 dialog 累积）。返回是否点了确认。"""
+    with ui.dialog() as dlg, ui.card():
+        ui.label(title).classes("font-bold")
+        if note:
+            ui.label(note).classes("text-xs text-gray-400")
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("取消", on_click=lambda: dlg.submit(False)).props("flat")
+            ok = ui.button(ok_label, on_click=lambda: dlg.submit(True)).props(f"color={ok_color}")
+            if ok_icon:
+                ok.props(f"icon={ok_icon}")
+    try:
+        return bool(await dlg)         # 点叉/点外部关闭 → None → False（当取消）
+    finally:
+        dlg.delete()
 
 
 @contextmanager

@@ -202,6 +202,14 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             episode = t.episode
             season = t.season
             title = t.anime_title
+            # 跨表守卫：同一物理种子已被剧场版管线拿去下/下完 → 文件已在 qB，别用不同路径重复提交。
+            # 锁内 DB 段全程无 await（对事件循环原子），故并发时后到者必能看到先到者已置 downloading。
+            if engine.hash_owned_elsewhere(t.info_hash, MovieTorrent):
+                t.status = "downloaded"
+                s.add(t)
+                s.commit()
+                log.info("跳过跨表重复种子（剧场版已持有）- %s", title)
+                return True
             # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）
             if not force and isinstance(episode, (int, float)) and episode >= 0 and anime_id:
                 dup = s.exec(select(AnimeTorrent).where(
@@ -561,16 +569,34 @@ def restore_anime(anime_id: int) -> None:
 
 
 def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
-    """把 loser 番的对照与种子并到 keeper，删除 loser（保持一个 bgm_id 唯一一部番）。"""
+    """把 loser 番的对照/种子/订阅状态并到 keeper，删除 loser（保持一个 bgm_id 唯一一部番）。
+
+    keeper 恒为当前操作的番（可能是刚绑定的『待确认』残条），loser 可能才是已确认/已下的主番；
+    故合并前先把订阅状态迁过来，别随 loser 一起删掉——否则番会静默从『追番中』掉回『待确认』停更。
+    """
     if loser_id == keeper_id:
         return
+    keeper = s.get(Anime, keeper_id)
+    loser = s.get(Anime, loser_id)
+    if keeper is not None and loser is not None:
+        # 追不追 = confirmed 且未 rejected。合并后是否继续追，取两方的『活跃』并集：任一方原本活跃就继续追；
+        # 两者都不活跃时保留『拒绝优先于待确认』——既不让活跃订阅被拒绝副本拖成隐藏，也不让被拒番复活自动下。
+        active = (keeper.confirmed and not keeper.rejected) or (loser.confirmed and not loser.rejected)
+        if active:
+            keeper.confirmed = True
+            keeper.rejected = False
+        else:
+            keeper.confirmed = keeper.confirmed or loser.confirmed
+            keeper.rejected = keeper.rejected or loser.rejected
+        if not keeper.pref_source and loser.pref_source:
+            keeper.pref_source = loser.pref_source                      # 保住下载源偏好
+        s.add(keeper)
     for al in s.exec(select(TitleAlias).where(TitleAlias.anime_id == loser_id)):
         al.anime_id = keeper_id
         s.add(al)
     for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == loser_id)):
         t.anime_id = keeper_id
         s.add(t)
-    loser = s.get(Anime, loser_id)
     if loser is not None:
         s.delete(loser)
     s.commit()

@@ -3,7 +3,7 @@ from nicegui import ui
 
 from core import anime
 import config
-from .layout import ep_str, frame, name_of, qb_live_text, season_label
+from .layout import confirm, ep_str, frame, name_of, qb_live_text, season_label
 
 _STATUS = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
            "error": "失败", "skipped": "跳过"}
@@ -150,23 +150,16 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
         return h
 
     def _del_one(torrent_id):
-        def open_confirm():
-            dlg = ui.dialog()
-            with dlg, ui.card():
-                ui.label("删除这一集的文件？").classes("font-bold")
-                ui.label("通过 qB 连同硬盘文件一起删除，不可撤销。").classes("text-xs text-gray-400")
-                with ui.row().classes("w-full justify-end gap-2"):
-                    ui.button("取消", on_click=dlg.close).props("flat")
-
-                    async def _do():
-                        dlg.close()
-                        ok = await anime.delete_anime_torrent(torrent_id)
-                        _after()
-                        ui.notify("已删除该集文件" if ok else "没删成（qB 未连上或该集无文件）",
-                                  type="positive" if ok else "warning")
-                    ui.button("删除文件", icon="delete_forever", on_click=_do).props("color=negative")
-            dlg.open()
-        return open_confirm
+        async def h():
+            if not await confirm("删除这一集的文件？",
+                                 "通过 qB 连同硬盘文件一起删除，不可撤销。",
+                                 ok_label="删除文件", ok_icon="delete_forever"):
+                return
+            ok = await anime.delete_anime_torrent(torrent_id)
+            _after()
+            ui.notify("已删除该集文件" if ok else "没删成（qB 未连上或该集无文件）",
+                      type="positive" if ok else "warning")
+        return h
 
     body()
 

@@ -10,7 +10,8 @@ from nicegui import ui
 
 import config
 from core import movies as mov
-from .layout import expand_collapse_bar, frame, human_size, name_of, paginate, qb_live_text
+from .layout import (confirm, expand_collapse_bar, frame, human_size, name_of, paginate,
+                     qb_live_text)
 
 _SEASONS = {"A": "冬", "B": "春", "C": "夏", "D": "秋"}
 _STATUS = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
@@ -146,23 +147,16 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
         return h
 
     def _del(mt_id):
-        def open_confirm():
-            dlg = ui.dialog()
-            with dlg, ui.card():
-                ui.label("删除这一版本的文件？").classes("font-bold")
-                ui.label("通过 qB 连同硬盘文件一起删除，不可撤销。").classes("text-xs text-gray-400")
-                with ui.row().classes("w-full justify-end gap-2"):
-                    ui.button("取消", on_click=dlg.close).props("flat")
-
-                    async def _do():
-                        dlg.close()
-                        ok = await mov.delete_movie_torrent(mt_id)
-                        _after()
-                        ui.notify("已删除该版本文件" if ok else "没删成（qB 未连上或无文件）",
-                                  type="positive" if ok else "warning")
-                    ui.button("删除文件", icon="delete_forever", on_click=_do).props("color=negative")
-            dlg.open()
-        return open_confirm
+        async def h():
+            if not await confirm("删除这一版本的文件？",
+                                 "通过 qB 连同硬盘文件一起删除，不可撤销。",
+                                 ok_label="删除文件", ok_icon="delete_forever"):
+                return
+            ok = await mov.delete_movie_torrent(mt_id)
+            _after()
+            ui.notify("已删除该版本文件" if ok else "没删成（qB 未连上或无文件）",
+                      type="positive" if ok else "warning")
+        return h
 
     async def _bind(inp):
         v = (inp.value or "").strip()
@@ -182,7 +176,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
 def movies_page(t: str = "list"):
     """t = 当前 tab（写在 URL ?t= 里），刷新后停在同一 tab。"""
     with frame("movies"):
-        list_page = {"n": 1}  # 列表分页：每页 20 个季度（5 年），当前页码
+        list_page = {"n": 1, "expand": None}  # 剧场版列表：分页页码 + 一键展开/收起意图（None=默认全开）
         detail_dlg = ui.dialog()
 
         def _list_goto(e):
@@ -273,9 +267,9 @@ def movies_page(t: str = "list"):
             on = "开" if f["enabled"].value else "关"
             ui.notify(f"已保存：自动扫描{on}，每 {secs // 3600} 小时一次", type="positive")
 
-        def _movie_card(m):
-            ts = mov.movie_torrents(m.id)
+        def _movie_card(m, ts):
             ndone = sum(1 for t in ts if t.status in ("downloaded", "downloading"))
+            srcs = sorted({t.source for t in ts if t.source})
             with ui.card().classes("w-full"):
                 with ui.row().classes("gap-3 items-start no-wrap w-full"):
                     if m.cover_url:
@@ -292,7 +286,7 @@ def movies_page(t: str = "list"):
                             ui.label(f"放送 {m.air_date or '—'}")
                             ui.label(f"版本 {len(ts)}")
                             ui.label(f"已下 {ndone}")
-                            ui.label("来源 " + (" · ".join(mov.movie_sources(m.id)) or "—"))
+                            ui.label("来源 " + (" · ".join(srcs) or "—"))
                     with ui.column().classes("gap-1 items-end shrink-0"):
                         ui.button("下载", icon="download", on_click=_download(m.id)).props(
                             "size=sm color=primary").tooltip("下一个最佳版本；要别的版本点番名进详情逐条下")
@@ -389,21 +383,20 @@ def movies_page(t: str = "list"):
                 quarters.append("未知")
             shown, total_pages, page = paginate(quarters, list_page["n"], 20)
             list_page["n"] = page
-            exps: list = []
             with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
-                expand_collapse_bar(exps)
+                expand_collapse_bar(list_page, list_panel.refresh)
                 if total_pages > 1:
                     ui.pagination(1, total_pages, direction_links=True, value=page,
                                   on_change=_list_goto).props("size=sm")
                     ui.label(f"共 {total_pages} 页 · 每页 5 年").classes("text-xs text-gray-500")
+            exp = list_page["expand"]  # None=默认全开；True/False=一键全展开/收起(跨页一致)
+            tmap = mov.torrents_by_movie([m.id for q in shown for m in by_q[q]])  # 本页种子一次查齐
             for q in shown:
                 grp = by_q[q]
-                exp = ui.expansion(f"{anime.quarter_label(q)}   ·   {len(grp)} 部",
-                                   value=True).classes("w-full")
-                exps.append(exp)
-                with exp:
+                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(grp)} 部",
+                                  value=(exp if exp is not None else True)).classes("w-full"):
                     for m in grp:
-                        _movie_card(m)
+                        _movie_card(m, tmap.get(m.id, []))
 
         @ui.refreshable
         def fail_panel():

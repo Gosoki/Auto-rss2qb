@@ -18,14 +18,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 class _SuppressDeletedSlot(logging.Filter):
-    """滤掉 NiceGUI 定时器在客户端断开瞬间偶发的良性报错（parent slot deleted）——
-    面板 30s 自动刷新的 ui.timer 在页面被拆掉的一刹那可能再触发一次、访问已删元素的 parent_slot。
-    不影响功能（该客户端已走），只是刷屏并掩盖真错，故按消息精确过滤掉。"""
-    _NEEDLE = "parent slot of the element has been deleted"
+    """滤掉 NiceGUI 在客户端断开瞬间偶发的一族良性报错——面板 30s 自动刷新的 ui.timer、或断连后
+    async 处理器回来时 ui.notify/refresh 访问已删元素/客户端，都会抛这几条兄弟消息。客户端已走、不影响
+    功能，只是刷屏并掩盖真错，故按消息精确过滤。三条 needle 都足够特指，不会误吞真正的错误。"""
+    _NEEDLES = (
+        "parent slot of the element has been deleted",
+        "The client this element belongs to has been deleted",
+        "The client this outbox belongs to has been deleted",
+    )
 
     def filter(self, record: logging.LogRecord) -> bool:
         exc = record.exc_info[1] if record.exc_info else None
-        return self._NEEDLE not in record.getMessage() and self._NEEDLE not in str(exc or "")
+        text = record.getMessage() + " " + str(exc or "")
+        return not any(n in text for n in self._NEEDLES)
 
 
 for _h in logging.getLogger().handlers:

@@ -140,7 +140,7 @@ async def fetch_by_id(bgm_id: int) -> dict | None:
 
 async def resolve(names, release_time=None, episode=None, info_hash=None) -> dict | None:
     """→ {bangumi_id, air_date, quarter, display_name}；拿不到返回 None。"""
-    names = names or ([] if not isinstance(names, str) else [names])
+    names = [names] if isinstance(names, str) and names else (names or [])
     if not names and not info_hash:
         return None
 

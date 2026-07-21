@@ -10,7 +10,8 @@ from nicegui import ui
 
 from core import anime
 import config
-from .layout import ep_str, expand_collapse_bar, frame, human_size, name_of, paginate, season_label
+from .layout import (confirm, ep_str, expand_collapse_bar, frame, human_size, name_of,
+                     paginate, season_label)
 from .sources import render_sources
 
 
@@ -58,7 +59,7 @@ _TAB_KEYS = ("overview", "manage", "confirm", "fail", "reject", "sources")
 def dashboard(t: str = "manage"):
     """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。"""
     with frame("manage"):  # 本页用 tab + 30s 定时刷新，不往顶栏右侧放自定义动作
-        manage_page = {"n": 1}  # 番剧表分页：每页 12 个季度（3 年），当前页码
+        manage_page = {"n": 1, "expand": None}  # 番剧表：分页页码 + 一键展开/收起意图（None=按默认）
 
         def _manage_goto(e):
             manage_page["n"] = int(e.value)
@@ -325,25 +326,32 @@ def dashboard(t: str = "manage"):
             src_map = anime.multi_source_map()
             groups, total_pages, page = paginate(_group_by_quarter(animes), manage_page["n"], 12)
             manage_page["n"] = page
-            exps: list = []
             with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
-                expand_collapse_bar(exps)
+                expand_collapse_bar(manage_page, manage_panel.refresh)
                 if total_pages > 1:
                     ui.pagination(1, total_pages, direction_links=True, value=page,
                                   on_change=_manage_goto).props("size=sm")
                     ui.label(f"共 {total_pages} 页 · 每页 3 年").classes("text-xs text-gray-500")
+            exp = manage_page["expand"]  # None=各季按默认(仅最新季开)；True/False=一键全展开/收起(跨页一致)
             for i, (q, items) in enumerate(groups):
-                exp = ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full")
-                exps.append(exp)
-                with exp:
+                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部",
+                                  value=(exp if exp is not None else i == 0)).classes("w-full"):
                     for a in items:
                         _anime_row(a, src_map.get(a.id))
 
         def refresh_dynamic():
+            # 用户操作后的全动态刷新：含『待确认/待识别』，好让确认/绑定/忽略后的番立即从对应列表流转。
             overview_panel.refresh()
             confirm_panel.refresh()
             reject_panel.refresh()
             fail_panel.refresh()
+            recent_panel.refresh()
+
+        def refresh_timer():
+            # 30s 定时器专用：排除 confirm_panel/fail_panel——它们含用户正在输入的 bgm 绑定框/源下拉，
+            # 定时重建会清空半途输入。后台新发现的待确认/待识别番在下次用户操作或整页刷新时显现（KPI 计数仍每 30s 更新）。
+            overview_panel.refresh()
+            reject_panel.refresh()
             recent_panel.refresh()
 
         def refresh_all():
@@ -388,23 +396,16 @@ def dashboard(t: str = "manage"):
             return h
 
         def _del_files(anime_id, name, cnt):
-            def open_confirm():
-                dlg = ui.dialog()
-                with dlg, ui.card():
-                    ui.label(f"删除《{name}》的 {cnt} 个已下文件？").classes("font-bold")
-                    ui.label("通过 qB 连同硬盘文件一起删除，不可撤销。").classes("text-xs text-gray-400")
-                    with ui.row().classes("w-full justify-end gap-2"):
-                        ui.button("取消", on_click=dlg.close).props("flat")
-
-                        async def _do():
-                            dlg.close()
-                            n = await anime.delete_anime_files(anime_id)
-                            refresh_all()
-                            ui.notify(f"已删除 {n} 个文件" if n else "没删成（qB 未连上或已无文件）",
-                                      type="positive" if n else "warning")
-                        ui.button("删除文件", icon="delete_forever", on_click=_do).props("color=negative")
-                dlg.open()
-            return open_confirm
+            async def h():
+                if not await confirm(f"删除《{name}》的 {cnt} 个已下文件？",
+                                     "通过 qB 连同硬盘文件一起删除，不可撤销。",
+                                     ok_label="删除文件", ok_icon="delete_forever"):
+                    return
+                n = await anime.delete_anime_files(anime_id)
+                refresh_all()
+                ui.notify(f"已删除 {n} 个文件" if n else "没删成（qB 未连上或已无文件）",
+                          type="positive" if n else "warning")
+            return h
 
         def _bind(anime_id, inp):
             async def h():
@@ -429,7 +430,7 @@ def dashboard(t: str = "manage"):
 
         async def _download_all():
             n = await anime.download_all_pending()
-            refresh_dynamic()
+            refresh_all()   # 含 manage_panel，好让季度小结的已下/待下计数也即时更新（展开/页码已持久化，不打乱视图）
             ui.notify(f"已触发补下 {n} 集")
 
         def _reident(seasons):
@@ -486,4 +487,4 @@ def dashboard(t: str = "manage"):
             with ui.tab_panel("sources"):
                 render_sources()
 
-        ui.timer(30.0, refresh_dynamic)  # 只刷动态区，不重建管理页（避免展开状态被重置）
+        ui.timer(30.0, refresh_timer)  # 只刷只读实时区，不重建管理页/含输入的待确认待识别（避免重置展开、清空输入）

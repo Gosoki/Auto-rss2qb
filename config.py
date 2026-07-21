@@ -138,6 +138,7 @@ def set_many(updates: dict) -> None:
     """把设置写进数据库并即时更新内存（热生效）。updates: {键: 字符串值}，非 _SPEC 键忽略。"""
     from db import get_session
     from db.models import Setting
+    applied = {}
     with get_session() as s:
         for k, raw in updates.items():
             if k not in _SPEC:
@@ -148,8 +149,9 @@ def set_many(updates: dict) -> None:
             else:
                 row.value = str(raw)
                 s.add(row)
-            _v[k] = _coerce(_SPEC[k][0], raw)
-        s.commit()
+            applied[k] = _coerce(_SPEC[k][0], raw)
+        s.commit()               # 先落库成功
+    _v.update(applied)           # 再更新内存：commit 抛异常时不会留下未持久化、重启即回退的幽灵值
 
 
 def update_env(updates: dict) -> None:
