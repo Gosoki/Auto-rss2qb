@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 from nicegui import ui
 
-from core import anime
+from core import anime, engine
 import config
 from .layout import (STATUS_CN, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, name_of, paginate, parse_bgm_id, qb_disabled_banner,
@@ -88,7 +88,7 @@ def dashboard(t: str = "manage"):
                         if not ov["by_quarter"]:
                             ui.label("—").classes("text-gray-500 text-sm")
                         for q, shows, done in ov["by_quarter"]:
-                            _barline(anime.quarter_label(q), done, maxdl, lw="w-36", text=f"{done} / {shows}")
+                            _barline(engine.quarter_label(q), done, maxdl, lw="w-36", text=f"{done} / {shows}")
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
                     ui.label(f"种子来源（已下 / 种子）· {len(ov['by_source'])}").classes("text-sm font-bold")
                     with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
@@ -147,7 +147,7 @@ def dashboard(t: str = "manage"):
                 ui.label("没有待确认的番。（『审核』策略的源组发现的番会出现在这里）").classes("text-gray-400 p-4")
                 return
             for i, (q, items) in enumerate(group_by_quarter(pend)):
-                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
+                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
                         srcs = anime.sources_for(a.id)
                         with ui.card().classes("w-full"):
@@ -173,7 +173,7 @@ def dashboard(t: str = "manage"):
                 ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
                 return
             for i, (q, items) in enumerate(group_by_quarter(rej)):
-                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
+                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
                         with ui.row().classes("items-center gap-3 pl-2 py-1 flex-wrap"):
                             ui.badge("已忽略").props("color=grey")
@@ -256,7 +256,7 @@ def dashboard(t: str = "manage"):
                         with ui.row().classes("items-center gap-2"):
                             ui.badge(b["tag"]).props(
                                 f"color={'primary' if b['tag'] == '当季' else 'blue-grey'}")
-                            ui.label(anime.quarter_label(b["key"])).classes("font-bold text-base")
+                            ui.label(engine.quarter_label(b["key"])).classes("font-bold text-base")
                         with ui.row().classes("gap-6"):
                             for num, lbl, color in stats:
                                 with ui.column().classes("items-center gap-0"):
@@ -292,7 +292,7 @@ def dashboard(t: str = "manage"):
                     ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
             exp = manage_page["expand"]  # None=各季按默认(仅最新季开)；True/False=一键全展开/收起(跨页一致)
             for i, (q, items) in enumerate(groups):
-                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部",
+                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
                                   value=(exp if exp is not None else i == 0)).classes("w-full"):
                     for a in items:
                         _anime_row(a, src_map.get(a.id))
@@ -405,7 +405,7 @@ def dashboard(t: str = "manage"):
                     ui.badge("已忽略").props("color=grey")
                 elif not a.confirmed:
                     ui.badge("待确认").props("color=orange")
-                elif a.source_kind in ("review", "other"):
+                elif a.source_kind == "review":
                     ui.badge("审核").props("color=blue-grey")  # 已确认但来自审核源（区别 ANi 直下）
                 color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
                 ui.label(name_of(a)).classes(

@@ -8,7 +8,7 @@ from datetime import datetime
 from nicegui import ui
 
 import config
-from core import anime, engine, movies as mov
+from core import engine, movies as mov
 from sources.parse import SEASON_CN
 from .layout import (STATUS_CN, WEEKDAY_CN, confirm, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, meta_card, name_of, paginate, parse_bgm_id,
@@ -41,7 +41,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
 
         wd = f"  {WEEKDAY_CN[cur.air_weekday]}" if cur.air_weekday is not None else ""
         meta_card(cur.cover_url, [
-            ("季度", anime.quarter_label(cur.quarter) if cur.quarter else "—"),
+            ("季度", engine.quarter_label(cur.quarter) if cur.quarter else "—"),
             ("放送", f"{cur.air_date or '—'}{wd}"),
             ("类型", cur.platform),
             ("评分", cur.rating),
@@ -271,7 +271,7 @@ def movies_page(t: str = "list"):
                     ui.label("—").classes("text-gray-500 text-sm")
                 for qk, tot, _ in ov["by_quarter"]:
                     with ui.row().classes("items-center gap-3 w-full text-sm py-0.5"):
-                        ui.label(anime.quarter_label(qk)).classes("w-36 shrink-0 truncate")
+                        ui.label(engine.quarter_label(qk)).classes("w-36 shrink-0 truncate")
                         with ui.element("div").classes("grow rounded").style(
                                 "background:rgba(255,255,255,.07);height:12px"):
                             ui.element("div").style(
@@ -311,7 +311,7 @@ def movies_page(t: str = "list"):
             exp = list_page["expand"]  # None=默认全开；True/False=一键全展开/收起(跨页一致)
             tmap = mov.torrents_by_movie([m.id for _, grp in shown for m in grp])  # 本页种子一次查齐
             for q, grp in shown:
-                with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(grp)} 部",
+                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(grp)} 部",
                                   value=(exp if exp is not None else True)).classes("w-full"):
                     for m in grp:
                         _movie_card(m, tmap.get(m.id, []))

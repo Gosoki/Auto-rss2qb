@@ -27,10 +27,10 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str) -> No
     """季度模板设置块：标题 + 说明 + 模板输入 + 实时预览 + 预设下拉。控件写入 f[key]。"""
     ui.separator()
     ui.label(title).classes("font-bold text-sm")
-    ui.label(note + "  占位：{yy}=26 {yyyy}=2026 {q}=C {season}=夏 {m}=7").classes(
-        "text-xs text-gray-500")
     inp = ui.input("季度模板", value=value).classes("w-full")
     f[key] = inp
+    ui.label(note + "  占位：{yy}=26 {yyyy}=2026 {q}=C {season}=夏 {m}=7").classes(
+        "text-xs text-gray-500")
     preview = ui.label().classes("text-sm text-blue-300")
 
     def _prev():
@@ -89,25 +89,29 @@ def settings():
             _text("QB_URL", "qB 地址", config.QB_URL)
             _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
             _password("QB_PASSWORD", "qB 密码（留空=不修改）")
-            _text("DOWN_PATH", "下载保存根目录", config.DOWN_PATH)
+            _text("DOWN_PATH", "下载保存根目录（番剧放这里的『番剧/』下）", config.DOWN_PATH)
+            _text("MOVIE_DOWN_PATH", "电影下载目录（留空=用上面根目录的『剧场版/』；填了=放这个独立目录）",
+                  config.MOVIE_DOWN_PATH)
 
             ui.separator()
             ui.label("目录结构").classes("font-bold text-sm")
             _switch("SEASON_SUBFOLDER",
                     "番名目录下再建『Season N』二级子目录（关=番剧文件直接放番名目录）",
                     config.SEASON_SUBFOLDER)
-            ui.label("开：下载根 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
-                     "　｜　关：… / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
+            ui.label("番剧与剧场版分开归档：下载根 /『番剧』或『剧场版』/ 季度 / 名字 …").classes(
+                "text-xs text-gray-500")
+            ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
+                     "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
 
             _quarter_setting(f, "QUARTER_FMT", "季度文件夹命名（只控制下载文件夹）",
                              "按季度建下载文件夹时，季度目录名怎么写。", config.QUARTER_FMT)
 
         with ui.card().classes("w-full"):
             ui.label("面板 / 显示").classes("font-bold")
-            ui.label("番剧表默认只显示订阅中；下面两项各自决定要不要也带上（它们仍在各自标签页）。").classes(
-                "text-xs text-gray-500")
             _switch("MANAGE_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.MANAGE_SHOW_PENDING)
             _switch("MANAGE_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.MANAGE_SHOW_REJECTED)
+            ui.label("番剧表默认只显示订阅中；上面两项各自决定要不要也带上（它们仍在各自标签页）。").classes(
+                "text-xs text-gray-500")
             ui.separator()
             ui.label("分页：一页显示多少年的季度（超出翻页）").classes("font-bold text-sm")
             with ui.row().classes("items-center gap-4 flex-wrap"):

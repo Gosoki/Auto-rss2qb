@@ -32,16 +32,16 @@ def _has_downloads(s, movie_id: int) -> bool:
 
 
 def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
-    """同一 bgm_id 裂成多条时合并：把 loser 的种子/审批状态并到 keeper 并删 loser。
+    """同一 bgm_id 裂成多条时合并：把 loser 的种子并到 keeper 并删 loser。
 
-    keeper 恒为当前操作的片，loser 可能才是已审批/已下的主片；合并前先迁订阅状态，别随 loser 删掉。
+    剧场版只有『忽略(rejected)』一个人工状态（逐版本手动下，无审批/首选源），故合并时两方任一被忽略则仍忽略。
     """
     if loser_id == keeper_id:
         return
     keeper = s.get(Movie, keeper_id)
     loser = s.get(Movie, loser_id)
     if keeper is not None and loser is not None:
-        engine.merge_subscription_state(keeper, loser)  # 与 anime 同一套『活跃并集』语义
+        keeper.rejected = keeper.rejected or loser.rejected
         s.add(keeper)
     for t in s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == loser_id)):
         t.movie_id = keeper_id
@@ -69,8 +69,7 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
             movie = s.exec(select(Movie).where(Movie.mikan_id == mikan_id)).first()
         is_new = movie is None
         if movie is None:
-            movie = Movie(title=title, mikan_id=mikan_id, confirmed=False,
-                          enriched=bgm_id is not None)
+            movie = Movie(title=title, mikan_id=mikan_id)
         movie.mikan_id = mikan_id
         movie.mikan_type = mikan_type   # Mikan 桶判定（剧场版/OVA），列表徽标用
         if not movie.display_name:
@@ -321,7 +320,6 @@ async def enrich_movie(movie_id: int) -> bool:
         m = s.get(Movie, movie_id)
         if m is None:
             return False
-        m.enriched = True
         engine.apply_bgm_meta(m, info, keep_quarter=_has_downloads(s, movie_id))
         s.add(m)
         s.commit()
@@ -341,7 +339,6 @@ async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
         m = s.get(Movie, movie_id)
         if m is None:
             return False
-        m.enriched = True
         engine.apply_bgm_meta(m, info, keep_quarter=_has_downloads(s, movie_id))
         s.add(m)
         s.commit()
@@ -386,7 +383,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
             quarter = (m.quarter if m else "") or "unknown"
             folder = (m and (m.jp_name or m.display_name)) or t.raw_title or "movie"
 
-    save_path = engine.build_save_path(quarter, folder)
+    save_path = engine.build_save_path(quarter, folder, top="剧场版", root=config.MOVIE_DOWN_PATH)
     if save_path is None:
         log.error("拒绝越界保存路径 - movie torrent %s", mt_id)
         _set_status(mt_id, "error")

@@ -185,17 +185,15 @@ async def fetch_detail(client, mikan_id: str) -> int | None:
     return int(bm.group(1)) if bm else None
 
 
-async def fetch_bangumi_torrents(client, mikan_id: str, priority: int = 0,
-                                 subgroups: list | None = None) -> list[ParsedItem]:
+async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
     """某 Mikan 番组的全部种子（各版本/字幕组）→ ParsedItem 列表。
 
-    剧场版/OVA 常无规范集号，episode 允许 -1/-2；不做批量过滤（剧场版本身可能是单条）。
+    剧场版/OVA 常无规范集号，episode 允许 -1/-2；不做批量/字幕组过滤（剧场版逐版本人工挑着下）。
     """
     url = f"{config.MIKAN_BASE}/RSS/Bangumi?bangumiId={mikan_id}"
     resp = await client.get(url)
     resp.raise_for_status()
     feed = feedparser.parse(resp.content)
-    subs = subgroups or []
     items: list[ParsedItem] = []
     for entry in feed.entries:
         try:
@@ -204,8 +202,6 @@ async def fetch_bangumi_torrents(client, mikan_id: str, priority: int = 0,
             if not re.fullmatch(r"[0-9a-f]{40}", info_hash):
                 continue
             group, anime_title, season, episode = parse_title(raw_title)
-            if subs and not any(g in group for g in subs):
-                continue
             download_url = _enclosure(entry)
             if not download_url:
                 continue
@@ -225,8 +221,7 @@ async def fetch_bangumi_torrents(client, mikan_id: str, priority: int = 0,
                 download_url=download_url,
                 source=group or "Mikan",
                 site="mikan",
-                source_kind="movie",
-                priority=priority,
+                priority=0,          # 剧场版逐版本人工挑，不参与优先级选择（source_kind 不落 MovieTorrent，故不设）
                 search_names=candidate_names(raw_title),
             ))
         except Exception as e:

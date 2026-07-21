@@ -35,7 +35,7 @@ def render_detail(anime_id: int, refresh_outer=None) -> None:
         # 元信息卡（封面 + bgm 元数据 + 简介）
         wd = f"  {WEEKDAY_CN[cur.air_weekday]}" if cur.air_weekday is not None else ""
         meta_card(cur.cover_url, [
-            ("季度", anime.quarter_label(cur.quarter)),
+            ("季度", engine.quarter_label(cur.quarter)),
             ("放送", f"{cur.air_date or '—'}{wd}"),
             ("类型", cur.platform),
             ("总集数", cur.total_episodes),

@@ -59,15 +59,24 @@ def prev_quarter(q: str) -> str:
     return f"{yy}{chr(ord(letter) - 1)}"
 
 
-def build_save_path(quarter: str, folder_name: str, season: int | None = None) -> str | None:
-    """下载保存路径：DOWN_PATH/季度目录/番名[/Season N]。做 realpath 包含校验，越界返回 None。"""
-    parts = [config.DOWN_PATH, safe_name(quarter_folder(quarter or "unknown")), safe_name(folder_name)]
+def build_save_path(quarter: str, folder_name: str, season: int | None = None,
+                    top: str = "", root: str = "") -> str | None:
+    """下载保存路径：根/[分类]/季度目录/番名[/Season N]。做 realpath 包含校验，越界返回 None。
+
+    root=下载根（空=config.DOWN_PATH）。top=分类顶层目录（番剧/剧场版）——仅在用默认根时加；
+    若给了独立 root（如电影专属目录），该 root 本身就是专属目录，不再套分类层。越界校验按实际根来。
+    """
+    base = root or config.DOWN_PATH
+    parts = [base]
+    if top and not root:
+        parts.append(safe_name(top))
+    parts += [safe_name(quarter_folder(quarter or "unknown")), safe_name(folder_name)]
     if season is not None and config.SEASON_SUBFOLDER:
         parts.append(f"Season {int(season)}")
     save_path = os.path.join(*parts)
-    root = os.path.realpath(config.DOWN_PATH)
+    base_real = os.path.realpath(base)
     real = os.path.realpath(save_path)
-    if real != root and not real.startswith(root + os.sep):
+    if real != base_real and not real.startswith(base_real + os.sep):
         return None
     return save_path
 
@@ -147,23 +156,6 @@ def pick_best(torrents, pref=None):
     return sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))[0]
 
 
-def merge_subscription_state(keeper, loser) -> None:
-    """身份合并时把 loser 的订阅态并进 keeper（只改对象、不碰 DB）。TV/剧场版共用。
-
-    追不追 = confirmed 且未 rejected，按两方『活跃』并集：任一方原本活跃就继续追；两者都不活跃时保留
-    『拒绝优先于待确认』——既不让活跃订阅被拒绝副本拖成隐藏，也不让被拒项复活自动下。pref_source 空则补。
-    """
-    active = (keeper.confirmed and not keeper.rejected) or (loser.confirmed and not loser.rejected)
-    if active:
-        keeper.confirmed = True
-        keeper.rejected = False
-    else:
-        keeper.confirmed = keeper.confirmed or loser.confirmed
-        keeper.rejected = keeper.rejected or loser.rejected
-    if not keeper.pref_source and loser.pref_source:
-        keeper.pref_source = loser.pref_source
-
-
 def hash_owned_elsewhere(info_hash: str, other_model) -> bool:
     """该 info_hash 在另一张表里是否仍被持有(downloading/downloaded)。
 
@@ -238,7 +230,6 @@ async def sync_qb_status(model_cls) -> int:
             t.qb_progress = float(d.get("progress", 0) or 0)
             t.qb_dlspeed = int(d.get("dlspeed", 0) or 0)
             t.qb_size = int(d.get("size", 0) or 0)
-            t.qb_eta = int(d.get("eta", 0) or 0)
             t.qb_synced_at = now
             if t.status == "downloading" and t.qb_progress >= 1.0:
                 t.status = "downloaded"

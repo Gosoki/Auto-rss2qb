@@ -24,10 +24,6 @@ from sources.parse import extract_quarter, season_from_name
 
 log = logging.getLogger("autorss")
 
-# 页面按 anime.quarter_label / quarter_folder 取用；底层在 engine（TV/剧场版共用），这里转出
-quarter_folder = engine.quarter_folder
-quarter_label = engine.quarter_label
-
 # 串行化『选集→占位下载』，防止 worker flush 与 UI 补下并发对同一集重复放行
 _download_lock = asyncio.Lock()
 
@@ -112,7 +108,7 @@ async def _resolve_anime(item) -> int:
             auto = _is_auto(item.source_kind) and bgm_id is not None
             anime = Anime(
                 title=item.anime_title, season=item.season, quarter=item.quarter,
-                confirmed=auto, source_kind=item.source_kind, enriched=True,
+                confirmed=auto, source_kind=item.source_kind,
             )
             _apply_bgm(anime, info)
             s.add(anime)
@@ -236,7 +232,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
                 season = a.season  # 用 bgm 纠正后的季号建 Season 子目录（种子把续作季号常解析回 1）
 
     # 组装保存路径（含越界校验），TV 按设置可加 Season N 子目录
-    save_path = engine.build_save_path(quarter, folder_name, season=season)
+    save_path = engine.build_save_path(quarter, folder_name, season=season, top="番剧")
     if save_path is None:
         log.error("拒绝越界保存路径 - %s -> %s / %s", title, quarter, folder_name)
         _set_status(torrent_id, "error")
@@ -554,7 +550,16 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
     keeper = s.get(Anime, keeper_id)
     loser = s.get(Anime, loser_id)
     if keeper is not None and loser is not None:
-        engine.merge_subscription_state(keeper, loser)  # 迁订阅态，别随 loser 删掉致停更/复活
+        # 迁订阅态，别随 loser 删掉致停更/复活：追不追=confirmed 且未 rejected，按两方『活跃』并集；
+        # 都不活跃时保留『拒绝优先于待确认』；pref_source 空则补。
+        active = (keeper.confirmed and not keeper.rejected) or (loser.confirmed and not loser.rejected)
+        if active:
+            keeper.confirmed, keeper.rejected = True, False
+        else:
+            keeper.confirmed = keeper.confirmed or loser.confirmed
+            keeper.rejected = keeper.rejected or loser.rejected
+        if not keeper.pref_source and loser.pref_source:
+            keeper.pref_source = loser.pref_source
         s.add(keeper)
     for al in s.exec(select(TitleAlias).where(TitleAlias.anime_id == loser_id)):
         al.anime_id = keeper_id
@@ -595,7 +600,6 @@ async def enrich_anime(anime_id: int) -> bool:
         a = s.get(Anime, anime_id)
         if a is None:
             return False
-        a.enriched = True
         # 无已下集就采用 bgm 季度（纠正种子解析得来的错季度）；有已下集才保留，避免散目录
         _apply_bgm(a, info, keep_quarter=_has_downloads(s, anime_id))
         s.add(a)
@@ -620,7 +624,6 @@ async def bind_bgm(anime_id: int, bgm_id: int) -> bool:
         a = s.get(Anime, anime_id)
         if a is None:
             return False
-        a.enriched = True
         a.confirmed = False  # 绑定后进『审核/待确认』，等人工确认下载
         # 无已下集就采用 bgm 季度（纠正错季度）；有已下集才保留，避免散目录
         _apply_bgm(a, info, keep_quarter=_has_downloads(s, anime_id))

@@ -61,7 +61,6 @@ class Anime(SQLModel, table=True):
     rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『拒绝』页恢复）
     source_kind: str = Field(default="auto")          # 引入它的策略（'auto'/'review'，徽章用）
     pref_source: str | None = Field(default=None)     # 首选下载源（子串匹配 torrent.source；空=按优先级）
-    enriched: bool = Field(default=False)             # 是否已尝试富集
     created_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -99,7 +98,6 @@ class AnimeTorrent(SQLModel, table=True):
     qb_progress: float = Field(default=0.0)     # 完成度 0..1
     qb_dlspeed: int = Field(default=0)          # 下载速度 B/s
     qb_size: int = Field(default=0)             # 种子总大小 B
-    qb_eta: int = Field(default=0)              # 预计剩余秒（qB 用 8640000 表示 ∞）
     qb_synced_at: datetime | None = Field(default=None)  # 最近一次从 qB 同步的时间
 
 
@@ -125,11 +123,8 @@ class Movie(SQLModel, table=True):
     cover_url: str | None = Field(default=None)
     rating: float | None = Field(default=None)
     summary: str | None = Field(default=None)
-    # ---- 审批 / 下载控制 ----
-    confirmed: bool = Field(default=False)            # 人工审批（点下载即视作收藏）；剧场版从不自动下
+    # ---- 忽略 / 识别 ----（剧场版逐版本人工下，无审批/首选源概念）
     rejected: bool = Field(default=False)             # 人工忽略（移出 /movies，可恢复）
-    pref_source: str | None = Field(default=None)     # 首选下载源
-    enriched: bool = Field(default=False)
     created_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -153,5 +148,4 @@ class MovieTorrent(SQLModel, table=True):
     qb_progress: float = Field(default=0.0)
     qb_dlspeed: int = Field(default=0)
     qb_size: int = Field(default=0)
-    qb_eta: int = Field(default=0)
     qb_synced_at: datetime | None = Field(default=None)

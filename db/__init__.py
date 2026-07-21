@@ -33,8 +33,8 @@ def init_db():
 def _migrate_add_columns():
     """给已存在的表补上模型里新增的列（create_all 不会 ALTER 老表）。
 
-    只做『加列』这一种轻量迁移，足以覆盖后续给模型加字段的场景（如 P1→P2 的
-    bangumi_id/enriched 等）。新列一律以可空加入，老行取 NULL。
+    只做『加列』这一种轻量迁移，足以覆盖后续给模型加字段的场景（如 bgm 元数据、
+    qB 实时态等）。新列一律以可空加入，老行取 NULL。
     """
     inspector = sa.inspect(engine)
     for table in SQLModel.metadata.tables.values():
