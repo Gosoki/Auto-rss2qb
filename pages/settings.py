@@ -10,7 +10,8 @@ import config
 from sources.parse import format_quarter
 from .layout import frame
 
-_NUMERIC = {"POLL_INTERVAL", "DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL"}
+_NUMERIC = {"POLL_INTERVAL", "DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
+            "MANAGE_PAGE_YEARS", "MOVIE_PAGE_YEARS"}
 _PASSWORD = {"QB_PASSWORD"}
 _RESTART_ONLY = {"WEB_PORT"}  # 绑端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
@@ -107,6 +108,14 @@ def settings():
                 "text-xs text-gray-500")
             _switch("MANAGE_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.MANAGE_SHOW_PENDING)
             _switch("MANAGE_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.MANAGE_SHOW_REJECTED)
+            ui.separator()
+            ui.label("分页：一页显示多少年的季度（超出翻页）").classes("font-bold text-sm")
+            with ui.row().classes("items-center gap-4 flex-wrap"):
+                f["MANAGE_PAGE_YEARS"] = ui.number("番剧表 · 年", value=config.MANAGE_PAGE_YEARS,
+                                                   min=1, max=5, format="%d").classes("w-32")
+                f["MOVIE_PAGE_YEARS"] = ui.number("剧场版 · 年", value=config.MOVIE_PAGE_YEARS,
+                                                  min=1, max=5, format="%d").classes("w-32")
+            ui.label("1 年 = 4 个季度。改完保存，下次进列表即生效。").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。", config.QUARTER_FMT_UI)
 

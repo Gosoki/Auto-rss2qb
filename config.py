@@ -43,6 +43,8 @@ _SPEC = {
     "QUARTER_FMT_UI": (str, ""),            # 空 = 跟随 QUARTER_FMT（见 __getattr__）
     "MANAGE_SHOW_PENDING": (bool, False),
     "MANAGE_SHOW_REJECTED": (bool, False),
+    "MANAGE_PAGE_YEARS": (int, 3),           # 番剧表一页显示几年的番（1~5，×4 得季度数）
+    "MOVIE_PAGE_YEARS": (int, 5),            # 剧场版列表一页显示几年（1~5）
     "POLL_ENABLED": (bool, True),           # 后台采集总开关（全新库首启默认关，见 load_from_db）
     "POLL_INTERVAL": (int, 1200),
     "DOWNLOAD_GRACE_MIN": (int, 120),

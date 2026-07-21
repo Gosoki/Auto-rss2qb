@@ -208,7 +208,8 @@ def frame(active: str = ""):
     ui.dark_mode(True)
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
     ui.add_head_html(
-        "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}</style>")
+        "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
+        ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}</style>")
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.07);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）

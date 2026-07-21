@@ -281,14 +281,15 @@ def dashboard(t: str = "manage"):
                 return
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.multi_source_map()
-            groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], 12)
+            yrs = max(1, config.MANAGE_PAGE_YEARS)  # 防 0（每页 0 季会除零）
+            groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], yrs * 4)
             manage_page["n"] = page
             with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
                 expand_collapse_bar(manage_page, manage_panel.refresh)
                 if total_pages > 1:
                     ui.pagination(1, total_pages, direction_links=True, value=page,
                                   on_change=_manage_goto).props("size=sm")
-                    ui.label(f"共 {total_pages} 页 · 每页 3 年").classes("text-xs text-gray-500")
+                    ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
             exp = manage_page["expand"]  # None=各季按默认(仅最新季开)；True/False=一键全展开/收起(跨页一致)
             for i, (q, items) in enumerate(groups):
                 with ui.expansion(f"{anime.quarter_label(q)}   ·   {len(items)} 部",

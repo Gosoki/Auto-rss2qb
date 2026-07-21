@@ -12,7 +12,7 @@ from core import anime, engine, movies as mov
 from sources.parse import SEASON_CN
 from .layout import (STATUS_CN, WEEKDAY_CN, confirm, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, meta_card, name_of, paginate, parse_bgm_id,
-                     qb_disabled_banner, qb_live_text, recent_table, source_options)
+                     qb_disabled_banner, qb_live_text, recent_table)
 
 _TABS = ("overview", "list", "fail", "reject", "sources")
 
@@ -54,9 +54,6 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
                 ui.button("恢复", icon="undo", on_click=_restore).props("size=sm color=primary")
             else:
                 ui.button("忽略", on_click=_reject).props("size=sm flat color=grey")
-            if sources:
-                ui.select(source_options(sources), value=(cur.pref_source or ""), label="下载源",
-                          on_change=_set_source).props("dense outlined").classes("min-w-40")
         if not cur.bangumi_id:
             with ui.row().classes("items-center gap-2 flex-wrap"):
                 inp = ui.input(placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").props(
@@ -87,11 +84,6 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
         body.refresh()
         if refresh_outer:
             refresh_outer()
-
-    def _set_source(e):
-        mov.set_movie_pref(movie_id, e.value or "")
-        body.refresh()
-        ui.notify("下载源：" + (e.value or "按优先级"))
 
     async def _enrich():
         ok = await mov.enrich_movie(movie_id)
@@ -179,18 +171,6 @@ def movies_page(t: str = "list"):
                 f"扫描完成：命中 {res['seen']} 部，新增 {res['movies']}，种子 {res['torrents']}{tail}",
                 type="positive")
 
-        def _download(movie_id):
-            async def h():
-                n = await mov.download_movie(movie_id)
-                refresh_all()
-                if n:
-                    ui.notify("已触发下载（一个最佳版本；要别的版本点番名进详情逐条下）", type="positive")
-                elif not config.QB_ENABLED:
-                    ui.notify("未启用 qB（设置页开 QB_ENABLED 才真正下载）", type="warning")
-                else:
-                    ui.notify("没有可下的版本（可能已下过）", type="warning")
-            return h
-
         def _reject(movie_id):
             def h():
                 mov.reject_movie(movie_id)
@@ -260,8 +240,9 @@ def movies_page(t: str = "list"):
                             ui.label(f"已下 {ndone}")
                             ui.label("来源 " + (" · ".join(srcs) or "—"))
                     with ui.column().classes("gap-1 items-end shrink-0"):
-                        ui.button("下载", icon="download", on_click=_download(m.id)).props(
-                            "size=sm color=primary").tooltip("下一个最佳版本；要别的版本点番名进详情逐条下")
+                        ui.button("下载", icon="download",
+                                  on_click=lambda mid=m.id: open_detail(mid)).props(
+                            "size=sm color=primary").tooltip("打开详情，自己挑版本下载")
                         ui.button("忽略", icon="block", on_click=_reject(m.id)).props(
                             "size=sm flat color=grey")
 
@@ -318,14 +299,15 @@ def movies_page(t: str = "list"):
                 ui.label("还没有剧场版/OVA。去『订阅源』tab 点『扫描』从 Mikan 拉取。").classes(
                     "text-gray-400 p-4")
                 return
-            shown, total_pages, page = paginate(group_by_quarter(items), list_page["n"], 20)
+            yrs = max(1, config.MOVIE_PAGE_YEARS)  # 防 0（每页 0 季会除零）
+            shown, total_pages, page = paginate(group_by_quarter(items), list_page["n"], yrs * 4)
             list_page["n"] = page
             with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
                 expand_collapse_bar(list_page, list_panel.refresh)
                 if total_pages > 1:
                     ui.pagination(1, total_pages, direction_links=True, value=page,
                                   on_change=_list_goto).props("size=sm")
-                    ui.label(f"共 {total_pages} 页 · 每页 5 年").classes("text-xs text-gray-500")
+                    ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
             exp = list_page["expand"]  # None=默认全开；True/False=一键全展开/收起(跨页一致)
             tmap = mov.torrents_by_movie([m.id for _, grp in shown for m in grp])  # 本页种子一次查齐
             for q, grp in shown:

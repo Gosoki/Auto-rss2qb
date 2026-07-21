@@ -305,15 +305,6 @@ def restore_movie(movie_id: int) -> None:
         s.commit()
 
 
-def set_movie_pref(movie_id: int, source: str) -> None:
-    with get_session() as s:
-        m = s.get(Movie, movie_id)
-        if m is not None:
-            m.pref_source = source or None
-            s.add(m)
-            s.commit()
-
-
 async def enrich_movie(movie_id: int) -> bool:
     """手动重识别某剧场版：用已有名字 + 最近一条种子回退，重取 bgm 元数据覆盖。"""
     with get_session() as s:
@@ -379,7 +370,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
         with get_session() as s:
             t = s.get(MovieTorrent, mt_id)
             if t is None or t.status in ("downloading", "downloaded"):
-                return False  # 已在下/已下 → 幂等短路，防并发（含 download_movie 竞态）重复交 qB
+                return False  # 已在下/已下 → 幂等短路，防并发（详情页多次点同一版本）重复交 qB
             # 跨表守卫：同一物理种子已被 TV 管线拿去下/下完 → 文件已在 qB，别用不同路径重复提交。
             if engine.hash_owned_elsewhere(t.info_hash, AnimeTorrent):
                 t.status = "downloaded"
@@ -415,27 +406,6 @@ async def download_movie_torrent(mt_id: int) -> bool:
         log.info("已加入qB（剧场版）- torrent=%s", mt_id)
         await notify(f"{folder} 🎬📥")
     return ok
-
-
-async def download_movie(movie_id: int) -> int:
-    """审批某剧场版/OVA 并下载一个最佳版本（一部作品只下一份；已有则不下）。返回触发的下载数。"""
-    with get_session() as s:
-        m = s.get(Movie, movie_id)
-        if m is None or m.rejected:
-            return 0
-        if not m.confirmed:
-            m.confirmed = True  # 点下载即视作收藏（审批通过）
-            s.add(m)
-            s.commit()
-        pref = m.pref_source
-        rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)))
-    if any(t.status in ("downloaded", "downloading") for t in rows):
-        return 0
-    pending = [t for t in rows if t.status in ("pending", "error")]
-    if not pending:
-        return 0
-    best = engine.pick_best(pending, pref)
-    return 1 if await download_movie_torrent(best.id) else 0
 
 
 async def delete_movie_torrent(mt_id: int) -> bool:
