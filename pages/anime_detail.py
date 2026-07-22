@@ -22,20 +22,22 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             return
         eps = anime.list_episodes(anime_id)
         sources = sorted({t.source for t in eps})
-        # 标题行：标题 + 第X季 + 状态徽章都贴在标题后；X 关闭键推到最右
-        with ui.row().classes("items-center gap-2 flex-wrap w-full"):
-            ui.label(name_of(cur)).classes("text-2xl font-bold")
-            _sl = season_label(cur)
-            if _sl:
-                ui.badge(_sl).props("color=blue-grey")
-            if cur.rejected:
-                ui.badge("已忽略").props("color=grey")
-            else:
-                ui.badge("✓ 已确认" if cur.confirmed else "⏳ 待确认").props(
-                    f"color={'green' if cur.confirmed else 'orange'}")
-            ui.space()
+        # 标题行：标题+第X季+状态徽章塞进左侧可换行容器（grow/min-w-0），窄屏先把它们挤下去换行；
+        # 外层 no-wrap + X 用 shrink-0 → X 永远钉在右上角，不被挤走。items-start 让 X 贴顶。
+        with ui.row().classes("items-start gap-2 w-full no-wrap"):
+            with ui.row().classes("items-center gap-2 flex-wrap grow min-w-0"):
+                ui.label(name_of(cur)).classes("text-2xl font-bold")
+                _sl = season_label(cur)
+                if _sl:
+                    ui.badge(_sl).props("color=blue-grey")
+                if cur.rejected:
+                    ui.badge("已忽略").props("color=grey")
+                else:
+                    ui.badge("✓ 已确认" if cur.confirmed else "⏳ 待确认").props(
+                        f"color={'green' if cur.confirmed else 'orange'}")
             if on_close:
-                ui.button(icon="close", on_click=on_close).props("flat round dense")
+                ui.button(icon="close", on_click=on_close).props("flat round dense").classes(
+                    "shrink-0")
 
         # 元操作行：重新识别 / 忽略 —— 放在标题下面
         with ui.row().classes("items-center gap-2 flex-wrap"):
