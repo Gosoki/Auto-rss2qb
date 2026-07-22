@@ -93,9 +93,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
                             ui.badge("备用").props("color=blue-grey").tooltip(
                                 "不会自动下：同集已由首选/已下覆盖，或非锁定源；要它就点右边下载")
                     elif t.status == "error":
-                        ui.badge("失败·将重试" if t.id in plan else "失败").props(
+                        ui.badge("失败·可补下" if t.id in plan else "失败").props(
                             f"color={'orange' if t.id in plan else 'red'}").tooltip(
-                            "下载失败过；在补下计划里会重试" if t.id in plan else "下载失败过")
+                            "下载失败过；点右边『下载』或『补下本番』手动重试（后台不自动重试 error）"
+                            if t.id in plan else "下载失败过")
                     else:
                         ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
                     ui.button("下载", icon="download", on_click=_force(t.id)).props(

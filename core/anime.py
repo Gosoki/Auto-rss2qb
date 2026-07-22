@@ -190,8 +190,12 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     async with _download_lock:
         with get_session() as s:
             t = s.get(AnimeTorrent, torrent_id)
-            if t is None or (not force and t.status not in ("pending", "error")):
-                return False  # 不存在 / 已下过 / 正在下（force 时不受此限）
+            if t is None:
+                return False
+            if t.status in ("downloading", "downloaded"):
+                return False  # 已在下/已下：幂等短路（force 也不例外），防重复交 qB / 把已下回写污染成 error
+            if not force and t.status not in ("pending", "error"):
+                return False  # 非 force：只放行 pending/error；skipped/deleted 需 force 才强制下
             anime_id = t.anime_id
             episode = t.episode
             season = t.season
@@ -204,8 +208,9 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
                 s.commit()
                 log.info("跳过跨表重复种子（剧场版已持有）- %s", title)
                 return True
-            # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）
-            if not force and isinstance(episode, (int, float)) and episode >= 0 and anime_id:
+            # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）。
+            # 含特别篇 -1（每番只放一份，与 flush 的 have_special 意图一致）；-2 未知集按设计逐个下、不去重。
+            if not force and isinstance(episode, (int, float)) and (episode >= 0 or episode == -1) and anime_id:
                 dup = s.exec(select(AnimeTorrent).where(
                     AnimeTorrent.anime_id == anime_id,
                     AnimeTorrent.episode == episode,
@@ -692,8 +697,8 @@ async def reenrich_scope(seasons: int | None = None) -> int:
 
 
 def _select_downloads(rows: list, pref: str | None = None, have_eps: set | None = None) -> list:
-    """从一部番的待下种子里挑要下的：正集号每集选一份（首选源优先、其次优先级），
-    负集号（特别篇 -1 / 未知 -2）整组只选一份——同一集/同一作品的多字幕组版本别全拉。
+    """从一部番的待下种子里挑要下的：按集号分组，每集选一份（首选源优先、其次优先级）。
+    特别篇(-1)、未知集(-2) 各自作为独立集号，互不挤占（下过 -1 不再挡待下的 -2，反之亦然）。
     have_eps 里的集（已在下/已下）跳过。返回选中的 AnimeTorrent 列表。
     """
     have = have_eps or set()
@@ -701,20 +706,14 @@ def _select_downloads(rows: list, pref: str | None = None, have_eps: set | None 
     def _best(cands: list):
         return engine.pick_best(cands, pref)
 
-    pos: dict = {}
-    neg: list = []
+    # 按集号分组：正集每集一份；负集 -1/-2 各自独立成组、各一份。早前把所有负集并成一个
+    # 互斥槽，会让下过 -1 就整组跳过、挡住待下的 -2（反之亦然）；按集号细分即可各行其是。
+    by_ep: dict = {}
     for t in rows:
         if t.episode in have:
             continue
-        if isinstance(t.episode, (int, float)) and t.episode >= 0:
-            pos.setdefault(t.episode, []).append(t)
-        else:
-            neg.append(t)
-    chosen = [_best(ts) for ts in pos.values()]
-    # 负集号整组只补一份；该番已下过负集内容(-1/-2)就不再补，免得同片各版本反复下
-    if neg and not any(isinstance(e, (int, float)) and e < 0 for e in have):
-        chosen.append(_best(neg))
-    return chosen
+        by_ep.setdefault(t.episode, []).append(t)
+    return [_best(ts) for ts in by_ep.values()]
 
 
 async def download_pending_for_anime(anime_id: int) -> int:

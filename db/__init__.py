@@ -1,5 +1,6 @@
 """数据库：SQLite + SQLModel，开启 WAL 让读写并发（后台轮询写、UI 读）。"""
 import logging
+from datetime import datetime
 
 import sqlalchemy as sa
 from sqlalchemy import event
@@ -8,6 +9,8 @@ from sqlmodel import Session, SQLModel, create_engine
 from config import DB_PATH
 
 log = logging.getLogger("autorss")
+
+_NO_DEFAULT = object()  # _column_default 解析不出默认值时的哨兵
 
 engine = create_engine(
     f"sqlite:///{DB_PATH}",
@@ -30,11 +33,27 @@ def init_db():
     _migrate_add_columns()   # 给模型新增字段的表加列（开发期加字段免删整表）
 
 
+def _column_default(col):
+    """取列的模型默认值（用于给非空新列回填老行 NULL）。解析不出返回 _NO_DEFAULT。"""
+    d = col.default
+    if d is None:
+        return _NO_DEFAULT
+    if getattr(d, "is_scalar", False):
+        return d.arg
+    if getattr(d, "is_callable", False):
+        try:
+            return d.arg(None)          # SQLAlchemy 把 default_factory 包成接收 context 的可调用
+        except Exception:
+            return _NO_DEFAULT
+    return _NO_DEFAULT
+
+
 def _migrate_add_columns():
     """给已存在的表补上模型里新增的列（create_all 不会 ALTER 老表）。
 
-    只做『加列』这一种轻量迁移，足以覆盖后续给模型加字段的场景（如 bgm 元数据、
-    qB 实时态等）。新列一律以可空加入，老行取 NULL。
+    覆盖后续给模型加字段的场景（bgm 元数据、qB 实时态等）。新列以可空加入；但对模型标注 NOT NULL
+    且带默认值的列，加列后立即把老行的 NULL 回填成模型默认值——否则老行该列为 NULL，会被
+    status=='pending' / episode>=0 之类过滤静默漏掉，从下载管线/统计里凭空消失。
     """
     inspector = sa.inspect(engine)
     for table in SQLModel.metadata.tables.values():
@@ -45,11 +64,18 @@ def _migrate_add_columns():
             if col.name in existing:
                 continue
             ddl_type = col.type.compile(dialect=engine.dialect)
+            val = _column_default(col) if not col.nullable else _NO_DEFAULT
+            if isinstance(val, datetime):
+                val = val.isoformat(sep=" ")   # 冻结成常量字符串（回填老行，非每行现算）
             with engine.begin() as conn:
                 conn.exec_driver_sql(
-                    f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {ddl_type}'
-                )
-            log.info("数据库迁移：%s 加列 %s", table.name, col.name)
+                    f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {ddl_type}')
+                if val is not _NO_DEFAULT:      # 非空列：把刚加进来的老行 NULL 回填成模型默认值
+                    conn.exec_driver_sql(
+                        f'UPDATE "{table.name}" SET "{col.name}"=? WHERE "{col.name}" IS NULL',
+                        (val,))
+            log.info("数据库迁移：%s 加列 %s%s", table.name, col.name,
+                     "" if val is _NO_DEFAULT else f"（回填 {val!r}）")
 
 
 def get_session() -> Session:

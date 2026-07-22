@@ -52,6 +52,8 @@ def _name_plausible(query: str, subject: dict) -> bool:
     if not _CJK_RE.search(query):
         return True
     cand = f"{subject.get('name_cn', '')} {subject.get('name', '')}"
+    if len(query) < 2:                       # 单字 CJK 名：2-gram 循环为空会恒 False，退回子串包含判断
+        return query in cand
     return any(query[i:i + 2] in cand for i in range(len(query) - 1) if query[i:i + 2].strip())
 
 

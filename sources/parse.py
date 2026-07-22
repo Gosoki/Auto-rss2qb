@@ -240,6 +240,13 @@ _NAME_BLOCK_SKIP = re.compile(
     r"简体?|繁體?|日語?|简繁日?|简日|繁日)$", re.I)
 
 
+def _is_skip_block(blk: str) -> bool:
+    """整块是否为『非番名』的画质/语言/来源块——按空格/下划线拆 token，每个 token 都是 skip 词才算。
+    早前用整块锚定匹配，遇 '1080p 简体' / 'x264 CHS' 这类多 token 块会漏判、把它误当番名。"""
+    toks = [t for t in re.split(r"[\s_]+", blk.strip()) if t]
+    return bool(toks) and all(_NAME_BLOCK_SKIP.match(t) for t in toks)
+
+
 def parse_multibracket(raw_title: str):
     """全括号命名 [组][番名块][集号][画质…] 的番名回退：挑出番名块 → 拆多语言 → 候选名。
 
@@ -252,14 +259,14 @@ def parse_multibracket(raw_title: str):
     body = raw_title[m.end():] if m else raw_title
     blocks = _INNER_BLK.findall(body)
     nameblk = next((b for b in blocks if "/" in b), None) or \
-        next((b for b in blocks if _CJK.search(b) and not _NAME_BLOCK_SKIP.match(b.strip())), None)
+        next((b for b in blocks if _CJK.search(b) and not _is_skip_block(b)), None)
     if not nameblk:
         return None
 
     names: list[str] = []
     for p in re.split(r"\s*/\s*|_", nameblk):        # 中文/罗马音/日文 多用 / 或 _ 分隔
         c = strip_season(_EXT_RE.sub("", re.sub(r"[\[【][^\]】]*[\]】]", "", p))).strip()
-        if len(c.replace(" ", "")) < 2 or _NAME_BLOCK_SKIP.match(c):
+        if len(c.replace(" ", "")) < 2 or _is_skip_block(c):
             continue
         if c not in names:
             names.append(c)

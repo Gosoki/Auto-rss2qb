@@ -66,7 +66,7 @@ async def run_worker() -> None:
             await poll_once()
         except Exception as e:
             log.error("本轮异常: %s", e)
-        await asyncio.sleep(config.ANIME_POLL_INTERVAL)  # 每轮读当前值，改了下一轮生效
+        await asyncio.sleep(max(60, config.ANIME_POLL_INTERVAL))  # 每轮读当前值；下限 60s 兜底，防坏值(0/负)忙循环
 
 
 async def run_movie_scan() -> None:

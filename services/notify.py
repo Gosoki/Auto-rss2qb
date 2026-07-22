@@ -12,7 +12,7 @@ log = logging.getLogger("autorss")
 async def notify(message: str) -> None:
     if not config.NOTIFY_URL:
         return
-    url = f"{config.NOTIFY_URL}/💡{quote(message)}"
+    url = f"{config.NOTIFY_URL}/💡{quote(message, safe='')}"  # safe='' 连 '/' 也编码，防可控番名注入额外路径段
     try:
         async with httpx.AsyncClient(timeout=config.NOTIFY_TIMEOUT) as client:
             await client.get(url)

@@ -22,10 +22,9 @@ def _state_rank(a):
     return 1 if not a.confirmed else 0
 
 
-# 概览用：种子状态 → (文案, quasar 颜色)
-_STATUS_CHIP = [("downloaded", "已下", "green"), ("downloading", "下载中", "blue"),
-                ("pending", "待下", "grey"), ("error", "失败", "red"),
-                ("skipped", "跳过", "blue-grey")]
+# 概览用：种子状态键 → quasar 颜色（中文文案单点取自 layout.STATUS_CN，别在此重复维护）
+_STATUS_CHIP = [("downloaded", "green"), ("downloading", "blue"),
+                ("pending", "grey"), ("error", "red"), ("skipped", "blue-grey")]
 
 
 def _barline(label, value, maxv, extra="", color="#3b82f6", lw="w-32", text=None):
@@ -104,8 +103,9 @@ def anime_page(t: str = "manage"):
                 ui.button("补下全部", icon="download", on_click=_download_all).props(
                     "outline color=primary size=sm").tooltip("订阅中所有待下集立即下")
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
-                for key, txt, color in _STATUS_CHIP:
-                    ui.badge(f"{txt} {ov['status'][key]}").props(f"color={color}").classes("text-sm")
+                for key, color in _STATUS_CHIP:
+                    ui.badge(f"{STATUS_CN.get(key, key)} {ov['status'][key]}").props(
+                        f"color={color}").classes("text-sm")
             # qB 实时态（接上 qB 后每 QB_SYNC_INTERVAL 秒刷新）
             if ov["config"]["qb"]:
                 q = ov["qb"]

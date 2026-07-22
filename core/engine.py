@@ -8,6 +8,7 @@ import ipaddress
 import logging
 import os
 import re
+import socket
 from datetime import datetime
 
 import httpx
@@ -102,19 +103,50 @@ def apply_bgm_meta(obj, info: dict | None, keep_quarter: bool = False) -> None:
 
 # ---------------- 下载原语（取种子 + 交 qB） ----------------
 
-def _is_internal_ip(host: str) -> bool:
-    """host 是字面私网/环回/链路本地/保留 IP 吗？域名一律放行（正常种子站都是域名，不误伤）。"""
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
+def _ip_is_internal(ip) -> bool:
+    """ipaddress 对象是否属内网/环回/链路本地/保留等不可路由到公网的范围。
+    IPv4-mapped IPv6（::ffff:127.0.0.1）先归一到内嵌 IPv4 再判，防映射写法绕过。"""
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
     return (ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
+async def _host_is_internal(host: str) -> bool:
+    """host（字面 IP 或域名）会不会连到内网/环回地址。
+
+    字面 IP 直接判；其余（域名，以及十进制 2130706433 / 0x7f000001 / 0177.0.0.1 等非点分整数写法）
+    交给 getaddrinfo 实际解析、对每个解析地址逐一判——这些花式写法会被解析成真实内网 IP 从而被拦，
+    指向内网的域名同样被拦（弥补『只拦字面 IP』的绕过面）。解析失败/无结果保守视作内网并拒（反正也连不上）。
+    """
+    host = (host or "").strip("[]")            # 去 IPv6 字面量方括号
+    try:
+        return _ip_is_internal(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError, ValueError):
+        return True
+    if not infos:
+        return True
+    for info in infos:
+        try:
+            if _ip_is_internal(ipaddress.ip_address(info[4][0])):
+                return True
+        except ValueError:
+            return True                        # 解析出无法识别的地址形态 → 保守拒
+    return False
+
+
 async def _block_internal_request(request: httpx.Request) -> None:
-    """请求级钩子：种子下载不许打到内网/环回字面 IP（含重定向后的每一跳）——挡住 RSS 里的 SSRF 载荷。"""
-    if _is_internal_ip(request.url.host or ""):
+    """请求级钩子：种子下载不许打到内网/环回地址（含重定向后的每一跳）——挡住 RSS 里的 SSRF 载荷。
+    已配代理时目标由代理侧解析、本地判定既无意义又会误伤，跳过。"""
+    if config.PROXY:
+        return
+    if await _host_is_internal(request.url.host or ""):
         raise ValueError(f"拒绝下载到内网/环回地址（防 SSRF）：{request.url.host}")
 
 
@@ -200,7 +232,8 @@ async def add_to_qb(data: bytes, save_path: str, category: str, tags: str) -> bo
 
 # ---------------- qB 实时态（对 AnimeTorrent / MovieTorrent 通用） ----------------
 
-# 含 qB 5.x 改名后的状态（forcedMetaDL / stoppedDL / stoppedUP）
+# 下载态含 qB 5.x 新增的 forcedMetaDL；做种态含 5.x 改名后的 stoppedUP（=已完成暂停做种）。
+# 暂停未完成的 pausedDL/stoppedDL 有意不计入下载、也不计入做种（既非在下也非已完成）。
 _QB_DOWNLOADING = {"downloading", "forcedDL", "metaDL", "forcedMetaDL", "stalledDL",
                    "queuedDL", "checkingDL", "allocating"}
 _QB_SEEDING = {"uploading", "forcedUP", "stalledUP", "queuedUP", "checkingUP",

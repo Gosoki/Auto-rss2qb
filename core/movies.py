@@ -146,7 +146,9 @@ async def scan_now(year: int, seasons: list[str] | None = None) -> dict:
     """扫描一次并记下扫描时间（手动『立即扫描』与后台自动扫描共用）。只碰剧场版，不涉 TV。"""
     res = await discover_movies(year, seasons)
     # 只有覆盖当年四季的完整扫描才刷新自动扫描时间基准；手动只扫单季(回填历史)不该顶掉它、推迟自动全年扫。
-    if seasons is None or set(seasons) >= {"A", "B", "C", "D"}:
+    # 整轮网络故障（一部没命中且有报错）不刷新基准——否则一次抓取失败就要等满一个间隔才重试；留给 5 分钟心跳重扫。
+    total_fail = res["seen"] == 0 and res["errors"] > 0
+    if (seasons is None or set(seasons) >= {"A", "B", "C", "D"}) and not total_fail:
         config.set_many({"MOVIE_SCAN_LAST": datetime.now().isoformat(timespec="seconds")})
     return res
 
