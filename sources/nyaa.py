@@ -4,6 +4,7 @@ feed 可以是 nyaa 用户名（自动拼 RSS）或一条完整 RSS URL（应对
 每条种子打上所属组的策略(policy)+优先级(priority)，交给主流程决定下不下、下哪份。
 """
 import logging
+import re
 from datetime import datetime
 
 import feedparser
@@ -17,11 +18,15 @@ log = logging.getLogger("autorss")
 
 
 def nyaa_feed_url(feed: str) -> str:
-    """用户名 → 拼 RSS；已是 http(s) URL → 原样用。"""
+    """用户名 → 拼 RSS；已是 http(s) URL → 原样用。
+
+    分类用 1_0（全部动漫）而非 1_2（仅英译）——ANi/Lilith-Raws 等中文字幕组的种子归在
+    1_3（非英译），若写死 1_2 这些组的 feed 会拉到 0 条（静默拉空）。1_0 覆盖各语言字幕。
+    """
     feed = (feed or "").strip()
     if feed.startswith(("http://", "https://")):
         return feed
-    return f"https://nyaa.si/?page=rss&u={feed}&c=1_2"
+    return f"https://nyaa.si/?page=rss&u={feed}&c=1_0"
 
 
 class NyaaSource(Source):
@@ -57,14 +62,16 @@ class NyaaSource(Source):
         try:
             raw_title = entry.title
             info_hash = (entry.get("nyaa_infohash") or "").strip().lower()
-            if not info_hash:
-                return None  # 没有 hash 无法跨源去重，跳过
+            if not re.fullmatch(r"[0-9a-f]{40}", info_hash):
+                return None  # 必须是 40 位 hex：既能跨源去重，也防脏 hash 注入 qB 的 '|' 分隔符
             if is_batch(raw_title):
                 return None  # 合集/BDRip/连续集范围 整理帖
             if self.title_filter and not any(k in raw_title for k in self.title_filter):
                 return None  # 标题不含所需关键词（如按语言 繁日/简日 过滤）
 
             group, anime_title, season, episode = parse_title(raw_title)
+            if not anime_title:
+                return None  # 番名解析为空（如纯多括号格式）→ 无法定位/去重，跳过免撞库
             if self.subgroups and not any(g in group for g in self.subgroups):
                 return None  # 不在白名单的字幕组
             if episode == -2:

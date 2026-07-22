@@ -65,7 +65,7 @@ class Anime(SQLModel, table=True):
 
 class AnimeAlias(SQLModel, table=True):
     """番名对照：某组解析出的 (标题, 季) → 番。命中即知是哪部番，无需再查 bgm。"""
-    __tablename__ = "anime_alias"   # 表名带 anime 前缀（旧名 titlealias，启动时自动改名迁移）
+    __tablename__ = "anime_alias"   # 表名带 anime 前缀（与剧场版/TV 分表命名一致）
     __table_args__ = (UniqueConstraint("title", "season", name="uq_alias_title_season"),)
 
     id: int | None = Field(default=None, primary_key=True)

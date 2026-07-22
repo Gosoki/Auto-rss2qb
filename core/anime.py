@@ -53,7 +53,7 @@ def quarter_brief() -> list[dict]:
 
 
 def _is_auto(kind: str) -> bool:
-    return kind in ("auto", "ani")  # 兼容旧值 'ani'
+    return kind == "auto"
 
 
 def _apply_bgm(a: Anime, info: dict | None, keep_quarter: bool = False) -> None:
@@ -110,16 +110,8 @@ async def _resolve_anime(item) -> int:
             )
             _apply_bgm(anime, info)
             s.add(anime)
-            try:
-                s.commit()
-                s.refresh(anime)
-            except IntegrityError:
-                # 旧库残留的 uq_anime_title_season 撞车 → 复用同 (title,季) 的既有番
-                s.rollback()
-                anime = s.exec(select(Anime).where(
-                    Anime.title == item.anime_title, Anime.season == item.season)).first()
-                if anime is None:
-                    raise
+            s.commit()          # Anime 无唯一约束，(title,季) 的去重由 AnimeAlias 负责，此处不会撞约束
+            s.refresh(anime)
         # 登记番名对照（并发/竞态下可能已存在则忽略）
         if not s.exec(select(AnimeAlias).where(
                 AnimeAlias.title == item.anime_title, AnimeAlias.season == item.season)).first():
@@ -222,8 +214,10 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             s.add(t)
             s.commit()
             url = t.download_url
-            quarter = t.quarter or "unknown"
             a = s.get(Anime, anime_id) if anime_id else None
+            # 季度与季号都以 bgm 纠正后的 Anime 为准：种子行的 quarter/季号是入库时快照，重识别后会过时，
+            # 沿用会把同一部番的新旧集散到两个季度目录（有下载时 keep_quarter 已锁死 a.quarter 保持稳定）。
+            quarter = (a.quarter if (a and a.quarter) else t.quarter) or "unknown"
             # 文件夹名统一用 bgm 日语原名，没有再退中文规范名，最后退种子解析番名
             folder_name = (a and (a.jp_name or a.display_name)) or t.anime_title
             if a is not None:
@@ -530,7 +524,8 @@ def restore_anime(anime_id: int) -> None:
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
         have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading")}
         for t in all_rows:
-            # 只放回『该集尚无下载』的 skipped：别把被集去重/删文件而 skipped 的旧版本翻出来重下
+            # 只放回『该集尚无下载』的 skipped（集去重留下的旧版本）；用户主动删过的记为 deleted，
+            # 不在此列——免得恢复订阅时把用户特意删掉的文件又重新下回来。
             if t.status == "skipped" and t.episode not in have_eps:
                 t.status = "pending"
                 s.add(t)
@@ -558,6 +553,10 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
             keeper.rejected = keeper.rejected or loser.rejected
         if not keeper.pref_source and loser.pref_source:
             keeper.pref_source = loser.pref_source
+        # 季度：keeper 尚未落盘而 loser 已有在下/已下文件时采用 loser 的季度，
+        # 免得合并后新集去了 keeper 的（可能不同）季度目录，与已落盘的旧集散在两处。
+        if loser.quarter and not _has_downloads(s, keeper_id) and _has_downloads(s, loser_id):
+            keeper.quarter = loser.quarter
         s.add(keeper)
     for al in s.exec(select(AnimeAlias).where(AnimeAlias.anime_id == loser_id)):
         al.anime_id = keeper_id
@@ -631,6 +630,13 @@ async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
         for other in list(s.exec(select(Anime).where(
                 Anime.bangumi_id == bgm_id, Anime.id != a.id))):
             _merge_anime(s, other.id, a.id)
+        # 显式绑定以用户意图为准：若并入的旧番曾被忽略、致 keeper 继承了 rejected，纠回『待确认』，
+        # 别让"用户主动绑定识别"的番静默掉进已忽略、从此停更。
+        a = s.get(Anime, a.id)
+        if a is not None and a.rejected:
+            a.rejected, a.confirmed = False, False
+            s.add(a)
+            s.commit()
     return True
 
 
@@ -756,11 +762,11 @@ async def delete_anime_torrent(torrent_id: int) -> bool:
             return False
         h = t.info_hash
     if engine.hash_owned_elsewhere(h, MovieTorrent):
-        _set_status(torrent_id, "skipped")  # 剧场版侧还持有同一种子 → 只脱手，不删文件
+        _set_status(torrent_id, "deleted")  # 剧场版侧还持有同一种子 → 只脱手，不删文件
         return True
     if not await engine.qb.delete([h], delete_files=True):
         return False
-    _set_status(torrent_id, "skipped")
+    _set_status(torrent_id, "deleted")   # 用户主动删除：终态，恢复订阅时不会被重新下（区别于集去重的 skipped）
     log.info("删除文件（单集）- torrent=%s", torrent_id)
     return True
 
@@ -786,7 +792,7 @@ async def delete_anime_files(anime_id: int) -> int:
         for tid, _ in pairs:
             t = s.get(AnimeTorrent, tid)
             if t is not None:
-                t.status = "skipped"  # 文件已删/或脱手，标记不再持有
+                t.status = "deleted"  # 用户主动删除，终态；恢复订阅时不重下（区别集去重的 skipped）
                 s.add(t)
         s.commit()
     log.info("删除文件 - anime=%s 共 %d 个种子（独占 %d 个删文件）", anime_id, len(pairs), len(exclusive))

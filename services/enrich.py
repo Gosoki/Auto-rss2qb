@@ -83,6 +83,8 @@ async def _search_one(client, name, est, release):
 
 async def _mikan_bridge(client, info_hash):
     """兜底：hash → Mikan 剧集页 → Mikan番组页 → bgm id。"""
+    if not re.fullmatch(r"[0-9a-f]{40}", info_hash or ""):
+        return None  # 只把 40 位 hex 拼进 URL：防非法 hash 造成路径穿越/请求注入
     try:
         ep = await client.get(f"{config.MIKAN_BASE}/Home/Episode/{info_hash}")
         if ep.status_code != 200:

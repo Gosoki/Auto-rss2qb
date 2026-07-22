@@ -297,7 +297,7 @@ def restore_movie(movie_id: int) -> None:
         s.add(m)
         rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)))
         anydl = any(t.status in ("downloaded", "downloading") for t in rows)
-        for t in rows:  # 剧场版=一部作品：已有一版就别把 skipped 旧版翻出来
+        for t in rows:  # 剧场版=一部作品：已有一版就别把 skipped 旧版翻出来（deleted 是用户主动删，也不重下）
             if t.status == "skipped" and not anydl:
                 t.status = "pending"
                 s.add(t)
@@ -416,11 +416,11 @@ async def delete_movie_torrent(mt_id: int) -> bool:
             return False
         h = t.info_hash
     if engine.hash_owned_elsewhere(h, AnimeTorrent):
-        _set_status(mt_id, "skipped")  # TV 侧还持有同一种子 → 只脱手，不删文件
+        _set_status(mt_id, "deleted")  # TV 侧还持有同一种子 → 只脱手，不删文件
         return True
     if not await engine.qb.delete([h], delete_files=True):
         return False
-    _set_status(mt_id, "skipped")
+    _set_status(mt_id, "deleted")   # 用户主动删除：终态，恢复时不会被重新下（区别于 skipped）
     log.info("删除文件（剧场版单条）- torrent=%s", mt_id)
     return True
 
