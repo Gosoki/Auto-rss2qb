@@ -456,14 +456,38 @@ def recent_anime_rows(limit: int = 50) -> list[dict]:
                   s.exec(select(Anime).where(Anime.id.in_(ids)))} if ids else {})
     return [{
         "id": t.id,
+        "anime_id": t.anime_id,
         "time": engine.torrent_time(t),
         "name": names.get(t.anime_id) or (t.anime_title or "?"),
         "episode": t.episode,
         "source": t.source,
         "status": t.status,
+        "qb_state": t.qb_state,
         "qb_progress": t.qb_progress,
         "qb_synced_at": t.qb_synced_at,
+        "qb_dlspeed": t.qb_dlspeed,
         "raw": t.raw_title or "",
+    } for t in ts]
+
+
+def inflight_anime_rows(limit: int = 50) -> list[dict]:
+    """仪表盘『正在下载』区：当前在下的 TV 种子（口径同 has_inflight），按完成度降序、接近下完的在上。"""
+    with get_session() as s:
+        ts = list(s.exec(
+            select(AnimeTorrent).where(*engine._inflight_where(AnimeTorrent))
+            .order_by(AnimeTorrent.qb_progress.desc(), AnimeTorrent.created_at.desc()).limit(limit)))
+        ids = {t.anime_id for t in ts if t.anime_id}
+        names = ({a.id: (a.display_name or a.title) for a in
+                  s.exec(select(Anime).where(Anime.id.in_(ids)))} if ids else {})
+    return [{
+        "id": t.id,
+        "name": names.get(t.anime_id) or (t.anime_title or "?"),
+        "episode": t.episode,
+        "status": t.status,
+        "qb_state": t.qb_state,
+        "qb_progress": t.qb_progress,
+        "qb_synced_at": t.qb_synced_at,
+        "qb_dlspeed": t.qb_dlspeed,
     } for t in ts]
 
 

@@ -11,8 +11,9 @@ import config
 from core import engine, movies as mov
 from sources.parse import SEASON_CN
 from .layout import (WEEKDAY_CN, confirm, expand_collapse_bar, frame, group_by_quarter,
-                     human_size, kpi_cards, meta_card, name_of, paginate, parse_bgm_id,
-                     qb_disabled_banner, qb_live_text, recent_table, torrent_status_cn)
+                     human_size, kpi_cards, live_status, meta_card, name_of, paginate,
+                     parse_bgm_id, qb_disabled_banner, qb_live_text, recent_table,
+                     torrent_status_cn)
 
 _TABS = ("overview", "list", "fail", "reject", "sources")
 
@@ -287,16 +288,38 @@ def movies_page(t: str = "list"):
                             "min-width:5rem")
 
         @ui.refreshable
+        def inflight_panel():
+            rows = mov.inflight_movie_rows()
+            ui.label(f"正在下载（{len(rows)}）").classes("text-sm font-bold mt-4 pl-1")
+            with ui.card().classes("w-full"):
+                if not rows:
+                    ui.label("暂无正在下载的种子").classes("text-gray-500 text-sm")
+                    return
+                with ui.column().classes("w-full gap-0"):
+                    for r in rows:
+                        text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
+                                                  r["qb_synced_at"], r["qb_dlspeed"])
+                        with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
+                                "border-bottom:1px solid rgba(255,255,255,.06)"):
+                            ui.label(r["name"]).classes("grow break-all")
+                            ui.badge(text).props(f"color={color}")
+
+        @ui.refreshable
         def recent_panel():
             ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
-            rows = [{
-                "id": r["id"],
-                "time": r["time"],
-                "name": r["name"],
-                "src": r["source"],
-                "raw": r["raw"] or "—",
-                "status": torrent_status_cn(r["status"], r["qb_progress"], r["qb_synced_at"]),
-            } for r in mov.recent_movie_rows(50)]
+            rows = []
+            for r in mov.recent_movie_rows(50):
+                text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
+                                          r["qb_synced_at"], r["qb_dlspeed"])
+                rows.append({
+                    "id": r["id"],
+                    "time": r["time"],
+                    "name": r["name"],
+                    "src": r["source"],
+                    "raw": r["raw"] or "—",
+                    "status": text,
+                    "status_color": color,
+                })
             recent_table(rows, "剧场版")
 
         @ui.refreshable
@@ -400,6 +423,7 @@ def movies_page(t: str = "list"):
 
         def refresh_all():
             overview_panel.refresh()
+            inflight_panel.refresh()
             recent_panel.refresh()
             list_panel.refresh()
             fail_panel.refresh()
@@ -419,6 +443,7 @@ def movies_page(t: str = "list"):
         with ui.tab_panels(tabs, value=start).classes("w-full"):
             with ui.tab_panel("overview"):
                 overview_panel()
+                inflight_panel()
                 recent_panel()
             with ui.tab_panel("list"):
                 list_panel()

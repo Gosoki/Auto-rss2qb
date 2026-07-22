@@ -10,9 +10,9 @@ from nicegui import ui
 from core import anime, engine
 import config
 from .layout import (STATUS_CN, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
-                     human_size, kpi_cards, name_of, paginate, parse_bgm_id, platform_badge,
-                     qb_disabled_banner, recent_table, season_label, source_options,
-                     torrent_status_cn)
+                     human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
+                     platform_badge, qb_disabled_banner, recent_table, season_label,
+                     source_options)
 from .sources import render_sources
 
 
@@ -231,16 +231,46 @@ def anime_page(t: str = "manage"):
                         ui.button("忽略", on_click=_reject(a.id)).props("size=sm flat color=grey")
 
         @ui.refreshable
+        def inflight_panel():
+            rows = anime.inflight_anime_rows()
+            ui.label(f"正在下载（{len(rows)}）").classes("text-sm font-bold mt-4 pl-1")
+            with ui.card().classes("w-full"):
+                if not rows:
+                    ui.label("暂无正在下载的种子").classes("text-gray-500 text-sm")
+                    return
+                with ui.column().classes("w-full gap-0"):
+                    for r in rows:
+                        text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
+                                                  r["qb_synced_at"], r["qb_dlspeed"])
+                        with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
+                                "border-bottom:1px solid rgba(255,255,255,.06)"):
+                            ui.label(f'{r["name"]}  第{ep_str(r["episode"])}集').classes(
+                                "grow break-all")
+                            ui.badge(text).props(f"color={color}")
+
+        @ui.refreshable
         def recent_panel():
             ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
-            rows = [{
-                "id": r["id"],
-                "time": r["time"],
-                "name": f'{r["name"]}  第{ep_str(r["episode"])}集',
-                "src": r["source"],
-                "raw": r["raw"] or "—",
-                "status": torrent_status_cn(r["status"], r["qb_progress"], r["qb_synced_at"]),
-            } for r in anime.recent_anime_rows(50)]
+            raw = anime.recent_anime_rows(50)
+            # 待下/失败行标『将下载/备用』：按番批量算一次 download_plan（每番一查），避免逐行查
+            plan_ids: set = set()
+            for aid in {r["anime_id"] for r in raw
+                        if r["status"] in ("pending", "error") and r["anime_id"]}:
+                plan_ids |= anime.download_plan(aid)
+            rows = []
+            for r in raw:
+                in_plan = (r["id"] in plan_ids) if r["status"] in ("pending", "error") else None
+                text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
+                                          r["qb_synced_at"], r["qb_dlspeed"], in_plan)
+                rows.append({
+                    "id": r["id"],
+                    "time": r["time"],
+                    "name": f'{r["name"]}  第{ep_str(r["episode"])}集',
+                    "src": r["source"],
+                    "raw": r["raw"] or "—",
+                    "status": text,
+                    "status_color": color,
+                })
             recent_table(rows, "番剧")
 
         @ui.refreshable
@@ -302,6 +332,7 @@ def anime_page(t: str = "manage"):
         def refresh_dynamic():
             # 用户操作后的全动态刷新：含『待确认/待识别』，好让确认/绑定/忽略后的番立即从对应列表流转。
             overview_panel.refresh()
+            inflight_panel.refresh()
             confirm_panel.refresh()
             reject_panel.refresh()
             fail_panel.refresh()
@@ -311,6 +342,7 @@ def anime_page(t: str = "manage"):
             # 30s 定时器专用：排除 confirm_panel/fail_panel——它们含用户正在输入的 bgm 绑定框/源下拉，
             # 定时重建会清空半途输入。后台新发现的待确认/待识别番在下次用户操作或整页刷新时显现（KPI 计数仍每 30s 更新）。
             overview_panel.refresh()
+            inflight_panel.refresh()
             reject_panel.refresh()
             recent_panel.refresh()
 
@@ -431,6 +463,7 @@ def anime_page(t: str = "manage"):
         with ui.tab_panels(tabs, value=start).classes("w-full"):
             with ui.tab_panel("overview"):
                 overview_panel()
+                inflight_panel()
                 recent_panel()
             with ui.tab_panel("manage"):
                 manage_panel()

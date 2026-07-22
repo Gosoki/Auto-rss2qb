@@ -53,4 +53,4 @@ async def _startup():
 if __name__ in {"__main__", "__mp_main__"}:
     # 绑定回环地址：本工具无鉴权、设置页含 qB 密码等敏感信息，默认不对局域网开放。
     # 如需内网访问，改 host 并自行加鉴权/反代。
-    ui.run(title="autorss", host="127.0.0.1", port=WEB_PORT, show=False, reload=False)
+    ui.run(title="autorss", host="127.0.0.1", port=WEB_PORT, show=False, reload=True)

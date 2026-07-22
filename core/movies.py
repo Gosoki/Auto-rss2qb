@@ -273,9 +273,31 @@ def recent_movie_rows(limit: int = 50) -> list[dict]:
         "name": names.get(t.movie_id) or (t.raw_title or "?"),
         "source": t.source,
         "status": t.status,
+        "qb_state": t.qb_state,
         "qb_progress": t.qb_progress,
         "qb_synced_at": t.qb_synced_at,
+        "qb_dlspeed": t.qb_dlspeed,
         "raw": t.raw_title or "",
+    } for t in ts]
+
+
+def inflight_movie_rows(limit: int = 50) -> list[dict]:
+    """仪表盘『正在下载』区：当前在下的剧场版/OVA 种子（口径同 has_inflight），按完成度降序。"""
+    with get_session() as s:
+        ts = list(s.exec(
+            select(MovieTorrent).where(*engine._inflight_where(MovieTorrent))
+            .order_by(MovieTorrent.qb_progress.desc(), MovieTorrent.created_at.desc()).limit(limit)))
+        ids = {t.movie_id for t in ts if t.movie_id}
+        names = ({m.id: (m.display_name or m.title) for m in
+                  s.exec(select(Movie).where(Movie.id.in_(ids)))} if ids else {})
+    return [{
+        "id": t.id,
+        "name": names.get(t.movie_id) or (t.raw_title or "?"),
+        "status": t.status,
+        "qb_state": t.qb_state,
+        "qb_progress": t.qb_progress,
+        "qb_synced_at": t.qb_synced_at,
+        "qb_dlspeed": t.qb_dlspeed,
     } for t in ts]
 
 
