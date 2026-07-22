@@ -99,8 +99,11 @@ def anime_page(t: str = "manage"):
             # ── 种子状态 ──
             with ui.row().classes("items-center gap-3 mt-3 pl-1"):
                 ui.label("种子状态").classes("text-sm font-bold")
-                ui.button("补下全部", icon="download", on_click=_download_all).props(
-                    "outline color=primary size=sm").tooltip("订阅中所有待下集立即下")
+                _dla = ui.button("补下全部", icon="download", on_click=_download_all).props(
+                    "outline color=primary size=sm")
+                _dla.set_enabled(config.QB_ENABLED)
+                _dla.tooltip("订阅中所有待下集立即下" if config.QB_ENABLED
+                             else "qB 未启用，去设置页开启后可下载")
             # 待下拆 将下载/备用/待确认（库态『下载中』恒≈0、与 qB 实时态重复不单列；未知集/失败上移到 KPI 可点卡）
             chips = [
                 ("已下", ov["status"]["downloaded"], "green", None),

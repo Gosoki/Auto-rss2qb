@@ -173,7 +173,7 @@ def settings():
             _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL)
             _num("WEB_PORT", "Web 端口", config.WEB_PORT)
 
-        def _save():
+        async def _save():
             updates = {}
             for key, ctrl in f.items():
                 v = ctrl.value
@@ -195,8 +195,18 @@ def settings():
             env_updates = {k: v for k, v in updates.items() if k in _RESTART_ONLY}
             if db_updates:
                 config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
-                if updates.get("QB_ENABLED") == "true" or updates.get("QB_SYNC_STATUS") == "true":
-                    engine.qb_kick.set()      # qB 发送/状态跟踪刚被打开：立即唤醒同步循环自查，别等一个保底周期
+                # qB 发送开着 → 保存后测一次连接：连不上就自动关掉开关（免得停在『开着却下不了』的迷惑态）
+                if config.QB_ENABLED:
+                    client = await engine.qb._login()
+                    if client is None:
+                        config.set_many({"QB_ENABLED": "false"})
+                        if "QB_ENABLED" in f:
+                            f["QB_ENABLED"].value = False   # 表单开关同步关掉
+                        ui.notify("连不上 qB，已自动关闭『发送到 qB』开关（检查地址/端口/账号密码）",
+                                  type="warning")
+                    else:
+                        await client.aclose()
+                        engine.qb_kick.set()      # 连上了：立即唤醒同步循环自查，别等一个保底周期
             if env_updates:
                 config.update_env(env_updates)  # WEB_PORT 等结构项仍走 .env
             msg = "已保存，即时生效" + ("（Web 端口改动需重启）" if env_updates else "")

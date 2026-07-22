@@ -66,7 +66,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             if not cur.rejected and not cur.confirmed:
                 ui.button("确认下载", on_click=_confirm).props("size=sm color=primary").style(
                     "font-size:12px")
-            ui.button("补下本番", on_click=_download).props("flat size=sm").style("font-size:12px")
+            _dln = ui.button("补下本番", on_click=_download).props("flat size=sm").style("font-size:12px")
+            _dln.set_enabled(config.QB_ENABLED)
+            if not config.QB_ENABLED:
+                _dln.tooltip("qB 未启用，去设置页开启后可下载")
             if sources:  # 下载源：按优先级=多源兜底；选具体组=锁定，之后只下这个组
                 ui.select(source_options(sources, "按优先级·多源兜底"),
                           value=(cur.pref_source or ""), label="下载源",
@@ -86,7 +89,15 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
                 # 第一行：集号 · 字幕组 · 时间 同一行居中（天然竖直齐平），状态/按钮 space() 推到最右
                 with ui.row().classes("items-center gap-3 w-full text-sm no-wrap"):
-                    ui.label(ep_txt).classes("shrink-0")                  # 主要信息：集号
+                    if t.status in ("pending", "error"):  # 待下/失败的集号都可点改：不止 -2，
+                        _neg = t.episode == -2                            # 解析也可能写错正整数(把分辨率/季号当集号)
+                        ui.label(ep_txt).classes(
+                            "shrink-0 cursor-pointer hover:underline"
+                            + (" text-blue-400" if _neg else "")).on(
+                            "click", _set_ep(t.id)).tooltip(
+                            "集号没解析出来；点这里改" if _neg else "集号不对？点这里改")
+                    else:
+                        ui.label(ep_txt).classes("shrink-0")              # 主要信息：集号（已下等不可改）
                     ui.label(t.source or "—").classes("shrink-0")         # 主要信息：字幕组（同色）
                     ui.label(engine.torrent_time(t)).classes("shrink-0 text-gray-500").style(
                         "font-size:11px")                                 # 次要：时间
@@ -96,8 +107,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _done = (t.qb_progress or 0) >= 1
                         ui.badge(live).props(f"color={'green' if _done else 'teal'}").tooltip(
                             "qB 实时状态")
-                    elif t.status == "pending":  # 待下：区分『会真下的首选』和『备用』
-                        if t.id in plan:
+                    elif t.status == "pending":  # 待下：未知集 / 将下载 / 备用
+                        if t.episode == -2:  # -2 后台不自动下，别标『将下载』
+                            ui.badge("未知集").props("color=purple").tooltip(
+                                "批量/集号没解析出来，后台不自动下。点左边『第?集』改集号，或下方排除")
+                        elif t.id in plan:
                             ui.badge("将下载").props("color=blue").tooltip(
                                 "这一集的首选版本，补下/自动下会下它")
                         else:
@@ -108,20 +122,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             f"color={'orange' if t.id in plan else 'red'}").tooltip(
                             "下载失败过；点右边『下载』或『补下本番』手动重试（后台不自动重试 error）"
                             if t.id in plan else "下载失败过")
-                    else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删)按状态
+                    else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删/已排除)按状态
                         ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
                             "color=blue-grey")
-                    ui.button("下载", icon="download", on_click=_force(t.id)).props(
-                        "size=sm flat dense").style("font-size:12px").tooltip(
-                        "强制下这一条到文件夹（无视去重/优先级）")
                     if t.status == "excluded":  # 已排除：给『恢复』放回待下
                         ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
                             "size=sm flat dense color=primary").style("font-size:12px").tooltip(
                             "放回待下，重新参与下载/去重")
-                    if t.episode == -2 and t.status in ("pending", "error"):  # 未知集：填对集号救回
-                        ui.button("改集号", icon="edit", on_click=_set_ep(t.id)).props(
-                            "size=sm flat dense").style("font-size:12px").tooltip(
-                            "这条集号没解析出来；填对集号让它进正常下载/去重")
                     if t.status in ("pending", "error"):  # 未下载的才可直接排除
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "size=sm flat dense color=grey").style("font-size:12px").tooltip(
@@ -130,6 +137,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.button(icon="delete_forever", on_click=_del_one(t.id)).props(
                             "size=sm flat dense color=negative").tooltip(
                             "删除这一集的文件（qB+硬盘，不可撤销）")
+                    _dlb = ui.button("下载", icon="download", on_click=_force(t.id)).props(  # 下载放最后
+                        "size=sm flat dense").style("font-size:12px")
+                    _dlb.set_enabled(config.QB_ENABLED)
+                    _dlb.tooltip("强制下这一条到文件夹（无视去重/优先级）" if config.QB_ENABLED
+                                 else "qB 未启用，去设置页开启后可下载")
                 # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
                 with ui.row().classes("items-start gap-3 w-full text-sm no-wrap"):
                     ui.label(ep_txt).classes("shrink-0").style("visibility:hidden")
