@@ -269,6 +269,7 @@ def recent_movie_rows(limit: int = 50) -> list[dict]:
                   s.exec(select(Movie).where(Movie.id.in_(ids)))} if ids else {})
     return [{
         "id": t.id,
+        "movie_id": t.movie_id,
         "time": engine.torrent_time(t),
         "name": names.get(t.movie_id) or (t.raw_title or "?"),
         "source": t.source,
@@ -428,13 +429,17 @@ async def download_movie_torrent(mt_id: int) -> bool:
         log.error("剧场版下载失败 - %s", e)
         _set_status(mt_id, "error")
         return False
-    _set_status(mt_id, "downloaded" if ok else "error")
-    if ok:
-        if config.QB_SYNC_STATUS:
-            engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子（关状态跟踪时不必唤醒）
-        log.info("已加入qB（剧场版）- torrent=%s", mt_id)
-        await notify(f"{folder} 🎬📥")
-    return ok
+    if not ok:
+        _set_status(mt_id, "error")
+        return False
+    if config.QB_SYNC_STATUS:
+        _set_status(mt_id, "downloaded")
+        engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
+    else:
+        engine.settle_downloaded(MovieTorrent, mt_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
+    log.info("已加入qB（剧场版）- torrent=%s", mt_id)
+    await notify(f"{folder} 🎬📥")
+    return True
 
 
 async def delete_movie_torrent(mt_id: int) -> bool:

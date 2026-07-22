@@ -235,6 +235,10 @@ def anime_page(t: str = "manage"):
             rows = anime.inflight_anime_rows()
             ui.label(f"正在下载（{len(rows)}）").classes("text-sm font-bold mt-4 pl-1")
             with ui.card().classes("w-full"):
+                if not config.QB_SYNC_STATUS:
+                    ui.label("已关闭 qB 状态跟踪：发送即视为『已下』，不跟踪下载进度（设置页可重新开启）。").classes(
+                        "text-gray-500 text-sm")
+                    return
                 if not rows:
                     ui.label("暂无正在下载的种子").classes("text-gray-500 text-sm")
                     return
@@ -252,18 +256,24 @@ def anime_page(t: str = "manage"):
         def recent_panel():
             ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
             raw = anime.recent_anime_rows(50)
-            # 待下/失败行标『将下载/备用』：按番批量算一次 download_plan（每番一查），避免逐行查
-            plan_ids: set = set()
-            for aid in {r["anime_id"] for r in raw
-                        if r["status"] in ("pending", "error") and r["anime_id"]}:
-                plan_ids |= anime.download_plan(aid)
+            # 待下/失败行标『将下载/备用』：只给『已确认』的番批量算 download_plan（每番一查）；
+            # 未确认（待确认）的番不算、显示『待确认』——它要点确认才会下，标将下载是假的。
+            pend_aids = {r["anime_id"] for r in raw
+                         if r["status"] in ("pending", "error") and r["anime_id"]}
+            confirmed = anime.confirmed_anime_ids(pend_aids)
+            plan_ids = anime.download_plan_for_ids(confirmed)   # 批量一次算完，避免每番一查(N+1)
             rows = []
             for r in raw:
-                in_plan = (r["id"] in plan_ids) if r["status"] in ("pending", "error") else None
+                if r["status"] in ("pending", "error"):
+                    conf = r["anime_id"] in confirmed
+                    in_plan = r["id"] in plan_ids
+                else:
+                    conf, in_plan = True, None
                 text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
-                                          r["qb_synced_at"], r["qb_dlspeed"], in_plan)
+                                          r["qb_synced_at"], r["qb_dlspeed"], in_plan, conf)
                 rows.append({
                     "id": r["id"],
+                    "detail_id": r["anime_id"],
                     "time": r["time"],
                     "name": f'{r["name"]}  第{ep_str(r["episode"])}集',
                     "src": r["source"],
@@ -271,7 +281,8 @@ def anime_page(t: str = "manage"):
                     "status": text,
                     "status_color": color,
                 })
-            recent_table(rows, "番剧")
+            recent_table(rows, "番剧",
+                         on_row_click=lambda row: row.get("detail_id") and open_detail(row["detail_id"]))
 
         @ui.refreshable
         def manage_panel():

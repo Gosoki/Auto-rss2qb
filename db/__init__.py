@@ -31,6 +31,7 @@ def init_db():
     from . import models  # noqa: F401  确保表被注册
     SQLModel.metadata.create_all(engine)
     _migrate_add_columns()   # 给模型新增字段的表加列（开发期加字段免删整表）
+    _migrate_inflight_indexes()   # 给 in-flight 高频查询建 partial index
 
 
 def _column_default(col):
@@ -76,6 +77,21 @@ def _migrate_add_columns():
                         (val,))
             log.info("数据库迁移：%s 加列 %s%s", table.name, col.name,
                      "" if val is _NO_DEFAULT else f"（回填 {val!r}）")
+
+
+def _migrate_inflight_indexes() -> None:
+    """给 _inflight_where 的高频查询(has_inflight/has_active_downloading/inflight_*_rows，每唤醒轮 +
+    每仪表盘刷新都跑)建 partial index。in-flight 集合天然极小 → 索引也小；常态『无在下』时不必再全表扫
+    两表才能确认为空。谓词与 _inflight_where 前两条件对齐(qb_state 作残余过滤)，对查询结果透明、行为等价。"""
+    ddl = (
+        "CREATE INDEX IF NOT EXISTS ix_animetorrent_inflight ON animetorrent(status, qb_progress) "
+        "WHERE status IN ('downloaded','downloading') AND qb_progress < 1.0",
+        "CREATE INDEX IF NOT EXISTS ix_movietorrent_inflight ON movietorrent(status, qb_progress) "
+        "WHERE status IN ('downloaded','downloading') AND qb_progress < 1.0",
+    )
+    with engine.begin() as conn:
+        for stmt in ddl:
+            conn.exec_driver_sql(stmt)
 
 
 def get_session() -> Session:

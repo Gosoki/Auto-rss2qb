@@ -292,6 +292,10 @@ def movies_page(t: str = "list"):
             rows = mov.inflight_movie_rows()
             ui.label(f"正在下载（{len(rows)}）").classes("text-sm font-bold mt-4 pl-1")
             with ui.card().classes("w-full"):
+                if not config.QB_SYNC_STATUS:
+                    ui.label("已关闭 qB 状态跟踪：发送即视为『已下』，不跟踪下载进度（设置页可重新开启）。").classes(
+                        "text-gray-500 text-sm")
+                    return
                 if not rows:
                     ui.label("暂无正在下载的种子").classes("text-gray-500 text-sm")
                     return
@@ -313,6 +317,7 @@ def movies_page(t: str = "list"):
                                           r["qb_synced_at"], r["qb_dlspeed"])
                 rows.append({
                     "id": r["id"],
+                    "detail_id": r["movie_id"],
                     "time": r["time"],
                     "name": r["name"],
                     "src": r["source"],
@@ -320,7 +325,8 @@ def movies_page(t: str = "list"):
                     "status": text,
                     "status_color": color,
                 })
-            recent_table(rows, "剧场版")
+            recent_table(rows, "剧场版",
+                         on_row_click=lambda row: row.get("detail_id") and open_detail(row["detail_id"]))
 
         @ui.refreshable
         def list_panel():

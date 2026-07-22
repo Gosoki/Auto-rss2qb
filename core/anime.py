@@ -254,13 +254,17 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
         _set_status(torrent_id, "error")
         return False
 
-    _set_status(torrent_id, "downloaded" if ok else "error")
-    if ok:
-        if config.QB_SYNC_STATUS:
-            engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子（关状态跟踪时不必唤醒）
-        log.info("已加入qB - %s 第%s季 第%s集", title, season, episode)
-        await notify(f"{title}[{episode}] 📥")
-    return ok
+    if not ok:
+        _set_status(torrent_id, "error")
+        return False
+    if config.QB_SYNC_STATUS:
+        _set_status(torrent_id, "downloaded")
+        engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
+    else:
+        engine.settle_downloaded(AnimeTorrent, torrent_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
+    log.info("已加入qB - %s 第%s季 第%s集", title, season, episode)
+    await notify(f"{title}[{episode}] 📥")
+    return True
 
 
 def _set_status(torrent_id: int, status: str) -> None:
@@ -489,6 +493,17 @@ def inflight_anime_rows(limit: int = 50) -> list[dict]:
         "qb_synced_at": t.qb_synced_at,
         "qb_dlspeed": t.qb_dlspeed,
     } for t in ts]
+
+
+def confirmed_anime_ids(ids) -> set:
+    """给定番 id 集合，返回其中『已确认下载』的。新入库里未确认（待确认）番的待下不显示
+    将下载/备用（那是假的、要点确认才会下），而是显示『待确认』——故先筛出已确认的。"""
+    ids = {i for i in ids if i}
+    if not ids:
+        return set()
+    with get_session() as s:
+        return set(s.exec(select(Anime.id).where(
+            Anime.id.in_(ids), Anime.confirmed == True)))  # noqa: E712
 
 
 def get_anime(anime_id: int) -> Anime | None:
@@ -786,6 +801,32 @@ def download_plan(anime_id: int) -> set[int]:
     if pref:
         pending = [t for t in pending if pref in (t.source or "")]
     return {t.id for t in _select_downloads(pending, pref, have_eps)}
+
+
+def download_plan_for_ids(anime_ids) -> set[int]:
+    """批量版 download_plan：给定一组番 id，返回它们『会真下』的种子 id 并集（供新入库一次性标将下载/备用）。
+    与 download_all_pending 同一挑选口径（锁定源过滤 + 跳过已下/在下集 + 每集一份、负集整组一份），只算不下。
+    把逐番 N 次查询压成 2 次：一次拿这些番的锁定源、一次拿它们的全部种子；等价于对每个 id 调 download_plan 求并。"""
+    ids = {i for i in anime_ids if i}
+    if not ids:
+        return set()
+    with get_session() as s:
+        pref_map = {a.id: a.pref_source for a in s.exec(select(Anime).where(Anime.id.in_(ids)))}
+        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id.in_(ids))))
+    by_anime: dict = {}
+    have_by_anime: dict = {}
+    for t in rows:
+        if t.status in ("pending", "error"):
+            by_anime.setdefault(t.anime_id, []).append(t)
+        elif t.status in ("downloaded", "downloading"):
+            have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
+    plan: set = set()
+    for aid, pending in by_anime.items():
+        lock = pref_map.get(aid)
+        if lock:
+            pending = [t for t in pending if lock in (t.source or "")]
+        plan |= {t.id for t in _select_downloads(pending, lock, have_by_anime.get(aid))}
+    return plan
 
 
 async def download_all_pending() -> int:

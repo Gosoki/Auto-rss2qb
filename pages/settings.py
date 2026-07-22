@@ -118,7 +118,7 @@ def settings():
             @ui.refreshable
             def _cb_cmd():
                 tok = (f["QB_CALLBACK_TOKEN"].value or "").strip()   # 读输入框实时值，不是已保存值
-                cmd = (f'curl -s "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
+                cmd = (f'curl -s -X POST "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
                        + (f'&t={tok}' if tok else '') + '"')
                 ui.code(cmd).classes("w-full text-xs")
 

@@ -68,10 +68,10 @@ def qb_disabled_banner(text: str) -> None:
         ui.label(text).classes("text-sm text-yellow-200")
 
 
-def recent_table(rows, name_label: str) -> None:
+def recent_table(rows, name_label: str, on_row_click=None) -> None:
     """『新入库』表：rows 已构造好(id/time/name/src/raw/status/status_color)，name_label 为番名列标题；
     番名下再压一行灰色原始种子名（长名换行、完整显示）；状态列渲染成彩色徽标（含 qB 实时态）。
-    番剧表与剧场版共用。"""
+    番剧表与剧场版共用。on_row_click(row) 非空时，番名可点开详情（传回整行 dict）。"""
     tbl = ui.table(
         columns=[
             {"name": "time", "label": "时间", "field": "time", "align": "left"},
@@ -81,15 +81,21 @@ def recent_table(rows, name_label: str) -> None:
         ],
         rows=rows, row_key="id",
     ).classes("w-full")
-    tbl.add_slot("body-cell-name", r'''
+    # 番名：可点则染蓝加手型、点击 $emit 回传整行给 Python；不可点则纯文本。原始名恒为灰色小字。
+    name_top = ('<div class="cursor-pointer text-blue-4" '
+                "@click=\"() => $parent.$emit('opendetail', props.row)\">{{ props.row.name }}</div>"
+                ) if on_row_click else "<div>{{ props.row.name }}</div>"
+    tbl.add_slot("body-cell-name", f'''
         <q-td :props="props">
-            <div>{{ props.row.name }}</div>
+            {name_top}
             <div class="text-grey-6"
                  style="font-size:11px;white-space:normal;word-break:break-all">
-                {{ props.row.raw }}
+                {{{{ props.row.raw }}}}
             </div>
         </q-td>
     ''')
+    if on_row_click:
+        tbl.on("opendetail", lambda e: on_row_click(e.args))
     tbl.add_slot("body-cell-status", r'''
         <q-td :props="props">
             <q-badge :color="props.row.status_color || 'blue-grey'" :label="props.row.status" />
@@ -183,12 +189,13 @@ def qb_live_text(t) -> str:
 
 
 def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
-                qb_dlspeed=0, in_plan=None) -> tuple[str, str]:
+                qb_dlspeed=0, in_plan=None, confirmed=True) -> tuple[str, str]:
     """新入库/正在下载：把一条种子压成 (文案, 徽标色)，复刻详情页那套阶梯。
 
     有 qB 实时态 → 『下载中 X% ↓速度』/『做种 100%』(完成绿、在下 teal)；否则 in_plan 非空(番剧)时
     区分待下『将下载/备用』、失败『可补下/失败』；再否则按 torrent_status_cn（刚交付未同步→下载中）。
-    in_plan=None 表示不区分首选/备用（剧场版没有集去重，用这个）。"""
+    in_plan=None 表示不区分首选/备用（剧场版没有集去重，用这个）。
+    confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。"""
     if qb_state:
         pr = qb_progress or 0
         parts = [qb_state_cn(qb_state), f"{pr * 100:.0f}%"]
@@ -197,6 +204,8 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
         return " ".join(parts), ("green" if pr >= 1 else "teal")
     if in_plan is not None:
         if status == "pending":
+            if not confirmed:
+                return "待确认", "orange"
             return ("将下载", "blue") if in_plan else ("备用", "blue-grey")
         if status == "error":
             return ("失败·可补下", "orange") if in_plan else ("失败", "red")

@@ -80,7 +80,9 @@ class QBittorrent:
         finally:
             await client.aclose()
         if not isinstance(data, list):
-            return {}
+            # 正常 qB 该端点恒返回数组。非列表(反代/网关在 200 下塞的错误 JSON/维护页等)按『连不上』处理、
+            # 本轮不动——绝不能当成空 {}，否则上游会把在下种子逐个误判为 error（真在下却被标失败）。
+            return None
         return {str(t.get("hash", "")).lower(): t for t in data if t.get("hash")}
 
     async def delete(self, hashes: list[str], delete_files: bool = True) -> bool:

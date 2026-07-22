@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import socket
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 from sqlmodel import func, or_, select
@@ -192,6 +192,18 @@ def set_torrent_status(model_cls, tid: int, status: str) -> None:
             s.commit()
 
 
+def settle_downloaded(model_cls, tid: int) -> None:
+    """把交付成功的种子直接落定为『已下完』(status=downloaded, qb_progress=1，脱离 in-flight)。
+    关状态跟踪(QB_SYNC_STATUS=off)时用：发送即已下、不轮询 qB——若不落定 qb_progress，它会永久满足
+    _inflight_where(progress<1 且 state 空未落定)，永远挂在『正在下载』区、且 has_inflight 恒真。"""
+    with get_session() as s:
+        t = s.get(model_cls, tid)
+        if t is not None:
+            t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "downloaded", 1.0, "", datetime.now()
+            s.add(t)
+            s.commit()
+
+
 def reset_downloading(model_cls) -> None:
     """启动时把某种子表上次异常退出遗留的 downloading 复位为 pending，好被重新下。"""
     with get_session() as s:
@@ -284,10 +296,15 @@ def has_active_downloading() -> bool:
     stalled(无源,0速)/排队/慢速爬行 都不算 → 只剩这些时快循环退回休眠、交给保底，别空转钉住循环。
     （注意：只要还有一个『在真下』，sync 每轮批量更新会顺便把慢的/stalled 的也一起刷新，不会漏。）"""
     thr = max(1, config.QB_ACTIVE_FLOOR_KBPS * 1024)   # KB/s→B/s；地板设 0 时=至少要有速度(≥1B/s)才算在真下
+    # 新鲜度闸：只认『最近一次同步够新』的种子为在真下。qB 掉线时 sync 走 None 分支不刷新 qb_synced_at、
+    # 速度值变陈旧——若不设闸，陈旧的高速值会让 has_active 恒真、内层循环永不退出、对着死掉的 qB 每轮空打。
+    # qB 在线的正常路径每轮都刷新 qb_synced_at(≤QB_SYNC_INTERVAL 秒)，远在窗口内、此闸永不误伤，行为等价。
+    cutoff = datetime.now() - timedelta(seconds=max(120, config.QB_SYNC_INTERVAL * 3))
     with get_session() as s:
         for model_cls in (AnimeTorrent, MovieTorrent):
             if s.exec(select(model_cls.id).where(
                     *_inflight_where(model_cls),
+                    model_cls.qb_synced_at >= cutoff,
                     or_(model_cls.qb_dlspeed >= thr,
                         model_cls.qb_state.in_(list(_QB_TRANSIENT)))).limit(1)).first():
                 return True
@@ -306,7 +323,7 @@ def mark_done_by_hash(info_hash: str) -> bool:
             if t is None:
                 continue
             if t.status not in ("downloaded", "downloading"):
-                return False   # 是我们的，但已 skipped/deleted/error 等终态 → 不动
+                continue   # 这张表里是终态 → 跨表同 hash 可能另一表还在下，继续查下一张，别提前 return
             t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "downloaded", 1.0, "", datetime.now()
             s.add(t)
             s.commit()
@@ -398,15 +415,31 @@ async def sync_qb_status(model_cls) -> int:
 
 
 def qb_summary(model_cls) -> dict:
-    """某表已交付种子的 qB 实时态聚合：跟踪数 / 下载中 / 做种 / 下速 / 平均进度。"""
+    """某表已交付种子的 qB 实时态聚合：跟踪数 / 下载中 / 做种 / 下速 / 平均进度。
+
+    SQL 侧按 qb_state 分组聚合，只回十几种 state 的汇总行，不把整表已下种子整行拉进内存
+    （已下是常态终态、只增不减，随挂机可累积到几千上万条）。qb_state='' 即未被 qB 跟踪，排除。"""
     with get_session() as s:
-        rows = [(t.qb_state, t.qb_progress or 0, t.qb_dlspeed or 0) for t in s.exec(
-            select(model_cls).where(model_cls.status.in_(["downloaded", "downloading"]))) if t.qb_state]
-    dl = [r for r in rows if qb_is_downloading(r[0])]
+        grp = s.exec(
+            select(model_cls.qb_state, func.count(), func.sum(model_cls.qb_dlspeed),
+                   func.sum(model_cls.qb_progress))
+            .where(model_cls.status.in_(["downloaded", "downloading"]), model_cls.qb_state != "")
+            .group_by(model_cls.qb_state)).all()
+    tracked = downloading = seeding = dlspeed = 0
+    prog_sum = 0.0
+    for state, cnt, speed, psum in grp:
+        cnt = cnt or 0
+        tracked += cnt
+        prog_sum += float(psum or 0)
+        if qb_is_downloading(state):
+            downloading += cnt
+            dlspeed += int(speed or 0)
+        if qb_is_seeding(state):
+            seeding += cnt
     return {
-        "tracked": len(rows),
-        "downloading": len(dl),
-        "seeding": sum(1 for st, _, _ in rows if qb_is_seeding(st)),
-        "dlspeed": sum(sp for _, _, sp in dl),
-        "avg_progress": (sum(pr for _, pr, _ in rows) / len(rows)) if rows else 0.0,
+        "tracked": tracked,
+        "downloading": downloading,
+        "seeding": seeding,
+        "dlspeed": dlspeed,
+        "avg_progress": (prog_sum / tracked) if tracked else 0.0,
     }
