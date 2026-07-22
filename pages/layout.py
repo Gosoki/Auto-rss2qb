@@ -110,6 +110,15 @@ def season_label(a):
     return f"第{a.season}季" if (a.season or 1) > 1 else None
 
 
+def platform_badge(obj) -> None:
+    """bgm 判定为非 TV（剧场版/OVA/WEB…）时，给番剧行加个紫色徽标提示 bgm 眼里的实际类型。
+
+    冷门/怪格式常被当周更番收进番剧表，但 bgm 可能识别成剧场版/OVA——打个紫标好一眼看出、自行判断。"""
+    p = getattr(obj, "platform", None)
+    if p and p != "TV":
+        ui.badge(p).props("color=deep-purple").tooltip("bgm 判定的类型（非 TV）")
+
+
 def ep_str(e) -> str:
     if e == -1:
         return "特别"

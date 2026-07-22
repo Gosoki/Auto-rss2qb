@@ -1,9 +1,9 @@
-"""番剧详情：可作为独立页 /anime/{id}，也可用 render_anime_detail 渲染进悬浮框(dialog)。"""
+"""番剧详情组件：render_anime_detail 渲染进列表页的悬浮框(dialog)，不再有独立页路由。"""
 from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (STATUS_CN, WEEKDAY_CN, confirm, ep_str, frame, meta_card, name_of,
+from .layout import (STATUS_CN, WEEKDAY_CN, confirm, ep_str, meta_card, name_of,
                      qb_live_text, season_label, source_options)
 
 
@@ -63,21 +63,24 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
             ui.label("（还没有种子）").classes("text-gray-400")
             return
         for t in eps:
-            with ui.row().classes("items-center gap-2 w-full py-1 text-sm").style(
+            with ui.column().classes("w-full gap-0 py-1").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
-                ui.label(f"第{ep_str(t.episode)}集").classes("w-14")
-                ui.label(engine.torrent_time(t)).classes("w-28 text-gray-400")
-                ui.label(t.source).classes("grow break-all")
-                live = qb_live_text(t)
-                if live:  # qB 实时态（下载中 45% ↓2MB/s / 做种 100%）优先展示
-                    ui.badge(live).props("color=teal").tooltip("qB 实时状态")
-                else:
-                    ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
-                ui.button("下载", icon="download", on_click=_force(t.id)).props(
-                    "size=sm flat dense").tooltip("强制下这一条到文件夹（无视去重/优先级）")
-                if t.status in ("downloaded", "downloading"):  # 下过才给按集删
-                    ui.button(icon="delete_forever", on_click=_del_one(t.id)).props(
-                        "size=sm flat dense color=negative").tooltip("删除这一集的文件（qB+硬盘，不可撤销）")
+                with ui.row().classes("items-center gap-2 w-full text-sm"):
+                    ui.label(f"第{ep_str(t.episode)}集").classes("w-14 shrink-0")
+                    ui.label(engine.torrent_time(t)).classes("w-28 shrink-0 text-gray-400")
+                    ui.label(t.source).classes("grow break-all")
+                    live = qb_live_text(t)
+                    if live:  # qB 实时态（下载中 45% ↓2MB/s / 做种 100%）优先展示
+                        ui.badge(live).props("color=teal").tooltip("qB 实时状态")
+                    else:
+                        ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
+                    ui.button("下载", icon="download", on_click=_force(t.id)).props(
+                        "size=sm flat dense").tooltip("强制下这一条到文件夹（无视去重/优先级）")
+                    if t.status in ("downloaded", "downloading"):  # 下过才给按集删
+                        ui.button(icon="delete_forever", on_click=_del_one(t.id)).props(
+                            "size=sm flat dense color=negative").tooltip("删除这一集的文件（qB+硬盘，不可撤销）")
+                # 第二行：种子原名（灰、可换行）——集数/版本拿不出来时靠它辨认是哪一版
+                ui.label(t.raw_title or "—").classes("text-grey-6 break-all pl-14").style("font-size:11px")
 
     def _after():
         body.refresh()
@@ -142,10 +145,3 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
         return h
 
     body()
-
-
-@ui.page("/anime/{anime_id}")
-def detail_page(anime_id: int):
-    with frame():
-        ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to("/")).props("flat round dense")
-        render_anime_detail(anime_id)

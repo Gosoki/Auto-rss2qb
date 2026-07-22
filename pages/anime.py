@@ -10,8 +10,8 @@ from nicegui import ui
 from core import anime, engine
 import config
 from .layout import (STATUS_CN, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
-                     human_size, kpi_cards, name_of, paginate, parse_bgm_id, qb_disabled_banner,
-                     recent_table, season_label, source_options)
+                     human_size, kpi_cards, name_of, paginate, parse_bgm_id, platform_badge,
+                     qb_disabled_banner, recent_table, season_label, source_options)
 from .sources import render_sources
 
 
@@ -159,6 +159,7 @@ def anime_page(t: str = "manage"):
                                 sl = season_label(a)
                                 if sl:
                                     ui.badge(sl).props("color=blue-grey")
+                                platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
                                 ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
                             with ui.row().classes("items-center gap-2 flex-wrap"):
                                 sel = ui.select(source_options(srcs, "从哪下：按优先级"),
@@ -412,6 +413,7 @@ def anime_page(t: str = "manage"):
                 sl = season_label(a)
                 if sl:
                     ui.badge(sl).props("color=blue-grey")
+                platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
                 if sources:
                     ui.badge(f"多源 {len(sources)}").props("color=green").tooltip("来源: " + " · ".join(sources))
 

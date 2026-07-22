@@ -121,8 +121,7 @@ def http_client_kwargs(timeout: int = 30) -> dict:
 def load_from_db() -> None:
     """启动时（init_db 之后）加载配置，并把 settings 表缺的键补齐写入。
 
-    新库 = 写入全部默认值；老库/以后新加的设置项也会补上缺的键。
-    补齐时若 .env 里还留着该键的旧值，就采用它（一次性迁移旧配置，之后 .env 不再参与）。
+    新库 = 写入全部默认值；以后往 _SPEC 新加的设置项，下次启动也会补上缺的键。
     """
     from sqlmodel import select
 
@@ -133,11 +132,8 @@ def load_from_db() -> None:
         fresh = not have  # settings 表原本为空 = 全新库首启
         for k, (kind, default) in _SPEC.items():
             if k not in have:
-                env = os.getenv(k)
-                if env not in (None, ""):
-                    have[k] = env                       # 一次性迁移旧 .env 值
-                elif fresh and k in _FRESH_OFF:
-                    have[k] = "false"                   # 全新库首启：配置好前先别采集
+                if fresh and k in _FRESH_OFF:
+                    have[k] = "false"          # 全新库首启：配置好前先别自动采集
                 else:
                     have[k] = _to_raw(kind, default)
                 s.add(Setting(key=k, value=have[k]))
