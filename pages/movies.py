@@ -17,8 +17,9 @@ from .layout import (WEEKDAY_CN, confirm, expand_collapse_bar, frame, group_by_q
 _TABS = ("overview", "list", "fail", "reject", "sources")
 
 
-def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
-    """把某剧场版详情渲染进当前容器：元信息 + 版本列表（逐条下/删）+ 识别/忽略。"""
+def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> None:
+    """把某剧场版详情渲染进当前容器：元信息 + 版本列表（逐条下/删）+ 识别/忽略。
+    on_close：非空则在标题行右侧渲染 X 关闭键（关掉外层 dialog）。"""
     if mov.get_movie(movie_id) is None:
         ui.label("剧场版不存在").classes("text-gray-400 p-4")
         return
@@ -31,13 +32,18 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
             return
         ts = mov.movie_torrents(movie_id)
         sources = sorted({t.source for t in ts})
-        with ui.row().classes("items-center gap-2 flex-wrap"):
-            ui.label(name_of(cur)).classes("text-2xl font-bold")
-            ui.badge(cur.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定
-            if cur.rejected:
-                ui.badge("已忽略").props("color=grey")
-            elif not cur.bangumi_id:
-                ui.badge("未识别").props("color=red")
+        # 标题行：标题+标签塞进左侧可换行容器；外层 no-wrap + X shrink-0 → X 永远钉右上角，窄屏先挤标签换行
+        with ui.row().classes("items-start gap-2 w-full no-wrap"):
+            with ui.row().classes("items-center gap-2 flex-wrap grow min-w-0"):
+                ui.label(name_of(cur)).classes("text-2xl font-bold")
+                ui.badge(cur.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定
+                if cur.rejected:
+                    ui.badge("已忽略").props("color=grey")
+                elif not cur.bangumi_id:
+                    ui.badge("未识别").props("color=red")
+            if on_close:
+                ui.button(icon="close", on_click=on_close).props("flat round dense").classes(
+                    "shrink-0")
 
         wd = f"  {WEEKDAY_CN[cur.air_weekday]}" if cur.air_weekday is not None else ""
         meta_card(cur.cover_url, [
@@ -154,9 +160,7 @@ def movies_page(t: str = "list"):
         def open_detail(movie_id):
             detail_dlg.clear()
             with detail_dlg, ui.card().classes("w-full").style("max-width:860px"):
-                with ui.row().classes("w-full justify-end"):
-                    ui.button(icon="close", on_click=detail_dlg.close).props("flat round dense")
-                render_movie_detail(movie_id, refresh_outer=refresh_all)
+                render_movie_detail(movie_id, refresh_outer=refresh_all, on_close=detail_dlg.close)
             detail_dlg.open()
 
         # ---- 事件 ----
