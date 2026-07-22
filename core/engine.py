@@ -12,7 +12,7 @@ import socket
 from datetime import datetime
 
 import httpx
-from sqlmodel import func, select
+from sqlmodel import func, or_, select
 
 import config
 from db import get_session
@@ -245,9 +245,9 @@ _QB_SEEDING = {"uploading", "forcedUP", "stalledUP", "queuedUP", "checkingUP",
 # 『落定』态：不再需要轮询跟踪的种子 qB 态——做种(=下载已完成) + 文件缺失(终态、不会再变)。
 # in-flight 判定与 sync 查询都据此把它们排除，使『停止监听』对做种/缺文件都生效。
 _QB_SETTLED = _QB_SEEDING | {"missingFiles"}
-# 『正在真下』态（下载态里排掉 stalled 无源/queued 排队这类短期不会变的）——用来决定要不要维持高频轮询：
-# 有它才维持快循环；只剩 stalled/排队/卡住的就退回休眠、交给保底自查，别让卡死种子把循环钉住空转。
-_QB_ACTIVE = {"downloading", "forcedDL", "metaDL", "forcedMetaDL", "checkingDL", "allocating"}
+# 短暂『工作中』态（在动但速度可能为 0：取元数据/校验/分配磁盘）——这些也算『在真下』，
+# 免得刚开始那几秒被速度地板误判成慢。真正的下载态(downloading/forcedDL)则改用速度地板判快慢。
+_QB_TRANSIENT = {"metaDL", "forcedMetaDL", "checkingDL", "allocating"}
 
 
 def qb_is_downloading(state: str) -> bool:
@@ -279,13 +279,17 @@ def has_inflight() -> bool:
 
 
 def has_active_downloading() -> bool:
-    """在下的种子里有没有『正在真下』(qB 态属 _QB_ACTIVE)的——决定要不要维持高频轮询。
-    只剩 stalled(无源)/排队/卡住的就返回 False，让快循环退回休眠、交给保底自查，别空转钉住循环。"""
+    """在下的种子里有没有『正在真下』的——决定要不要维持高频轮询。
+    判据：下载速度 ≥ 慢速地板(QB_ACTIVE_FLOOR_KBPS)，或处于短暂工作态(取元数据/校验/分配)。
+    stalled(无源,0速)/排队/慢速爬行 都不算 → 只剩这些时快循环退回休眠、交给保底，别空转钉住循环。
+    （注意：只要还有一个『在真下』，sync 每轮批量更新会顺便把慢的/stalled 的也一起刷新，不会漏。）"""
+    thr = max(1, config.QB_ACTIVE_FLOOR_KBPS * 1024)   # KB/s→B/s；地板设 0 时=至少要有速度(≥1B/s)才算在真下
     with get_session() as s:
         for model_cls in (AnimeTorrent, MovieTorrent):
             if s.exec(select(model_cls.id).where(
                     *_inflight_where(model_cls),
-                    model_cls.qb_state.in_(list(_QB_ACTIVE))).limit(1)).first():
+                    or_(model_cls.qb_dlspeed >= thr,
+                        model_cls.qb_state.in_(list(_QB_TRANSIENT)))).limit(1)).first():
                 return True
     return False
 

@@ -11,7 +11,8 @@ from sources.parse import format_quarter
 from .layout import frame
 
 _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
-            "QB_SYNC_BACKSTOP_MIN", "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS"}
+            "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
+            "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS"}
 _PASSWORD = {"QB_PASSWORD"}
 _RESTART_ONLY = {"WEB_PORT"}  # 绑端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
@@ -97,9 +98,13 @@ def settings():
                  config.QB_SYNC_INTERVAL)
             _num("QB_SYNC_BACKSTOP_MIN", "qB 保底自查间隔（分钟）——没被唤醒也每隔这么久兜底扫一次",
                  config.QB_SYNC_BACKSTOP_MIN)
+            with ui.row().classes("items-center gap-4 flex-wrap"):
+                _num("QB_ACTIVE_FLOOR_KBPS", "慢速地板（KB/s，慢于此算没在真下）", config.QB_ACTIVE_FLOOR_KBPS)
+                _num("QB_SLOW_ROUNDS", "判慢轮次（连续几轮都没真下才休眠）", config.QB_SLOW_ROUNDS)
             ui.label("开状态跟踪：事件驱动——种子交给 qB 时立刻开始跟、按活跃间隔拉进度，全下完就休眠、不再打扰 qB；"
-                     "下完/做种/文件缺失/卡住无源的种子都不再高频轮询，只由保底间隔偶尔兜底（默认 180=3 小时）。"
-                     "关状态跟踪：发送过去即当『已下』，一次 qB 都不查（零轮询、也看不到进度）。").classes(
+                     "下完/做种/文件缺失/卡住无源/慢过地板 的种子都不再高频轮询，只由保底间隔偶尔兜底（默认 180=3 小时）。"
+                     "慢速地板 20KB/s + 连续 3 轮判慢：某种子长期龟速也能让循环休眠；但只要还有别的种子在真下，"
+                     "每轮批量刷新会顺便把慢的一起更新。关状态跟踪：发送过去即当『已下』，一次 qB 都不查（零轮询、看不到进度）。").classes(
                 "text-xs text-gray-500")
             _text("QB_URL", "qB 地址", config.QB_URL)
             _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)

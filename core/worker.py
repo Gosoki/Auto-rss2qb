@@ -104,12 +104,17 @@ async def run_qb_sync() -> None:
         except asyncio.TimeoutError:
             pass                       # 保底到点：没人 kick 也醒来自查一遍
         engine.qb_kick.clear()
+        idle = 0                            # 连续几轮没在真下（局部计数，本次唤醒周期内累加、下次唤醒清零，无需入库）
         while config.QB_ENABLED and config.QB_SYNC_STATUS and engine.has_inflight():
             try:
-                await anime.sync_qb_status()
+                await anime.sync_qb_status()   # 每轮批量刷新所有在下的：有活种子时慢的/stalled 的也顺便一起更新
                 await movies.sync_qb_status()
             except Exception as e:
                 log.error("qB 状态同步异常: %s", e)
-            if not engine.has_active_downloading():
-                break   # 有在下的、但没一个在真下(全 stalled 无源/排队/卡住) → 退出高频轮询，回等 kick/保底，别空转钉住循环
+            if engine.has_active_downloading():
+                idle = 0
+            else:
+                idle += 1
+                if idle >= max(1, config.QB_SLOW_ROUNDS):
+                    break   # 连续 N 轮没一个在真下(全 stalled/排队/慢速爬行) → 退出高频轮询，回等 kick/保底、休眠
             await asyncio.sleep(max(5, config.QB_SYNC_INTERVAL))
