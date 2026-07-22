@@ -51,13 +51,20 @@ def group_by_quarter(items):
 
 
 def kpi_cards(cards) -> None:
-    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或''), ...]；值非零且给了色才染色。"""
+    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') 或 (标签, 数值, 高亮色, on_click), ...]；
+    给了 on_click 的卡可点（手型光标+悬浮高亮）。值非零且给了色才染色。"""
     with ui.row().classes("gap-3 flex-wrap p-1"):
-        for label, val, hi in cards:
-            with ui.card().classes("items-center px-5 py-2"):
+        for card in cards:
+            label, val, hi = card[:3]
+            on_click = card[3] if len(card) > 3 else None
+            c = ui.card().classes("items-center px-5 py-2" + (
+                " cursor-pointer hover:bg-white/5" if on_click else ""))
+            with c:
                 cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
                 ui.label(str(val)).classes(cls)
                 ui.label(label).classes("text-xs text-gray-400")
+            if on_click:
+                c.on("click", on_click)
 
 
 def qb_disabled_banner(text: str) -> None:

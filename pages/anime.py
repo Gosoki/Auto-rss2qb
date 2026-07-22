@@ -9,7 +9,7 @@ from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (STATUS_CN, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
+from .layout import (confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, qb_disabled_banner, recent_table, season_label,
                      source_options)
@@ -21,11 +21,6 @@ def _state_rank(a):
     if a.rejected:
         return 2
     return 1 if not a.confirmed else 0
-
-
-# 概览用：种子状态键 → quasar 颜色（中文文案单点取自 layout.STATUS_CN，别在此重复维护）
-_STATUS_CHIP = [("downloaded", "green"), ("downloading", "blue"),
-                ("pending", "grey"), ("error", "red"), ("skipped", "blue-grey")]
 
 
 def _barline(label, value, maxv, extra="", color="#3b82f6", lw="w-32", text=None):
@@ -59,12 +54,15 @@ def anime_page(t: str = "manage"):
         def overview_panel():
             ov = anime.overview()
             k = ov["kpi"]
+            ps = ov["pending_split"]
 
-            # ── KPI 卡片 ──
+            # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
             kpi_cards([("订阅中", k["tracking"], ""), ("待识别", k["fail"], "red"),
                        ("待确认", k["confirm"], "orange"), ("已忽略", k["rejected"], ""),
-                       ("已下集", k["done"], "green"), ("待下", k["pending"], "orange"),
-                       ("多源", k["multi"], ""), ("种子", k["torrents"], "")])
+                       ("已下集", k["done"], "green"), ("将下载", k["will"], "blue"),
+                       ("未知集", ps["unknown"], "purple", _open_unknown),
+                       ("失败", ov["status"]["error"], "red", _open_failed),
+                       ("种子", k["torrents"], "")])
 
             # ── qB 未启用提醒 ──
             if not ov["config"]["qb"]:
@@ -103,10 +101,19 @@ def anime_page(t: str = "manage"):
                 ui.label("种子状态").classes("text-sm font-bold")
                 ui.button("补下全部", icon="download", on_click=_download_all).props(
                     "outline color=primary size=sm").tooltip("订阅中所有待下集立即下")
+            # 待下拆 将下载/备用/待确认（库态『下载中』恒≈0、与 qB 实时态重复不单列；未知集/失败上移到 KPI 可点卡）
+            chips = [
+                ("已下", ov["status"]["downloaded"], "green", None),
+                ("将下载", ps["will"], "blue", "已确认番·本集首选（含特别篇），会自动下"),
+                ("备用", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
+                ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
+                ("跳过", ov["status"]["skipped"], "blue-grey", None),
+            ]
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
-                for key, color in _STATUS_CHIP:
-                    ui.badge(f"{STATUS_CN.get(key, key)} {ov['status'][key]}").props(
-                        f"color={color}").classes("text-sm")
+                for label, val, color, tip in chips:
+                    b = ui.badge(f"{label} {val}").props(f"color={color}").classes("text-sm")
+                    if tip:
+                        b.tooltip(tip)
             # qB 实时态（接上 qB 后每 QB_SYNC_INTERVAL 秒刷新）
             if ov["config"]["qb"]:
                 q = ov["qb"]
@@ -370,6 +377,39 @@ def anime_page(t: str = "manage"):
             with detail_dlg, ui.card().classes("w-full").style("max-width:860px"):
                 render_anime_detail(anime_id, refresh_outer=refresh_all, on_close=detail_dlg.close)
             detail_dlg.open()
+
+        # KPI 卡点开：列出对应种子（未知集/失败），点番名进详情页处理。详情弹窗叠在本弹窗之上、
+        # 不关掉它——关了详情仍回到这层列表，一层一层来。
+        list_dlg = ui.dialog()
+
+        def _open_torrent_list(title, desc, fetch):
+            list_dlg.clear()
+            rows = fetch()
+            with list_dlg, ui.card().classes("w-full").style("max-width:720px"):
+                ui.label(f"{title} · {len(rows)}").classes("text-base font-bold")
+                if desc:
+                    ui.label(desc).classes("text-xs text-gray-400")
+                if not rows:
+                    ui.label("（空）").classes("text-gray-500 p-2")
+                for r in rows:
+                    with ui.column().classes("gap-0 w-full py-1").style(
+                            "border-bottom:1px solid rgba(255,255,255,.08)"):
+                        ui.label(r["name"]).classes(
+                            "text-sm text-blue-400 cursor-pointer hover:underline").on(
+                            "click", lambda aid=r["anime_id"]: open_detail(aid))  # 不关本弹窗，详情叠上面
+                        ui.label(r["raw"] or "—").classes("text-xs text-gray-500 break-all")
+                ui.button("关闭", on_click=list_dlg.close).props("flat")
+            list_dlg.open()
+
+        def _open_unknown():
+            _open_torrent_list(
+                "未知集", "批量打包 / 集号没解析出来的种子，后台不自动下。点番名进详情页处理（下载/忽略）。",
+                anime.unknown_episode_rows)
+
+        def _open_failed():
+            _open_torrent_list(
+                "失败", "下载失败过的种子（取种/发送失败）。点番名进详情页补下重试 / 忽略。",
+                anime.failed_rows)
 
         # ---- 事件处理（闭包，直接引用上面的刷新函数）----
         def _confirm(anime_id, sel=None):

@@ -380,17 +380,18 @@ def overview() -> dict:
     by_source = sorted((((src or "?"), cnt, src_done.get(src, 0)) for src, cnt in src_total.items()),
                        key=lambda x: -x[1])
 
+    split = pending_breakdown()   # 待下拆 将下载/备用/待确认/未知，算一次给 KPI 与状态区共用
     return {
         "kpi": {
             "tracking": len(confirmed), "fail": sum(1 for a in animes if not a.bangumi_id),
             "confirm": len(pending_c), "rejected": rejected,
             "done": status.get("downloaded", 0),
-            "pending": status.get("pending", 0) + status.get("error", 0),
-            "multi": len(multi_source_map()),
+            "will": split["will"],   # 顶部只汇总『真会自动下的』，别再用糊在一起的 pending 总数误导
             "torrents": total_torrents,
         },
         "status": {k: status.get(k, 0) for k in
                    ("downloaded", "downloading", "pending", "error", "skipped")},
+        "pending_split": split,
         "by_quarter": by_quarter,
         "by_source": by_source,
         "enriched": (sum(1 for a in animes if a.bangumi_id), len(animes)),
@@ -827,6 +828,61 @@ def download_plan_for_ids(anime_ids) -> set[int]:
             pending = [t for t in pending if lock in (t.source or "")]
         plan |= {t.id for t in _select_downloads(pending, lock, have_by_anime.get(aid))}
     return plan
+
+
+def pending_breakdown() -> dict:
+    """把『待下』(pending)拆成 将下载/备用/待确认/未知，供仪表盘种子状态区看清那一大坨到底是什么。
+    · 将下载 = 已确认番·本集首选（download_plan 会挑中，会自动下；含特别篇 -1 的首选）
+    · 备用   = 已确认番·同集已有更优版本（不会自动下）；含已拒绝番/孤儿的残留
+    · 待确认 = 番还没确认（要点确认才下）
+    · 未知   = 批量/未知集(-2)——flush 后台不自动下（即便被 _select_downloads 挑中），需人工在详情页下
+    四者之和 = 待下总数。复用批量 download_plan_for_ids，仅几条查询、只在仪表盘打开时算。"""
+    with get_session() as s:
+        conf = {aid: c for aid, c in s.exec(
+            select(Anime.id, Anime.confirmed).where(Anime.rejected.is_not(True)))}
+        pend = list(s.exec(select(AnimeTorrent.id, AnimeTorrent.anime_id, AnimeTorrent.episode)
+                           .where(AnimeTorrent.status == "pending")))
+    plan = download_plan_for_ids({aid for aid, c in conf.items() if c})
+    will = backup = unconfirmed = unknown = 0
+    for tid, aid, ep in pend:
+        c = conf.get(aid)
+        if c is None:            # 番已拒绝/孤儿 → 不会自动下
+            backup += 1
+        elif not c:              # 番未确认
+            unconfirmed += 1
+        elif ep == -2:           # 批量/未知集：flush 不自动下（即便 plan 挑中），单列，别混进将下载
+            unknown += 1
+        elif tid in plan:        # 已确认·本集首选（含 -1 特别篇的首选）
+            will += 1
+        else:                    # 已确认·非首选（同集有更优）
+            backup += 1
+    return {"will": will, "backup": backup, "unconfirmed": unconfirmed, "unknown": unknown}
+
+
+def _torrent_rows(*where) -> list[dict]:
+    """按条件取 TV 种子并解析番名，供 KPI 卡点开的列表弹窗（未知集/失败等）复用。"""
+    with get_session() as s:
+        ts = list(s.exec(select(AnimeTorrent).where(*where)
+                         .order_by(AnimeTorrent.created_at.desc())))
+        ids = {t.anime_id for t in ts if t.anime_id}
+        names = ({a.id: (a.display_name or a.title) for a in
+                  s.exec(select(Anime).where(Anime.id.in_(ids)))} if ids else {})
+    return [{
+        "id": t.id,
+        "anime_id": t.anime_id,
+        "name": names.get(t.anime_id) or (t.anime_title or "?"),
+        "raw": t.raw_title or "",
+    } for t in ts]
+
+
+def unknown_episode_rows() -> list[dict]:
+    """待下里 episode==-2（批量/无法解析集号，flush 不自动下）的种子，供 KPI『未知集』点开手动处理。"""
+    return _torrent_rows(AnimeTorrent.status == "pending", AnimeTorrent.episode == -2)
+
+
+def failed_rows() -> list[dict]:
+    """status==error（下载失败过）的种子，供 KPI『失败』点开查看 / 进详情补下重试。"""
+    return _torrent_rows(AnimeTorrent.status == "error")
 
 
 async def download_all_pending() -> int:
