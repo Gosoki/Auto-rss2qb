@@ -10,9 +10,9 @@ from nicegui import ui
 import config
 from core import engine, movies as mov
 from sources.parse import SEASON_CN
-from .layout import (STATUS_CN, WEEKDAY_CN, confirm, expand_collapse_bar, frame, group_by_quarter,
+from .layout import (WEEKDAY_CN, confirm, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, meta_card, name_of, paginate, parse_bgm_id,
-                     qb_disabled_banner, qb_live_text, recent_table)
+                     qb_disabled_banner, qb_live_text, recent_table, torrent_status_cn)
 
 _TABS = ("overview", "list", "fail", "reject", "sources")
 
@@ -74,8 +74,9 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
                     _done = (t.qb_progress or 0) >= 1
                     ui.badge(live).props(f"color={'green' if _done else 'teal'}").tooltip(
                         "qB 实时状态")
-                else:
-                    ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
+                else:  # 无 qB 实时态：刚交付未同步→下载中；其余按状态
+                    ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
+                        "color=blue-grey")
                 ui.button("下载", icon="download", on_click=_force(t.id)).props(
                     "size=sm flat dense").tooltip("强制下这一版本到文件夹")
                 if t.status in ("downloaded", "downloading"):
@@ -290,7 +291,7 @@ def movies_page(t: str = "list"):
                 "name": r["name"],
                 "src": r["source"],
                 "raw": r["raw"] or "—",
-                "status": STATUS_CN.get(r["status"], r["status"]),
+                "status": torrent_status_cn(r["status"], r["qb_progress"], r["qb_synced_at"]),
             } for r in mov.recent_movie_rows(50)]
             recent_table(rows, "剧场版")
 

@@ -8,7 +8,7 @@ import logging
 
 from core import anime
 import config
-from core import movies
+from core import engine, movies
 from core.anime import flush_ready_downloads, list_source_groups, process_item
 from sources.mikan import MikanSource
 from sources.nyaa import NyaaSource, nyaa_feed_url
@@ -87,13 +87,27 @@ async def run_movie_scan() -> None:
 
 
 async def run_qb_sync() -> None:
-    """独立协程：定期从 qB 拉取种子实时态（TV + 剧场版两张表）。比采集频率高，接近实时。"""
-    log.info("qB 状态同步启动，每 %d 秒一次（QB_ENABLED 关时空转）", config.QB_SYNC_INTERVAL)
+    """qB 状态同步：事件驱动 + 保底自查。
+
+    平时停在 qb_kick 上休眠（0 开销）；有种子交付给 qB 时被 kick 立即醒来，按活跃间隔轮询这批『在下的』，
+    全下完就回去休眠。另设保底超时（QB_SYNC_BACKSTOP_MIN 分钟）——即便漏了 kick / 重启 / qB 开关切换，也每隔
+    这么久醒来自查一次、兜住漏网的在下种子。快路径管跟手、慢路径管最终一致，且种子在 qB 里照下不受影响。
+    """
+    log.info("qB 状态同步启动（事件驱动，活跃间隔 %ds，保底 %d 分钟）",
+             config.QB_SYNC_INTERVAL, config.QB_SYNC_BACKSTOP_MIN)
+    if engine.has_inflight():
+        engine.qb_kick.set()          # 启动即自查：接上重启前遗留的『在下的』种子
     while True:
         try:
-            if config.QB_ENABLED:
+            await asyncio.wait_for(engine.qb_kick.wait(),
+                                   timeout=max(60, config.QB_SYNC_BACKSTOP_MIN * 60))
+        except asyncio.TimeoutError:
+            pass                       # 保底到点：没人 kick 也醒来自查一遍
+        engine.qb_kick.clear()
+        while config.QB_ENABLED and engine.has_inflight():
+            try:
                 await anime.sync_qb_status()
                 await movies.sync_qb_status()
-        except Exception as e:
-            log.error("qB 状态同步异常: %s", e)
-        await asyncio.sleep(max(5, config.QB_SYNC_INTERVAL))
+            except Exception as e:
+                log.error("qB 状态同步异常: %s", e)
+            await asyncio.sleep(max(5, config.QB_SYNC_INTERVAL))

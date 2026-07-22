@@ -204,6 +204,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             # 锁内 DB 段全程无 await（对事件循环原子），故并发时后到者必能看到先到者已置 downloading。
             if engine.hash_owned_elsewhere(t.info_hash, MovieTorrent):
                 t.status = "downloaded"
+                t.qb_progress = 1.0   # 落定：物理种子实态由剧场版那份跟踪，本重复指针不必再进 in-flight 轮询
                 s.add(t)
                 s.commit()
                 log.info("跳过跨表重复种子（剧场版已持有）- %s", title)
@@ -255,6 +256,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
 
     _set_status(torrent_id, "downloaded" if ok else "error")
     if ok:
+        engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
         log.info("已加入qB - %s 第%s季 第%s集", title, season, episode)
         await notify(f"{title}[{episode}] 📥")
     return ok
@@ -458,6 +460,8 @@ def recent_anime_rows(limit: int = 50) -> list[dict]:
         "episode": t.episode,
         "source": t.source,
         "status": t.status,
+        "qb_progress": t.qb_progress,
+        "qb_synced_at": t.qb_synced_at,
         "raw": t.raw_title or "",
     } for t in ts]
 

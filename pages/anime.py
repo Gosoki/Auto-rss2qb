@@ -11,7 +11,8 @@ from core import anime, engine
 import config
 from .layout import (STATUS_CN, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, name_of, paginate, parse_bgm_id, platform_badge,
-                     qb_disabled_banner, recent_table, season_label, source_options)
+                     qb_disabled_banner, recent_table, season_label, source_options,
+                     torrent_status_cn)
 from .sources import render_sources
 
 
@@ -238,7 +239,7 @@ def anime_page(t: str = "manage"):
                 "name": f'{r["name"]}  第{ep_str(r["episode"])}集',
                 "src": r["source"],
                 "raw": r["raw"] or "—",
-                "status": STATUS_CN.get(r["status"], r["status"]),
+                "status": torrent_status_cn(r["status"], r["qb_progress"], r["qb_synced_at"]),
             } for r in anime.recent_anime_rows(50)]
             recent_table(rows, "番剧")
 

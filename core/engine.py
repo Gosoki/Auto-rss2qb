@@ -12,16 +12,20 @@ import socket
 from datetime import datetime
 
 import httpx
-from sqlmodel import select
+from sqlmodel import func, select
 
 import config
 from db import get_session
+from db.models import AnimeTorrent, MovieTorrent, Setting
 from services.qbittorrent import QBittorrent
 from sources.parse import format_quarter
 
 log = logging.getLogger("autorss")
 
 qb = QBittorrent()
+
+# 有种子交付给 qB 时 set()，唤醒 qB 同步循环立即开始跟；平时循环停在这上面休眠（见 worker.run_qb_sync）
+qb_kick = asyncio.Event()
 
 _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _QUARTER_KEY_RE = re.compile(r"(\d{2})([A-D])")
@@ -238,6 +242,9 @@ _QB_DOWNLOADING = {"downloading", "forcedDL", "metaDL", "forcedMetaDL", "stalled
                    "queuedDL", "checkingDL", "allocating"}
 _QB_SEEDING = {"uploading", "forcedUP", "stalledUP", "queuedUP", "checkingUP",
                "pausedUP", "stoppedUP"}  # 含已完成（暂停做种）
+# 『落定』态：不再需要轮询跟踪的种子 qB 态——做种(=下载已完成) + 文件缺失(终态、不会再变)。
+# in-flight 判定与 sync 查询都据此把它们排除，使『停止监听』对做种/缺文件都生效。
+_QB_SETTLED = _QB_SEEDING | {"missingFiles"}
 
 
 def qb_is_downloading(state: str) -> bool:
@@ -248,44 +255,100 @@ def qb_is_seeding(state: str) -> bool:
     return state in _QB_SEEDING
 
 
-async def sync_qb_status(model_cls) -> int:
-    """从 qB 拉取已交付种子的实时态写回某表（AnimeTorrent 或 MovieTorrent，qb_* 字段同名）。返回更新数。
+def _inflight_where(model_cls):
+    """『在下的种子』筛选条件（sync 查询与 has_inflight 共用，口径一致）：
+    已交付(downloaded/downloading) 且 进度<100% 且 qB 态未落定(非做种/非文件缺失)。
+    进度满/做种(已完成)/文件缺失 都算落定 → 不再轮询，qB 压力只随『当前在下数』走。"""
+    return (
+        model_cls.status.in_(["downloaded", "downloading"]),
+        model_cls.qb_progress < 1.0,
+        func.coalesce(model_cls.qb_state, "").not_in(list(_QB_SETTLED)),
+    )
 
-    只查 downloaded/downloading（已交给 qB 的）；qB 里没有的清实时态；进度到 1 的把 downloading 收敛为
-    downloaded；同步期间被删/忽略（→非跟踪态）的跳过，免得已删种子在面板复活。连不上 qB 安静返回 0。
+
+def has_inflight() -> bool:
+    """还有没有『在下的』种子（TV 或剧场版任一）——供 worker 决定要不要继续轮询、还是休眠。"""
+    with get_session() as s:
+        for model_cls in (AnimeTorrent, MovieTorrent):
+            if s.exec(select(model_cls.id).where(*_inflight_where(model_cls)).limit(1)).first():
+                return True
+    return False
+
+
+def backfill_legacy_downloaded_once() -> None:
+    """一次性迁移：本功能上线前 status='downloaded' 语义=已交付（历史行都早已下完），但 qb_progress 可能为 0/未满。
+    新模型以 qb_progress>=1 判『已完成、停止监听』，故上线时把现存 downloaded 行的 qb_progress 补成 1.0，免得它们
+    被误判成『在下』而永久滞留 in-flight、每活跃间隔空打一次 qB。用 Setting 标记，只跑一次（后续新交付照常跟踪）。"""
+    flag = "_QB_PROGRESS_BACKFILLED"
+    n = 0
+    with get_session() as s:
+        if s.get(Setting, flag) is not None:
+            return
+        for model_cls in (AnimeTorrent, MovieTorrent):
+            for t in s.exec(select(model_cls).where(
+                    model_cls.status == "downloaded", model_cls.qb_progress < 1.0)):
+                t.qb_progress = 1.0
+                s.add(t)
+                n += 1
+        s.add(Setting(key=flag, value="1"))
+        s.commit()
+    if n:
+        log.info("一次性迁移：%d 条历史 downloaded 种子标记为已完成（qb_progress=1，脱离 in-flight）", n)
+
+
+async def sync_qb_status(model_cls) -> int:
+    """从 qB 拉『在下的』种子实时态写回某表（AnimeTorrent/MovieTorrent，qb_* 字段同名）。返回更新数。
+
+    一次 hashes= 拿全状态，客户端按 qB 态分桶：
+    · 下载态          → 镜像进度/速度（显示『下载中』）；
+    · 进度满/做种态    → 镜像后本轮起落定，下轮不再拉（『停止监听』）；
+    · error           → 回传 status=error（该集脱离已下，可被别的源补/手动重下）；
+    · missingFiles    → 不回传 status，只镜像『文件缺失』，下轮因落定被排除；
+    · qB 已无此种子    → 保证有限轮内落定(见下)，绝不让它永久滞留 in-flight、把循环钉住不休眠。
+    只拉『在下的』(见 _inflight_where)，全下完时查询为空、直接返回，不打 qB。连不上(None)安静返回 0；
+    qB 在线但这批一个都不在(空{})则逐行走 d is None 落定，保证被删/移除的种子有限轮内脱离 in-flight。
     """
     if not config.QB_ENABLED:
         return 0
     with get_session() as s:
-        rows = [(t.id, t.info_hash) for t in s.exec(select(model_cls).where(
-            model_cls.status.in_(["downloaded", "downloading"]))) if t.info_hash]
+        rows = [(t.id, t.info_hash, t.qb_synced_at is not None, t.qb_progress or 0.0)
+                for t in s.exec(select(model_cls).where(*_inflight_where(model_cls)))
+                if t.info_hash]
     if not rows:
         return 0
-    info = await qb.torrents_info([h for _, h in rows])
+    info = await qb.torrents_info([h for _, h, _, _ in rows])
     if info is None:
-        return 0
+        return 0   # 只在『连不上/出错』(None) 本轮不动。空 dict {} 是『qB 在线但这批一个都不在』——
+                   # 须落到下面逐行走 d is None 落定(全被删/移除时)，否则它们永久 in-flight、循环永不休眠。
     now = datetime.now()
     updated = 0
     with get_session() as s:
-        for tid, h in rows:
+        for tid, h, was_synced, last_prog in rows:
             t = s.get(model_cls, tid)
             if t is None or t.status not in ("downloaded", "downloading"):
                 continue
             d = info.get(h)
             if d is None:
-                if t.qb_state:
-                    t.qb_state = ""
+                # qB 查不到这个在下的种子——必须在有限轮内落定，否则它恒满足 in-flight、循环永不休眠：
+                if last_prog >= 0.999:      # 曾接近满 → 下完被 qB 自动删/移除，落定为已下
+                    t.qb_progress, t.qb_state, t.qb_synced_at = 1.0, "", now
+                elif was_synced:            # 曾在下又没下完就消失(qB 端删了半成品/丢了) → 落定 error，可补/重下
+                    t.status, t.qb_state, t.qb_synced_at = "error", "", now
+                else:                       # 从未被 qB 确认(刚交付未登记?) → 给一轮宽限，下轮仍无则上面→error
                     t.qb_synced_at = now
-                    s.add(t)
-                    updated += 1
+                s.add(t)
+                updated += 1
                 continue
-            t.qb_state = d.get("state", "") or ""
+            state = d.get("state", "") or ""
+            t.qb_state = state
             t.qb_progress = float(d.get("progress", 0) or 0)
             t.qb_dlspeed = int(d.get("dlspeed", 0) or 0)
             t.qb_size = int(d.get("size", 0) or 0)
             t.qb_synced_at = now
-            if t.status == "downloading" and t.qb_progress >= 1.0:
-                t.status = "downloaded"
+            if state == "error":
+                t.status = "error"          # qB 侧真错误 → 回传；missingFiles 有意不回传（只镜像显示）
+            elif t.status == "downloading" and t.qb_progress >= 1.0:
+                t.status = "downloaded"     # 兼容旧的 downloading 占位（正常已在交付时置 downloaded）
             s.add(t)
             updated += 1
         s.commit()

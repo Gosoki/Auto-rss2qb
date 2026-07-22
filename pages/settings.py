@@ -5,13 +5,13 @@
 """
 from nicegui import ui
 
-from core import anime
+from core import anime, engine
 import config
 from sources.parse import format_quarter
 from .layout import frame
 
 _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
-            "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS"}
+            "QB_SYNC_BACKSTOP_MIN", "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS"}
 _PASSWORD = {"QB_PASSWORD"}
 _RESTART_ONLY = {"WEB_PORT"}  # 绑端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
@@ -91,7 +91,13 @@ def settings():
         with ui.card().classes("w-full"):
             ui.label("下载 / qBittorrent").classes("font-bold")
             _switch("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
-            _num("QB_SYNC_INTERVAL", "qB 状态同步间隔（秒，回拉下载进度/做种态）", config.QB_SYNC_INTERVAL)
+            _num("QB_SYNC_INTERVAL", "qB 活跃轮询间隔（秒）——仅在有种子正在下时按此频率拉进度",
+                 config.QB_SYNC_INTERVAL)
+            _num("QB_SYNC_BACKSTOP_MIN", "qB 保底自查间隔（分钟）——没被唤醒也每隔这么久兜底扫一次",
+                 config.QB_SYNC_BACKSTOP_MIN)
+            ui.label("同步是事件驱动：种子交给 qB 时立刻开始跟、按上面的活跃间隔拉进度，全下完就休眠、"
+                     "不再打扰 qB。下完/做种/文件缺失的种子不再轮询；保底间隔是兜底自查（默认 180=3 小时）。").classes(
+                "text-xs text-gray-500")
             _text("QB_URL", "qB 地址", config.QB_URL)
             _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
             _password("QB_PASSWORD", "qB 密码（留空=不修改）")
@@ -158,6 +164,8 @@ def settings():
             env_updates = {k: v for k, v in updates.items() if k in _RESTART_ONLY}
             if db_updates:
                 config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
+                if updates.get("QB_ENABLED") == "true":
+                    engine.qb_kick.set()      # qB 刚被打开：立即唤醒同步循环自查，别等一个保底周期
             if env_updates:
                 config.update_env(env_updates)  # WEB_PORT 等结构项仍走 .env
             msg = "已保存，即时生效" + ("（Web 端口改动需重启）" if env_updates else "")

@@ -273,6 +273,8 @@ def recent_movie_rows(limit: int = 50) -> list[dict]:
         "name": names.get(t.movie_id) or (t.raw_title or "?"),
         "source": t.source,
         "status": t.status,
+        "qb_progress": t.qb_progress,
+        "qb_synced_at": t.qb_synced_at,
         "raw": t.raw_title or "",
     } for t in ts]
 
@@ -376,6 +378,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
             # 跨表守卫：同一物理种子已被 TV 管线拿去下/下完 → 文件已在 qB，别用不同路径重复提交。
             if engine.hash_owned_elsewhere(t.info_hash, AnimeTorrent):
                 t.status = "downloaded"
+                t.qb_progress = 1.0   # 落定：物理种子实态由 TV 那份跟踪，本重复指针不必再进 in-flight 轮询
                 s.add(t)
                 s.commit()
                 log.info("跳过跨表重复种子（TV 已持有）- movie torrent=%s", mt_id)
@@ -405,6 +408,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
         return False
     _set_status(mt_id, "downloaded" if ok else "error")
     if ok:
+        engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
         log.info("已加入qB（剧场版）- torrent=%s", mt_id)
         await notify(f"{folder} 🎬📥")
     return ok

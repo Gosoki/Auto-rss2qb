@@ -16,6 +16,14 @@ STATUS_CN = {"downloaded": "已下", "pending": "待下", "downloading": "下载
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
+def torrent_status_cn(status: str, qb_progress=0, qb_synced_at=None) -> str:
+    """无 qB 实时态时的回落显示：已交给 qB 但还没首次同步回来（刚发送）→『下载中』；其余按 STATUS_CN
+    （含已下完/跳过/已删）。有实时态时调用方用 qb_live_text 显示『下载中 X% / 做种 100%』，不走这里。"""
+    if status == "downloaded" and (qb_progress or 0) < 1.0 and qb_synced_at is None:
+        return "下载中"
+    return STATUS_CN.get(status, status)
+
+
 def parse_bgm_id(text: str) -> int | None:
     """从用户输入里抠出 bgm subject id：优先 bgm.tv/subject/<id>，退而取任意数字。取不到返回 None。"""
     m = re.search(r"subject/(\d+)", text or "") or re.search(r"(\d+)", text or "")

@@ -3,8 +3,8 @@ from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (STATUS_CN, WEEKDAY_CN, confirm, ep_str, meta_card, name_of,
-                     qb_live_text, season_label, source_options)
+from .layout import (WEEKDAY_CN, confirm, ep_str, meta_card, name_of,
+                     qb_live_text, season_label, source_options, torrent_status_cn)
 
 
 def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> None:
@@ -106,8 +106,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             f"color={'orange' if t.id in plan else 'red'}").tooltip(
                             "下载失败过；点右边『下载』或『补下本番』手动重试（后台不自动重试 error）"
                             if t.id in plan else "下载失败过")
-                    else:
-                        ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
+                    else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删)按状态
+                        ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
+                            "color=blue-grey")
                     ui.button("下载", icon="download", on_click=_force(t.id)).props(
                         "size=sm flat dense").style("font-size:12px").tooltip(
                         "强制下这一条到文件夹（无视去重/优先级）")
