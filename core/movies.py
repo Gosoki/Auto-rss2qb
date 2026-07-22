@@ -10,7 +10,7 @@ from collections import Counter
 from datetime import datetime
 
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import select
+from sqlmodel import func, select
 
 import config
 from core import engine
@@ -173,17 +173,20 @@ def overview() -> dict:
     """/movies 仪表盘的聚合数据：KPI + 各季度(电影数/已下) + qB 实时态。"""
     with get_session() as s:
         all_m = list(s.exec(select(Movie)))
-        pairs = list(s.exec(select(MovieTorrent.movie_id, MovieTorrent.status)))
+        # 种子维度用 SQL 聚合（不整表拉进内存）
+        status = {st: c for st, c in s.exec(
+            select(MovieTorrent.status, func.count()).group_by(MovieTorrent.status))}
+        versions = s.exec(select(func.count()).select_from(MovieTorrent)).one()
+        dl_ids = set(s.exec(select(MovieTorrent.movie_id)
+                            .where(MovieTorrent.status == "downloaded").distinct()))
     active = [m for m in all_m if not m.rejected]
     active_ids = {m.id for m in active}
     q_of = {m.id: (m.quarter or "未知") for m in active}
-    dl_ids = {mid for mid, st in pairs if st == "downloaded"}
     total_by_q = Counter(q_of[m.id] for m in active)
     dl_by_q = Counter(q_of[mid] for mid in dl_ids if mid in q_of)
     qs = sorted((q for q in total_by_q if q != "未知"), reverse=True)
     if "未知" in total_by_q:
         qs.append("未知")
-    status = Counter(st for _, st in pairs)
     return {
         "kpi": {
             "total": len(active),
@@ -191,7 +194,7 @@ def overview() -> dict:
             "unmatched": sum(1 for m in active if not m.bangumi_id),
             "downloaded": len([mid for mid in dl_ids if mid in active_ids]),
             "rejected": sum(1 for m in all_m if m.rejected),
-            "versions": len(pairs),
+            "versions": versions,
         },
         "by_quarter": [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs],
         "status": {k: status.get(k, 0) for k in

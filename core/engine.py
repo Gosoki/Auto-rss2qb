@@ -4,6 +4,7 @@ anime.py(TV) 与 movies.py(剧场版) 都依赖这里；本模块不含任何 TV
 两条线因此互不相干又不重复造轮子。
 """
 import asyncio
+import ipaddress
 import logging
 import os
 import re
@@ -101,16 +102,33 @@ def apply_bgm_meta(obj, info: dict | None, keep_quarter: bool = False) -> None:
 
 # ---------------- 下载原语（取种子 + 交 qB） ----------------
 
+def _is_internal_ip(host: str) -> bool:
+    """host 是字面私网/环回/链路本地/保留 IP 吗？域名一律放行（正常种子站都是域名，不误伤）。"""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+async def _block_internal_request(request: httpx.Request) -> None:
+    """请求级钩子：种子下载不许打到内网/环回字面 IP（含重定向后的每一跳）——挡住 RSS 里的 SSRF 载荷。"""
+    if _is_internal_ip(request.url.host or ""):
+        raise ValueError(f"拒绝下载到内网/环回地址（防 SSRF）：{request.url.host}")
+
+
 async def fetch_torrent_bytes(url: str) -> bytes:
     """流式下载 .torrent，封顶 32MB + 整体 180s 超时（download_url 源自 RSS 可被投毒 + 跟随重定向）。
 
     httpx 的 timeout=60 只是每次读的超时、逐块重置，慢速 trickle 连接能让它无限挂起并堵死整个下载/
     采集循环；故再套一层 asyncio.timeout 对总传输时长封顶。取到返回 bytes；HTTP/超限/超时失败抛异常，
-    由调用方回写 error。
+    由调用方回写 error。请求级钩子额外挡内网/环回字面 IP（防 SSRF，含重定向每一跳）。
     """
     if not (url or "").lower().startswith(("http://", "https://")):
         raise ValueError(f"拒绝非 http(s) 下载地址（防 SSRF）：{(url or '')[:80]}")
     kwargs = config.http_client_kwargs(60)
+    kwargs["event_hooks"] = {"request": [_block_internal_request]}
     async with asyncio.timeout(180):
         async with httpx.AsyncClient(**kwargs) as client:
             async with client.stream("GET", url) as resp:

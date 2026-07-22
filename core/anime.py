@@ -31,13 +31,18 @@ def quarter_brief() -> list[dict]:
     cur = extract_quarter(datetime.now())
     prev = engine.prev_quarter(cur)
     with get_session() as s:
+        # 番数按当季/上季两季拉；种子维度按 (季度,状态) 在库内聚合，都不整表扫、不把种子行拉进内存
         animes = list(s.exec(select(
-            Anime.quarter, Anime.confirmed, Anime.rejected, Anime.bangumi_id)))
-        torrents = list(s.exec(select(AnimeTorrent.quarter, AnimeTorrent.status)))
+            Anime.quarter, Anime.confirmed, Anime.rejected, Anime.bangumi_id)
+            .where(Anime.quarter.in_([cur, prev]))))
+        tcounts = list(s.exec(
+            select(AnimeTorrent.quarter, AnimeTorrent.status, func.count())
+            .where(AnimeTorrent.quarter.in_([cur, prev]))
+            .group_by(AnimeTorrent.quarter, AnimeTorrent.status)))
     out = []
     for tag, q in (("当季", cur), ("上季", prev)):
         aq = [(conf, rej, bid) for aqk, conf, rej, bid in animes if (aqk or "") == q]
-        tq = [st for tqk, st in torrents if (tqk or "") == q]
+        qc = {st: c for tqk, st, c in tcounts if (tqk or "") == q}
         out.append({
             "tag": tag, "key": q,
             # 互斥四分：已忽略(rej) / 待识别(未匹配 bgm) / 待确认(有 bgm 未确认) / 追番中(有 bgm 已确认)
@@ -45,9 +50,9 @@ def quarter_brief() -> list[dict]:
             "confirm": sum(1 for conf, rej, bid in aq if not conf and not rej and bid),  # 待确认
             "fail": sum(1 for conf, rej, bid in aq if not rej and not bid),    # 待识别(未匹配)
             "ignored": sum(1 for conf, rej, bid in aq if rej),                 # 已忽略
-            "torrents": len(tq),
-            "done": sum(1 for st in tq if st == "downloaded"),
-            "pending": sum(1 for st in tq if st in ("pending", "error")),
+            "torrents": sum(qc.values()),
+            "done": qc.get("downloaded", 0),
+            "pending": qc.get("pending", 0) + qc.get("error", 0),
         })
     return out
 
@@ -326,18 +331,27 @@ def overview() -> dict:
         animes = list(s.exec(select(Anime).where(Anime.rejected.is_not(True))))  # 非拒绝（含待确认）
         rejected = s.exec(select(func.count()).select_from(Anime)
                           .where(Anime.rejected == True)).one()  # noqa: E712
-        torrents = list(s.exec(select(AnimeTorrent)))
         groups = list(s.exec(select(SourceGroup)))
         all_aq = list(s.exec(select(Anime.id, Anime.quarter)))  # 所有 TV 番(含待确认/忽略)的 id+季度
+        # 种子维度全用 SQL 聚合（GROUP BY count / DISTINCT）：种子攒到几千条也不把整表拉进内存，
+        # 只在库内算完返回几个数字——CPU/内存/DB 传输都轻。
+        status = {st: c for st, c in s.exec(
+            select(AnimeTorrent.status, func.count()).group_by(AnimeTorrent.status))}
+        total_torrents = s.exec(select(func.count()).select_from(AnimeTorrent)).one()
+        dl_ids = set(s.exec(select(AnimeTorrent.anime_id)
+                            .where(AnimeTorrent.status == "downloaded").distinct()))
+        src_total = {src: c for src, c in s.exec(
+            select(AnimeTorrent.source, func.count()).group_by(AnimeTorrent.source))}
+        src_done = {src: c for src, c in s.exec(
+            select(AnimeTorrent.source, func.count())
+            .where(AnimeTorrent.status == "downloaded").group_by(AnimeTorrent.source))}
 
     confirmed = [a for a in animes if a.confirmed]
     pending_c = [a for a in animes if not a.confirmed and a.bangumi_id]  # 待确认=已匹配未确认；未匹配的算『富集失败』
-    status = Counter(t.status for t in torrents)
 
     # 各季度：总番数（含待确认/待识别/已忽略）+ 有已下集的番数（真·比例，分子分母同为"部"）
     total_by_q = Counter((q or "未知") for _, q in all_aq)
     aid_q = {aid: (q or "未知") for aid, q in all_aq}
-    dl_ids = {t.anime_id for t in torrents if t.status == "downloaded" and t.anime_id}
     dl_by_q = Counter(aid_q[aid] for aid in dl_ids if aid in aid_q)
     qs = sorted((q for q in total_by_q if q != "未知"), reverse=True)
     if "未知" in total_by_q:
@@ -345,9 +359,7 @@ def overview() -> dict:
     by_quarter = [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs]
 
     # 各来源：种子数 + 已下
-    src_total = Counter((t.source or "?") for t in torrents)
-    src_done = Counter((t.source or "?") for t in torrents if t.status == "downloaded")
-    by_source = sorted(((src, cnt, src_done.get(src, 0)) for src, cnt in src_total.items()),
+    by_source = sorted((((src or "?"), cnt, src_done.get(src, 0)) for src, cnt in src_total.items()),
                        key=lambda x: -x[1])
 
     return {
@@ -357,7 +369,7 @@ def overview() -> dict:
             "done": status.get("downloaded", 0),
             "pending": status.get("pending", 0) + status.get("error", 0),
             "multi": len(multi_source_map()),
-            "torrents": len(torrents),
+            "torrents": total_torrents,
         },
         "status": {k: status.get(k, 0) for k in
                    ("downloaded", "downloading", "pending", "error", "skipped")},
@@ -401,7 +413,8 @@ def multi_source_map() -> dict:
     """{番 id: [来源...]}，仅含来源多于一个的番（管理页据此标『多源』）。"""
     from collections import defaultdict
     with get_session() as s:
-        pairs = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.source)))
+        # DISTINCT 让库内先去重 (番,来源) 对，返回的行数只与『番×来源』有关，与种子总数无关
+        pairs = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.source).distinct()))
     src: dict = defaultdict(set)
     for aid, source in pairs:
         if aid:
