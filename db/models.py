@@ -59,7 +59,7 @@ class Anime(SQLModel, table=True):
     # ---- 下载控制 ----
     confirmed: bool = Field(default=True)             # 确认状态（待确认源默认 False，等人工确认）；确认即自动下
     rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『拒绝』页恢复）
-    pref_source: str | None = Field(default=None)     # 首选下载源（子串匹配 torrent.source；空=按优先级）
+    pref_source: str | None = Field(default=None)     # 锁定下载源（子串匹配 torrent.source）；空=按优先级多源兜底，非空=只下这个组、缺集不兜底
     created_at: datetime = Field(default_factory=datetime.now)
 
 

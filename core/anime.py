@@ -166,10 +166,13 @@ async def process_item(item) -> bool:
         s.refresh(torrent)
         torrent_id = torrent.id
         should_download = bool(a and a.confirmed and not a.rejected)
+        lock = a.pref_source if a else None   # 锁定源：入库即下也只放行锁定组
 
     log.info("新增 - %s - %s 第%s季 第%s集", item.source, item.anime_title, item.season, item.episode)
-    # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 → 入库就下，不等缓冲窗口
-    if config.ANIME_TOP_PRIORITY_INSTANT and should_download and (item.priority or 0) >= _top_priority():
+    # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 + (未锁源或正是锁定源) → 入库就下，不等缓冲窗口
+    if (config.ANIME_TOP_PRIORITY_INSTANT and should_download
+            and (item.priority or 0) >= _top_priority()
+            and (not lock or lock in (item.source or ""))):
         await download_anime_torrent(torrent_id)
     return True
 
@@ -291,6 +294,9 @@ async def flush_ready_downloads() -> int:
         for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.status == "pending")):
             if t.anime_id not in auto_ids:
                 continue
+            lock = pref_map.get(t.anime_id)
+            if lock and lock not in (t.source or ""):
+                continue  # 锁定源：这部番只收锁定组的种子（硬锁、不兜底）；别的源一律不自动下
             if t.episode is None or t.episode < 0:
                 if t.episode == -1:
                     special_groups.setdefault(t.anime_id, []).append(t)  # 特别篇按番归组
@@ -484,7 +490,7 @@ def downloaded_count(anime_id: int) -> int:
 # ---------------- 给 UI 的操作 ----------------
 
 def confirm_anime(anime_id: int, pref_source: str = "") -> None:
-    """确认下载该番；pref_source 非空则钉住首选下载源（本次及以后新集都优先用它）。"""
+    """确认下载该番；pref_source 非空则锁定下载源（本次及以后只下这个组，缺集不兜底）。"""
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is not None:
@@ -495,7 +501,7 @@ def confirm_anime(anime_id: int, pref_source: str = "") -> None:
 
 
 def set_pref_source(anime_id: int, source: str) -> None:
-    """改某番的首选下载源（空=按优先级）。详情页用。"""
+    """设/改某番的锁定下载源（空=按优先级多源兜底；非空=锁定只下这个组）。详情页用。"""
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is not None:
@@ -725,12 +731,33 @@ async def download_pending_for_anime(anime_id: int) -> int:
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading")}
     pending = [t for t in all_rows if t.status in ("pending", "error")]
+    if pref:  # 锁定源：只补锁定组的待下集（硬锁、不兜底）
+        pending = [t for t in pending if pref in (t.source or "")]
     chosen = _select_downloads(pending, pref, have_eps)
     n = 0
     for t in chosen:
         if await download_anime_torrent(t.id):
             n += 1
     return n
+
+
+def download_plan(anime_id: int) -> set[int]:
+    """这部番『现在补下/自动下会挑中』的种子 id 集合——供详情页标『将下载 / 备用』。
+
+    与 download_pending_for_anime 同一套挑选（锁定源过滤 + 跳过已下集 + 每集一份、负集整组一份），
+    只算不下。不在这个集合里的待下种子=备用（同集已被首选/已下覆盖，或非锁定源）。
+    """
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is None:
+            return set()
+        pref = a.pref_source
+        all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
+    have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading")}
+    pending = [t for t in all_rows if t.status in ("pending", "error")]
+    if pref:
+        pending = [t for t in pending if pref in (t.source or "")]
+    return {t.id for t in _select_downloads(pending, pref, have_eps)}
 
 
 async def download_all_pending() -> int:
@@ -753,7 +780,10 @@ async def download_all_pending() -> int:
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
     n = 0
     for aid, pending in by_anime.items():
-        for t in _select_downloads(pending, pref_map.get(aid), have_by_anime.get(aid)):
+        lock = pref_map.get(aid)
+        if lock:  # 锁定源：只补锁定组
+            pending = [t for t in pending if lock in (t.source or "")]
+        for t in _select_downloads(pending, lock, have_by_anime.get(aid)):
             if await download_anime_torrent(t.id):
                 n += 1
     return n

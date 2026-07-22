@@ -58,15 +58,19 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
                 ui.button("确认下载", on_click=_confirm).props("size=sm color=primary").style(
                     "font-size:12px")
             ui.button("补下本番", on_click=_download).props("flat size=sm").style("font-size:12px")
-            if sources:  # 首选下载源（多源时选从哪个组下）
-                ui.select(source_options(sources), value=(cur.pref_source or ""), label="下载源",
-                          on_change=_set_source).props("dense outlined").classes("min-w-40")
+            if sources:  # 下载源：按优先级=多源兜底；选具体组=锁定，之后只下这个组
+                ui.select(source_options(sources, "按优先级·多源兜底"),
+                          value=(cur.pref_source or ""), label="下载源",
+                          on_change=_set_source).props("dense outlined").classes("min-w-52").tooltip(
+                    "『按优先级』= 多源自动挑、缺集用别的源兜底；"
+                    "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）")
 
         # 分集 / 种子（每条可单独强制下载）
         ui.label(f"分集 / 种子（{len(eps)}）").classes("text-sm font-bold mt-2")
         if not eps:
             ui.label("（还没有种子）").classes("text-gray-400")
             return
+        plan = anime.download_plan(anime_id)  # 待下里『会真下』的那些（首选/锁定组），其余待下=备用
         for t in eps:
             ep_txt = f"第{ep_str(t.episode)}集"
             with ui.column().classes("w-full gap-0 py-1").style(
@@ -81,6 +85,17 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
                     live = qb_live_text(t)
                     if live:  # qB 实时态（下载中 45% ↓2MB/s / 做种 100%）优先展示
                         ui.badge(live).props("color=teal").tooltip("qB 实时状态")
+                    elif t.status == "pending":  # 待下：区分『会真下的首选』和『备用』
+                        if t.id in plan:
+                            ui.badge("将下载").props("color=green").tooltip(
+                                "这一集的首选版本，补下/自动下会下它")
+                        else:
+                            ui.badge("备用").props("color=blue-grey").tooltip(
+                                "不会自动下：同集已由首选/已下覆盖，或非锁定源；要它就点右边下载")
+                    elif t.status == "error":
+                        ui.badge("失败·将重试" if t.id in plan else "失败").props(
+                            f"color={'orange' if t.id in plan else 'red'}").tooltip(
+                            "下载失败过；在补下计划里会重试" if t.id in plan else "下载失败过")
                     else:
                         ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
                     ui.button("下载", icon="download", on_click=_force(t.id)).props(
@@ -104,7 +119,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
     def _set_source(e):
         anime.set_pref_source(anime_id, e.value or "")
         body.refresh()
-        ui.notify("下载源：" + (e.value or "按优先级"))
+        if e.value:
+            ui.notify(f"已锁定：之后只下 {e.value}（缺集不兜底，自己来点下载）", type="warning")
+        else:
+            ui.notify("已改回『按优先级』：多源自动挑、缺集用别的源兜底", type="positive")
 
     async def _enrich():
         ok = await anime.enrich_anime(anime_id)
