@@ -90,11 +90,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         "font-size:11px")                                 # 次要：时间
                     ui.space()
                     live = qb_live_text(t)
-                    if live:  # qB 实时态（下载中 45% ↓2MB/s / 做种 100%）优先展示
-                        ui.badge(live).props("color=teal").tooltip("qB 实时状态")
+                    if live:  # qB 实时态：完成(做种/100%)才绿，下载中用 teal
+                        _done = (t.qb_progress or 0) >= 1
+                        ui.badge(live).props(f"color={'green' if _done else 'teal'}").tooltip(
+                            "qB 实时状态")
                     elif t.status == "pending":  # 待下：区分『会真下的首选』和『备用』
                         if t.id in plan:
-                            ui.badge("将下载").props("color=green").tooltip(
+                            ui.badge("将下载").props("color=blue").tooltip(
                                 "这一集的首选版本，补下/自动下会下它")
                         else:
                             ui.badge("备用").props("color=blue-grey").tooltip(

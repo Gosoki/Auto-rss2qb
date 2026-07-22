@@ -70,8 +70,10 @@ def render_movie_detail(movie_id: int, refresh_outer=None) -> None:
                 ui.label(engine.torrent_time(t)).classes("w-28 text-gray-400")
                 ui.label(t.raw_title or t.source).classes("grow break-all")
                 live = qb_live_text(t)
-                if live:
-                    ui.badge(live).props("color=teal").tooltip("qB 实时状态")
+                if live:  # 完成(做种/100%)才绿，下载中用 teal
+                    _done = (t.qb_progress or 0) >= 1
+                    ui.badge(live).props(f"color={'green' if _done else 'teal'}").tooltip(
+                        "qB 实时状态")
                 else:
                     ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
                 ui.button("下载", icon="download", on_click=_force(t.id)).props(
