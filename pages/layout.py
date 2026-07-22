@@ -14,7 +14,7 @@ NAV = [("manage", "动漫番剧", "/"), ("movies", "OVA・剧场版", "/movies")
 
 # 应用侧种子状态 → 中文（番剧表/剧场版/详情/新入库共用）
 STATUS_CN = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
-             "error": "失败", "skipped": "跳过", "deleted": "已删"}
+             "error": "失败", "skipped": "跳过", "deleted": "已删", "excluded": "已排除"}
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 

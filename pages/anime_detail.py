@@ -114,9 +114,22 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     ui.button("下载", icon="download", on_click=_force(t.id)).props(
                         "size=sm flat dense").style("font-size:12px").tooltip(
                         "强制下这一条到文件夹（无视去重/优先级）")
+                    if t.status == "excluded":  # 已排除：给『恢复』放回待下
+                        ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
+                            "size=sm flat dense color=primary").style("font-size:12px").tooltip(
+                            "放回待下，重新参与下载/去重")
+                    if t.episode == -2 and t.status in ("pending", "error"):  # 未知集：填对集号救回
+                        ui.button("改集号", icon="edit", on_click=_set_ep(t.id)).props(
+                            "size=sm flat dense").style("font-size:12px").tooltip(
+                            "这条集号没解析出来；填对集号让它进正常下载/去重")
+                    if t.status in ("pending", "error"):  # 未下载的才可直接排除
+                        ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
+                            "size=sm flat dense color=grey").style("font-size:12px").tooltip(
+                            "不想要这条：从待下直接排除（不删文件，只改状态；可撤销）")
                     if t.status in ("downloaded", "downloading"):  # 下过才给按集删
                         ui.button(icon="delete_forever", on_click=_del_one(t.id)).props(
-                            "size=sm flat dense color=negative").tooltip("删除这一集的文件（qB+硬盘，不可撤销）")
+                            "size=sm flat dense color=negative").tooltip(
+                            "删除这一集的文件（qB+硬盘，不可撤销）")
                 # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
                 with ui.row().classes("items-start gap-3 w-full text-sm no-wrap"):
                     ui.label(ep_txt).classes("shrink-0").style("visibility:hidden")
@@ -186,6 +199,49 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             _after()
             ui.notify("已删除该集文件" if ok else "没删成（qB 未连上或该集无文件）",
                       type="positive" if ok else "warning")
+        return h
+
+    def _set_ep(torrent_id):
+        async def h():
+            dlg = ui.dialog()
+            with dlg, ui.card().classes("gap-2"):
+                ui.label("改集号").classes("font-bold")
+                ui.label("这条集号没解析出来（批量/命名怪）。填对集号，它就进正常下载+去重流程。"
+                         "支持 .5（如 12.5）。").classes("text-xs text-gray-400")
+                num = ui.number("集号", value=1, min=0, step=1, format="%g").props(
+                    "dense outlined autofocus")
+                with ui.row().classes("gap-2 justify-end w-full"):
+                    ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
+                    ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("color=primary")
+            val = await dlg
+            if val is None:
+                return
+            if val < 0:
+                ui.notify("集号要 ≥ 0", type="warning")
+                return
+            ok = anime.set_torrent_episode(torrent_id, float(val))
+            _after()
+            ui.notify(f"已改为第 {ep_str(float(val))} 集" if ok else "改不了（已下载的种子不改集号）",
+                      type="positive" if ok else "warning")
+        return h
+
+    def _exclude(torrent_id):
+        async def h():
+            if not await confirm("排除这一条？",
+                                 "从待下里直接排除（终态：不再下、不再挂在未知集，RSS 再遇到同种子也不重收）。",
+                                 ok_label="排除", ok_icon="block"):
+                return
+            ok = anime.exclude_torrent(torrent_id)
+            _after()
+            ui.notify("已排除" if ok else "排除失败（已下载的用『删除文件』）",
+                      type="positive" if ok else "warning")
+        return h
+
+    def _unexclude(torrent_id):
+        def h():
+            ok = anime.unexclude_torrent(torrent_id)
+            _after()
+            ui.notify("已放回待下" if ok else "取消失败", type="positive" if ok else "warning")
         return h
 
     body()

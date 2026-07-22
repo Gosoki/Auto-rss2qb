@@ -885,6 +885,45 @@ def failed_rows() -> list[dict]:
     return _torrent_rows(AnimeTorrent.status == "error")
 
 
+def set_torrent_episode(torrent_id: int, episode: float) -> bool:
+    """手动改一条种子的集号——把 -2 未知集 / 误判集号救回正常集，让它进正常下载+去重流程。
+    只动未下载的(pending/error)；改完仍是待下，由 flush / 补下本番按新集号处理。返回是否改了。"""
+    with get_session() as s:
+        t = s.get(AnimeTorrent, torrent_id)
+        if t is None or t.status not in ("pending", "error"):
+            return False
+        t.episode = episode
+        s.add(t)
+        s.commit()
+    return True
+
+
+def exclude_torrent(torrent_id: int) -> bool:
+    """直接排除一条不想要的待下种子：置专门的终态 excluded（不删文件、不碰 qB，只改状态）——
+    flush/补下永不再挑、restore 不复活、RSS 再遇到同 hash 也不重收，彻底脱离待下/未知集；可用
+    unexclude_torrent 撤销。只动未下载的(pending/error)。返回是否排除了。"""
+    with get_session() as s:
+        t = s.get(AnimeTorrent, torrent_id)
+        if t is None or t.status not in ("pending", "error"):
+            return False
+        t.status = "excluded"
+        s.add(t)
+        s.commit()
+    return True
+
+
+def unexclude_torrent(torrent_id: int) -> bool:
+    """取消排除：把 excluded 的种子放回 pending，重新参与下载/去重。返回是否放回了。"""
+    with get_session() as s:
+        t = s.get(AnimeTorrent, torrent_id)
+        if t is None or t.status != "excluded":
+            return False
+        t.status = "pending"
+        s.add(t)
+        s.commit()
+    return True
+
+
 async def download_all_pending() -> int:
     """补下所有『已订阅且已确认』番剧的待下/失败种子。返回触发数。
 
