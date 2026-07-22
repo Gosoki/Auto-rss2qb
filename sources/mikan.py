@@ -20,7 +20,7 @@ import httpx
 import config
 from sources.base import ParsedItem, Source
 from sources.parse import (SEASON_CN, candidate_names, estimate_premiere, extract_quarter,
-                           is_batch, parse_title)
+                           is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
 
@@ -93,6 +93,11 @@ class MikanSource(Source):
                 return None  # 标题不含所需关键词（如按语言 繁日/简日 过滤）
 
             group, anime_title, season, episode = parse_title(raw_title)
+            search_names = candidate_names(raw_title)
+            if not anime_title and config.ANIME_MULTIBRACKET_PARSE:
+                mb = parse_multibracket(raw_title)   # 开关开：全括号命名回退捕获番名
+                if mb:
+                    anime_title, search_names = mb
             # 白名单：子串匹配，兼顾联合发布（如 "喵萌奶茶屋&LoliHouse"）
             if self.subgroups and not any(g in group for g in self.subgroups):
                 return None
@@ -123,7 +128,7 @@ class MikanSource(Source):
                 site="mikan",
                 source_kind=self.policy,
                 priority=self.priority,
-                search_names=candidate_names(raw_title),
+                search_names=search_names,
             )
         except Exception as e:
             log.error("Mikan 解析失败: %s - %s", e, entry.get("title", "?"))

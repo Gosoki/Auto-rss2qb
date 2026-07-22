@@ -77,6 +77,12 @@ def settings():
             _num("ANIME_POLL_INTERVAL", "轮询间隔（秒）", config.ANIME_POLL_INTERVAL)
             _num("ANIME_DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）", config.ANIME_DOWNLOAD_GRACE_MIN)
             _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）", config.ANIME_TOP_PRIORITY_INSTANT)
+            _switch("ANIME_MULTIBRACKET_PARSE",
+                    "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
+                    config.ANIME_MULTIBRACKET_PARSE)
+            ui.label("默认关：解析不出番名的种子直接进『待识别』。开了才尝试从括号块猜番名——best-effort，"
+                     "偶尔可能猜错，拿不准会自动跳过；大组(ANi/Lilith 等)永不受影响。可在『解析测试』页粘标题验证。").classes(
+                "text-xs text-gray-500")
             ui.label("Bangumi 识别：项目恒开（规范名/季度/日语文件夹名统一采用 bgm）。").classes(
                 "text-xs text-gray-500")
             ui.label("源组（feed/策略/优先级/字幕组白名单）都在『源管理』页配置，改完下一轮生效。").classes(

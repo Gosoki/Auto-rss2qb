@@ -226,3 +226,49 @@ def candidate_names(raw_title: str) -> list[str]:
         if len(n.replace(" ", "")) >= 2 and n not in out:
             out.append(n)
     return out
+
+
+# ---- 全括号命名的番名回退捕获（沸羊羊/悠哈/GM-Team 等，config 开关控制是否启用）----
+_CJK = re.compile(r"[一-鿿぀-ヿ]")
+_INNER_BLK = re.compile(r"[\[【]([^\]】]+)[\]】]")
+# 明显不是番名的块：分类 / 年份 / 画质 / 编码 / 来源 / 语言 / 纯集号——回退挑名字时跳过它们
+_NAME_BLOCK_SKIP = re.compile(
+    r"^(?:国漫|国番|日漫|港漫|美漫|新番|完结|補番|补番|\d{4}|\d{1,4}(?:\.\d+)?|"
+    r"\d+P|\d+x\d+|4K|x26[45]|H\.?26[45]|HEVC|AVC|AAC|FLAC|OPUS|DDP|"
+    r"GB|BIG5|CHT|CHS|BDRIP|BD|WEB-?RIP|WEB-?DL|Baha|B-?Global|CR|Crunchyroll|"
+    r"Bilibili|IQIYI|Netflix|ViuTV|NTV|MKV|MP4|TS|SRT|ASS|"
+    r"简体?|繁體?|日語?|简繁日?|简日|繁日)$", re.I)
+
+
+def parse_multibracket(raw_title: str):
+    """全括号命名 [组][番名块][集号][画质…] 的番名回退：挑出番名块 → 拆多语言 → 候选名。
+
+    仅当 parse_title 得空名、且开了 ANIME_MULTIBRACKET_PARSE 时兜底调用（见 nyaa/mikan 源）。
+    挑名策略：① 优先含 '/' 的块（中文/罗马音/日文，最明确）；② 退而取第一个『含 CJK 且非标签』的块。
+    带信心闸：洗完拿不到 ≥2 字符的合理候选就返回 None——宁可不猜、落『待识别』，也不建垃圾番。
+    返回 (anime_title, candidate_names) 或 None。
+    """
+    m = _GROUP_RE.match(raw_title)
+    body = raw_title[m.end():] if m else raw_title
+    blocks = _INNER_BLK.findall(body)
+    nameblk = next((b for b in blocks if "/" in b), None) or \
+        next((b for b in blocks if _CJK.search(b) and not _NAME_BLOCK_SKIP.match(b.strip())), None)
+    if not nameblk:
+        return None
+
+    names: list[str] = []
+    for p in re.split(r"\s*/\s*|_", nameblk):        # 中文/罗马音/日文 多用 / 或 _ 分隔
+        c = strip_season(_EXT_RE.sub("", re.sub(r"[\[【][^\]】]*[\]】]", "", p))).strip()
+        if len(c.replace(" ", "")) < 2 or _NAME_BLOCK_SKIP.match(c):
+            continue
+        if c not in names:
+            names.append(c)
+        if _CJK.search(c):
+            simp = t2s(c)                            # bgm 的 name_cn 是简体
+            if simp != c and simp not in names:
+                names.append(simp)
+    if not names:                                    # 信心闸：一个合理候选都没有 → 放弃
+        return None
+    cjk = [n for n in names if _CJK.search(n)]
+    anime_title = (cjk[0] if cjk else names[0]).replace(" ", "")
+    return anime_title, names

@@ -21,7 +21,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
             return
         eps = anime.list_episodes(anime_id)
         sources = sorted({t.source for t in eps})
-        with ui.row().classes("items-center gap-2 flex-wrap"):
+        with ui.row().classes("items-center gap-2 flex-wrap w-full"):
             ui.label(name_of(cur)).classes("text-2xl font-bold")
             _sl = season_label(cur)
             if _sl:
@@ -31,6 +31,15 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
             else:
                 ui.badge("✓ 已确认" if cur.confirmed else "⏳ 待确认").props(
                     f"color={'green' if cur.confirmed else 'orange'}")
+            ui.space()  # 元操作靠右上角
+            ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat size=sm").style(
+                "font-size:12px")
+            if cur.rejected:
+                ui.button("恢复订阅", icon="undo", on_click=_restore).props(
+                    "size=sm color=primary").style("font-size:12px")
+            else:
+                ui.button("忽略本番", icon="block", on_click=_reject).props(
+                    "size=sm flat color=grey").style("font-size:12px")
 
         # 元信息卡（封面 + bgm 元数据 + 简介）
         wd = f"  {WEEKDAY_CN[cur.air_weekday]}" if cur.air_weekday is not None else ""
@@ -43,16 +52,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
             ("来源", " · ".join(sources) or "—"),
         ], cur.bangumi_id, cur.title, cur.summary)
 
-        # 操作
+        # 下载类操作（重新识别/忽略已移到右上角）
         with ui.row().classes("items-center gap-3 flex-wrap"):
-            ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat size=sm")
-            if cur.rejected:
-                ui.button("恢复订阅", icon="undo", on_click=_restore).props("size=sm color=primary")
-            else:
-                if not cur.confirmed:
-                    ui.button("确认下载", on_click=_confirm).props("size=sm color=primary")
-                ui.button("忽略", on_click=_reject).props("size=sm flat color=grey")
-            ui.button("补下本番", on_click=_download).props("flat size=sm")
+            if not cur.rejected and not cur.confirmed:
+                ui.button("确认下载", on_click=_confirm).props("size=sm color=primary").style(
+                    "font-size:12px")
+            ui.button("补下本番", on_click=_download).props("flat size=sm").style("font-size:12px")
             if sources:  # 首选下载源（多源时选从哪个组下）
                 ui.select(source_options(sources), value=(cur.pref_source or ""), label="下载源",
                           on_change=_set_source).props("dense outlined").classes("min-w-40")
@@ -63,24 +68,32 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
             ui.label("（还没有种子）").classes("text-gray-400")
             return
         for t in eps:
+            ep_txt = f"第{ep_str(t.episode)}集"
             with ui.column().classes("w-full gap-0 py-1").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
-                with ui.row().classes("items-center gap-2 w-full text-sm"):
-                    ui.label(f"第{ep_str(t.episode)}集").classes("w-14 shrink-0")
-                    ui.label(engine.torrent_time(t)).classes("w-28 shrink-0 text-gray-400")
-                    ui.label(t.source).classes("grow break-all")
+                # 第一行：集号 · 字幕组 · 时间 同一行居中（天然竖直齐平），状态/按钮 space() 推到最右
+                with ui.row().classes("items-center gap-3 w-full text-sm no-wrap"):
+                    ui.label(ep_txt).classes("shrink-0")                  # 主要信息：集号
+                    ui.label(t.source or "—").classes("shrink-0")         # 主要信息：字幕组（同色）
+                    ui.label(engine.torrent_time(t)).classes("shrink-0 text-gray-500").style(
+                        "font-size:11px")                                 # 次要：时间
+                    ui.space()
                     live = qb_live_text(t)
                     if live:  # qB 实时态（下载中 45% ↓2MB/s / 做种 100%）优先展示
                         ui.badge(live).props("color=teal").tooltip("qB 实时状态")
                     else:
                         ui.badge(STATUS_CN.get(t.status, t.status)).props("color=blue-grey")
                     ui.button("下载", icon="download", on_click=_force(t.id)).props(
-                        "size=sm flat dense").tooltip("强制下这一条到文件夹（无视去重/优先级）")
+                        "size=sm flat dense").style("font-size:12px").tooltip(
+                        "强制下这一条到文件夹（无视去重/优先级）")
                     if t.status in ("downloaded", "downloading"):  # 下过才给按集删
                         ui.button(icon="delete_forever", on_click=_del_one(t.id)).props(
                             "size=sm flat dense color=negative").tooltip("删除这一集的文件（qB+硬盘，不可撤销）")
-                # 第二行：种子原名（灰、可换行）——集数/版本拿不出来时靠它辨认是哪一版
-                ui.label(t.raw_title or "—").classes("text-grey-6 break-all pl-14").style("font-size:11px")
+                # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
+                with ui.row().classes("items-start gap-3 w-full text-sm no-wrap"):
+                    ui.label(ep_txt).classes("shrink-0").style("visibility:hidden")
+                    ui.label(t.raw_title or "—").classes("text-gray-500 break-all min-w-0").style(
+                        "font-size:11px")
 
     def _after():
         body.refresh()
