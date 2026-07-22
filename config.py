@@ -33,6 +33,7 @@ except ValueError:
 # ---- 可热改设置：{键: (类型, 默认值)}，类型 bool/int/str/list ----
 _SPEC = {
     "QB_ENABLED": (bool, True),
+    "QB_SYNC_STATUS": (bool, True),         # 开=读 qB 实时态(下载中/进度/做种…)；关=发送过去即『已下』、完全不轮询 qB
     "QB_SYNC_INTERVAL": (int, 15),          # 有种子在下时的活跃轮询间隔（秒）——只在下载窗口内轮询
     "QB_SYNC_BACKSTOP_MIN": (int, 180),     # 保底自查间隔（分钟）：没被事件唤醒也每隔这么久兜底扫一次，默认 3 小时
     "QB_URL": (str, "http://127.0.0.1:8080"),

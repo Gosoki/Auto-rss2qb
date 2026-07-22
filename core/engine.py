@@ -245,6 +245,9 @@ _QB_SEEDING = {"uploading", "forcedUP", "stalledUP", "queuedUP", "checkingUP",
 # 『落定』态：不再需要轮询跟踪的种子 qB 态——做种(=下载已完成) + 文件缺失(终态、不会再变)。
 # in-flight 判定与 sync 查询都据此把它们排除，使『停止监听』对做种/缺文件都生效。
 _QB_SETTLED = _QB_SEEDING | {"missingFiles"}
+# 『正在真下』态（下载态里排掉 stalled 无源/queued 排队这类短期不会变的）——用来决定要不要维持高频轮询：
+# 有它才维持快循环；只剩 stalled/排队/卡住的就退回休眠、交给保底自查，别让卡死种子把循环钉住空转。
+_QB_ACTIVE = {"downloading", "forcedDL", "metaDL", "forcedMetaDL", "checkingDL", "allocating"}
 
 
 def qb_is_downloading(state: str) -> bool:
@@ -271,6 +274,18 @@ def has_inflight() -> bool:
     with get_session() as s:
         for model_cls in (AnimeTorrent, MovieTorrent):
             if s.exec(select(model_cls.id).where(*_inflight_where(model_cls)).limit(1)).first():
+                return True
+    return False
+
+
+def has_active_downloading() -> bool:
+    """在下的种子里有没有『正在真下』(qB 态属 _QB_ACTIVE)的——决定要不要维持高频轮询。
+    只剩 stalled(无源)/排队/卡住的就返回 False，让快循环退回休眠、交给保底自查，别空转钉住循环。"""
+    with get_session() as s:
+        for model_cls in (AnimeTorrent, MovieTorrent):
+            if s.exec(select(model_cls.id).where(
+                    *_inflight_where(model_cls),
+                    model_cls.qb_state.in_(list(_QB_ACTIVE))).limit(1)).first():
                 return True
     return False
 

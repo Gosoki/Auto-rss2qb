@@ -408,7 +408,8 @@ async def download_movie_torrent(mt_id: int) -> bool:
         return False
     _set_status(mt_id, "downloaded" if ok else "error")
     if ok:
-        engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
+        if config.QB_SYNC_STATUS:
+            engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子（关状态跟踪时不必唤醒）
         log.info("已加入qB（剧场版）- torrent=%s", mt_id)
         await notify(f"{folder} 🎬📥")
     return ok

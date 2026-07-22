@@ -256,7 +256,8 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
 
     _set_status(torrent_id, "downloaded" if ok else "error")
     if ok:
-        engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
+        if config.QB_SYNC_STATUS:
+            engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子（关状态跟踪时不必唤醒）
         log.info("已加入qB - %s 第%s季 第%s集", title, season, episode)
         await notify(f"{title}[{episode}] 📥")
     return ok
