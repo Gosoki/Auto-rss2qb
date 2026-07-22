@@ -110,8 +110,8 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
     ''')
 
 
-def meta_card(cover_url, kv_pairs, bangumi_id, title, summary) -> None:
-    """详情元信息卡：封面 + 两列 kv 网格 + bgm 链接 + 原始标题 + 简介。番剧/剧场版详情共用，
+def meta_card(cover_url, kv_pairs, bangumi_id, summary) -> None:
+    """详情元信息卡：封面 + 两列 kv 网格 + bgm 链接 + 简介。番剧/剧场版详情共用，
     kv_pairs=[(标签, 值)...] 各页自备（字段集略不同）。"""
     with ui.card().classes("w-full"):
         with ui.row().classes("gap-4 items-start no-wrap w-full"):
@@ -126,7 +126,6 @@ def meta_card(cover_url, kv_pairs, bangumi_id, title, summary) -> None:
                     ui.link(f"bgm.tv/subject/{bangumi_id}",
                             f"https://bgm.tv/subject/{bangumi_id}").props(
                         "target=_blank").classes("text-xs")
-                ui.label(f"原始标题: {title}").classes("text-xs text-gray-500")
         if summary:
             ui.separator()
             ui.label(summary).classes("text-sm text-gray-300 whitespace-pre-wrap")

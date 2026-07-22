@@ -53,7 +53,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             ("类型", cur.platform),
             ("评分", cur.rating),
             ("来源", " · ".join(sources) or "—"),
-        ], cur.bangumi_id, cur.title, cur.summary)
+        ], cur.bangumi_id, cur.summary)
 
         with ui.row().classes("items-center gap-3 flex-wrap"):
             ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat size=sm")
