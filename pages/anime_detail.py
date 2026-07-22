@@ -3,7 +3,7 @@ from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (WEEKDAY_CN, confirm, ep_str, meta_card, name_of,
+from .layout import (WEEKDAY_CN, confirm, ep_str, meta_card, name_of, parse_bgm_id,
                      qb_live_text, season_label, source_options, torrent_status_cn)
 
 
@@ -27,6 +27,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         with ui.row().classes("items-start gap-2 w-full no-wrap"):
             with ui.row().classes("items-center gap-2 flex-wrap grow min-w-0"):
                 ui.label(name_of(cur)).classes("text-2xl font-bold")
+                ui.button(icon="edit", on_click=_bind).props("flat round dense size=sm").tooltip(
+                    "认错了？手动绑定正确的 bgm（粘链接或 ID）")
                 _sl = season_label(cur)
                 if _sl:
                     ui.badge(_sl).props("color=blue-grey")
@@ -39,27 +41,31 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.button(icon="close", on_click=on_close).props("flat round dense").classes(
                     "shrink-0")
 
-        # 元操作行：重新识别 / 忽略 —— 放在标题下面
-        with ui.row().classes("items-center gap-2 flex-wrap"):
-            ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat size=sm").style(
-                "font-size:12px")
+        # 元操作行：重新识别 / 忽略 —— 放在标题下面（dense 收紧内边距 + -ml-1 抵消残余左边距，跟标题左缘对齐）
+        with ui.row().classes("items-center gap-3 flex-wrap -ml-1"):
+            ui.button("重新识别", icon="refresh", on_click=_enrich).props(
+                "flat dense size=sm").style("font-size:12px")
             if cur.rejected:
                 ui.button("恢复订阅", icon="undo", on_click=_restore).props(
-                    "size=sm color=primary").style("font-size:12px")
+                    "dense size=sm color=primary").style("font-size:12px")
             else:
                 ui.button("忽略本番", icon="block", on_click=_reject).props(
-                    "size=sm flat color=grey").style("font-size:12px")
+                    "flat dense size=sm color=grey").style("font-size:12px")
 
         # 元信息卡（封面 + bgm 元数据 + 简介）
         wd = f"  {WEEKDAY_CN[cur.air_weekday]}" if cur.air_weekday is not None else ""
         meta_card(cur.cover_url, [
+            ("日文", cur.jp_name),
+            ("集数", cur.total_episodes),
             ("季度", engine.quarter_label(cur.quarter)),
             ("放送", f"{cur.air_date or '—'}{wd}"),
             ("类型", cur.platform),
-            ("总集数", cur.total_episodes),
-            ("评分", cur.rating),
+            ("原作", cur.author),
+            ("导演", cur.director),
+            ("音乐", cur.music),
+            ("声优", cur.cast),
             ("来源", " · ".join(sources) or "—"),
-        ], cur.bangumi_id, cur.summary)
+        ], cur.bangumi_id, cur.summary, rating=cur.rating)
 
         # 下载类操作（重新识别/忽略在上面的元操作行）
         with ui.row().classes("items-center gap-3 flex-wrap"):
@@ -73,7 +79,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.button("确认下载", on_click=_confirm).props("size=sm color=primary").style(
                     "font-size:12px")
             _dln = ui.button("下载该源", icon="download", on_click=_download).props(
-                "flat size=sm").style("font-size:12px")
+                "flat dense size=sm").style("font-size:12px")
             _dln.set_enabled(config.QB_ENABLED)
             _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
                          else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过")
@@ -100,8 +106,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     else:
                         ui.label(ep_txt).classes("shrink-0")              # 主要信息：集号（已下等不可改）
                     ui.label(t.source or "—").classes("shrink-0")         # 主要信息：字幕组（同色）
-                    ui.label(engine.torrent_time(t)).classes("shrink-0 text-gray-500").style(
-                        "font-size:11px")                                 # 次要：时间
+                    ui.label(engine.torrent_time(t)).classes(
+                        "shrink-0 text-gray-500 text-xs")                 # 次要：时间(12px)
                     ui.space()
                     live = qb_live_text(t)
                     if live:  # qB 实时态：完成(做种/100%)才绿，下载中用 teal
@@ -146,8 +152,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
                 with ui.row().classes("items-start gap-3 w-full text-sm no-wrap"):
                     ui.label(ep_txt).classes("shrink-0").style("visibility:hidden")
-                    ui.label(t.raw_title or "—").classes("text-gray-500 break-all min-w-0").style(
-                        "font-size:11px")
+                    ui.label(t.raw_title or "—").classes(
+                        "text-gray-500 break-all min-w-0 text-xs")
 
     def _after():
         body.refresh()
@@ -167,6 +173,30 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         ok = await anime.enrich_anime(anime_id)
         _after()
         ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）")
+
+    async def _bind():
+        dlg = ui.dialog()
+        with dlg, ui.card().classes("gap-2"):
+            ui.label("绑定 bgm").classes("font-bold")
+            ui.label("自动认错了就把正确的 bgm 链接或 ID 填这——直接取权威元数据覆盖。").classes(
+                "text-xs text-gray-400")
+            inp = ui.input(placeholder="bgm.tv/subject/464376 或 464376").props(
+                "dense outlined autofocus").classes("min-w-80")
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
+                ui.button("绑定", icon="link",
+                          on_click=lambda: dlg.submit(inp.value)).props("color=primary")
+        val = await dlg
+        if not val:
+            return
+        bid = parse_bgm_id(val)
+        if not bid:
+            ui.notify("没认出 bgm ID（粘 bgm.tv/subject/数字 或纯数字）", type="warning")
+            return
+        ok = await anime.bind_anime_bgm(anime_id, bid)
+        _after()
+        ui.notify("已绑定并识别 ✓（回到待确认，去点确认下载）" if ok
+                  else "绑定失败：ID 不存在或取不到 bgm 数据", type="positive" if ok else "negative")
 
     async def _confirm():
         anime.confirm_anime(anime_id)

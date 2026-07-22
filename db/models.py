@@ -56,6 +56,11 @@ class Anime(SQLModel, table=True):
     cover_url: str | None = Field(default=None)       # 封面图 URL
     rating: float | None = Field(default=None)        # bgm 评分（0-10）
     summary: str | None = Field(default=None)         # 简介
+    # ---- 制作信息（bgm infobox + 主角声优；纯文本展示，想看全部点 bgm 链接）----
+    author: str | None = Field(default=None)          # 原作
+    director: str | None = Field(default=None)        # 导演
+    music: str | None = Field(default=None)           # 音乐
+    cast: str | None = Field(default=None)            # 主角声优：'角色：声优 / …'
     # ---- 下载控制 ----
     confirmed: bool = Field(default=True)             # 确认状态（待确认源默认 False，等人工确认）；确认即自动下
     rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『拒绝』页恢复）
@@ -123,6 +128,11 @@ class Movie(SQLModel, table=True):
     cover_url: str | None = Field(default=None)
     rating: float | None = Field(default=None)
     summary: str | None = Field(default=None)
+    # ---- 制作信息（bgm infobox + 主角声优）----
+    author: str | None = Field(default=None)          # 原作
+    director: str | None = Field(default=None)        # 导演
+    music: str | None = Field(default=None)           # 音乐
+    cast: str | None = Field(default=None)            # 主角声优：'角色：声优 / …'
     # ---- 忽略 / 识别 ----（剧场版逐版本人工下，无审批/首选源概念）
     rejected: bool = Field(default=False)             # 人工忽略（移出 /movies，可恢复）
     created_at: datetime = Field(default_factory=datetime.now)

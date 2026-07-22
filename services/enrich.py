@@ -103,11 +103,61 @@ async def _mikan_bridge(client, info_hash):
         return None
 
 
+def _infobox_get(infobox, *keys) -> str | None:
+    """从 bgm infobox 取某键的文本值（值可能是字符串或 [{v:..}] 列表）；按给定键顺序取第一个命中的。"""
+    idx = {it.get("key"): it.get("value") for it in (infobox or [])
+           if isinstance(it, dict) and it.get("key")}
+    for k in keys:
+        v = idx.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, list):
+            parts = [str(x.get("v") if isinstance(x, dict) else x).strip() for x in v]
+            parts = [p for p in parts if p]
+            if parts:
+                return "、".join(parts)
+    return None
+
+
+async def _fetch_cast(client, bgm_id, limit=8) -> str | None:
+    """取『主角』的声优名（去重、只要 CV 名不要角色名）→ '声优、声优…' 文本；失败/无主角返回 None。
+    只抓主角、不存人物 URL（要全部演员表点 bgm 链接）。"""
+    try:
+        r = await client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}/characters", headers=_UA)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(data, list):
+        return None
+    names: list[str] = []
+    for ch in data:
+        if not isinstance(ch, dict) or ch.get("relation") != "主角":
+            continue
+        for a in (ch.get("actors") or []):
+            nm = a.get("name") if isinstance(a, dict) else None
+            if nm and nm not in names:
+                names.append(nm)
+    return "、".join(names[:limit]) or None
+
+
+def _clean_summary(s: str | None) -> str | None:
+    """bgm 简介：统一换行、去行尾空白、把连续 2 行以上空白压成 1 行（避免大段空白）。"""
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not s:
+        return None
+    s = re.sub(r"[ \t　]+(?=\n)", "", s)   # 去每行尾部空白（含全角空格）
+    s = re.sub(r"\n{3,}", "\n\n", s)           # 连续 2 行以上空白 → 压成 1 行
+    return s
+
+
 def _subject_to_info(bgm_id, meta: dict) -> dict:
-    """bgm subject 元数据 → 统一的富集 info 字典（resolve 与手动绑定共用）。"""
+    """bgm subject 元数据 → 统一的富集 info 字典（resolve 与手动绑定共用）。cast 由调用方另调 /characters 填。"""
     jp_name = meta.get("name") or None                  # 原名（日文）
     display_name = meta.get("name_cn") or jp_name        # 规范名，无中文退日文
     dt = _parse_date(meta.get("date"))
+    ib = meta.get("infobox")
     return {
         "bangumi_id": bgm_id,
         "display_name": display_name,
@@ -119,7 +169,10 @@ def _subject_to_info(bgm_id, meta: dict) -> dict:
         "platform": meta.get("platform") or None,        # TV/剧场版/OVA…
         "cover_url": (meta.get("images") or {}).get("large") or None,
         "rating": (meta.get("rating") or {}).get("score") or None,
-        "summary": (meta.get("summary") or "").strip() or None,
+        "summary": _clean_summary(meta.get("summary")),
+        "author": _infobox_get(ib, "原作"),
+        "director": _infobox_get(ib, "导演", "監督", "总导演"),
+        "music": _infobox_get(ib, "音乐", "音楽"),
     }
 
 
@@ -128,15 +181,18 @@ async def fetch_by_id(bgm_id: int) -> dict | None:
     try:
         async with httpx.AsyncClient(**config.http_client_kwargs(config.ENRICH_TIMEOUT)) as client:
             r = await client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA)
-        if r.status_code != 200:
-            return None
-        j = r.json()
+            if r.status_code != 200:
+                return None
+            j = r.json()
+            cast = await _fetch_cast(client, bgm_id)
     except (httpx.HTTPError, ValueError) as e:
         log.warning("按 id 取 bgm 失败 %s: %s", bgm_id, e)
         return None
     if not isinstance(j, dict) or not j.get("id"):
         return None
-    return _subject_to_info(bgm_id, j)
+    info = _subject_to_info(bgm_id, j)
+    info["cast"] = cast
+    return info
 
 
 async def resolve(names, release_time=None, episode=None, info_hash=None) -> dict | None:
@@ -174,8 +230,9 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
             if bgm_id is None and info_hash:
                 bgm_id = await _mikan_bridge(client, info_hash)
 
-            # ③ 取 bgm 元数据（规范名/原名/放送日 + 简介/总集数/类型/封面/评分）
+            # ③ 取 bgm 元数据（规范名/原名/放送日 + 简介/总集数/类型/封面/评分 + 原作/导演/音乐）
             meta = {}
+            cast = None
             if bgm_id is not None:
                 try:
                     r = await client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA)
@@ -184,10 +241,13 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
                         meta = j if isinstance(j, dict) else {}  # 防 bgm 返回数组/非对象
                 except (httpx.HTTPError, ValueError):
                     meta = {}
+                cast = await _fetch_cast(client, bgm_id)   # 声优另调 /characters（只抓主角）
 
         if _parse_date(meta.get("date")) is None and bgm_id is None:
             return None
-        return _subject_to_info(bgm_id, meta)
+        info = _subject_to_info(bgm_id, meta)
+        info["cast"] = cast
+        return info
     except httpx.HTTPError as e:
         log.warning("富集失败 %s: %s", (names[0] if names else info_hash or "")[:16], e)
         return None

@@ -48,24 +48,33 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
 
         wd = f"  {WEEKDAY_CN[cur.air_weekday]}" if cur.air_weekday is not None else ""
         meta_card(cur.cover_url, [
+            ("日文名", cur.jp_name),
             ("季度", engine.quarter_label(cur.quarter) if cur.quarter else "—"),
             ("放送", f"{cur.air_date or '—'}{wd}"),
             ("类型", cur.platform),
-            ("评分", cur.rating),
+            ("原作", cur.author),
+            ("导演", cur.director),
+            ("音乐", cur.music),
+            ("声优", cur.cast),
+            None,                                       # 隔开：来源是下载源、不是 bgm 元数据
             ("来源", " · ".join(sources) or "—"),
-        ], cur.bangumi_id, cur.summary)
+        ], cur.bangumi_id, cur.summary, rating=cur.rating)
 
         with ui.row().classes("items-center gap-3 flex-wrap"):
-            ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat size=sm")
+            ui.button("重新识别", icon="refresh", on_click=_enrich).props(
+                "flat dense size=sm").style("font-size:12px")
             if cur.rejected:
-                ui.button("恢复", icon="undo", on_click=_restore).props("size=sm color=primary")
+                ui.button("恢复", icon="undo", on_click=_restore).props(
+                    "dense size=sm color=primary").style("font-size:12px")
             else:
-                ui.button("忽略", on_click=_reject).props("size=sm flat color=grey")
+                ui.button("忽略", icon="block", on_click=_reject).props(
+                    "flat dense size=sm color=grey").style("font-size:12px")
         if not cur.bangumi_id:
             with ui.row().classes("items-center gap-2 flex-wrap"):
                 inp = ui.input(placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").props(
                     "dense outlined").classes("min-w-96")
-                ui.button("绑定", icon="link", on_click=lambda: _bind(inp)).props("size=sm color=primary")
+                ui.button("绑定", icon="link", on_click=lambda: _bind(inp)).props(
+                    "dense size=sm color=primary").style("font-size:12px")
 
         ui.label(f"版本 / 种子（{len(ts)}）").classes("text-sm font-bold mt-2")
         if not ts:
@@ -74,7 +83,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         for t in ts:
             with ui.row().classes("items-center gap-2 w-full py-1 text-sm").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
-                ui.label(engine.torrent_time(t)).classes("w-28 text-gray-400")
+                ui.label(engine.torrent_time(t)).classes("w-28 text-gray-400 text-xs")
                 ui.label(t.raw_title or t.source).classes("grow break-all")
                 live = qb_live_text(t)
                 if live:  # 完成(做种/100%)才绿，下载中用 teal
@@ -85,7 +94,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
                         "color=blue-grey")
                 ui.button("下载", icon="download", on_click=_force(t.id)).props(
-                    "size=sm flat dense").tooltip("强制下这一版本到文件夹")
+                    "size=sm flat dense").style("font-size:12px").tooltip("强制下这一版本到文件夹")
                 if t.status in ("downloaded", "downloading"):
                     ui.button(icon="delete_forever", on_click=_del(t.id)).props(
                         "size=sm flat dense color=negative").tooltip("删除这一版本的文件（qB+硬盘，不可撤销）")

@@ -110,22 +110,50 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
     ''')
 
 
-def meta_card(cover_url, kv_pairs, bangumi_id, summary) -> None:
-    """详情元信息卡：封面 + 两列 kv 网格 + bgm 链接 + 简介。番剧/剧场版详情共用，
-    kv_pairs=[(标签, 值)...] 各页自备（字段集略不同）。"""
+# bgm 官方评分档位文案：无独立接口，按分数四舍五入到整数分本地映射（4→较差 6→还行 …）
+_BGM_RATING_TIERS = {
+    1: "不忍直视", 2: "很差", 3: "差", 4: "较差", 5: "不过不失",
+    6: "还行", 7: "推荐", 8: "力荐", 9: "神作", 10: "超神作",
+}
+
+
+def rating_label(score) -> str | None:
+    return _BGM_RATING_TIERS.get(round(score)) if score else None
+
+
+def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
+    """详情元信息卡：封面 + bgm 链接（图下） + 两列 kv 网格 + 右上角豆瓣式评分（分+评价） + 简介。
+    番剧/剧场版详情共用，kv_pairs=[(标签, 值)...] 各页自备（字段集略不同）。"""
     with ui.card().classes("w-full"):
         with ui.row().classes("gap-4 items-start no-wrap w-full"):
+            # 左列：海报原图完整（不裁）——锁定高度、宽度随图片自然比例走（原生 img：高定死、宽 auto）
             if cover_url:
-                ui.image(cover_url).classes("rounded").style("min-width:7rem;width:7rem")
-            with ui.column().classes("gap-1 grow"):
-                with ui.grid(columns=2).classes("gap-x-8 gap-y-1"):
-                    for kk, vv in kv_pairs:
+                ui.html(f'<img src="{cover_url}" style="height:18.5rem;width:auto" '
+                        f'class="rounded">').classes("shrink-0 w-fit")
+            # 中列：两列 kv 网格 + bgm 快捷方式(subject id + 跳转图标) 摆在『来源』下面
+            with ui.column().classes("gap-1 grow min-w-0"):
+                with ui.grid(columns=2).classes("gap-x-8 gap-y-1").style(
+                        "grid-template-columns:auto minmax(0,1fr)"):
+                    for pair in kv_pairs:
+                        if pair is None:                 # 分隔行：留一点空当，把非 bgm 字段隔开
+                            ui.element("div").style("height:0.4rem")
+                            ui.element("div")
+                            continue
+                        kk, vv = pair
                         ui.label(kk).classes("text-xs text-gray-400")
                         ui.label(str(vv) if vv not in (None, "") else "—")
-                if bangumi_id:
+                if bangumi_id:  # bgm 链接，摆在『来源』下面
                     ui.link(f"bgm.tv/subject/{bangumi_id}",
                             f"https://bgm.tv/subject/{bangumi_id}").props(
                         "target=_blank").classes("text-xs")
+            # 右列：大号分数 / 中文评价，竖排右对齐
+            if rating:
+                with ui.column().classes("gap-0.5 shrink-0 items-end"):
+                    ui.label(f"{rating:g}").classes(
+                        "text-3xl font-bold text-amber-400 leading-none")
+                    _lab = rating_label(rating)
+                    if _lab:
+                        ui.label(_lab).classes("text-xs text-gray-400")
         if summary:
             ui.separator()
             ui.label(summary).classes("text-sm text-gray-300 whitespace-pre-wrap")
