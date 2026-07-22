@@ -106,6 +106,29 @@ def settings():
                      "慢速地板 20KB/s + 连续 3 轮判慢：某种子长期龟速也能让循环休眠；但只要还有别的种子在真下，"
                      "每轮批量刷新会顺便把慢的一起更新。关状态跟踪：发送过去即当『已下』，一次 qB 都不查（零轮询、看不到进度）。").classes(
                 "text-xs text-gray-500")
+
+            ui.separator()
+            ui.label("完成回调（可选·精确兜底）").classes("font-bold text-sm")
+            _text("QB_CALLBACK_TOKEN", "回调 token（可选，防被乱调；填了下面命令会自动带上 &t=，改完记得点保存）",
+                  config.QB_CALLBACK_TOKEN)
+            ui.label("把下面这行填进 qB → Options → Downloads → 『Run external program on torrent finished』，"
+                     "种子一下完 qB 就回调、精确把这一集标『已下』（%I 由 qB 替换成种子 hash）：").classes(
+                "text-xs text-gray-500")
+
+            @ui.refreshable
+            def _cb_cmd():
+                tok = (f["QB_CALLBACK_TOKEN"].value or "").strip()   # 读输入框实时值，不是已保存值
+                cmd = (f'curl -s "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
+                       + (f'&t={tok}' if tok else '') + '"')
+                ui.code(cmd).classes("w-full text-xs")
+
+            _cb_cmd()
+            f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 一改，命令即时跟着变
+            ui.label("为什么需要它：种子若长期龟速/卡住被降级停跟，又恰好在休眠里下完并被 qB『完成即删种』删掉，"
+                     "我们看不到它到 100%，会把它标成『失败』。配了这个回调就能精确兜底标成『已下』。"
+                     "不配也行——这种情况很少（多半是剧场版没源慢下），标失败后手动补一下即可。"
+                     "仅当 qB 与本程序在同一台机器（回调打 127.0.0.1）时可用。").classes("text-xs text-gray-500")
+
             _text("QB_URL", "qB 地址", config.QB_URL)
             _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
             _password("QB_PASSWORD", "qB 密码（留空=不修改）")

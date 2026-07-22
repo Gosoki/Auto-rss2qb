@@ -38,6 +38,7 @@ _SPEC = {
     "QB_SYNC_BACKSTOP_MIN": (int, 180),     # 保底自查间隔（分钟）：没被事件唤醒也每隔这么久兜底扫一次，默认 3 小时
     "QB_ACTIVE_FLOOR_KBPS": (int, 20),      # 慢速地板（KB/s）：下载慢于此算『没在真下』；0=只要有速度就算
     "QB_SLOW_ROUNDS": (int, 3),             # 连续几轮都没在真下才退出高频轮询、休眠（防单次抖动误判）
+    "QB_CALLBACK_TOKEN": (str, ""),         # qB 完成回调 /api/qb/done 的校验 token（空=不校验；填了 qB 命令里要带 &t=）
     "QB_URL": (str, "http://127.0.0.1:8080"),
     "QB_USERNAME": (str, ""),
     "QB_PASSWORD": (str, ""),

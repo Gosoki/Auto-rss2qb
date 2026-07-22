@@ -294,6 +294,27 @@ def has_active_downloading() -> bool:
     return False
 
 
+def mark_done_by_hash(info_hash: str) -> bool:
+    """把某 info_hash 的种子标记为『已下完』(qb_progress=1、脱离 in-flight)——供 qB『完成时回调』精确兜底。
+    只认我们自己表里已交付(downloaded/downloading)的种子；非法 hash / 非我们的 / 已终态 返回 False。"""
+    h = (info_hash or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", h):
+        return False
+    with get_session() as s:
+        for model_cls in (AnimeTorrent, MovieTorrent):
+            t = s.exec(select(model_cls).where(model_cls.info_hash == h)).first()
+            if t is None:
+                continue
+            if t.status not in ("downloaded", "downloading"):
+                return False   # 是我们的，但已 skipped/deleted/error 等终态 → 不动
+            t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "downloaded", 1.0, "", datetime.now()
+            s.add(t)
+            s.commit()
+            log.info("qB 完成回调：标记已下完 - %s", h[:12])
+            return True
+    return False   # 不是我们的种子 → 忽略
+
+
 def backfill_legacy_downloaded_once() -> None:
     """一次性迁移：本功能上线前 status='downloaded' 语义=已交付（历史行都早已下完），但 qb_progress 可能为 0/未满。
     新模型以 qb_progress>=1 判『已完成、停止监听』，故上线时把现存 downloaded 行的 qb_progress 补成 1.0，免得它们
@@ -349,9 +370,11 @@ async def sync_qb_status(model_cls) -> int:
             d = info.get(h)
             if d is None:
                 # qB 查不到这个在下的种子——必须在有限轮内落定，否则它恒满足 in-flight、循环永不休眠：
-                if last_prog >= 0.999:      # 曾接近满 → 下完被 qB 自动删/移除，落定为已下
+                if last_prog >= 0.999:      # 曾接近满 → 判下完被 qB 移除，落定已下
                     t.qb_progress, t.qb_state, t.qb_synced_at = 1.0, "", now
-                elif was_synced:            # 曾在下又没下完就消失(qB 端删了半成品/丢了) → 落定 error，可补/重下
+                elif was_synced:            # 曾在下、还没下完就从 qB 消失 → 落定 error（可补/重下）。
+                    # 注：慢速种子被降级停跟后、在休眠里下完又被 qB 删（remove-on-complete）也会走这里被标 error——
+                    # 我们看不到它爬到 100%。要精确标『已下』就在 qB 配『完成回调』(/api/qb/done，可选，见设置页)。
                     t.status, t.qb_state, t.qb_synced_at = "error", "", now
                 else:                       # 从未被 qB 确认(刚交付未登记?) → 给一轮宽限，下轮仍无则上面→error
                     t.qb_synced_at = now
