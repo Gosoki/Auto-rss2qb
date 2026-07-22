@@ -7,8 +7,9 @@ from .layout import (STATUS_CN, WEEKDAY_CN, confirm, ep_str, meta_card, name_of,
                      qb_live_text, season_label, source_options)
 
 
-def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
-    """把某番详情渲染进当前容器。refresh_outer：改动数据后刷新外层列表（番剧列表/待确认/已忽略 等）。"""
+def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> None:
+    """把某番详情渲染进当前容器。refresh_outer：改动数据后刷新外层列表（番剧列表/待确认/已忽略 等）。
+    on_close：非空则在标题行右侧渲染 X 关闭键（关掉外层 dialog）。"""
     if anime.get_anime(anime_id) is None:
         ui.label("番剧不存在").classes("text-gray-400 p-4")
         return
@@ -21,6 +22,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
             return
         eps = anime.list_episodes(anime_id)
         sources = sorted({t.source for t in eps})
+        # 标题行：标题 + 第X季 + 状态徽章都贴在标题后；X 关闭键推到最右
         with ui.row().classes("items-center gap-2 flex-wrap w-full"):
             ui.label(name_of(cur)).classes("text-2xl font-bold")
             _sl = season_label(cur)
@@ -31,7 +33,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
             else:
                 ui.badge("✓ 已确认" if cur.confirmed else "⏳ 待确认").props(
                     f"color={'green' if cur.confirmed else 'orange'}")
-            ui.space()  # 元操作靠右上角
+            ui.space()
+            if on_close:
+                ui.button(icon="close", on_click=on_close).props("flat round dense")
+
+        # 元操作行：重新识别 / 忽略 —— 放在标题下面
+        with ui.row().classes("items-center gap-2 flex-wrap"):
             ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat size=sm").style(
                 "font-size:12px")
             if cur.rejected:
@@ -52,7 +59,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None) -> None:
             ("来源", " · ".join(sources) or "—"),
         ], cur.bangumi_id, cur.title, cur.summary)
 
-        # 下载类操作（重新识别/忽略已移到右上角）
+        # 下载类操作（重新识别/忽略在上面的元操作行）
         with ui.row().classes("items-center gap-3 flex-wrap"):
             if not cur.rejected and not cur.confirmed:
                 ui.button("确认下载", on_click=_confirm).props("size=sm color=primary").style(

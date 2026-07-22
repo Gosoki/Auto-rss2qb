@@ -324,9 +324,7 @@ def anime_page(t: str = "manage"):
             from .anime_detail import render_anime_detail
             detail_dlg.clear()
             with detail_dlg, ui.card().classes("w-full").style("max-width:860px"):
-                with ui.row().classes("w-full justify-end"):
-                    ui.button(icon="close", on_click=detail_dlg.close).props("flat round dense")
-                render_anime_detail(anime_id, refresh_outer=refresh_all)
+                render_anime_detail(anime_id, refresh_outer=refresh_all, on_close=detail_dlg.close)
             detail_dlg.open()
 
         # ---- 事件处理（闭包，直接引用上面的刷新函数）----
