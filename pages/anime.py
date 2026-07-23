@@ -57,13 +57,14 @@ def anime_page(t: str = "manage"):
             ps = ov["pending_split"]
 
             # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
-            # 种子维度的卡统一绿字（已下集/将下载/未知集/失败/种子），与番维度（订阅中/待识别/待确认/已忽略）区分
+            # 种子维度的卡用绿色说明文字分组（已下集/将下载/未知集/失败/种子）；数字保持各自语义色，与番维度区分
             kpi_cards([("订阅中", k["tracking"], ""), ("待识别", k["fail"], "red"),
                        ("待确认", k["confirm"], "orange"), ("已忽略", k["rejected"], ""),
-                       ("已下集", k["done"], "green"), ("将下载", k["will"], "green"),
-                       ("未知集", ps["unknown"], "green", _open_unknown),
-                       ("失败", ov["status"]["error"], "green", _open_failed),
-                       ("种子", k["torrents"], "green")])
+                       ("已下集", k["done"], "green", None, "green"),
+                       ("将下载", k["will"], "blue", None, "green"),
+                       ("未知集", ps["unknown"], "purple", _open_unknown, "green"),
+                       ("失败", ov["status"]["error"], "red", _open_failed, "green"),
+                       ("种子", k["torrents"], "", None, "green")])
 
             # ── qB 未启用提醒 ──
             if not ov["config"]["qb"]:

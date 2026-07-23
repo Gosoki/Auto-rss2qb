@@ -51,19 +51,21 @@ def group_by_quarter(items):
 
 
 def kpi_cards(cards) -> None:
-    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') 或 (标签, 数值, 高亮色, on_click), ...]；
-    给了 on_click 的卡可点（手型光标+悬浮高亮）。值非零且给了色才染色。"""
+    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') / (…, on_click) / (…, on_click, 标签色), ...]；
+    给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签色用来把同类卡分组（种子维度用绿字）。"""
     with ui.row().classes("gap-3 flex-wrap p-1"):
         for card in cards:
             label, val, hi = card[:3]
             on_click = card[3] if len(card) > 3 else None
-            c = ui.card().classes("items-center px-5 py-2" + (
+            label_color = card[4] if len(card) > 4 else None   # 说明文字颜色，缺省灰
+            c = ui.card().classes("items-center px-3 py-2" + (
                 " cursor-pointer hover:bg-white/5" if on_click else ""))
             with c:
                 cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
                 ui.label(str(val)).classes(cls).style(  # 预留 5 位数宽度：数字增减时卡不抖、各卡等宽
                     "min-width:5ch;text-align:center;font-variant-numeric:tabular-nums")
-                ui.label(label).classes("text-xs text-gray-400")
+                ui.label(label).classes(
+                    "text-xs " + (f"text-{label_color}-400" if label_color else "text-gray-400"))
             if on_click:
                 c.on("click", on_click)
 
