@@ -33,6 +33,15 @@ def _ep_label(e) -> str:
     return f"第 {ep_str(e)} 集"
 
 
+def _ep_short(e) -> str:
+    """徽标用的短集号；完整解释放 tooltip。"""
+    if e == -1:
+        return "特别篇"
+    if e == -2:
+        return "未识别"
+    return f"第 {ep_str(e)} 集"
+
+
 @ui.page("/parse")
 def parse_test_page():
     with frame("parse"):
@@ -40,11 +49,13 @@ def parse_test_page():
         ui.label("粘贴一条 RSS 里的种子标题，实时看解析结果。也用来验证解析规则会不会误伤大组"
                  "——粘 ANi/Lilith 的标题，看番名/集数是否照旧。").classes("text-xs text-gray-400 mb-2")
 
-        inp = ui.input("种子标题", placeholder="粘贴一条种子名…").classes("w-full")
-        with ui.row().classes("items-center gap-2"):
-            sw = ui.switch("多括号回退捕获（沸羊羊/悠哈/GM-Team 等）",
-                           value=config.ANIME_MULTIBRACKET_PARSE).props("dense")
-            ui.label("← 就地开关，立即看效果（全局生效，等同设置页那个）").classes("text-xs text-gray-500")
+        with ui.card().classes("w-full gap-3"):
+            inp = ui.input("种子标题", placeholder="粘贴一条种子名…").props(
+                "dense outlined clearable autofocus").classes("w-full")
+            with ui.row().classes("items-center gap-2 flex-wrap"):
+                sw = ui.switch("多括号回退捕获", value=config.ANIME_MULTIBRACKET_PARSE).props("dense")
+                ui.label("沸羊羊/悠哈/GM-Team 等多括号命名；就地开关立即看效果（全局生效，等同设置页）").classes(
+                    "text-xs text-gray-500")
 
         @ui.refreshable
         def result():
@@ -74,21 +85,32 @@ def parse_test_page():
             else:
                 verdict, icon, color = "会被采集入库", "check_circle", "green"
 
-            with ui.card().classes("w-full gap-1"):
-                with ui.row().classes("items-center gap-2"):
-                    ui.icon(icon).classes(f"text-{color}-400")
-                    ui.label(verdict).classes(f"font-bold text-{color}-300")
+            with ui.card().classes("w-full gap-3"):
+                # 判定横幅：图标 + 采集判定
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    ui.icon(icon).classes(f"text-{color}-400 text-2xl shrink-0")
+                    ui.label(verdict).classes(f"text-sm font-bold text-{color}-300")
                 ui.separator()
-                with ui.grid(columns=2).classes("gap-x-8 gap-y-1"):
-                    for k, v in [("组名", group or "—"), ("番名", name or "（空）"),
-                                 ("季", f"第 {season} 季"), ("集", _ep_label(episode)),
-                                 ("是否合集", "是" if batch else "否")]:
-                        ui.label(k).classes("text-xs text-gray-400")
-                        ui.label(str(v))
-                ui.label("bgm 搜索候选名（识别就靠它们）").classes("text-xs text-gray-400 mt-1")
+                # 番名（醒目）+ 合集/单集
+                with ui.row().classes("items-center gap-2 flex-wrap"):
+                    ui.label(name or "（番名为空）").classes(
+                        "text-lg font-bold" + ("" if name else " text-gray-500"))
+                    ui.badge("合集" if batch else "单集").props(
+                        f"color={'red' if batch else 'green'}").classes("text-sm")
+                # 组 / 季 / 集 徽标
+                with ui.row().classes("gap-2 flex-wrap items-center"):
+                    ui.badge(f"组 · {group or '—'}").props("color=blue-grey").classes("text-sm")
+                    ui.badge(f"第 {season} 季").props("color=blue-grey").classes("text-sm")
+                    ui.badge(f"集 · {_ep_short(episode)}").props(
+                        f"color={'orange' if episode == -2 else 'blue-grey'}").classes("text-sm").tooltip(
+                        _ep_label(episode))
+                ui.separator()
+                # bgm 候选名（识别就靠它们）
+                ui.label("bgm 搜索候选名（识别就靠它们）").classes("text-xs text-gray-400")
                 if cands:
-                    for c in cands:
-                        ui.label("· " + c).classes("text-sm")
+                    with ui.row().classes("gap-2 flex-wrap"):
+                        for c in cands:
+                            ui.badge(c).props("color=indigo").classes("text-sm")
                 else:
                     ui.label("（无——识别不到会进『待识别』，可手动绑定 bgm）").classes("text-sm text-orange-300")
 
@@ -106,12 +128,12 @@ def parse_test_page():
             result.refresh()
 
         ui.label("点一个示例填入（前两条是大组，开着开关也应名字/集数照旧）：").classes(
-            "text-xs text-gray-500 mt-3")
-        with ui.column().classes("gap-1 w-full"):
+            "text-xs text-gray-500 mt-4 mb-1")
+        with ui.column().classes("gap-0 w-full"):
             for tag, ex in _EXAMPLES:
-                with ui.row().classes("items-baseline gap-2 no-wrap w-full"):
+                with ui.row().classes(
+                        "items-center gap-2 no-wrap w-full cursor-pointer rounded px-2 py-1 "
+                        "hover:bg-white/5 transition-colors").on("click", lambda e=ex: _fill(e)):
                     ui.badge(tag).props("color=blue-grey").classes("shrink-0")
-                    ui.label(ex).classes(
-                        "cursor-pointer text-xs text-blue hover:underline break-all").on(
-                        "click", lambda e=ex: _fill(e))
+                    ui.label(ex).classes("text-xs text-gray-400 break-all")
         result()
