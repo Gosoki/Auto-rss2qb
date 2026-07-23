@@ -171,6 +171,13 @@ async def process_item(item) -> bool:
             return False
         s.refresh(torrent)
         torrent_id = torrent.id
+        # 自动升确认：auto 源为『已识别、未确认、未拒』的番贡献种子 → 转自动下。
+        # 救回『review/泛 feed 先建番把 auto 主力番静默压进待确认』与『bgm 瞬时失败先建的番』。
+        if (a is not None and not a.confirmed and not a.rejected
+                and a.bangumi_id is not None and _is_auto(item.source_kind)):
+            a.confirmed = True
+            s.add(a)
+            s.commit()
         should_download = bool(a and a.confirmed and not a.rejected)
         lock = a.pref_source if a else None   # 锁定源：入库即下也只放行锁定组
         kw = a.pref_keyword if a else None     # 版本关键词：即时下载也只放行命中该版本的
@@ -260,6 +267,12 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     if not ok:
         _set_status(torrent_id, "error")
         return False
+    with get_session() as s:   # 记实际保存路径：改季度/重绑后据此移动或提醒旧位置
+        t = s.get(AnimeTorrent, torrent_id)
+        if t is not None:
+            t.save_path = save_path
+            s.add(t)
+            s.commit()
     if config.QB_SYNC_STATUS:
         _set_status(torrent_id, "downloaded")
         engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
@@ -610,6 +623,24 @@ def set_pref_keyword(anime_id: int, keyword: str) -> None:
             s.commit()
 
 
+def set_quarter(anime_id: int, quarter: str) -> bool:
+    """手动改某番的归档季度（内部键如 26A；bgm 三级兜底之外的最终人工纠错）。
+
+    校验格式（两位年 + A/B/C/D）；成功返回 True。改后由调用方触发 relocate_anime 移动已下文件。
+    """
+    q = (quarter or "").strip().upper()
+    if not re.fullmatch(r"\d{2}[A-D]", q):
+        return False
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is None:
+            return False
+        a.quarter = q
+        s.add(a)
+        s.commit()
+    return True
+
+
 def reject_anime(anime_id: int) -> None:
     """拒绝某个番：打上 rejected（移出主列表进『拒绝』页）、不下载，积压待下种子标记跳过。"""
     with get_session() as s:
@@ -690,10 +721,13 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
 
 
 def _has_downloads(s, anime_id: int) -> bool:
-    """该番是否已有在下/已下的种子——有则季度已落盘，不该再改（避免散目录）。"""
+    """该番是否已下过（在下/已下/曾删）——有则季度已落盘/曾落盘，不该被重识别改（避免散目录）。
+
+    含 deleted：用户删过文件也算『季度已定』，否则全删后 keep_quarter 失效、重识别会把稳定季度冲掉。
+    """
     return s.exec(select(AnimeTorrent).where(
         AnimeTorrent.anime_id == anime_id,
-        AnimeTorrent.status.in_(["downloading", "downloaded"]),
+        AnimeTorrent.status.in_(["downloading", "downloaded", "deleted"]),
     )).first() is not None
 
 
@@ -786,12 +820,65 @@ async def reenrich_scope(seasons: int | None = None) -> int:
             ids = list(s.exec(base.where(Anime.quarter.in_(quarters))))
     n = 0
     for aid in ids:
+        reset_enrich_tries(aid)   # 手动重识别：清零后台重试计数，让未识别番重新获得自动重试机会
         try:
             if await enrich_anime(aid):
                 n += 1
         except Exception as e:
             log.warning("重新识别失败 anime=%s: %s", aid, e)
     log.info("重新识别（范围=%s）完成：%d/%d 命中", seasons or "全部", n, len(ids))
+    return n
+
+
+def reset_enrich_tries(anime_id: int) -> None:
+    """清零某番的 bgm 后台重试计数（手动『重新识别』时调用，让它重新获得自动重试机会）。"""
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is not None and a.enrich_tries:
+            a.enrich_tries = 0
+            s.add(a)
+            s.commit()
+
+
+async def retry_unmatched() -> int:
+    """后台延迟重试(指数退避)：对『待识别』(bangumi_id 空、未拒) 且未满次数上限的番，按『失败等待翻倍』重跑 bgm。
+
+    每番下次到点 = max(上次尝试, 建番时) + min(BASE * 2^已试次数, MAX)；到点才试。每试记 enrich_tries += 1、
+    刷新 last_enrich_at，满 REENRICH_MAX_TRIES 停自动、留手动（手动重识别清零重来）。enrich_anime 绕开
+    alias 短路、真查 bgm；命中即落 bgm_id → 从『待识别』升『待确认』，之后有 auto 源再来种子会自动升确认。返回命中数。
+    """
+    cap = max(1, config.REENRICH_MAX_TRIES)
+    base = max(1, config.REENRICH_RETRY_BASE) * 60          # 配置单位=分钟 → 秒
+    maxd = max(base, config.REENRICH_RETRY_MAX * 60)
+    now = datetime.now()
+    due: list[int] = []
+    with get_session() as s:
+        for a in s.exec(select(Anime).where(
+                Anime.bangumi_id.is_(None), Anime.rejected.is_not(True),
+                Anime.enrich_tries < cap).order_by(Anime.enrich_tries)):
+            delay = min(base * (2 ** (a.enrich_tries or 0)), maxd)  # 失败一次等待翻倍，封顶 MAX
+            ref = a.last_enrich_at or a.created_at
+            if (now - ref).total_seconds() >= delay:
+                due.append(a.id)
+                if len(due) >= 50:      # 单轮上限，防一次性狂打 bgm
+                    break
+    n = 0
+    for aid in due:
+        with get_session() as s:
+            a = s.get(Anime, aid)
+            if a is None:
+                continue
+            a.enrich_tries = (a.enrich_tries or 0) + 1
+            a.last_enrich_at = datetime.now()
+            s.add(a)
+            s.commit()
+        try:
+            if await enrich_anime(aid):
+                n += 1
+        except Exception as e:
+            log.warning("延迟重识别失败 anime=%s: %s", aid, e)
+    if due:
+        log.info("延迟重识别：%d 到点，命中 %d", len(due), n)
     return n
 
 
@@ -1137,6 +1224,88 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
 async def sync_qb_status() -> int:
     """从 qB 同步 TV 种子实时态（剧场版走 movies.sync_qb_status）。"""
     return await engine.sync_qb_status(AnimeTorrent)
+
+
+def anime_save_path(anime_id: int) -> str | None:
+    """该番当前的归档目录（build_save_path 结果：分类/季度/番名/[Season N]）；算不出返回 None。
+
+    与 download_anime_torrent 的取值一致：季度用 a.quarter，番名 jp_name→display_name→title。
+    """
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is None:
+            return None
+        quarter = a.quarter or "unknown"
+        folder = (a.jp_name or a.display_name) or a.title or "unknown"
+        season = a.season
+    return engine.build_save_path(quarter, folder, season=season, top="番剧")
+
+
+async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
+    """把该番已下/在下的种子移到当前归档目录（改季度/重绑后调用；调用方应已落新 a.quarter/名/季号）。
+
+    qB 跟踪该种子 → setLocation 原地搬 + 更新 save_path；qB 关/连不上/不跟踪(remove-on-complete)
+    → 清完成状态待重下到新目录；setLocation 报 403/409(新目录不可写) → 只报告、不动状态。
+    返回 {new_path, old_path, moved, redownload, untracked, failed, fail_code?, error?}。
+    """
+    new_path = anime_save_path(anime_id)
+    rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
+           "redownload": 0, "untracked": 0, "failed": 0}
+    if new_path is None:
+        rep["error"] = "算不出新路径（越界或无番）"
+        return rep
+    with get_session() as s:
+        pairs = [(t.id, t.info_hash) for t in s.exec(select(AnimeTorrent).where(
+            AnimeTorrent.anime_id == anime_id,
+            AnimeTorrent.status.in_(["downloaded", "downloading"])))]
+    if not pairs:
+        return rep
+
+    def _clear(ids):   # 清完成状态→pending，等 flush 重下到新目录
+        with get_session() as s:
+            for tid in ids:
+                t = s.get(AnimeTorrent, tid)
+                if t is not None and t.status in ("downloaded", "downloading"):
+                    t.status = "pending"
+                    s.add(t)
+            s.commit()
+
+    def _mark_moved(ids):
+        with get_session() as s:
+            for tid in ids:
+                t = s.get(AnimeTorrent, tid)
+                if t is not None:
+                    t.save_path = new_path
+                    s.add(t)
+            s.commit()
+
+    all_ids = [tid for tid, _ in pairs]
+    if not config.QB_ENABLED:   # qB 关：只能清状态待重下 + 提醒
+        _clear(all_ids)
+        rep["redownload"] = len(all_ids)
+        return rep
+    info = await engine.qb.torrents_info([h for _, h in pairs])
+    if info is None:            # qB 连不上：同上
+        _clear(all_ids)
+        rep["redownload"] = len(all_ids)
+        return rep
+    tracked = [(tid, h) for tid, h in pairs if h in info]
+    untracked = [tid for tid, h in pairs if h not in info]
+    if untracked:               # remove-on-complete 等：qB 已不认识 → 清状态待重下
+        _clear(untracked)
+        rep["untracked"] = rep["redownload"] = len(untracked)
+    if tracked:
+        code = await engine.qb.set_location([h for _, h in tracked], new_path)
+        if code == 200:
+            _mark_moved([tid for tid, _ in tracked])
+            rep["moved"] = len(tracked)
+        elif code is None:      # 中途连不上：退回清状态待重下
+            _clear([tid for tid, _ in tracked])
+            rep["redownload"] += len(tracked)
+        else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
+            rep["failed"] = len(tracked)
+            rep["fail_code"] = code
+    return rep
 
 
 async def delete_anime_torrent(torrent_id: int) -> bool:

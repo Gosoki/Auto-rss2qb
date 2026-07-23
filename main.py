@@ -11,7 +11,7 @@ import config
 import pages  # noqa: F401  导入即注册页面
 from config import WEB_PORT
 from core import anime, engine, movies
-from core.worker import run_movie_scan, run_qb_sync, run_worker
+from core.worker import run_movie_scan, run_qb_sync, run_reenrich_retry, run_worker
 from db import init_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -48,6 +48,7 @@ async def _startup():
     asyncio.create_task(run_worker())
     asyncio.create_task(run_qb_sync())    # qB 种子实时态同步（独立频率）
     asyncio.create_task(run_movie_scan())  # 剧场版/OVA 自动扫描（独立频率）
+    asyncio.create_task(run_reenrich_retry())  # 『待识别』番后台重试 bgm（独立频率，不阻塞采集）
 
 
 if __name__ in {"__main__", "__mp_main__"}:

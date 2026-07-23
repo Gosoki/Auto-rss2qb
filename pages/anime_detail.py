@@ -45,6 +45,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         with ui.row().classes("items-center gap-3 flex-wrap -ml-1"):
             ui.button("重新识别", icon="refresh", on_click=_enrich).props(
                 "flat dense size=sm").style("font-size:12px")
+            ui.button("编辑季度", icon="event", on_click=_edit_quarter).props(
+                "flat dense size=sm").style("font-size:12px").tooltip(
+                "手动改归档季度（bgm 定错/无放送日时兜底）。改后可把已下文件移到新目录。")
             if cur.rejected:
                 ui.button("恢复订阅", icon="undo", on_click=_restore).props(
                     "dense size=sm color=primary").style("font-size:12px")
@@ -104,6 +107,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label("（还没有种子）").classes("text-gray-400")
             return
         plan = anime.download_plan(anime_id)  # 待下里『会真下』的那些（首选/锁定组），其余待下=备用
+        # 这一集是否『有着落』：有将下/已下/在下、或你曾删过。没着落的正集=真·缺集（被锁定源/版本过滤光了）
+        covered = {t.episode for t in eps
+                   if t.id in plan or t.status in ("downloaded", "downloading", "deleted")}
         for t in eps:
             ep_txt = f"第{ep_str(t.episode)}集"
             with ui.column().classes("w-full gap-0 py-1").style(
@@ -135,9 +141,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         elif t.id in plan:
                             ui.badge("将下载").props("color=blue").tooltip(
                                 "这一集的首选版本，补下/自动下会下它")
-                        else:
+                        elif t.episode in covered or t.episode < 0:
                             ui.badge("备用").props("color=blue-grey").tooltip(
-                                "不会自动下：同集已由首选/已下覆盖，或非锁定源；要它就点右边下载")
+                                "同集已有『将下载/已下』的更优版本；要这条就点右边下载")
+                        else:  # 该集没有任何将下/已下版本——被锁定源/版本过滤光了=真·缺集
+                            ui.badge("缺集·仅非锁源").props("color=orange").tooltip(
+                                "这一集在当前锁定源/版本下没有可下的，只剩被过滤掉的版本；要它就点右边下载")
                     elif t.status == "error":
                         ui.badge("失败·可补下" if t.id in plan else "失败").props(
                             f"color={'orange' if t.id in plan else 'red'}").tooltip(
@@ -191,6 +200,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                   else "已取消版本限定", type="warning" if v else "positive")
 
     async def _enrich():
+        anime.reset_enrich_tries(anime_id)   # 手动重识别：清零后台重试计数，重新获得自动重试机会
         ok = await anime.enrich_anime(anime_id)
         _after()
         ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）")
@@ -214,10 +224,82 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if not bid:
             ui.notify("没认出 bgm ID（粘 bgm.tv/subject/数字 或纯数字）", type="warning")
             return
+        old_path = anime.anime_save_path(anime_id)   # 重绑前的归档路径（bind 可能改名/季度/季号）
         ok = await anime.bind_anime_bgm(anime_id, bid)
         _after()
         ui.notify("已绑定并识别 ✓（回到待确认，去点确认下载）" if ok
                   else "绑定失败：ID 不存在或取不到 bgm 数据", type="positive" if ok else "negative")
+        if ok:
+            await _maybe_relocate(old_path)
+
+    async def _edit_quarter():
+        cur = anime.get_anime(anime_id)
+        dlg = ui.dialog()
+        with dlg, ui.card().classes("gap-2"):
+            ui.label("编辑归档季度").classes("font-bold")
+            ui.label("内部键 = 两位年 + 季母（A冬 B春 C夏 D秋），如 26A=2026年冬。"
+                     "改后可把已下文件移到新目录。").classes("text-xs text-gray-400")
+            inp = ui.input("季度键", value=(cur.quarter if cur else "")).props(
+                "dense outlined autofocus").classes("min-w-60")
+            prev = ui.label().classes("text-sm text-blue")
+
+            def _pv():
+                q = (inp.value or "").strip().upper()
+                good = len(q) == 3 and q[:2].isdigit() and q[2] in "ABCD"
+                prev.text = ("预览：" + engine.quarter_label(q)) if good else "格式：26A / 26B / 26C / 26D"
+
+            inp.on_value_change(lambda: _pv())
+            _pv()
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
+                ui.button("保存", icon="save",
+                          on_click=lambda: dlg.submit(inp.value)).props("color=primary")
+        val = await dlg
+        if val is None:
+            return
+        old_path = anime.anime_save_path(anime_id)
+        if not anime.set_quarter(anime_id, val):
+            ui.notify("季度格式不对（应为 26A/26B/26C/26D）", type="warning")
+            return
+        _after()
+        ui.notify(f"季度已改为 {engine.quarter_label((val or '').strip().upper())}", type="positive")
+        await _maybe_relocate(old_path)
+
+    async def _maybe_relocate(old_path):
+        """改季度/重绑后：路径变了且有已下集就问是否移动，并按结果提示。"""
+        new_path = anime.anime_save_path(anime_id)
+        if not new_path or new_path == old_path:
+            return   # 路径没变，无需移动
+        dl = [t for t in anime.list_episodes(anime_id)
+              if t.status in ("downloaded", "downloading")]
+        if not dl:
+            ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
+            return
+        if not await confirm("归档目录变了，移动已下文件？",
+                             f"{len(dl)} 集已下，移到新目录：{new_path}",
+                             ok_label="移动文件", ok_icon="drive_file_move"):
+            ui.notify("已更新记录，未移动文件（新集将下到新目录，旧文件留在原处）", type="warning")
+            return
+        rep = await anime.relocate_anime(anime_id, old_path)
+        _after()
+        _notify_relocate(rep)
+
+    def _notify_relocate(rep):
+        if rep.get("error"):
+            ui.notify(f"移动失败：{rep['error']}", type="negative")
+            return
+        parts = []
+        if rep.get("moved"):
+            parts.append(f"已移动 {rep['moved']} 集到新目录")
+        if rep.get("redownload"):
+            parts.append(f"{rep['redownload']} 集 qB 未跟踪/连不上 → 已清状态待重下到新目录")
+        if rep.get("failed"):
+            parts.append(f"{rep['failed']} 集移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
+        msg = "；".join(parts) or "无需移动"
+        warn = bool(rep.get("redownload") or rep.get("failed"))
+        if rep.get("redownload") and rep.get("old_path"):
+            msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
+        ui.notify(msg, type="warning" if warn else "positive")
 
     async def _confirm():
         anime.confirm_anime(anime_id)

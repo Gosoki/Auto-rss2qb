@@ -7,6 +7,7 @@
 拿到 bgm id 后，name_cn=规范名、date=真实放送日→季度、id=跨源去重身份，全出自 bgm。
 全程尽力而为，拿不到返回 None，绝不阻断主下载链路。
 """
+import asyncio
 import logging
 import re
 from collections import Counter
@@ -18,6 +19,23 @@ import config
 from sources.parse import extract_quarter
 
 log = logging.getLogger("autorss")
+
+
+async def _retryable(make_request):
+    """执行一次 HTTP 请求；遇瞬时错误(超时/连接/读)按 config.ENRICH_RETRY_TIMES 重试(指数退避)。
+
+    make_request：无参 async，返回 httpx.Response。重试用尽后把最后一次异常抛出（交由各调用点的
+    try/except httpx.HTTPError 收成 None/{}）。非瞬时错误（如 404 正常返回）不在此重试。
+    """
+    times = max(1, config.ENRICH_RETRY_TIMES)
+    for i in range(times):
+        try:
+            return await make_request()
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
+                httpx.RemoteProtocolError):
+            if i + 1 >= times:
+                raise
+            await asyncio.sleep(0.5 * (2 ** i))   # 0.5s → 1s → 2s …
 
 _MIKAN_BANGUMI_RE = re.compile(r"/Home/Bangumi/(\d+)")
 _BGM_SUBJECT_RE = re.compile(r"bgm\.tv/subject/(\d+)")
@@ -60,10 +78,10 @@ def _name_plausible(query: str, subject: dict) -> bool:
 async def _search_one(client, name, est, release):
     """用一个名字搜 bgm，返回第一个通过日期+名字校验的 subject（bgm 按相关性排序）。"""
     try:
-        r = await client.post(
+        r = await _retryable(lambda: client.post(
             f"{config.BGM_API}/v0/search/subjects", headers=_UA,
             json={"keyword": name, "filter": {"type": [2]}},
-        )
+        ))
         if r.status_code != 200:
             return None
         body = r.json()
@@ -88,13 +106,13 @@ async def _mikan_bridge(client, info_hash):
     if not re.fullmatch(r"[0-9a-f]{40}", info_hash or ""):
         return None  # 只把 40 位 hex 拼进 URL：防非法 hash 造成路径穿越/请求注入
     try:
-        ep = await client.get(f"{config.MIKAN_BASE}/Home/Episode/{info_hash}")
+        ep = await _retryable(lambda: client.get(f"{config.MIKAN_BASE}/Home/Episode/{info_hash}"))
         if ep.status_code != 200:
             return None
         m = _MIKAN_BANGUMI_RE.search(ep.text)
         if not m:
             return None
-        bg = await client.get(f"{config.MIKAN_BASE}/Home/Bangumi/{m.group(1)}")
+        bg = await _retryable(lambda: client.get(f"{config.MIKAN_BASE}/Home/Bangumi/{m.group(1)}"))
         if bg.status_code != 200:
             return None
         sm = _BGM_SUBJECT_RE.search(bg.text)
@@ -180,7 +198,7 @@ async def fetch_by_id(bgm_id: int) -> dict | None:
     """按明确的 bgm subject id 直接取元数据（『富集失败』页手动绑定用）。取不到返回 None。"""
     try:
         async with httpx.AsyncClient(**config.http_client_kwargs(config.ENRICH_TIMEOUT)) as client:
-            r = await client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA)
+            r = await _retryable(lambda: client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
             if r.status_code != 200:
                 return None
             j = r.json()
@@ -235,7 +253,7 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
             cast = None
             if bgm_id is not None:
                 try:
-                    r = await client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA)
+                    r = await _retryable(lambda: client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
                     if r.status_code == 200:
                         j = r.json()
                         meta = j if isinstance(j, dict) else {}  # 防 bgm 返回数组/非对象

@@ -69,6 +69,24 @@ async def run_worker() -> None:
         await asyncio.sleep(max(60, config.ANIME_POLL_INTERVAL))  # 每轮读当前值；下限 60s 兜底，防坏值(0/负)忙循环
 
 
+async def run_reenrich_retry() -> None:
+    """独立协程：按指数退避对『待识别』番重跑 bgm 识别（到点判定与翻倍在 anime.retry_unmatched）。
+
+    刻意独立于主采集轮询——重试是串行 bgm 请求，放主循环里会拖住 poll_once/下载放行。采集暂停时也暂停重试。
+    以『检查节拍』周期性醒来看谁到点（节拍 ≤ 基准等待、封顶 10 分钟），到点的才真打 bgm。
+    """
+    log.info("待识别重试协程启动（指数退避：基准 %d 分、翻倍封顶 %d 分、最多 %d 次）",
+             config.REENRICH_RETRY_BASE, config.REENRICH_RETRY_MAX, config.REENRICH_MAX_TRIES)
+    while True:
+        await asyncio.sleep(max(60, min(config.REENRICH_RETRY_BASE * 60, 600)))  # 检查节拍(秒)：≤基准、封顶10分；先睡后查
+        if not config.ANIME_POLL_ENABLED:
+            continue                # 采集暂停 → 重试也暂停
+        try:
+            await anime.retry_unmatched()
+        except Exception as e:
+            log.error("延迟重识别异常: %s", e)
+
+
 async def run_movie_scan() -> None:
     """独立协程：按 MOVIE_SCAN_INTERVAL 自动扫描 Mikan 当年剧场版/OVA（开关在 /movies 订阅源）。
 

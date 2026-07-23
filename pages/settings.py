@@ -12,7 +12,8 @@ from .layout import frame
 
 _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
-            "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS"}
+            "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
+            "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES"}
 _PASSWORD = {"QB_PASSWORD"}
 _RESTART_ONLY = {"WEB_PORT"}  # 绑端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
@@ -88,6 +89,17 @@ def settings():
                 "text-xs text-gray-500")
             ui.label("源组（feed/策略/优先级/字幕组白名单）都在『源管理』页配置，改完下一轮生效。").classes(
                 "text-xs text-gray-500")
+
+            ui.separator()
+            ui.label("Bangumi 重试（识别不到时）").classes("font-bold text-sm")
+            with ui.row().classes("items-center gap-4 flex-wrap"):
+                _num("ENRICH_RETRY_TIMES", "即时重试次数（bgm 请求超时/连接错时）", config.ENRICH_RETRY_TIMES)
+                _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
+                _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
+                _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
+            ui.label("识别不到 bgm 的番进『待识别』：即时重试挡网络抖动；之后按指数退避后台再试——每失败一次"
+                     "等待翻倍（默认 30分→60→120→…封顶 1440分=24h），满『最多次数』就停（留手动，进详情页点"
+                     "『重新识别』即清零重来）。查到 bgm 自动升『待确认』。").classes("text-xs text-gray-500")
 
         with ui.card().classes("w-full"):
             ui.label("下载 / qBittorrent").classes("font-bold")
