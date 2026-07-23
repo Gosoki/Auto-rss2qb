@@ -54,14 +54,14 @@ def parse_test_page():
                 "dense outlined clearable autofocus").classes("w-full")
             with ui.row().classes("items-center gap-2 flex-wrap"):
                 sw = ui.switch("多括号回退捕获", value=config.ANIME_MULTIBRACKET_PARSE).props("dense")
-                ui.label("沸羊羊/悠哈/GM-Team 等多括号命名；就地开关立即看效果（全局生效，等同设置页）").classes(
+                ui.label("多括号命名：番名也塞在 [ ] 括号块里（如 [组][番名/别名][集数][分辨率]），"
+                         "常规解析取不到番名；打开则从括号块回退捞出番名。全局生效，等同设置页那个开关").classes(
                     "text-xs text-gray-500")
 
         @ui.refreshable
         def result():
             raw = (inp.value or "").strip()
             if not raw:
-                ui.label("（在上面粘贴一个标题，或点下面的示例）").classes("text-gray-500 p-4")
                 return
             group, name, season, episode = parse_title(raw)
             batch = is_batch(raw)
@@ -127,7 +127,7 @@ def parse_test_page():
             inp.value = text
             result.refresh()
 
-        ui.label("点一个示例填入（前两条是大组，开着开关也应名字/集数照旧）：").classes(
+        ui.label("点一个示例填入：").classes(
             "text-xs text-gray-500 mt-4 mb-1")
         with ui.column().classes("gap-0 w-full"):
             for tag, ex in _EXAMPLES:
