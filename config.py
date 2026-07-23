@@ -52,8 +52,9 @@ _SPEC = {
     "QB_URL": (str, "http://127.0.0.1:8080"),
     "QB_USERNAME": (str, ""),
     "QB_PASSWORD": (str, ""),
-    "DOWN_PATH": (str, "/media/upan/Anime"),
-    "MOVIE_DOWN_PATH": (str, ""),            # 电影独立下载根（空=用 DOWN_PATH/剧场版；填了=放这个独立目录，可另一块盘）
+    "DOWN_PATH": (str, "/media/upan/Anime"),   # 工作目录=下载根；动漫/电影留空时都落它下面
+    "ANIME_DOWN_PATH": (str, ""),           # 动漫独立下载根（空=用工作目录 DOWN_PATH/番剧；填了=放这个独立目录，可另一块盘）
+    "MOVIE_DOWN_PATH": (str, ""),            # 电影独立下载根（空=用工作目录 DOWN_PATH/剧场版；填了=放这个独立目录，可另一块盘）
     "ANIME_SEASON_SUBFOLDER": (bool, True),
     "QUARTER_FMT": (str, "{yy}{q} · {m}月 · {season}"),
     "QUARTER_FMT_UI": (str, ""),            # 空 = 跟随 QUARTER_FMT（见 __getattr__）

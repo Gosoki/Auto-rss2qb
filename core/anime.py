@@ -248,7 +248,8 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
                 season = a.season  # 用 bgm 纠正后的季号建 Season 子目录（种子把续作季号常解析回 1）
 
     # 组装保存路径（含越界校验），TV 按设置可加 Season N 子目录
-    save_path = engine.build_save_path(quarter, folder_name, season=season, top="番剧")
+    save_path = engine.build_save_path(quarter, folder_name, season=season, top="番剧",
+                                       root=config.ANIME_DOWN_PATH)
     if save_path is None:
         log.error("拒绝越界保存路径 - %s -> %s / %s", title, quarter, folder_name)
         _set_status(torrent_id, "error")
@@ -1246,7 +1247,8 @@ def anime_save_path(anime_id: int) -> str | None:
         quarter = a.quarter or "unknown"
         folder = (a.jp_name or a.display_name) or a.title or "unknown"
         season = a.season
-    return engine.build_save_path(quarter, folder, season=season, top="番剧")
+    return engine.build_save_path(quarter, folder, season=season, top="番剧",
+                                  root=config.ANIME_DOWN_PATH)
 
 
 async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:

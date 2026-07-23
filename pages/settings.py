@@ -97,8 +97,9 @@ def settings():
         def _switch(key, label, val):
             f[key] = ui.switch(label, value=val).props("dense")
 
-        def _text(key, label, val):
-            f[key] = ui.input(label, value=str(val)).props("dense outlined").classes("w-full")
+        def _text(key, label, val, ph=""):
+            f[key] = ui.input(label, value=str(val), placeholder=ph).props(
+                "dense outlined").classes("w-full")
 
         def _select(key, label, options, val):
             # 下拉单选：options={键:显示名}，存的是键；当前值不在选项里时回落到第一个键
@@ -118,36 +119,14 @@ def settings():
         def _password(key, label):
             f[key] = ui.input(label, value="", password=True).props("dense outlined").classes("w-full")  # 不回填现值
 
-        with ui.card().classes("w-full"):
-            ui.label("采集").classes("font-bold")
-            _switch("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
-                    config.ANIME_POLL_ENABLED)
-            with ui.element("div").classes("field-grid w-full"):
-                _num("ANIME_POLL_INTERVAL", "轮询间隔（秒）", config.ANIME_POLL_INTERVAL)
-                _num("ANIME_DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）",
-                     config.ANIME_DOWNLOAD_GRACE_MIN)
-            _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）", config.ANIME_TOP_PRIORITY_INSTANT)
-            _switch("ANIME_MULTIBRACKET_PARSE",
-                    "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
-                    config.ANIME_MULTIBRACKET_PARSE)
-            ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
-                     "大组不受影响），可在『解析测试』页验证。").classes("text-xs text-gray-500")
-            ui.label("Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。").classes("text-xs text-gray-500")
-            ui.label("源组（feed/策略/优先级/字幕组）在『源管理』页配置。").classes("text-xs text-gray-500")
+        _inherit_ph = (f"留空=用工作目录 {config.DOWN_PATH}" if config.DOWN_PATH
+                       else "工作目录未设，此处需填绝对路径")
 
-            ui.separator()
-            ui.label("Bangumi 重试（识别不到时）").classes("font-bold text-sm")
-            with ui.element("div").classes("field-grid w-full"):
-                _num("ENRICH_RETRY_TIMES", "即时重试次数（bgm 请求超时/连接错时）", config.ENRICH_RETRY_TIMES)
-                _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
-                _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
-                _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
-            ui.label("认不到 bgm 的番进『待识别』：先即时重试挡抖动，再指数退避后台重试（每失败翻倍、封顶 24h），"
-                     "满次数就停、留手动（详情页『重新识别』清零重来）。查到 bgm 自动升『待确认』。").classes(
-                "text-xs text-gray-500")
-
-        with ui.card().classes("w-full"):
-            ui.label("下载 / qBittorrent").classes("font-bold")
+        # ========== 折叠 ① 通用（默认展开）==========
+        with ui.card().classes("w-full"), ui.expansion(
+                "通用（qB / 保存 / 网络 / Web / 高级）", icon="tune", value=True).classes(
+                "w-full").props("dense"):
+            ui.label("下载 / qBittorrent").classes("font-bold text-sm")
             _switch("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
             _switch("QB_SYNC_STATUS", "读取 qB 实时状态（关=发送过去即『已下』，完全不轮询 qB）",
                     config.QB_SYNC_STATUS)
@@ -191,46 +170,23 @@ def settings():
             _text("QB_URL", "qB 地址", config.QB_URL)
             _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
             _password("QB_PASSWORD", "qB 密码（留空=不修改）")
-            _text("DOWN_PATH", "下载保存根目录（番剧放这里的『番剧/』下）", config.DOWN_PATH)
-            _text("MOVIE_DOWN_PATH", "电影下载目录（留空=用上面根目录的『剧场版/』；填了=放这个独立目录）",
-                  config.MOVIE_DOWN_PATH)
 
             ui.separator()
-            ui.label("目录结构").classes("font-bold text-sm")
-            _switch("ANIME_SEASON_SUBFOLDER",
-                    "番名目录下再建『Season N』二级子目录（关=番剧文件直接放番名目录）",
-                    config.ANIME_SEASON_SUBFOLDER)
-            ui.label("番剧与剧场版分开归档：下载根 /『番剧』或『剧场版』/ 季度 / 名字 …").classes(
+            ui.label("保存 & 命名").classes("font-bold text-sm")
+            _text("DOWN_PATH", "工作目录（下载根，两侧默认都落它下面）", config.DOWN_PATH)
+            _text("ANIME_DOWN_PATH", "动漫下载目录", config.ANIME_DOWN_PATH, _inherit_ph)
+            _text("MOVIE_DOWN_PATH", "电影下载目录", config.MOVIE_DOWN_PATH, _inherit_ph)
+            ui.label("三者都是下载根。动漫/电影留空=继承工作目录（各自归到 番剧//剧场版/ 下）；填了=下到该绝对路径，"
+                     "两个可以是完全不同的盘。工作目录与某侧都空则无处下载、保存会被拦下。").classes(
                 "text-xs text-gray-500")
-            ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
-                     "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
-
             _quarter_setting(f, "QUARTER_FMT", "季度文件夹命名（只控制下载文件夹）",
                              "按季度建下载文件夹时，季度目录名怎么写。", config.QUARTER_FMT)
-
-        with ui.card().classes("w-full"):
-            ui.label("面板 / 显示").classes("font-bold")
-            _switch("ANIME_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.ANIME_SHOW_PENDING)
-            _switch("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
-            ui.label("番剧表默认只显示订阅中；上面两项各自决定要不要也带上（它们仍在各自标签页）。").classes(
-                "text-xs text-gray-500")
-            ui.separator()
-            ui.label("默认标签页（进页面先落在哪个标签；地址带 ?t= 时以其为准）").classes("font-bold text-sm")
-            with ui.element("div").classes("field-grid w-full"):
-                _select("ANIME_DEFAULT_TAB", "番剧页", _ANIME_TABS, config.ANIME_DEFAULT_TAB)
-                _select("MOVIE_DEFAULT_TAB", "剧场版页", _MOVIE_TABS, config.MOVIE_DEFAULT_TAB)
-            ui.separator()
-            ui.label("分页：一页显示多少年的季度（超出翻页）").classes("font-bold text-sm")
-            with ui.element("div").classes("field-grid w-full"):
-                _num("ANIME_PAGE_YEARS", "番剧表 · 年", config.ANIME_PAGE_YEARS, 1, 5)
-                _num("MOVIE_PAGE_YEARS", "剧场版 · 年", config.MOVIE_PAGE_YEARS, 1, 5)
-            ui.label("1 年 = 4 个季度。").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随『季度文件夹命名』模板。",
                              config.QUARTER_FMT_UI)
 
-        with ui.card().classes("w-full"):
-            ui.label("网络 / 通知").classes("font-bold")
+            ui.separator()
+            ui.label("网络 / 通知").classes("font-bold text-sm")
             _switch("OPEN_PROXY", "启用代理", config.OPEN_PROXY)
             _text("PROXY_URL", "代理地址", config.PROXY_URL)
             _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL)
@@ -248,16 +204,74 @@ def settings():
                      "保存时会被拦下。经反向代理时对端是代理 IP，此项应留空、鉴权交给代理。").classes(
                 "text-xs text-amber-400")
 
-        with ui.card().classes("w-full"):
-            with ui.expansion("高级（超时 / 站点地址 · 一般不用动）", icon="tune").classes(
-                    "w-full").props("dense"):
-                with ui.element("div").classes("field-grid w-full"):
-                    _num("ENRICH_TIMEOUT", "Bangumi 请求超时（秒）", config.ENRICH_TIMEOUT)
-                    _num("NOTIFY_TIMEOUT", "通知推送超时（秒）", config.NOTIFY_TIMEOUT)
-                _text("MIKAN_BASE", "Mikan 站点根地址", config.MIKAN_BASE)
-                _text("BGM_API", "Bangumi API 根地址", config.BGM_API)
-                ui.label("一般不用改。超时：网络慢可调大。站点地址：换镜像时才改，改错会导致识别/抓取全挂，"
-                         "结尾别带 /。").classes("text-xs text-gray-500")
+            ui.separator()
+            ui.label("高级（超时 / 站点地址 · 一般不用动）").classes("font-bold text-sm")
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ENRICH_TIMEOUT", "Bangumi 请求超时（秒）", config.ENRICH_TIMEOUT)
+                _num("NOTIFY_TIMEOUT", "通知推送超时（秒）", config.NOTIFY_TIMEOUT)
+            _text("MIKAN_BASE", "Mikan 站点根地址", config.MIKAN_BASE)
+            _text("BGM_API", "Bangumi API 根地址", config.BGM_API)
+            ui.label("一般不用改。超时：网络慢可调大。站点地址：换镜像时才改，改错会导致识别/抓取全挂，"
+                     "结尾别带 /。").classes("text-xs text-gray-500")
+
+        # ========== 折叠 ② 番剧 ==========
+        with ui.card().classes("w-full"), ui.expansion(
+                "番剧", icon="movie").classes("w-full").props("dense"):
+            ui.label("采集").classes("font-bold text-sm")
+            _switch("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
+                    config.ANIME_POLL_ENABLED)
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ANIME_POLL_INTERVAL", "轮询间隔（秒）", config.ANIME_POLL_INTERVAL)
+                _num("ANIME_DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）",
+                     config.ANIME_DOWNLOAD_GRACE_MIN)
+            _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
+                    config.ANIME_TOP_PRIORITY_INSTANT)
+            _switch("ANIME_MULTIBRACKET_PARSE",
+                    "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
+                    config.ANIME_MULTIBRACKET_PARSE)
+            ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
+                     "大组不受影响），可在『解析测试』页验证。").classes("text-xs text-gray-500")
+            ui.label("Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在"
+                     "『源管理』页配置。").classes("text-xs text-gray-500")
+
+            ui.separator()
+            ui.label("Bangumi 重试（识别不到时）").classes("font-bold text-sm")
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ENRICH_RETRY_TIMES", "即时重试次数（bgm 请求超时/连接错时）", config.ENRICH_RETRY_TIMES)
+                _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
+                _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
+                _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
+            ui.label("认不到 bgm 的番进『待识别』：先即时重试挡抖动，再指数退避后台重试（每失败翻倍、封顶 24h），"
+                     "满次数就停、留手动（详情页『重新识别』清零重来）。查到 bgm 自动升『待确认』。").classes(
+                "text-xs text-gray-500")
+
+            ui.separator()
+            ui.label("归档").classes("font-bold text-sm")
+            _switch("ANIME_SEASON_SUBFOLDER",
+                    "番名目录下再建『Season N』二级子目录（关=番剧文件直接放番名目录）",
+                    config.ANIME_SEASON_SUBFOLDER)
+            ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
+                     "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
+
+            ui.separator()
+            ui.label("番剧表显示").classes("font-bold text-sm")
+            _switch("ANIME_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.ANIME_SHOW_PENDING)
+            _switch("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
+            with ui.element("div").classes("field-grid w-full"):
+                _select("ANIME_DEFAULT_TAB", "默认标签页", _ANIME_TABS, config.ANIME_DEFAULT_TAB)
+                _num("ANIME_PAGE_YEARS", "分页 · 每页年数", config.ANIME_PAGE_YEARS, 1, 5)
+            ui.label("番剧表默认只显示订阅中，上两项决定要不要带上『待确认/已忽略』。默认标签页=进番剧页先落哪个标签"
+                     "（地址带 ?t= 时以其为准）。分页：1 年=4 个季度。").classes("text-xs text-gray-500")
+
+        # ========== 折叠 ③ 剧场版 ==========
+        with ui.card().classes("w-full"), ui.expansion(
+                "剧场版", icon="theaters").classes("w-full").props("dense"):
+            ui.label("列表显示").classes("font-bold text-sm")
+            with ui.element("div").classes("field-grid w-full"):
+                _select("MOVIE_DEFAULT_TAB", "默认标签页", _MOVIE_TABS, config.MOVIE_DEFAULT_TAB)
+                _num("MOVIE_PAGE_YEARS", "分页 · 每页年数", config.MOVIE_PAGE_YEARS, 1, 5)
+            ui.label("默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
+                     "自动扫描开关/间隔在『剧场版页 → 订阅源』里。").classes("text-xs text-gray-500")
 
         async def _save():
             updates = {}
@@ -301,6 +315,13 @@ def settings():
                 ui.notify(f"你正从 {my_ip} 访问，该地址不在要保存的允许网段内——保存后会立刻把你自己挡在门外。"
                           f"已取消保存；请把 {my_ip} 所在网段一并加入（或留空=不限制）。", type="negative")
                 return
+            # 路径防呆：每侧有效根 =(该侧目录 or 工作目录)不能为空，否则无处下载
+            work = updates.get("DOWN_PATH", "")
+            for side, key in (("动漫", "ANIME_DOWN_PATH"), ("电影", "MOVIE_DOWN_PATH")):
+                if not (updates.get(key, "") or work):
+                    ui.notify(f"{side}下载目录与工作目录都为空——无处下载。请填工作目录，或填这一侧的绝对路径。",
+                              type="negative")
+                    return
             db_updates = {k: v for k, v in updates.items() if k not in _RESTART_ONLY}
             env_updates = {k: v for k, v in updates.items() if k in _RESTART_ONLY}
             if db_updates:
