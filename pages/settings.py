@@ -28,7 +28,7 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str) -> No
     """季度模板设置块：标题 + 说明 + 模板输入 + 实时预览 + 预设下拉。控件写入 f[key]。"""
     ui.separator()
     ui.label(title).classes("font-bold text-sm")
-    inp = ui.input("季度模板", value=value).classes("w-full")
+    inp = ui.input("季度模板", value=value).props("dense outlined").classes("w-full")
     f[key] = inp
     ui.label(note + "  占位：{yy}=26 {yyyy}=2026 {q}=C {season}=夏 {m}=7").classes(
         "text-xs text-gray-500")
@@ -63,13 +63,13 @@ def settings():
             f[key] = ui.switch(label, value=val).props("dense")
 
         def _text(key, label, val):
-            f[key] = ui.input(label, value=str(val)).classes("w-full")
+            f[key] = ui.input(label, value=str(val)).props("dense outlined").classes("w-full")
 
         def _num(key, label, val):
-            f[key] = ui.number(label, value=val, format="%d").classes("w-full")
+            f[key] = ui.number(label, value=val, format="%d").props("dense outlined").classes("w-full")
 
         def _password(key, label):
-            f[key] = ui.input(label, value="", password=True).classes("w-full")  # 不回填现值
+            f[key] = ui.input(label, value="", password=True).props("dense outlined").classes("w-full")  # 不回填现值
 
         with ui.card().classes("w-full"):
             ui.label("采集").classes("font-bold")
@@ -159,9 +159,9 @@ def settings():
             ui.label("分页：一页显示多少年的季度（超出翻页）").classes("font-bold text-sm")
             with ui.row().classes("items-center gap-4 flex-wrap"):
                 f["ANIME_PAGE_YEARS"] = ui.number("番剧表 · 年", value=config.ANIME_PAGE_YEARS,
-                                                   min=1, max=5, format="%d").classes("w-32")
+                                                   min=1, max=5, format="%d").props("dense outlined").classes("w-32")
                 f["MOVIE_PAGE_YEARS"] = ui.number("剧场版 · 年", value=config.MOVIE_PAGE_YEARS,
-                                                  min=1, max=5, format="%d").classes("w-32")
+                                                  min=1, max=5, format="%d").props("dense outlined").classes("w-32")
             ui.label("1 年 = 4 个季度。改完保存，下次进列表即生效。").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。", config.QUARTER_FMT_UI)
@@ -224,5 +224,5 @@ def settings():
             ui.notify(f"重新识别完成：{n} 部命中", type="positive")
 
         with ui.row().classes("items-center gap-2 mt-2"):
-            ui.button("保存", icon="save", on_click=_save).props("color=primary")
+            ui.button("保存", icon="save", on_click=_save).props("color=primary unelevated")
             ui.button("重新识别全部", icon="refresh", on_click=_reenrich).props("flat")

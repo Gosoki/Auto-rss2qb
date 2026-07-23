@@ -87,9 +87,9 @@ def parse_test_page():
 
             with ui.card().classes("w-full gap-3"):
                 # 判定横幅：图标 + 采集判定
-                with ui.row().classes("items-center gap-2 no-wrap"):
+                with ui.row().classes("items-start gap-2 no-wrap"):
                     ui.icon(icon).classes(f"text-{color}-400 text-2xl shrink-0")
-                    ui.label(verdict).classes(f"text-sm font-bold text-{color}-300")
+                    ui.label(verdict).classes(f"text-sm font-bold text-{color}-300 min-w-0")
                 ui.separator()
                 # 番名（醒目）+ 合集/单集
                 with ui.row().classes("items-center gap-2 flex-wrap"):
@@ -112,7 +112,7 @@ def parse_test_page():
                         for c in cands:
                             ui.badge(c).props("color=indigo").classes("text-sm")
                 else:
-                    ui.label("（无——识别不到会进『待识别』，可手动绑定 bgm）").classes("text-sm text-orange-300")
+                    ui.label("（无——识别不到会进『待识别』，可手动绑定 bgm）").classes("text-sm text-gray-400")
 
         def _toggle():
             config.set_many({"ANIME_MULTIBRACKET_PARSE": "true" if sw.value else "false"})

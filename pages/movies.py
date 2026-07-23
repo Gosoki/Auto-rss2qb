@@ -66,8 +66,8 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             ui.button("重新识别", icon="refresh", on_click=_enrich).props(
                 "flat dense size=sm").style("font-size:12px")
             if cur.rejected:
-                ui.button("恢复", icon="undo", on_click=_restore).props(
-                    "dense size=sm color=primary").style("font-size:12px")
+                ui.button("恢复订阅", icon="undo", on_click=_restore).props(
+                    "dense size=sm color=primary unelevated").style("font-size:12px")
             else:
                 ui.button("忽略", icon="block", on_click=_reject).props(
                     "flat dense size=sm color=grey").style("font-size:12px")
@@ -81,7 +81,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                 with ui.row().classes("items-center gap-2 w-full text-sm"):
                     ui.label(engine.torrent_time(t)).classes("shrink-0 text-gray-400 text-xs")
                     ui.label(t.raw_title or t.source).classes("grow break-all")
-                with ui.row().classes("items-center gap-2"):   # 状态标签 + 下载：统一左下
+                with ui.row().classes("items-center gap-2 flex-wrap"):   # 状态标签 + 下载：统一左下
                     live = qb_live_text(t)
                     if live:  # 完成(做种/100%)才绿，下载中用 teal
                         _done = (t.qb_progress or 0) >= 1
@@ -90,8 +90,11 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余按状态
                         ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
                             "color=blue-grey")
-                    ui.button("下载", icon="download", on_click=_force(t.id)).props(
-                        "size=sm flat dense").style("font-size:12px").tooltip("强制下这一版本到文件夹")
+                    _vdl = ui.button("下载", icon="download", on_click=_force(t.id)).props(
+                        "size=sm flat dense").style("font-size:12px")
+                    _vdl.set_enabled(config.QB_ENABLED)
+                    _vdl.tooltip("强制下这一版本到文件夹" if config.QB_ENABLED
+                                 else "qB 未启用，去设置页开启后可下载")
                     if t.status in ("downloaded", "downloading"):
                         ui.button(icon="delete_forever", on_click=_del(t.id)).props(
                             "size=sm flat dense color=negative").tooltip("删除这一版本的文件（qB+硬盘，不可撤销）")
@@ -151,7 +154,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("绑定", icon="link",
-                          on_click=lambda: dlg.submit(inp.value)).props("color=primary")
+                          on_click=lambda: dlg.submit(inp.value)).props("color=primary unelevated")
         val = await dlg
         if not val:
             return
@@ -395,7 +398,7 @@ def movies_page(t: str = "list"):
                         (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-600"),
                     ]
                     with ui.card().classes("gap-2 py-3").style("flex:1 1 300px"):
-                        with ui.row().classes("items-center gap-2"):
+                        with ui.row().classes("items-center gap-2 flex-wrap"):
                             ui.badge(b["tag"]).props(
                                 f"color={'primary' if b['tag'] == '今年' else 'blue-grey'}").classes("text-sm")
                             ui.label(f"{b['key']} 年 · {b['total']} 部").classes("font-bold text-base")
@@ -473,7 +476,7 @@ def movies_page(t: str = "list"):
                         ui.label("来源: " + (" · ".join(mov.movie_sources(m.id)) or "—")).classes(
                             "text-xs text-gray-400")
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
-                        ui.button("恢复", icon="undo", on_click=_restore(m.id)).props(
+                        ui.button("恢复订阅", icon="undo", on_click=_restore(m.id)).props(
                             "color=primary unelevated")
 
         @ui.refreshable

@@ -47,7 +47,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 "flat dense size=sm").style("font-size:12px")
             if cur.rejected:
                 ui.button("恢复订阅", icon="undo", on_click=_restore).props(
-                    "dense size=sm color=primary").style("font-size:12px")
+                    "dense size=sm color=primary unelevated").style("font-size:12px")
             else:
                 ui.button("忽略本番", icon="block", on_click=_reject).props(
                     "flat dense size=sm color=grey").style("font-size:12px")
@@ -72,7 +72,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             if sources:  # 下载源放最前：按优先级=多源兜底；选具体组=锁定，之后只下这个组
                 ui.select(source_options(sources, "下载源：按优先级·多源兜底"),
                           value=(cur.pref_source or ""),
-                          on_change=_set_source).props("dense outlined").classes("min-w-52").tooltip(
+                          on_change=_set_source).props("dense outlined").classes(
+                    "w-full sm:w-auto sm:min-w-52").tooltip(
                     "『按优先级』= 多源自动挑、缺集用别的源兜底；"
                     "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）")
             if not cur.rejected and not cur.confirmed:
@@ -93,7 +94,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             with ui.column().classes("w-full gap-0 py-1").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
                 # 第一行：集号 · 字幕组 · 时间 同一行居中（天然竖直齐平），状态/按钮 space() 推到最右
-                with ui.row().classes("items-center gap-3 w-full text-sm no-wrap"):
+                with ui.row().classes("items-center gap-3 w-full text-sm flex-wrap"):
                     if t.status in ("pending", "error"):  # 待下/失败的集号都可点改：不止 -2，
                         _neg = t.episode == -2                            # 解析也可能写错正整数(把分辨率/季号当集号)
                         ui.label(ep_txt).classes(
@@ -183,7 +184,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("绑定", icon="link",
-                          on_click=lambda: dlg.submit(inp.value)).props("color=primary")
+                          on_click=lambda: dlg.submit(inp.value)).props("color=primary unelevated")
         val = await dlg
         if not val:
             return
@@ -253,7 +254,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     "dense outlined autofocus")
                 with ui.row().classes("gap-2 justify-end w-full"):
                     ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
-                    ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("color=primary")
+                    ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("color=primary unelevated")
             val = await dlg
             if val is None:
                 return

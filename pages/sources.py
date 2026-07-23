@@ -29,20 +29,20 @@ def render_sources() -> None:
         for g in groups:
             with ui.card().classes("w-full"):
                 with ui.row().classes("items-center gap-2 w-full flex-wrap"):
-                    name = ui.input("名字", value=g.name).classes("w-32")
-                    site = ui.select(SITE_OPTS, value=g.site, label="类型").classes("w-24")
-                    policy = ui.select(POLICY_OPTS, value=g.policy, label="策略").classes("w-24")
-                    priority = ui.number("优先级", value=g.priority, format="%d").classes("w-24")
+                    name = ui.input("名字", value=g.name).props("dense outlined").classes("w-32")
+                    site = ui.select(SITE_OPTS, value=g.site, label="类型").props("dense outlined").classes("w-24")
+                    policy = ui.select(POLICY_OPTS, value=g.policy, label="策略").props("dense outlined").classes("w-24")
+                    priority = ui.number("优先级", value=g.priority, format="%d").props("dense outlined").classes("w-24")
                     enabled = ui.switch("启用", value=g.enabled).props("dense")
-                feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).classes("w-full")
+                feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).props("dense outlined").classes("w-full")
                 subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）",
-                                     value=g.subgroups).classes("w-full")
+                                     value=g.subgroups).props("dense outlined").classes("w-full")
                 tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日）",
-                                   value=g.title_filter).classes("w-full")
+                                   value=g.title_filter).props("dense outlined").classes("w-full")
                 with ui.row().classes("gap-2"):
                     ui.button("保存", icon="save",
                               on_click=_save(g.id, name, site, policy, priority, enabled, feed, subgroups, tfilter)
-                              ).props("size=sm color=primary")
+                              ).props("size=sm color=primary unelevated")
                     ui.button("删除", icon="delete",
                               on_click=_delete(g.id)).props("size=sm flat color=grey")
 
@@ -50,16 +50,16 @@ def render_sources() -> None:
         ui.label("添加新组").classes("font-bold")
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center gap-2 w-full flex-wrap"):
-                n_name = ui.input("名字").classes("w-32")
-                n_site = ui.select(SITE_OPTS, value="nyaa", label="类型").classes("w-24")
-                n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").classes("w-24")
-                n_priority = ui.number("优先级", value=50, format="%d").classes("w-24")
-            n_feed = ui.input("feed（nyaa 用户名如 Lilith-Raws，或完整 RSS URL）").classes("w-full")
-            n_subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）").classes("w-full")
-            n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").classes("w-full")
+                n_name = ui.input("名字").props("dense outlined").classes("w-32")
+                n_site = ui.select(SITE_OPTS, value="nyaa", label="类型").props("dense outlined").classes("w-24")
+                n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").props("dense outlined").classes("w-24")
+                n_priority = ui.number("优先级", value=50, format="%d").props("dense outlined").classes("w-24")
+            n_feed = ui.input("feed（nyaa 用户名如 Lilith-Raws，或完整 RSS URL）").props("dense outlined").classes("w-full")
+            n_subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）").props("dense outlined").classes("w-full")
+            n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").props("dense outlined").classes("w-full")
             ui.button("添加", icon="add",
                       on_click=_add(n_name, n_site, n_policy, n_priority, n_feed, n_subgroups, n_tfilter)
-                      ).props("size=sm color=primary")
+                      ).props("size=sm color=primary unelevated")
 
     def _save(gid, name, site, policy, priority, enabled, feed, subgroups, tfilter):
         def h():

@@ -50,8 +50,8 @@ def group_by_quarter(items):
     return [(q, by_q[q]) for q in quarters]
 
 
-def barline(label, value, maxv, extra="", color="#2196f3", lw="w-32", text=None) -> None:
-    """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认 value+extra）。番剧/剧场版共用。"""
+def barline(label, value, maxv, color="#2196f3", lw="w-32", text=None) -> None:
+    """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认取 value）。番剧/剧场版共用。"""
     pct = (value / maxv * 100) if maxv else 0
     with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
         ui.label(str(label)).classes(f"{lw} shrink-0 truncate").tooltip(str(label))
@@ -59,7 +59,7 @@ def barline(label, value, maxv, extra="", color="#2196f3", lw="w-32", text=None)
                 "background:rgba(255,255,255,.07);height:12px"):
             ui.element("div").style(
                 f"width:{pct:.1f}%;height:12px;background:{color};border-radius:6px")
-        ui.label(text if text is not None else f"{value}{extra}").classes(
+        ui.label(text if text is not None else str(value)).classes(
             "shrink-0 text-gray-400 text-right").style("min-width:5rem")
 
 
@@ -120,7 +120,8 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
         columns=[
             {"name": "time", "label": "时间", "field": "time", "align": "left"},
             {"name": "name", "label": name_label, "field": "name", "align": "left"},
-            {"name": "src", "label": "来源", "field": "src", "align": "left"},
+            {"name": "src", "label": "来源", "field": "src", "align": "left",
+             "classes": "hidden sm:table-cell", "headerClasses": "hidden sm:table-cell"},  # 窄屏隐去次要列
             {"name": "status", "label": "状态", "field": "status", "align": "left"},
         ],
         rows=rows, row_key="id",
@@ -162,7 +163,7 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
     """详情元信息卡：封面 + bgm 链接（图下） + 两列 kv 网格 + 右上角豆瓣式评分（分+评价） + 简介。
     番剧/剧场版详情共用，kv_pairs=[(标签, 值)...] 各页自备（字段集略不同）。"""
     with ui.card().classes("w-full"):
-        with ui.row().classes("gap-4 items-start no-wrap w-full"):
+        with ui.row().classes("gap-4 items-start w-full flex-col sm:flex-row"):   # 窄屏竖排堆叠，不再挤压中列
             # 左列：海报原图完整（不裁）——锁定高度、宽度随图片自然比例走（原生 img：高定死、宽 auto）
             if cover_url:
                 ui.html(f'<img src="{cover_url}" style="height:18.5rem;width:auto" '
@@ -312,13 +313,13 @@ def expand_collapse_bar(state: dict, refresh) -> None:
 async def confirm(title: str, note: str = "", ok_label: str = "确定",
                   ok_icon: str = "", ok_color: str = "negative") -> bool:
     """弹一个确认框，等用户选择，用完即销毁自身（不残留隐藏 dialog 累积）。返回是否点了确认。"""
-    with ui.dialog() as dlg, ui.card():
+    with ui.dialog() as dlg, ui.card().style("max-width:92vw"):
         ui.label(title).classes("font-bold")
         if note:
             ui.label(note).classes("text-xs text-gray-400")
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("取消", on_click=lambda: dlg.submit(False)).props("flat")
-            ok = ui.button(ok_label, on_click=lambda: dlg.submit(True)).props(f"color={ok_color}")
+            ok = ui.button(ok_label, on_click=lambda: dlg.submit(True)).props(f"color={ok_color} unelevated")
             if ok_icon:
                 ok.props(f"icon={ok_icon}")
     try:
@@ -349,10 +350,12 @@ def frame(active: str = ""):
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.07);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）
-        with ui.row().classes("items-center gap-2 w-full px-4").style("height:56px;overflow:hidden"):
-            with ui.row().classes("items-center gap-2 mr-6"):
+        with ui.row().classes("items-center gap-2 w-full px-4").style(
+                "height:56px;overflow-x:auto;overflow-y:hidden"):   # 窄屏导航横向可滚，不再裁掉够不着
+            with ui.row().classes("items-center gap-2 mr-2 sm:mr-6"):
                 ui.icon("live_tv").classes("text-2xl").style("color:#60a5fa")
-                ui.label("autorss").classes("text-lg font-bold").style("color:#f3f4f6;letter-spacing:.5px")
+                ui.label("autorss").classes("text-lg font-bold hidden sm:block").style(
+                    "color:#f3f4f6;letter-spacing:.5px")   # 站名窄屏隐去、留图标腾出导航空间
             for key, label, path in NAV:
                 cls = "cursor-pointer text-sm px-2 transition-colors "
                 cls += ("text-blue font-semibold underline underline-offset-8 decoration-2"
