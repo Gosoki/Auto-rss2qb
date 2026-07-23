@@ -164,14 +164,14 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
     """详情元信息卡：封面 + bgm 链接（图下） + 两列 kv 网格 + 右上角豆瓣式评分（分+评价） + 简介。
     番剧/剧场版详情共用，kv_pairs=[(标签, 值)...] 各页自备（字段集略不同）。"""
     with ui.card().classes("w-full"):
-        with ui.row().classes("gap-4 items-start w-full flex-col sm:flex-row"):   # 窄屏竖排堆叠，不再挤压中列
+        with ui.row().classes("gap-4 items-start w-full flex-col sm:flex-row sm:flex-nowrap"):   # 窄屏竖排；宽屏三列不换行(长标题在中列内换行、不把评分挤下去)
             # 左列：海报原图完整（不裁）——锁定高度、宽度随图片自然比例走（原生 img：高定死、宽 auto）
             if cover_url:
                 ui.html(f'<img src="{cover_url}" style="height:18.5rem;width:auto" '
                         f'class="rounded">').classes("shrink-0 w-fit")
             # 中列：两列 kv 网格 + bgm 快捷方式(subject id + 跳转图标) 摆在『来源』下面
             with ui.column().classes("gap-1 grow min-w-0"):
-                with ui.grid(columns=2).classes("gap-x-8 gap-y-1").style(
+                with ui.grid(columns=2).classes("w-full gap-x-8 gap-y-1").style(
                         "grid-template-columns:auto minmax(0,1fr)"):
                     for pair in kv_pairs:
                         if pair is None:                 # 分隔行：留一点空当，把非 bgm 字段隔开

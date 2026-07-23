@@ -18,6 +18,12 @@ from .layout import (WEEKDAY_CN, barline, confirm, expand_collapse_bar, frame,
 _TABS = ("overview", "list", "fail", "reject", "sources")
 
 
+def _mov_live_status(*a):
+    """剧场版把库态 pending 的『待下』显示为蓝色『可下载』（与影片页术语/配色统一）；其余同 live_status。"""
+    text, color = live_status(*a)
+    return ("可下载", "blue") if text == "待下" else (text, color)
+
+
 def _season_toggle_btn(key: str, name: str, selected: set) -> None:
     """季度点选按钮：在 selected 集里=填充蓝，不在=描边灰；点击切换。比多选下拉直观，不用展开。"""
     b = ui.button(name)
@@ -307,7 +313,7 @@ def movies_page(t: str = "list"):
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-300"),
                        "|",
                        ("已下", k["downloaded"], "green", None, "green-400"),
-                       ("待下载", ov["status"]["pending"], "blue", None, "green-400"),
+                       ("可下载", ov["status"]["pending"], "blue", None, "green-400"),
                        ("失败", ov["status"]["error"], "red", None, "green-400"),
                        ("版本", k["versions"], "", None, "green-400")])
             if not ov["config"]["qb"]:
@@ -330,7 +336,7 @@ def movies_page(t: str = "list"):
                 ("已下载", ov["status"]["downloaded"], "green", None),
                 ("可下载", ov["status"]["pending"], "blue", "还没下的版本，进详情逐条下"),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
-                 "已忽略剧场版留下的种子；恢复时若一版都没下过会放回待下"),
+                 "已忽略剧场版留下的种子；恢复时若一版都没下过会放回可下载"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的版本"),
                 ("种子数", k["versions"], "blue-grey", "全部种子/版本数（各状态之和）"),
             ]
@@ -378,8 +384,8 @@ def movies_page(t: str = "list"):
                     return
                 with ui.column().classes("w-full gap-0"):
                     for r in rows:
-                        text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
-                                                  r["qb_synced_at"], r["qb_dlspeed"])
+                        text, color = _mov_live_status(r["status"], r["qb_state"], r["qb_progress"],
+                                                       r["qb_synced_at"], r["qb_dlspeed"])
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
                                 "border-bottom:1px solid rgba(255,255,255,.06)"):
                             ui.label(r["name"]).classes("grow break-all")
@@ -390,8 +396,8 @@ def movies_page(t: str = "list"):
             ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
             rows = []
             for r in mov.recent_movie_rows(50):
-                text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
-                                          r["qb_synced_at"], r["qb_dlspeed"])
+                text, color = _mov_live_status(r["status"], r["qb_state"], r["qb_progress"],
+                                               r["qb_synced_at"], r["qb_dlspeed"])
                 rows.append({
                     "id": r["id"],
                     "detail_id": r["movie_id"],
