@@ -31,7 +31,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     "认错了？手动绑定正确的 bgm（粘链接或 ID）")
                 _sl = season_label(cur)
                 if _sl:
-                    ui.badge(_sl).props("color=blue-grey")
+                    ui.badge(_sl).props("color=purple")
                 if cur.rejected:
                     ui.badge("已忽略").props("color=grey")
                 else:

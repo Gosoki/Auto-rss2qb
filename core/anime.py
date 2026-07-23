@@ -490,8 +490,8 @@ def list_unmatched_anime() -> list[Anime]:
         ))
 
 
-def multi_source_map() -> dict:
-    """{番 id: [来源...]}，仅含来源多于一个的番（管理页据此标『多源』）。"""
+def source_map() -> dict:
+    """{番 id: [来源...]}，含所有有种子的番（管理页据此标『多源 N / 单源 1』）。"""
     from collections import defaultdict
     with get_session() as s:
         # DISTINCT 让库内先去重 (番,来源) 对，返回的行数只与『番×来源』有关，与种子总数无关
@@ -500,7 +500,7 @@ def multi_source_map() -> dict:
     for aid, source in pairs:
         if aid:
             src[aid].add(source)
-    return {aid: sorted(v) for aid, v in src.items() if len(v) > 1}
+    return {aid: sorted(v) for aid, v in src.items() if v}
 
 
 def pending_confirm() -> list[Anime]:

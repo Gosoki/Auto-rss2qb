@@ -208,7 +208,7 @@ def anime_page(t: str = ""):
                                     "click", lambda aid=a.id: open_detail(aid))
                                 sl = season_label(a)
                                 if sl:
-                                    ui.badge(sl).props("color=blue-grey")
+                                    ui.badge(sl).props("color=purple")
                                 platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
                                 ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
                             with ui.row().classes("items-stretch gap-3 flex-wrap"):
@@ -234,7 +234,7 @@ def anime_page(t: str = ""):
                                     "click", lambda aid=a.id: open_detail(aid))
                                 sl = season_label(a)
                                 if sl:
-                                    ui.badge(sl).props("color=blue-grey")
+                                    ui.badge(sl).props("color=purple")
                                 ui.label("来源: " + (" · ".join(anime.anime_sources(a.id)) or "—")).classes(
                                     "text-xs text-gray-400")
                             with ui.row().classes("items-stretch gap-3 flex-wrap"):
@@ -267,7 +267,7 @@ def anime_page(t: str = ""):
                             "click", lambda aid=a.id: open_detail(aid))
                         sl = season_label(a)
                         if sl:
-                            ui.badge(sl).props("color=blue-grey")
+                            ui.badge(sl).props("color=purple")
                         ui.badge("待确认" if not a.confirmed else "自动").props(
                             f"color={'orange' if not a.confirmed else 'blue-grey'}")
                         ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
@@ -374,7 +374,7 @@ def anime_page(t: str = ""):
                 ui.label("（还没有番剧，等采集）").classes("text-gray-400 p-4")
                 return
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
-            src_map = anime.multi_source_map()
+            src_map = anime.source_map()
             yrs = max(1, config.ANIME_PAGE_YEARS)  # 防 0（每页 0 季会除零）
             groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], yrs * 4)
             manage_page["n"] = page
@@ -528,6 +528,10 @@ def anime_page(t: str = ""):
 
         def _anime_row(a, sources=None):
             with ui.row().classes("items-center gap-3 pl-2 py-1"):
+                if sources:   # 源徽标放最前：多源(>1)绿 / 单源(==1)蓝
+                    n = len(sources)
+                    _lab, _c = (f"多源 {n}", "green") if n > 1 else (f"单源 {n}", "blue")
+                    ui.badge(_lab).props(f"color={_c}").tooltip("来源: " + " · ".join(sources))
                 if a.rejected:                       # 状态徽标（互斥，最多一个）
                     ui.badge("已忽略").props("color=grey")
                 elif not a.confirmed:
@@ -538,10 +542,8 @@ def anime_page(t: str = ""):
                     "click", lambda aid=a.id: open_detail(aid))
                 sl = season_label(a)
                 if sl:
-                    ui.badge(sl).props("color=blue-grey")
+                    ui.badge(sl).props("color=purple")
                 platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
-                if sources:
-                    ui.badge(f"多源 {len(sources)}").props("color=green").tooltip("来源: " + " · ".join(sources))
 
         # ---- 页面布局 ----
         with ui.tabs().classes("w-full") as tabs:
