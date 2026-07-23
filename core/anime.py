@@ -62,6 +62,11 @@ def _is_auto(kind: str) -> bool:
     return kind == "auto"
 
 
+def _kw_match(kw: str, raw: str) -> bool:
+    """版本关键词是否命中种子原名？大小写不敏感子串（繁日/简日/1080p 等）。调用方保证 kw 非空。"""
+    return kw.lower() in (raw or "").lower()
+
+
 def _apply_bgm(a: Anime, info: dict | None, keep_quarter: bool = False) -> None:
     """把 enrich 结果写进 TV 番（engine 落库 + 按 bgm 规范名纠正季号）。"""
     engine.apply_bgm_meta(a, info, keep_quarter)
@@ -168,6 +173,7 @@ async def process_item(item) -> bool:
         torrent_id = torrent.id
         should_download = bool(a and a.confirmed and not a.rejected)
         lock = a.pref_source if a else None   # 锁定源：入库即下也只放行锁定组
+        kw = a.pref_keyword if a else None     # 版本关键词：即时下载也只放行命中该版本的
 
     log.info("新增 - %s - %s 第%s季 第%s集", item.source, item.anime_title, item.season, item.episode)
     # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 + (未锁源或正是锁定源) → 入库就下，不等缓冲窗口。
@@ -175,7 +181,8 @@ async def process_item(item) -> bool:
     if (config.ANIME_TOP_PRIORITY_INSTANT and should_download
             and item.episode != -2
             and (item.priority or 0) >= _top_priority()
-            and (not lock or lock == (item.source or ""))):
+            and (not lock or lock == (item.source or ""))
+            and (not kw or _kw_match(kw, item.raw_title))):
         await download_anime_torrent(torrent_id)
     return True
 
@@ -322,6 +329,7 @@ async def flush_ready_downloads() -> int:
         ))
         auto_ids = {a.id for a in auto}
         pref_map = {a.id: a.pref_source for a in auto if a.pref_source}
+        kw_map = {a.id: a.pref_keyword for a in auto if a.pref_keyword}
         if not auto_ids:
             return 0
         downloaded = {
@@ -338,6 +346,9 @@ async def flush_ready_downloads() -> int:
             lock = pref_map.get(t.anime_id)
             if lock and lock != (t.source or ""):
                 continue  # 锁定源：这部番只收锁定组的种子（硬锁、不兜底）；别的源一律不自动下
+            kw = kw_map.get(t.anime_id)
+            if kw and not _kw_match(kw, t.raw_title):
+                continue  # 版本关键词：只收命中该版本的（硬锁、不兜底）
             if t.episode is None or t.episode < 0:
                 if t.episode == -1:
                     special_groups.setdefault(t.anime_id, []).append(t)  # 特别篇按番归组
@@ -589,6 +600,16 @@ def set_pref_source(anime_id: int, source: str) -> None:
             s.commit()
 
 
+def set_pref_keyword(anime_id: int, keyword: str) -> None:
+    """设/改某番的版本关键词（空=不限；非空=只下 raw_title 命中该词的版本，与锁定源叠加）。详情页用。"""
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is not None:
+            a.pref_keyword = (keyword or "").strip() or None
+            s.add(a)
+            s.commit()
+
+
 def reject_anime(anime_id: int) -> None:
     """拒绝某个番：打上 rejected（移出主列表进『拒绝』页）、不下载，积压待下种子标记跳过。"""
     with get_session() as s:
@@ -804,12 +825,14 @@ async def download_pending_for_anime(anime_id: int) -> int:
         a = s.get(Anime, anime_id)
         if a is None or not (a.confirmed and not a.rejected):
             return 0
-        pref = a.pref_source
+        pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}  # deleted 也算已处理，不重下
     pending = [t for t in all_rows if t.status in ("pending", "error")]
     if pref:  # 锁定源：只补锁定组的待下集（硬锁、不兜底）
         pending = [t for t in pending if pref == (t.source or "")]
+    if kw:     # 版本关键词：再过滤到命中该版本的（繁日/简日/画质…；硬锁、不兜底）
+        pending = [t for t in pending if _kw_match(kw, t.raw_title)]
     chosen = _select_downloads(pending, pref, have_eps)
     n = 0
     for t in chosen:
@@ -828,12 +851,14 @@ def download_plan(anime_id: int) -> set[int]:
         a = s.get(Anime, anime_id)
         if a is None:
             return set()
-        pref = a.pref_source
+        pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}  # deleted 也算已处理，不重下
     pending = [t for t in all_rows if t.status in ("pending", "error")]
     if pref:
         pending = [t for t in pending if pref == (t.source or "")]
+    if kw:
+        pending = [t for t in pending if _kw_match(kw, t.raw_title)]
     return {t.id for t in _select_downloads(pending, pref, have_eps)}
 
 
@@ -845,7 +870,9 @@ def download_plan_for_ids(anime_ids) -> set[int]:
     if not ids:
         return set()
     with get_session() as s:
-        pref_map = {a.id: a.pref_source for a in s.exec(select(Anime).where(Anime.id.in_(ids)))}
+        animes = list(s.exec(select(Anime).where(Anime.id.in_(ids))))
+        pref_map = {a.id: a.pref_source for a in animes}
+        kw_map = {a.id: a.pref_keyword for a in animes}
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id.in_(ids))))
     by_anime: dict = {}
     have_by_anime: dict = {}
@@ -859,6 +886,9 @@ def download_plan_for_ids(anime_ids) -> set[int]:
         lock = pref_map.get(aid)
         if lock:
             pending = [t for t in pending if lock == (t.source or "")]
+        kw = kw_map.get(aid)
+        if kw:
+            pending = [t for t in pending if _kw_match(kw, t.raw_title)]
         plan |= {t.id for t in _select_downloads(pending, lock, have_by_anime.get(aid))}
     return plan
 
@@ -966,6 +996,7 @@ async def download_all_pending() -> int:
         auto = list(s.exec(select(Anime).where(  # noqa: E712
             Anime.confirmed == True, Anime.rejected.is_not(True))))
         pref_map = {a.id: a.pref_source for a in auto}
+        kw_map = {a.id: a.pref_keyword for a in auto}
         auto_ids = set(pref_map)
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id.in_(auto_ids)))) if auto_ids else []
     by_anime: dict = {}
@@ -980,6 +1011,9 @@ async def download_all_pending() -> int:
         lock = pref_map.get(aid)
         if lock:  # 锁定源：只补锁定组
             pending = [t for t in pending if lock == (t.source or "")]
+        kw = kw_map.get(aid)
+        if kw:  # 版本关键词：再过滤到命中该版本的
+            pending = [t for t in pending if _kw_match(kw, t.raw_title)]
         for t in _select_downloads(pending, lock, have_by_anime.get(aid)):
             if await download_anime_torrent(t.id):
                 n += 1

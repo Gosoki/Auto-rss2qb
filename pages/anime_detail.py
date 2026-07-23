@@ -75,6 +75,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                           on_change=_set_source).props("dense outlined").classes("min-w-52").tooltip(
                     "『按优先级』= 多源自动挑、缺集用别的源兜底；"
                     "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）")
+                _kwin = ui.input(value=(cur.pref_keyword or ""), label="版本",
+                                 placeholder="繁日/简日/1080p…").props("dense outlined").classes(
+                    "w-36").tooltip(
+                    "版本关键词：在『下载源』基础上，再只下种子原名含此词的版本（繁日/简日/画质等，大小写不敏感）。"
+                    "留空=不限；硬过滤、缺此版本的集不兜底。回车或点输入框外生效。")
+                _kwin.on("blur", lambda: _set_keyword(_kwin.value))
+                _kwin.on("keydown.enter", lambda: _set_keyword(_kwin.value))
             if not cur.rejected and not cur.confirmed:
                 ui.button("确认下载", on_click=_confirm).props("size=sm color=primary").style(
                     "font-size:12px")
@@ -175,6 +182,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ui.notify(f"已锁定：之后只下 {e.value}（缺集不兜底，自己来点下载）", type="warning")
         else:
             ui.notify("已改回『按优先级』：多源自动挑、缺集用别的源兜底", type="positive")
+
+    def _set_keyword(val):
+        v = (val or "").strip()
+        anime.set_pref_keyword(anime_id, v)
+        body.refresh()
+        ui.notify(f"版本限定『{v}』：只下原名含此词的版本（缺此版本的集不兜底）" if v
+                  else "已取消版本限定", type="warning" if v else "positive")
 
     async def _enrich():
         ok = await anime.enrich_anime(anime_id)
