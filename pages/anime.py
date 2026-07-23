@@ -134,20 +134,21 @@ def anime_page(t: str = "manage"):
                 _dla.tooltip("订阅中所有待下集立即下" if config.QB_ENABLED
                              else "qB 未启用，去设置页开启后可下载")
             # 待下拆 将下载/备用/待确认/未知（库态『下载中』恒≈0、与 qB 实时态重复不单列）；失败、种子总数一并列出，与 KPI 卡呼应
+            # 颜色跟上面 KPI 数字同一套 Tailwind 色板（-400）；green 太亮单独降到 green-500
             chips = [
-                ("已下载", ov["status"]["downloaded"], "green", None),
-                ("将下载", ps["will"], "blue", "已确认番·本集首选（含特别篇），会自动下"),
-                ("备用项", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
-                ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
-                ("未知集", ps["unknown"], "purple", "批量/未知集，后台不自动下，需在详情页手动下"),
-                ("跳过数", ov["status"]["skipped"], "blue-grey",
+                ("已下载", ov["status"]["downloaded"], "green-500", None),
+                ("将下载", ps["will"], "blue-400", "已确认番·本集首选（含特别篇），会自动下"),
+                ("备用项", ps["backup"], "slate-400", "同集已有更优版本，不会自动下"),
+                ("待确认", ps["unconfirmed"], "orange-400", "番还没确认，去『待确认』页点确认才会下"),
+                ("未知集", ps["unknown"], "purple-400", "批量/未知集，后台不自动下，需在详情页手动下"),
+                ("跳过数", ov["status"]["skipped"], "slate-400",
                  "同集已有别版在下/已下被去重，或忽略番的积压；换源兜底时可能被复活"),
-                ("失败数", ov["status"]["error"], "red", "下载出错的种子"),
-                ("种子数", k["torrents"], "grey", "全部种子数（各状态之和）"),
+                ("失败数", ov["status"]["error"], "red-400", "下载出错的种子"),
+                ("种子数", k["torrents"], "gray-400", "全部种子数（各状态之和）"),
             ]
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
-                    b = ui.badge(f"{label} {val}").props(f"color={color}").classes("text-sm")
+                    b = ui.badge(f"{label} {val}").classes(f"bg-{color}! text-white! text-sm")
                     if tip:
                         b.tooltip(tip)
             # qB 实时态（接上 qB 后每 QB_SYNC_INTERVAL 秒刷新）
