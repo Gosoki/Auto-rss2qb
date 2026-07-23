@@ -333,7 +333,7 @@ async def flush_ready_downloads() -> int:
     留作降级）。特别篇/未知集不做集去重，逐个下。返回实际触发下载的数量。
     """
     _revive_orphaned_skipped()   # 先把『首选源已失败、该集无其它下载』的 skipped 兄弟放回 pending，本轮即可换源
-    grace = timedelta(minutes=config.ANIME_DOWNLOAD_GRACE_MIN)
+    grace = timedelta(minutes=max(0, config.ANIME_DOWNLOAD_GRACE_MIN))  # 负值会使门槛永假、废掉多源补齐，钳到 0
     now = datetime.now()
     chosen: list[int] = []
     with get_session() as s:

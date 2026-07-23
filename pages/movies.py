@@ -558,7 +558,8 @@ def movies_page(t: str = "list"):
             ui.tab("sources", "订阅源", "rss_feed")
         tabs.on_value_change(lambda e: ui.run_javascript(
             f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))"))
-        start = t if t in _TABS else "list"
+        start = t if t in _TABS else (
+            config.MOVIE_DEFAULT_TAB if config.MOVIE_DEFAULT_TAB in _TABS else "list")
         with ui.tab_panels(tabs, value=start).classes("w-full"):
             with ui.tab_panel("overview"):
                 overview_panel()
