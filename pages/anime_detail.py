@@ -83,6 +83,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             _dln.set_enabled(config.QB_ENABLED)
             _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
                          else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过")
+            _bf1 = ui.button("补齐该源", icon="playlist_add", on_click=_backfill_loose).props(
+                "flat dense size=sm").style("font-size:12px")
+            _bf1.tooltip("去 nyaa/Mikan 按名搜『当前下载源』的种子补漏收（季度过滤，你人工审核）。"
+                         "入库后转『待确认』，点『确认下载』才下。")
+            _bf2 = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_strict).props(
+                "flat dense size=sm").style("font-size:12px")
+            _bf2.tooltip("同『补齐该源』，但额外用番名近似过滤挡掉同名衍生作/别的季，更少需人工把关。")
 
         # 分集 / 种子（每条可单独强制下载）
         ui.label(f"分集 / 种子（{len(eps)}）").classes("text-sm font-bold mt-2")
@@ -219,6 +226,40 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         n = await anime.download_pending_for_anime(anime_id)
         _after()
         ui.notify(f"已触发下载 {n} 集")
+
+    _bf_busy = {"v": False}   # 防长耗时补齐期间重复点击/双击并发跑多次
+
+    async def _run_backfill(strict):
+        if _bf_busy["v"]:
+            ui.notify("正在补齐中，请稍候…", type="info")
+            return
+        _bf_busy["v"] = True
+        ui.notify("正在搜索补齐…（去 nyaa/Mikan 按名搜，请稍候）")
+        try:
+            res = await anime.backfill_source(anime_id, strict)
+        except Exception as e:            # 兜住 fetch 之外的意外，别逃逸崩掉处理器
+            ui.notify(f"补齐出错：{e}", type="negative")
+            return
+        finally:
+            _bf_busy["v"] = False
+        _after()
+        if res.get("error"):
+            ui.notify(res["error"], type="warning")
+        elif res["ingested"]:
+            if res.get("to_confirm"):
+                ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}）→ 已转『待确认』，去点『确认下载』",
+                          type="positive")
+            else:   # rejected 番：入库了但订阅态没变，不会自动下
+                ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}），但本番仍在『已忽略』；"
+                          "需先『恢复订阅』这些才会下载", type="warning")
+        else:
+            ui.notify(f"没有新种子可补（搜到 {res['found']}，都已有或被季号/名字过滤）", type="info")
+
+    async def _backfill_loose():
+        await _run_backfill(False)
+
+    async def _backfill_strict():
+        await _run_backfill(True)
 
     def _force(torrent_id):
         async def h():

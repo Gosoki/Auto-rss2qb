@@ -142,6 +142,12 @@ def make_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(**config.http_client_kwargs())
 
 
+def mikan_search_url(query: str) -> str:
+    """Mikan 搜索 RSS：/RSS/Search?searchstr=<关键词>。补齐(backfill)用；返回 /Home/Episode/<hash>
+    格式，MikanSource._parse / _hash_from_link 直接吃。"""
+    return f"{config.MIKAN_BASE}/RSS/Search?searchstr={quote(query)}"
+
+
 def season_cn(quarter_letter: str) -> str:
     """季度字母 A/B/C/D → Mikan 季名 冬/春/夏/秋。"""
     return SEASON_CN.get(quarter_letter, "")

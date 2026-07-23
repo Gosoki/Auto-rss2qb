@@ -6,6 +6,7 @@
 """
 import asyncio
 import logging
+import re
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -18,7 +19,7 @@ from db import get_session
 from db.models import Anime, AnimeTorrent, MovieTorrent, SourceGroup, AnimeAlias
 from services import enrich
 from services.notify import notify
-from sources.parse import extract_quarter, season_from_name
+from sources.parse import candidate_names, extract_quarter, season_from_name
 
 log = logging.getLogger("autorss")
 
@@ -805,7 +806,7 @@ async def download_pending_for_anime(anime_id: int) -> int:
             return 0
         pref = a.pref_source
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-    have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading")}
+    have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}  # deleted 也算已处理，不重下
     pending = [t for t in all_rows if t.status in ("pending", "error")]
     if pref:  # 锁定源：只补锁定组的待下集（硬锁、不兜底）
         pending = [t for t in pending if pref in (t.source or "")]
@@ -829,7 +830,7 @@ def download_plan(anime_id: int) -> set[int]:
             return set()
         pref = a.pref_source
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-    have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading")}
+    have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}  # deleted 也算已处理，不重下
     pending = [t for t in all_rows if t.status in ("pending", "error")]
     if pref:
         pending = [t for t in pending if pref in (t.source or "")]
@@ -851,7 +852,7 @@ def download_plan_for_ids(anime_ids) -> set[int]:
     for t in rows:
         if t.status in ("pending", "error"):
             by_anime.setdefault(t.anime_id, []).append(t)
-        elif t.status in ("downloaded", "downloading"):
+        elif t.status in ("downloaded", "downloading", "deleted"):   # deleted 也算已处理，不重下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
     plan: set = set()
     for aid, pending in by_anime.items():
@@ -972,7 +973,7 @@ async def download_all_pending() -> int:
     for t in rows:
         if t.status in ("pending", "error"):
             by_anime.setdefault(t.anime_id, []).append(t)
-        elif t.status in ("downloaded", "downloading"):
+        elif t.status in ("downloaded", "downloading", "deleted"):   # deleted 也算已处理，不重下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
     n = 0
     for aid, pending in by_anime.items():
@@ -983,6 +984,120 @@ async def download_all_pending() -> int:
             if await download_anime_torrent(t.id):
                 n += 1
     return n
+
+
+def _norm_name(s: str) -> str:
+    """归一化番名做集合比对：去所有空白 + 小写（罗马音大小写不敏感）。"""
+    return re.sub(r"\s+", "", (s or "")).lower()
+
+
+async def backfill_source(anime_id: int, strict: bool = False) -> dict:
+    """『补齐该源』/『自动补齐』：去 nyaa/Mikan 按名搜『该源』的种子，把漏收的补进这部番。
+
+    该源 = 锁定源(pref_source)；没锁则取该番最高优先级的源。搜到的按 hash 去重、【季号过滤】（挡 S1/S2 混淆），
+    strict=True(自动补齐) 再加【番名近似过滤】挡同名衍生作；新的入库 pending 且把番置 confirmed=False（复用待确认
+    审核，不自动下——交给用户点『确认下载』）。返回 {found, kept, ingested, sites}。已忽略(rejected)的番不改订阅态。"""
+    from sources.nyaa import NyaaSource, nyaa_search_url
+    from sources.mikan import MikanSource, mikan_search_url
+
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is None:
+            return {"found": 0, "kept": 0, "ingested": 0, "sites": [], "error": "番不存在"}
+        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
+        pref, quarter = a.pref_source, a.quarter
+        names = [n for n in (a.jp_name, a.display_name) if n]     # 搜索名（有序：先 日/中，再罗马音）
+        ref_names = {_norm_name(x) for x in (a.jp_name, a.display_name, a.title) if x}  # strict 参考名集
+
+    latest = max(rows, key=lambda t: t.created_at, default=None)
+    if latest:
+        for n in candidate_names(latest.raw_title):
+            if n not in names:
+                names.append(n)
+    ref_names |= {_norm_name(t.anime_title) for t in rows if t.anime_title}
+    # 季号过滤基准：用本番种子【实际解析出的季号】而非 bgm 纠正后的 a.season——否则锁定源的续季番若种子标题
+    # 无季标记(解析成 season=1)，会与 a.season=2 全对不上而假阴、补齐永远搜不到。
+    existing_seasons = {t.season for t in rows}
+    queries = [n for n in names if len(n.replace(" ", "")) >= 2][:4]   # 限 4 个查询，别打太多请求
+    if not queries:
+        return {"found": 0, "kept": 0, "ingested": 0, "sites": [], "error": "没有可搜索的番名"}
+
+    # 目标源(组名)+站点：锁定源→只补该源；没锁→补最高优先级的源（Mikan 群组同优先级即并列全取）
+    tors = [(t.source, t.site, t.priority or 0) for t in rows if t.source]
+    if pref:
+        targets = [(src, site) for src, site, _ in tors if pref in (src or "")]
+    else:
+        maxpri = max((pr for _, _, pr in tors), default=0)
+        targets = [(src, site) for src, site, pr in tors if pr == maxpri]
+    site_groups: dict = {}
+    for src, site in targets:
+        site_groups.setdefault(site, set()).add(src)
+    if not site_groups:
+        return {"found": 0, "kept": 0, "ingested": 0, "sites": [], "error": "该番还没有任何来源，无法判断去哪搜"}
+
+    # 抓取（唯一分站处）：按站构造搜索源，复用 Source._parse（含组名白名单/合集过滤/hash 校验）。
+    # 各 (site × 查询名) 并发抓，墙钟=最慢一次而非累加，避免最坏 ~8×30s 串行阻塞几分钟。
+    async def _fetch_one(site, groups, q):
+        try:
+            if site == "nyaa":
+                src_obj = NyaaSource("补齐", nyaa_search_url(q), subgroups=list(groups), title_filter=[])
+            elif site == "mikan":
+                src_obj = MikanSource("补齐", mikan_search_url(q), subgroups=list(groups), title_filter=[])
+            else:
+                return []
+            return await src_obj.fetch()
+        except Exception as e:
+            log.warning("补齐搜索失败 site=%s q=%s: %s", site, q, e)
+            return []
+
+    tasks = [_fetch_one(site, groups, q) for site, groups in site_groups.items() for q in queries]
+    found: dict = {}
+    for items in await asyncio.gather(*tasks):
+        for it in items:
+            found.setdefault(it.info_hash, it)
+
+    # 过滤：季号一致（挡 S1/S2 混淆）+ strict 番名近似（挡同名衍生作/恶搞）
+    kept = []
+    for it in found.values():
+        if it.season not in existing_seasons:
+            continue
+        if strict:
+            res = {_norm_name(it.anime_title)} | {_norm_name(x) for x in (it.search_names or [])}
+            if not (ref_names & res):
+                continue
+        kept.append(it)
+
+    # 入库：hash 去重、anime_id 直挂、不登 alias、status=pending
+    ingested = 0
+    to_confirm = False
+    with get_session() as s:
+        a_now = s.get(Anime, anime_id)   # 重取：await 抓取期间该番可能被合并/删除，别把种子插到悬空 anime_id 上
+        if a_now is None:
+            return {"found": len(found), "kept": len(kept), "ingested": 0,
+                    "sites": list(site_groups), "error": "该番已被合并或删除，补齐取消"}
+        for it in kept:
+            if s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == it.info_hash)).first():
+                continue
+            s.add(AnimeTorrent(
+                info_hash=it.info_hash, anime_id=anime_id, source=it.source, site=it.site,
+                anime_title=it.anime_title, raw_title=it.raw_title, season=it.season,
+                episode=it.episode, quarter=quarter or it.quarter,
+                download_url=it.download_url, release_time=it.release_time,
+                priority=it.priority, status="pending"))
+            try:
+                s.commit()
+                ingested += 1
+            except IntegrityError:
+                s.rollback()
+        if ingested and not a_now.rejected:   # 有新货且未忽略(实时态) → 转待确认，复用审核流、别自动下
+            a_now.confirmed = False
+            s.add(a_now)
+            s.commit()
+            to_confirm = True
+    log.info("补齐 anime=%s strict=%s：搜到 %d（站 %s）→ 留 %d → 入库 %d",
+             anime_id, strict, len(found), list(site_groups), len(kept), ingested)
+    return {"found": len(found), "kept": len(kept), "ingested": ingested,
+            "sites": list(site_groups), "to_confirm": to_confirm}
 
 
 async def sync_qb_status() -> int:
