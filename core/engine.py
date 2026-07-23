@@ -31,10 +31,10 @@ _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _QUARTER_KEY_RE = re.compile(r"(\d{2})([A-D])")
 _TORRENT_CAP = 32 * 1024 * 1024  # .torrent 通常 < 1MB，32MB 已是极宽松上限
 
-# 写回 Anime/Movie 的 bgm 字段（两者同名）；season/kind 等各自专属，不在此
+# 写回 Anime/Movie 的 bgm 字段；多数两者同名，个别（duration=片长）仅剧场版有，靠下方 hasattr 跳过番剧
 _BGM_FIELDS = ("bangumi_id", "display_name", "jp_name", "air_date", "air_weekday",
                "total_episodes", "platform", "cover_url", "rating", "summary",
-               "author", "director", "music", "cast")
+               "author", "director", "music", "cast", "duration")
 
 
 # ---------------- 文件名 / 季度 ----------------
@@ -100,7 +100,7 @@ def apply_bgm_meta(obj, info: dict | None, keep_quarter: bool = False) -> None:
         return
     for k in _BGM_FIELDS:
         v = info.get(k)
-        if v is not None:
+        if v is not None and hasattr(obj, k):   # hasattr 跳过一方没有的列（番剧无 duration）
             setattr(obj, k, v)
     if info.get("quarter") and not (keep_quarter and obj.quarter):
         obj.quarter = info["quarter"]

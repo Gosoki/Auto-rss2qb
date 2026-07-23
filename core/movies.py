@@ -206,6 +206,40 @@ def overview() -> dict:
     }
 
 
+def year_brief() -> list[dict]:
+    """列表页顶部小结：今年 + 上年 的剧场版分布（已识别/待识别/已忽略）+ 种子维度（已下/待下/版本）。
+    剧场版按年归档（quarter 前两位=年份后两位），故按年而非季度小结。"""
+    now_year = datetime.now().year
+
+    def yr_of(q):
+        return 2000 + int(q[:2]) if q and q[:2].isdigit() else None
+
+    with get_session() as s:
+        movies = list(s.exec(select(Movie.id, Movie.quarter, Movie.rejected, Movie.bangumi_id)))
+        # 种子按 (movie_id,状态) 库内聚合，再按影片年份归拢（MovieTorrent 无 quarter 列）
+        tcounts = list(s.exec(select(MovieTorrent.movie_id, MovieTorrent.status, func.count())
+                              .group_by(MovieTorrent.movie_id, MovieTorrent.status)))
+    yr_by_mid = {mid: yr_of(q) for mid, q, _, _ in movies}
+    out = []
+    for tag, yr in (("今年", now_year), ("上年", now_year - 1)):
+        mv = [(rej, bid) for _, q, rej, bid in movies if yr_of(q) == yr]
+        qc: dict[str, int] = {}
+        for mid, st, c in tcounts:
+            if yr_by_mid.get(mid) == yr:
+                qc[st] = qc.get(st, 0) + c
+        out.append({
+            "tag": tag, "key": yr,
+            "total": len(mv),
+            "matched": sum(1 for rej, bid in mv if not rej and bid),   # 已识别（有 bgm、未忽略）
+            "fail": sum(1 for rej, bid in mv if not rej and not bid),  # 待识别（未匹配 bgm）
+            "ignored": sum(1 for rej, bid in mv if rej),               # 已忽略
+            "versions": sum(qc.values()),
+            "done": qc.get("downloaded", 0),
+            "pending": qc.get("pending", 0) + qc.get("error", 0),
+        })
+    return out
+
+
 def list_unmatched_movies() -> list[Movie]:
     """未识别（bgm 没匹配上）的剧场版/OVA——供『待识别』tab 手动绑定。"""
     with get_session() as s:

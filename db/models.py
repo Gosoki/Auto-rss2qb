@@ -124,6 +124,7 @@ class Movie(SQLModel, table=True):
     air_date: str | None = Field(default=None)
     air_weekday: int | None = Field(default=None)
     total_episodes: int | None = Field(default=None)
+    duration: str | None = Field(default=None)        # bgm infobox『片长』（剧场版详情展示；番剧无此列）
     platform: str | None = Field(default=None)        # 剧场版 / OVA / OAD / WEB（bgm 类型，仅展示）
     cover_url: str | None = Field(default=None)
     rating: float | None = Field(default=None)

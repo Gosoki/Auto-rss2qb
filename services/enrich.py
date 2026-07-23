@@ -173,6 +173,7 @@ def _subject_to_info(bgm_id, meta: dict) -> dict:
         "author": _infobox_get(ib, "原作"),
         "director": _infobox_get(ib, "导演", "監督", "总导演"),
         "music": _infobox_get(ib, "音乐", "音楽"),
+        "duration": _infobox_get(ib, "片长", "时长"),   # 剧场版展示用；番剧无 duration 列，写回时跳过
     }
 
 

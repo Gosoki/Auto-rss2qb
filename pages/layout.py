@@ -50,6 +50,19 @@ def group_by_quarter(items):
     return [(q, by_q[q]) for q in quarters]
 
 
+def barline(label, value, maxv, extra="", color="#2196f3", lw="w-32", text=None) -> None:
+    """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认 value+extra）。番剧/剧场版共用。"""
+    pct = (value / maxv * 100) if maxv else 0
+    with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
+        ui.label(str(label)).classes(f"{lw} shrink-0 truncate").tooltip(str(label))
+        with ui.element("div").classes("grow rounded min-w-0").style(
+                "background:rgba(255,255,255,.07);height:12px"):
+            ui.element("div").style(
+                f"width:{pct:.1f}%;height:12px;background:{color};border-radius:6px")
+        ui.label(text if text is not None else f"{value}{extra}").classes(
+            "shrink-0 text-gray-400 text-right").style("min-width:5rem")
+
+
 def kpi_cards(cards) -> None:
     """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') / (…, on_click) / (…, on_click, 标签色带深浅如'pink-300'), ...]；
     给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签色用来把同类卡分组。
@@ -85,7 +98,8 @@ def kpi_cards(cards) -> None:
     else:                                  # 多组：每组打包、左右平铺满宽，窄了整组换行成上下布局
         with ui.row().classes("w-full gap-4 flex-wrap items-stretch p-1"):
             for group in groups:
-                with ui.row().classes("gap-3 flex-wrap items-stretch").style("flex:1 0 440px"):
+                n = len(group)   # 组宽按卡数分配，跨组各卡等宽（4+4 或 4+2 都不偏）
+                with ui.row().classes("gap-3 flex-wrap items-stretch").style(f"flex:{n} 0 {n * 110}px"):
                     for card in group:
                         _card(card, grow=True)
 

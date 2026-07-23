@@ -9,7 +9,7 @@ from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
+from .layout import (barline, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, qb_disabled_banner, recent_table, season_label,
                      source_options)
@@ -21,19 +21,6 @@ def _state_rank(a):
     if a.rejected:
         return 2
     return 1 if not a.confirmed else 0
-
-
-def _barline(label, value, maxv, extra="", color="#2196f3", lw="w-32", text=None):
-    """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认 value+extra）。"""
-    pct = (value / maxv * 100) if maxv else 0
-    with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
-        ui.label(str(label)).classes(f"{lw} shrink-0 truncate").tooltip(str(label))
-        with ui.element("div").classes("grow rounded min-w-0").style(
-                "background:rgba(255,255,255,.07);height:12px"):
-            ui.element("div").style(
-                f"width:{pct:.1f}%;height:12px;background:{color};border-radius:6px")
-        ui.label(text if text is not None else f"{value}{extra}").classes(
-            "shrink-0 text-gray-400 text-right").style("min-width:5rem")
 
 
 _TAB_KEYS = ("overview", "manage", "confirm", "fail", "reject", "sources")
@@ -90,7 +77,7 @@ def anime_page(t: str = "manage"):
                         if not ov["by_quarter"]:
                             ui.label("—").classes("text-gray-500 text-sm")
                         for q, shows, done in ov["by_quarter"]:
-                            _barline(engine.quarter_label(q), done, maxdl, lw="w-36", text=f"{done} / {shows}")
+                            barline(engine.quarter_label(q), done, maxdl, lw="w-36", text=f"{done} / {shows}")
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
                     ui.label(f"种子来源（已下 / 种子）· {len(ov['by_source'])}").classes("text-sm font-bold")
                     with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
@@ -98,7 +85,7 @@ def anime_page(t: str = "manage"):
                         if not ov["by_source"]:
                             ui.label("—").classes("text-gray-500 text-sm")
                         for src, tot, done in ov["by_source"]:
-                            _barline(src, tot, maxs, color="#8b5cf6", text=f"{done} / {tot}")
+                            barline(src, tot, maxs, color="#8b5cf6", text=f"{done} / {tot}")
 
             # ── 种子状态 ──
             with ui.row().classes("items-center gap-3 mt-3 pl-1"):
