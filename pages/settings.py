@@ -52,6 +52,7 @@ _MOVIE_TABS = {"overview": "仪表盘", "list": "列表", "fail": "待识别",
                "reject": "已忽略", "sources": "订阅源"}
 
 _QUARTER_PRESETS = {
+    "{yyyy}": "年份  → 2026",
     "{yy}{q}": "字母  → 26C",
     "{yy}{season}": "季节  → 26夏",
     "{yy}年{m}月": "月份  → 26年7月",
@@ -179,10 +180,8 @@ def settings():
             ui.label("三者都是下载根。动漫/电影留空=继承工作目录（各自归到 番剧//剧场版/ 下）；填了=下到该绝对路径，"
                      "两个可以是完全不同的盘。工作目录与某侧都空则无处下载、保存会被拦下。").classes(
                 "text-xs text-gray-500")
-            _quarter_setting(f, "QUARTER_FMT", "季度文件夹命名（只控制下载文件夹）",
-                             "按季度建下载文件夹时，季度目录名怎么写。", config.QUARTER_FMT)
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
-                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随『季度文件夹命名』模板。",
+                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的季度文件夹命名。",
                              config.QUARTER_FMT_UI)
 
             ui.separator()
@@ -252,6 +251,8 @@ def settings():
                     config.ANIME_SEASON_SUBFOLDER)
             ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
                      "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
+            _quarter_setting(f, "QUARTER_FMT", "季度文件夹命名（只控制下载文件夹）",
+                             "番剧按季度建下载文件夹时，季度目录名怎么写。", config.QUARTER_FMT)
 
             ui.separator()
             ui.label("番剧表显示").classes("font-bold text-sm")
@@ -272,6 +273,9 @@ def settings():
                 _num("MOVIE_PAGE_YEARS", "分页 · 每页年数", config.MOVIE_PAGE_YEARS, 1, 5)
             ui.label("默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
                      "自动扫描开关/间隔在『剧场版页 → 订阅源』里。").classes("text-xs text-gray-500")
+            _quarter_setting(f, "MOVIE_QUARTER_FMT", "下载文件夹命名（默认按年份）",
+                             "电影按此建下载文件夹（默认年份，如 2026；同年电影归一个文件夹）。",
+                             config.MOVIE_QUARTER_FMT)
 
         async def _save():
             updates = {}

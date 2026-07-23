@@ -56,7 +56,8 @@ _SPEC = {
     "ANIME_DOWN_PATH": (str, ""),           # 动漫独立下载根（空=用工作目录 DOWN_PATH/番剧；填了=放这个独立目录，可另一块盘）
     "MOVIE_DOWN_PATH": (str, ""),            # 电影独立下载根（空=用工作目录 DOWN_PATH/剧场版；填了=放这个独立目录，可另一块盘）
     "ANIME_SEASON_SUBFOLDER": (bool, True),
-    "QUARTER_FMT": (str, "{yy}{q} · {m}月 · {season}"),
+    "QUARTER_FMT": (str, "{yy}{q} · {m}月 · {season}"),   # 番剧下载文件夹的季度目录名
+    "MOVIE_QUARTER_FMT": (str, "{yyyy}"),   # 电影下载文件夹命名（默认年份 2026）；番剧走 QUARTER_FMT
     "QUARTER_FMT_UI": (str, ""),            # 空 = 跟随 QUARTER_FMT（见 __getattr__）
     "ANIME_SHOW_PENDING": (bool, False),
     "ANIME_SHOW_REJECTED": (bool, False),

@@ -45,11 +45,6 @@ def safe_name(name: str) -> str:
     return cleaned or "unknown"
 
 
-def quarter_folder(quarter: str) -> str:
-    """内部季度键(26C) → 下载文件夹用的季度目录名（config.QUARTER_FMT）。"""
-    return format_quarter(quarter, config.QUARTER_FMT)
-
-
 def quarter_label(quarter: str) -> str:
     """内部季度键(26C) → 页面显示用的季度名（config.QUARTER_FMT_UI）。"""
     return format_quarter(quarter, config.QUARTER_FMT_UI)
@@ -67,17 +62,19 @@ def prev_quarter(q: str) -> str:
 
 
 def build_save_path(quarter: str, folder_name: str, season: int | None = None,
-                    top: str = "", root: str = "") -> str | None:
+                    top: str = "", root: str = "", quarter_fmt: str = "") -> str | None:
     """下载保存路径：根/[分类]/季度目录/番名[/Season N]。做 realpath 包含校验，越界返回 None。
 
     root=下载根（空=config.DOWN_PATH）。top=分类顶层目录（番剧/剧场版）——仅在用默认根时加；
     若给了独立 root（如电影专属目录），该 root 本身就是专属目录，不再套分类层。越界校验按实际根来。
+    quarter_fmt=季度目录命名模板（空=config.QUARTER_FMT，即番剧默认；电影传 MOVIE_QUARTER_FMT=年份）。
     """
     base = root or config.DOWN_PATH
     parts = [base]
     if top and not root:
         parts.append(safe_name(top))
-    parts += [safe_name(quarter_folder(quarter or "unknown")), safe_name(folder_name)]
+    parts += [safe_name(format_quarter(quarter or "unknown", quarter_fmt or config.QUARTER_FMT)),
+              safe_name(folder_name)]
     if season is not None and config.ANIME_SEASON_SUBFOLDER:
         parts.append(f"Season {int(season)}")
     save_path = os.path.join(*parts)
