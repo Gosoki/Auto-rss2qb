@@ -57,9 +57,12 @@ def anime_page(t: str = "manage"):
             ps = ov["pending_split"]
 
             # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
-            # 种子维度的卡用绿色说明文字分组（已下集/将下载/未知集/失败/种子）；数字保持各自语义色，与番维度区分
-            kpi_cards([("订阅中", k["tracking"], ""), ("待识别", k["fail"], "red"),
-                       ("待确认", k["confirm"], "orange"), ("已忽略", k["rejected"], ""),
+            # 番维度四卡用粉字，种子维度五卡用绿字，中间竖线分组；数字保持各自语义色
+            kpi_cards([("订阅中", k["tracking"], "", None, "pink"),
+                       ("待识别", k["fail"], "red", None, "pink"),
+                       ("待确认", k["confirm"], "orange", None, "pink"),
+                       ("已忽略", k["rejected"], "", None, "pink"),
+                       "|",
                        ("已下集", k["done"], "green", None, "green"),
                        ("将下载", k["will"], "blue", None, "green"),
                        ("未知集", ps["unknown"], "purple", _open_unknown, "green"),

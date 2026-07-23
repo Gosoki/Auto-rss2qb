@@ -52,9 +52,13 @@ def group_by_quarter(items):
 
 def kpi_cards(cards) -> None:
     """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') / (…, on_click) / (…, on_click, 标签色), ...]；
-    给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签色用来把同类卡分组（种子维度用绿字）。"""
+    给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签色用来把同类卡分组（种子维度用绿字）。
+    列表里放字符串 "|" 会在该处竖一根分隔线，把左右不同维度的卡分组。"""
     with ui.row().classes("gap-3 flex-wrap p-1"):
         for card in cards:
+            if card == "|":                # 维度分隔竖线
+                ui.element("div").classes("self-stretch w-px bg-white/20 mx-1")
+                continue
             label, val, hi = card[:3]
             on_click = card[3] if len(card) > 3 else None
             label_color = card[4] if len(card) > 4 else None   # 说明文字颜色，缺省灰
