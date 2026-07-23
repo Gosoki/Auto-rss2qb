@@ -205,6 +205,27 @@ def settle_downloaded(model_cls, tid: int) -> None:
             s.commit()
 
 
+def settle_inflight_off() -> int:
+    """关闭 qB 状态跟踪(QB_SYNC_STATUS→off)或发送(QB_ENABLED→off)时，一次性把当前所有『在下的』种子
+    落定为已下完(status=downloaded、qb_progress=1、脱离 in-flight)。返回落定数。
+
+    off 之后 sync 内层循环不再运行(见 worker.run_qb_sync 的 while 条件)，这批『on 模式交付、进度未满』的行
+    再无路径推进 → 会永久满足 _inflight_where、恒挂『正在下载』区、has_inflight 恒真。此处一次性落定，语义与
+    settle_downloaded/『off=发送即已下』一致。settle_downloaded 只对【新交付】单条生效，故切换时刻的旧行须靠这里兜。"""
+    n = 0
+    now = datetime.now()
+    with get_session() as s:
+        for model_cls in (AnimeTorrent, MovieTorrent):
+            for t in s.exec(select(model_cls).where(*_inflight_where(model_cls))):
+                t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "downloaded", 1.0, "", now
+                s.add(t)
+                n += 1
+        s.commit()
+    if n:
+        log.info("关闭 qB 跟踪/发送：落定 %d 条在下种子为已下完（脱离 in-flight）", n)
+    return n
+
+
 def reset_downloading(model_cls) -> None:
     """启动时把某种子表上次异常退出遗留的 downloading 复位为 pending，好被重新下。"""
     with get_session() as s:
@@ -369,26 +390,28 @@ async def sync_qb_status(model_cls) -> int:
     if not config.QB_ENABLED:
         return 0
     with get_session() as s:
-        rows = [(t.id, t.info_hash, t.qb_synced_at is not None, t.qb_progress or 0.0)
+        rows = [(t.id, t.info_hash, t.qb_synced_at is not None)
                 for t in s.exec(select(model_cls).where(*_inflight_where(model_cls)))
                 if t.info_hash]
     if not rows:
         return 0
-    info = await qb.torrents_info([h for _, h, _, _ in rows])
+    info = await qb.torrents_info([h for _, h, _ in rows])
     if info is None:
         return 0   # 只在『连不上/出错』(None) 本轮不动。空 dict {} 是『qB 在线但这批一个都不在』——
                    # 须落到下面逐行走 d is None 落定(全被删/移除时)，否则它们永久 in-flight、循环永不休眠。
     now = datetime.now()
     updated = 0
     with get_session() as s:
-        for tid, h, was_synced, last_prog in rows:
+        for tid, h, was_synced in rows:
             t = s.get(model_cls, tid)
             if t is None or t.status not in ("downloaded", "downloading"):
                 continue
             d = info.get(h)
             if d is None:
-                # qB 查不到这个在下的种子——必须在有限轮内落定，否则它恒满足 in-flight、循环永不休眠：
-                if last_prog >= 0.999:      # 曾接近满 → 判下完被 qB 移除，落定已下
+                # qB 查不到这个在下的种子——必须在有限轮内落定，否则它恒满足 in-flight、循环永不休眠。
+                # 用【重读后】的实时进度判定（await 期间该行可能被完成回调 mark_done_by_hash/新交付推进到满）：
+                # 若仍用 await 前的陈旧快照，会把刚被 /api/qb/done 回调标『已下完』的行覆写回 error、使回调形同虚设。
+                if (t.qb_progress or 0.0) >= 0.999:  # 已满(含完成回调刚落定) → 下完被 qB 移除，落定已下
                     t.qb_progress, t.qb_state, t.qb_synced_at = 1.0, "", now
                 elif was_synced:            # 曾在下、还没下完就从 qB 消失 → 落定 error（可补/重下）。
                     # 注：慢速种子被降级停跟后、在休眠里下完又被 qB 删（remove-on-complete）也会走这里被标 error——

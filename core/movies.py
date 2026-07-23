@@ -326,7 +326,8 @@ def restore_movie(movie_id: int) -> None:
         m.rejected = False
         s.add(m)
         rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)))
-        anydl = any(t.status in ("downloaded", "downloading") for t in rows)
+        # deleted 也算『有过一版』：唯一版本被用户删掉后，不该把 skipped 旧版翻出来重下（与承诺一致）
+        anydl = any(t.status in ("downloaded", "downloading", "deleted") for t in rows)
         for t in rows:  # 剧场版=一部作品：已有一版就别把 skipped 旧版翻出来（deleted 是用户主动删，也不重下）
             if t.status == "skipped" and not anydl:
                 t.status = "pending"
@@ -443,7 +444,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
 
 
 async def delete_movie_torrent(mt_id: int) -> bool:
-    """删除单条剧场版种子在 qB 里的文件（走 qB 接口），标记回 skipped。
+    """删除单条剧场版种子在 qB 里的文件（走 qB 接口），标记为 deleted（终态，恢复时不重下）。
 
     若同一 hash TV 管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。
     """

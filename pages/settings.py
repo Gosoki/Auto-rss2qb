@@ -194,6 +194,8 @@ def settings():
             db_updates = {k: v for k, v in updates.items() if k not in _RESTART_ONLY}
             env_updates = {k: v for k, v in updates.items() if k in _RESTART_ONLY}
             if db_updates:
+                sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
+                qb_was_on = config.QB_ENABLED
                 config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
                 # qB 发送开着 → 保存后测一次连接：连不上就自动关掉开关（免得停在『开着却下不了』的迷惑态）
                 if config.QB_ENABLED:
@@ -207,6 +209,10 @@ def settings():
                     else:
                         await client.aclose()
                         engine.qb_kick.set()      # 连上了：立即唤醒同步循环自查，别等一个保底周期
+                # 关跟踪/关发送（含上面连不上自动关）→ 落定切换时刻仍在下的旧种子，
+                # 否则它们再无路径推进、永久卡『正在下载』、has_inflight 恒真
+                if (sync_was_on and not config.QB_SYNC_STATUS) or (qb_was_on and not config.QB_ENABLED):
+                    engine.settle_inflight_off()
             if env_updates:
                 config.update_env(env_updates)  # WEB_PORT 等结构项仍走 .env
             msg = "已保存，即时生效" + ("（Web 端口改动需重启）" if env_updates else "")

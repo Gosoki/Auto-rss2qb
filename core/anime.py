@@ -169,8 +169,10 @@ async def process_item(item) -> bool:
         lock = a.pref_source if a else None   # 锁定源：入库即下也只放行锁定组
 
     log.info("新增 - %s - %s 第%s季 第%s集", item.source, item.anime_title, item.season, item.episode)
-    # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 + (未锁源或正是锁定源) → 入库就下，不等缓冲窗口
+    # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 + (未锁源或正是锁定源) → 入库就下，不等缓冲窗口。
+    # 排除 -2(未知/批量)：与 flush 一致留人工处理，别让它是否被下取决于来源组优先级（instant 下、flush 不下）。
     if (config.ANIME_TOP_PRIORITY_INSTANT and should_download
+            and item.episode != -2
             and (item.priority or 0) >= _top_priority()
             and (not lock or lock in (item.source or ""))):
         await download_anime_torrent(torrent_id)
@@ -276,6 +278,38 @@ def reset_downloading() -> None:
     engine.reset_downloading(AnimeTorrent)
 
 
+def _revive_orphaned_skipped() -> None:
+    """换源兜底：某集的胜出源事后转 error（qB 侧失败/消失），而该集已无在下/已下/已删时，把当初被同集去重
+    压成 skipped 的兄弟种子放回 pending——否则 flush/补下都只挑 pending/error、永不碰 skipped，该集会永久卡死
+    在唯一失败源上、别的可用源被 skipped 终态排除。只对『已确认未拒绝』的自动番生效；deleted 的集不复活（用户
+    特意删的不重下，与 restore_anime 口径一致）。幂等：skipped→pending 后不再是 skipped，收敛于源数上限。"""
+    with get_session() as s:
+        auto_ids = set(s.exec(select(Anime.id).where(
+            Anime.confirmed == True, Anime.rejected.is_not(True))))  # noqa: E712
+        if not auto_ids:
+            return
+        rows = list(s.exec(select(AnimeTorrent).where(
+            AnimeTorrent.anime_id.in_(auto_ids),
+            AnimeTorrent.status.in_(["error", "skipped", "downloaded", "downloading", "deleted"]))))
+        by_ep: dict = {}
+        for t in rows:
+            by_ep.setdefault((t.anime_id, t.episode), set()).add(t.status)
+        # 目标集：有 error，且无 downloaded/downloading/deleted（首选已败、该集尚无可用或已删的下载）
+        revive = {k for k, sts in by_ep.items()
+                  if "error" in sts and not ({"downloaded", "downloading", "deleted"} & sts)}
+        if not revive:
+            return
+        changed = 0
+        for t in rows:
+            if t.status == "skipped" and (t.anime_id, t.episode) in revive:
+                t.status = "pending"
+                s.add(t)
+                changed += 1
+        if changed:
+            s.commit()
+            log.info("换源兜底：复活 %d 个被去重的 skipped 兄弟（该集首选源已失败）", changed)
+
+
 async def flush_ready_downloads() -> int:
     """缓冲窗口 + 严格优先级：每轮跑一次。
 
@@ -284,6 +318,7 @@ async def flush_ready_downloads() -> int:
     config.ANIME_DOWNLOAD_GRACE_MIN 分钟才放行，到点从该集所有种子挑优先级最高的下一份（错误的排后，
     留作降级）。特别篇/未知集不做集去重，逐个下。返回实际触发下载的数量。
     """
+    _revive_orphaned_skipped()   # 先把『首选源已失败、该集无其它下载』的 skipped 兄弟放回 pending，本轮即可换源
     grace = timedelta(minutes=config.ANIME_DOWNLOAD_GRACE_MIN)
     now = datetime.now()
     chosen: list[int] = []
@@ -591,10 +626,11 @@ def restore_anime(anime_id: int) -> None:
         a.confirmed = True
         s.add(a)
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-        have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading")}
+        # deleted 也算『该集已处理过』：用户特意删过的集，其去重落选的 skipped 兄弟不该被复活重下。
+        have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}
         for t in all_rows:
-            # 只放回『该集尚无下载』的 skipped（集去重留下的旧版本）；用户主动删过的记为 deleted，
-            # 不在此列——免得恢复订阅时把用户特意删掉的文件又重新下回来。
+            # 只放回『该集尚无下载/未被删过』的 skipped（集去重留下的旧版本）；用户主动删过的记为 deleted，
+            # 其集已进 have_eps 而被排除——免得恢复订阅时把用户特意删掉的文件又重新下回来。
             if t.status == "skipped" and t.episode not in have_eps:
                 t.status = "pending"
                 s.add(t)
@@ -959,8 +995,9 @@ async def sync_qb_status() -> int:
 
 
 async def delete_anime_torrent(torrent_id: int) -> bool:
-    """删除单条种子在 qB 里的文件（走 qB 接口），标记回 skipped。详情页按集删用。
+    """删除单条种子在 qB 里的文件（走 qB 接口），标记为 deleted。详情页按集删用。
 
+    deleted 是用户主动删除的终态：恢复订阅时不会被重新下（区别于集去重落选、可复活的 skipped）。
     若同一 hash 剧场版管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。
     """
     with get_session() as s:
@@ -981,7 +1018,7 @@ async def delete_anime_torrent(torrent_id: int) -> bool:
 async def delete_anime_files(anime_id: int) -> int:
     """删除该番在 qB 里的已下/在下种子及其硬盘文件（走 qB 正规接口，非裸删文件系统）。
 
-    显式、独立于『拒绝』的动作，需 UI 二次确认。成功后把这些种子标记回 skipped（不再持有）。
+    显式、独立于『拒绝』的动作，需 UI 二次确认。成功后把这些种子标记为 deleted（终态，恢复订阅不重下）。
     与剧场版共享 hash 的只脱手不删文件。返回处理的种子数；qB 未连上/无已下则返回 0。
     """
     with get_session() as s:
