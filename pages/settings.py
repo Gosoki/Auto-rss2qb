@@ -44,6 +44,13 @@ def _bad_cidrs(v: str) -> list:
                 bad.append(part)
     return bad
 
+
+# 各页标签 {键: 显示名}，键须与 pages/anime.py、pages/movies.py 的 ui.tab 一致（用于『默认标签页』下拉）
+_ANIME_TABS = {"overview": "仪表盘", "manage": "番剧表", "confirm": "待确认",
+               "fail": "待识别", "reject": "已忽略", "sources": "订阅源"}
+_MOVIE_TABS = {"overview": "仪表盘", "list": "列表", "fail": "待识别",
+               "reject": "已忽略", "sources": "订阅源"}
+
 _QUARTER_PRESETS = {
     "{yy}{q}": "字母  → 26C",
     "{yy}{season}": "季节  → 26夏",
@@ -92,6 +99,11 @@ def settings():
 
         def _text(key, label, val):
             f[key] = ui.input(label, value=str(val)).props("dense outlined").classes("w-full")
+
+        def _select(key, label, options, val):
+            # 下拉单选：options={键:显示名}，存的是键；当前值不在选项里时回落到第一个键
+            v = val if val in options else next(iter(options))
+            f[key] = ui.select(options, label=label, value=v).props("dense outlined").classes("w-full")
 
         def _num(key, label, val, mn=None, mx=None):
             # 数字项：标签在框内浮动，框占满所在栅格格（配合 field-grid 即 1/4 宽）。1/4 窄框放不下的长标签会截断成 …
@@ -210,6 +222,11 @@ def settings():
             _switch("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
             ui.label("番剧表默认只显示订阅中；上面两项各自决定要不要也带上（它们仍在各自标签页）。").classes(
                 "text-xs text-gray-500")
+            ui.separator()
+            ui.label("默认标签页（进页面先落在哪个标签；地址带 ?t= 时以其为准）").classes("font-bold text-sm")
+            with ui.element("div").classes("field-grid w-full"):
+                _select("ANIME_DEFAULT_TAB", "番剧页", _ANIME_TABS, config.ANIME_DEFAULT_TAB)
+                _select("MOVIE_DEFAULT_TAB", "剧场版页", _MOVIE_TABS, config.MOVIE_DEFAULT_TAB)
             ui.separator()
             ui.label("分页：一页显示多少年的季度（超出翻页）").classes("font-bold text-sm")
             with ui.element("div").classes("field-grid w-full"):

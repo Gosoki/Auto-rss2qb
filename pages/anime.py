@@ -512,7 +512,8 @@ def anime_page(t: str = "manage"):
         # 切 tab 时把当前 tab 写进 URL（不重载），这样『刷新』重载后仍停在该 tab
         tabs.on_value_change(lambda e: ui.run_javascript(
             f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))"))
-        start = t if t in _TAB_KEYS else "manage"
+        start = t if t in _TAB_KEYS else (
+            config.ANIME_DEFAULT_TAB if config.ANIME_DEFAULT_TAB in _TAB_KEYS else "manage")
         with ui.tab_panels(tabs, value=start).classes("w-full"):
             with ui.tab_panel("overview"):
                 overview_panel()

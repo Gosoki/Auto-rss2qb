@@ -61,6 +61,8 @@ _SPEC = {
     "ANIME_SHOW_REJECTED": (bool, False),
     "ANIME_PAGE_YEARS": (int, 3),           # 番剧表一页显示几年的番（1~5，×4 得季度数）
     "MOVIE_PAGE_YEARS": (int, 5),            # 剧场版列表一页显示几年（1~5）
+    "ANIME_DEFAULT_TAB": (str, "manage"),   # 番剧页默认停哪个标签（overview/manage/confirm/fail/reject/sources），URL 带 ?t= 时以 URL 为准
+    "MOVIE_DEFAULT_TAB": (str, "list"),     # 剧场版页默认停哪个标签（overview/list/fail/reject/sources）
     "ANIME_MULTIBRACKET_PARSE": (bool, False),    # 全括号命名(沸羊羊/悠哈/GM-Team 等)番名回退捕获——默认关，开了才对空名种子尝试从括号块猜番名
     "ANIME_POLL_ENABLED": (bool, True),           # 后台采集总开关（全新库首启默认关，见 load_from_db）
     "ANIME_POLL_INTERVAL": (int, 1200),
