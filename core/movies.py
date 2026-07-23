@@ -399,14 +399,8 @@ async def download_movie_torrent(mt_id: int) -> bool:
             t = s.get(MovieTorrent, mt_id)
             if t is None or t.status in ("downloading", "downloaded"):
                 return False  # 已在下/已下 → 幂等短路，防并发（详情页多次点同一版本）重复交 qB
-            # 跨表守卫：同一物理种子已被 TV 管线拿去下/下完 → 文件已在 qB，别用不同路径重复提交。
-            if engine.hash_owned_elsewhere(t.info_hash, AnimeTorrent):
-                t.status = "downloaded"
-                t.qb_progress = 1.0   # 落定：物理种子实态由 TV 那份跟踪，本重复指针不必再进 in-flight 轮询
-                s.add(t)
-                s.commit()
-                log.info("跳过跨表重复种子（TV 已持有）- movie torrent=%s", mt_id)
-                return True
+            # 跨表【不】去重：剧场版/番剧各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
+            # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer。
             m = s.get(Movie, t.movie_id)
             t.status = "downloading"
             s.add(t)

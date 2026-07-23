@@ -202,15 +202,8 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             episode = t.episode
             season = t.season
             title = t.anime_title
-            # 跨表守卫：同一物理种子已被剧场版管线拿去下/下完 → 文件已在 qB，别用不同路径重复提交。
-            # 锁内 DB 段全程无 await（对事件循环原子），故并发时后到者必能看到先到者已置 downloading。
-            if engine.hash_owned_elsewhere(t.info_hash, MovieTorrent):
-                t.status = "downloaded"
-                t.qb_progress = 1.0   # 落定：物理种子实态由剧场版那份跟踪，本重复指针不必再进 in-flight 轮询
-                s.add(t)
-                s.commit()
-                log.info("跳过跨表重复种子（剧场版已持有）- %s", title)
-                return True
+            # 跨表【不】去重：番剧/剧场版各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
+            # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer（曾致删/下竞态静默丢文件）。
             # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）。
             # 含特别篇 -1（每番只放一份，与 flush 的 have_special 意图一致）；-2 未知集按设计逐个下、不去重。
             if not force and isinstance(episode, (int, float)) and (episode >= 0 or episode == -1) and anime_id:
