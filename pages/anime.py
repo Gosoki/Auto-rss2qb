@@ -104,13 +104,16 @@ def anime_page(t: str = "manage"):
                 _dla.set_enabled(config.QB_ENABLED)
                 _dla.tooltip("订阅中所有待下集立即下" if config.QB_ENABLED
                              else "qB 未启用，去设置页开启后可下载")
-            # 待下拆 将下载/备用/待确认（库态『下载中』恒≈0、与 qB 实时态重复不单列；未知集/失败上移到 KPI 可点卡）
+            # 待下拆 将下载/备用/待确认/未知（库态『下载中』恒≈0、与 qB 实时态重复不单列）；失败、种子总数一并列出，与 KPI 卡呼应
             chips = [
                 ("已下", ov["status"]["downloaded"], "green", None),
                 ("将下载", ps["will"], "blue", "已确认番·本集首选（含特别篇），会自动下"),
                 ("备用", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
+                ("未知", ps["unknown"], "purple", "批量/未知集，后台不自动下，需在详情页手动下"),
                 ("跳过", ov["status"]["skipped"], "blue-grey", None),
+                ("失败", ov["status"]["error"], "red", "下载出错的种子"),
+                ("种子总数", k["torrents"], "grey", "全部种子数（各状态之和）"),
             ]
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
