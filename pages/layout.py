@@ -61,7 +61,8 @@ def kpi_cards(cards) -> None:
                 " cursor-pointer hover:bg-white/5" if on_click else ""))
             with c:
                 cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
-                ui.label(str(val)).classes(cls)
+                ui.label(str(val)).classes(cls).style(  # 预留 5 位数宽度：数字增减时卡不抖、各卡等宽
+                    "min-width:5ch;text-align:center;font-variant-numeric:tabular-nums")
                 ui.label(label).classes("text-xs text-gray-400")
             if on_click:
                 c.on("click", on_click)
