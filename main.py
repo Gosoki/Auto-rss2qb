@@ -8,13 +8,15 @@ from nicegui import app, ui
 
 import config
 import pages  # noqa: F401  导入即注册页面
-from config import WEB_PORT
+from config import WEB_HOST, WEB_PORT
 from core import anime, engine, movies
 from core.logsetup import setup_logging
+from core.netguard import install as install_netguard
 from core.worker import run_movie_scan, run_qb_sync, run_reenrich_retry, run_worker
 from db import init_db
 
 setup_logging()   # 控制台 + 滚动文件(data/autorss.log) + 内存环形缓冲(供 /logs 页实时看)
+install_netguard(app)   # 网段白名单中间件（WEB_ALLOW_CIDRS 为空则放行一切；须在起服务器前挂）
 
 
 @app.on_startup
@@ -32,6 +34,6 @@ async def _startup():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    # 绑定回环地址：本工具无鉴权、设置页含 qB 密码等敏感信息，默认不对局域网开放。
-    # 如需内网访问，改 host 并自行加鉴权/反代。
-    ui.run(title="autorss", host="127.0.0.1", port=WEB_PORT, show=False, reload=True)
+    # 监听地址默认回环 127.0.0.1：本工具无鉴权、设置页含 qB 密码等敏感信息，默认不对局域网开放。
+    # 可在设置页改绑定地址（写 .env、需重启）；改成 0.0.0.0 会对内网开放，务必自行加鉴权/反代（页内已警示）。
+    ui.run(title="autorss", host=WEB_HOST, port=WEB_PORT, show=False, reload=True)

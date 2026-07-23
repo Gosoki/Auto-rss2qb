@@ -23,12 +23,14 @@ except Exception:
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-# ---- 结构性/绑定项：走 .env，改了需重启（DB_PATH 是启动 DB 的前提，WEB_PORT 绑端口）----
+# ---- 结构性/绑定项：走 .env，改了需重启（DB_PATH 是启动 DB 的前提，WEB_HOST/WEB_PORT 绑监听）----
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "autorss.db"))
 try:
     WEB_PORT = int(os.getenv("WEB_PORT", "8080") or "8080")
 except ValueError:
     WEB_PORT = 8080
+# 监听地址：空/未设=只本机(127.0.0.1)。0.0.0.0=整个局域网可访问——本工具无鉴权、含 qB 密码，慎改（见设置页提示）
+WEB_HOST = os.getenv("WEB_HOST") or "127.0.0.1"
 
 # ---- 可热改设置：{键: (类型, 默认值)}，类型 bool/int/str/list ----
 _SPEC = {
@@ -58,6 +60,7 @@ _SPEC = {
     "ANIME_TOP_PRIORITY_INSTANT": (bool, True),
     "OPEN_PROXY": (bool, False),
     "PROXY_URL": (str, ""),
+    "WEB_ALLOW_CIDRS": (str, ""),   # Web 访问网段白名单(CIDR,逗号分隔;空=不限)——绑 0.0.0.0 时限定可信内网,本机恒放行,即时生效
     "NOTIFY_URL": (str, ""),
     "NOTIFY_TIMEOUT": (int, 10),
     "ENRICH_TIMEOUT": (int, 15),

@@ -13,9 +13,10 @@ from .layout import frame
 _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
             "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
-            "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES"}
+            "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES",
+            "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT"}
 _PASSWORD = {"QB_PASSWORD"}
-_RESTART_ONLY = {"WEB_PORT"}  # 绑端口，仍走 .env、改了要重启；其余都进 DB 即时生效
+_RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}  # 绑监听地址/端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
 _QUARTER_PRESETS = {
     "{yy}{q}": "字母  → 26C",
@@ -66,8 +67,15 @@ def settings():
         def _text(key, label, val):
             f[key] = ui.input(label, value=str(val)).props("dense outlined").classes("w-full")
 
-        def _num(key, label, val):
-            f[key] = ui.number(label, value=val, format="%d").props("dense outlined").classes("w-full")
+        def _num(key, label, val, mn=None, mx=None):
+            # 数字项：标签在框内浮动，框占满所在栅格格（配合 field-grid 即 1/4 宽）。1/4 窄框放不下的长标签会截断成 …
+            kw = {}
+            if mn is not None:
+                kw["min"] = mn
+            if mx is not None:
+                kw["max"] = mx
+            f[key] = ui.number(label, value=val, format="%d", **kw).props(
+                "dense outlined").classes("w-full")
 
         def _password(key, label):
             f[key] = ui.input(label, value="", password=True).props("dense outlined").classes("w-full")  # 不回填现值
@@ -76,8 +84,10 @@ def settings():
             ui.label("采集").classes("font-bold")
             _switch("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
                     config.ANIME_POLL_ENABLED)
-            _num("ANIME_POLL_INTERVAL", "轮询间隔（秒）", config.ANIME_POLL_INTERVAL)
-            _num("ANIME_DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）", config.ANIME_DOWNLOAD_GRACE_MIN)
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ANIME_POLL_INTERVAL", "轮询间隔（秒）", config.ANIME_POLL_INTERVAL)
+                _num("ANIME_DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）",
+                     config.ANIME_DOWNLOAD_GRACE_MIN)
             _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）", config.ANIME_TOP_PRIORITY_INSTANT)
             _switch("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
@@ -92,7 +102,7 @@ def settings():
 
             ui.separator()
             ui.label("Bangumi 重试（识别不到时）").classes("font-bold text-sm")
-            with ui.row().classes("items-center gap-4 flex-wrap"):
+            with ui.element("div").classes("field-grid w-full"):
                 _num("ENRICH_RETRY_TIMES", "即时重试次数（bgm 请求超时/连接错时）", config.ENRICH_RETRY_TIMES)
                 _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
                 _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
@@ -106,13 +116,11 @@ def settings():
             _switch("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
             _switch("QB_SYNC_STATUS", "读取 qB 实时状态（关=发送过去即『已下』，完全不轮询 qB）",
                     config.QB_SYNC_STATUS)
-            _num("QB_SYNC_INTERVAL", "qB 活跃轮询间隔（秒）——仅在有种子正在下时按此频率拉进度",
-                 config.QB_SYNC_INTERVAL)
-            _num("QB_SYNC_BACKSTOP_MIN", "qB 保底自查间隔（分钟）——没被唤醒也每隔这么久兜底扫一次",
-                 config.QB_SYNC_BACKSTOP_MIN)
-            with ui.row().classes("items-center gap-4 flex-wrap"):
-                _num("QB_ACTIVE_FLOOR_KBPS", "慢速地板（KB/s，慢于此算没在真下）", config.QB_ACTIVE_FLOOR_KBPS)
-                _num("QB_SLOW_ROUNDS", "判慢轮次（连续几轮都没真下才休眠）", config.QB_SLOW_ROUNDS)
+            with ui.element("div").classes("field-grid w-full"):
+                _num("QB_SYNC_INTERVAL", "活跃轮询间隔（秒）", config.QB_SYNC_INTERVAL)
+                _num("QB_SYNC_BACKSTOP_MIN", "保底自查间隔（分钟）", config.QB_SYNC_BACKSTOP_MIN)
+                _num("QB_ACTIVE_FLOOR_KBPS", "慢速地板（KB/s）", config.QB_ACTIVE_FLOOR_KBPS)
+                _num("QB_SLOW_ROUNDS", "判慢轮次", config.QB_SLOW_ROUNDS)
             ui.label("开状态跟踪：事件驱动——种子交给 qB 时立刻开始跟、按活跃间隔拉进度，全下完就休眠、不再打扰 qB；"
                      "下完/做种/文件缺失/卡住无源/慢过地板 的种子都不再高频轮询，只由保底间隔偶尔兜底（默认 180=3 小时）。"
                      "慢速地板 20KB/s + 连续 3 轮判慢：某种子长期龟速也能让循环休眠；但只要还有别的种子在真下，"
@@ -132,7 +140,16 @@ def settings():
                 tok = (f["QB_CALLBACK_TOKEN"].value or "").strip()   # 读输入框实时值，不是已保存值
                 cmd = (f'curl -s -X POST "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
                        + (f'&t={tok}' if tok else '') + '"')
-                ui.code(cmd).classes("w-full text-xs")
+
+                async def _copy(c=cmd):
+                    await ui.clipboard.write(c)
+                    ui.notify("已复制命令到剪贴板", type="positive")
+
+                with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                    ui.input(value=cmd).props("dense outlined readonly").classes(
+                        "grow font-mono").style("font-size:12px")
+                    ui.button(icon="content_copy", on_click=_copy).props(
+                        "flat round dense color=primary").tooltip("复制命令")
 
             _cb_cmd()
             f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 一改，命令即时跟着变
@@ -169,11 +186,9 @@ def settings():
                 "text-xs text-gray-500")
             ui.separator()
             ui.label("分页：一页显示多少年的季度（超出翻页）").classes("font-bold text-sm")
-            with ui.row().classes("items-center gap-4 flex-wrap"):
-                f["ANIME_PAGE_YEARS"] = ui.number("番剧表 · 年", value=config.ANIME_PAGE_YEARS,
-                                                   min=1, max=5, format="%d").props("dense outlined").classes("w-32")
-                f["MOVIE_PAGE_YEARS"] = ui.number("剧场版 · 年", value=config.MOVIE_PAGE_YEARS,
-                                                  min=1, max=5, format="%d").props("dense outlined").classes("w-32")
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ANIME_PAGE_YEARS", "番剧表 · 年", config.ANIME_PAGE_YEARS, 1, 5)
+                _num("MOVIE_PAGE_YEARS", "剧场版 · 年", config.MOVIE_PAGE_YEARS, 1, 5)
             ui.label("1 年 = 4 个季度。改完保存，下次进列表即生效。").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。", config.QUARTER_FMT_UI)
@@ -183,7 +198,30 @@ def settings():
             _switch("OPEN_PROXY", "启用代理", config.OPEN_PROXY)
             _text("PROXY_URL", "代理地址", config.PROXY_URL)
             _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL)
-            _num("WEB_PORT", "Web 端口", config.WEB_PORT)
+
+            ui.separator()
+            ui.label("Web 访问").classes("font-bold text-sm")
+            with ui.element("div").classes("field-grid w-full"):
+                _text("WEB_HOST", "绑定地址", config.WEB_HOST)
+                _num("WEB_PORT", "Web 端口", config.WEB_PORT)
+                _text("WEB_ALLOW_CIDRS", "允许网段(CIDR)", config.WEB_ALLOW_CIDRS)
+            ui.label("绑定地址：127.0.0.1=仅本机；0.0.0.0=整个局域网可访问。改绑定地址/端口写 .env、需重启；"
+                     "留空或填错地址下次启动回落 127.0.0.1。").classes("text-xs text-gray-500")
+            ui.label("⚠ 本工具无鉴权、本页含 qB 密码。绑 0.0.0.0 时用『允许网段』把访问限定在可信内网（如 "
+                     "192.168.1.0/24，多个用逗号）——即时生效、无需重启；本机 127.0.0.1 恒放行，不会把自己锁在外面。"
+                     "留空=不限制。经反向代理访问时对端 IP 是代理，此项应留空、改在代理层做鉴权。").classes(
+                "text-xs text-amber-500")
+
+        with ui.card().classes("w-full"):
+            with ui.expansion("高级（超时 / 站点地址 · 一般不用动）", icon="tune").classes(
+                    "w-full").props("dense"):
+                with ui.element("div").classes("field-grid w-full"):
+                    _num("ENRICH_TIMEOUT", "Bangumi 请求超时（秒）", config.ENRICH_TIMEOUT)
+                    _num("NOTIFY_TIMEOUT", "通知推送超时（秒）", config.NOTIFY_TIMEOUT)
+                _text("MIKAN_BASE", "Mikan 站点根地址", config.MIKAN_BASE)
+                _text("BGM_API", "Bangumi API 根地址", config.BGM_API)
+                ui.label("一般保持默认，保存即时生效。超时：网络慢可调大。站点地址：仅当官方站被墙／用镜像时才改，"
+                         "改错会导致识别或抓取全部失败；结尾别带斜杠 /。").classes("text-xs text-gray-500")
 
         async def _save():
             updates = {}
@@ -227,7 +265,7 @@ def settings():
                     engine.settle_inflight_off()
             if env_updates:
                 config.update_env(env_updates)  # WEB_PORT 等结构项仍走 .env
-            msg = "已保存，即时生效" + ("（Web 端口改动需重启）" if env_updates else "")
+            msg = "已保存，即时生效" + ("（Web 绑定地址/端口改动需重启）" if env_updates else "")
             ui.notify(msg, type="positive")
 
         async def _reenrich():

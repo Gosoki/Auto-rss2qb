@@ -347,6 +347,12 @@ def frame(active: str = ""):
         # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
         ".kpi-group{display:grid;gap:.75rem;grid-template-columns:repeat(2,minmax(0,1fr))}"
         "@media(min-width:860px){.kpi-group{grid-template-columns:repeat(var(--kpi-n,4),minmax(0,1fr))}}"
+        # 数字输入：隐去浏览器原生上下箭头（各浏览器样式不一、与 dense 描边框高度错位），统一成纯输入框
+        "input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button"
+        "{-webkit-appearance:none;margin:0}input[type=number]{-moz-appearance:textfield}"
+        # 设置页数字项栅格：桌面每格 1/4 宽（4 列），窄屏落到 2 列；顶端对齐（标签在框上、行高不齐也整齐）
+        ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
+        "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
         "</style>")
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.07);box-shadow:none"):
