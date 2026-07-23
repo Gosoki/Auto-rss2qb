@@ -88,8 +88,9 @@ def anime_page(t: str = "manage"):
                             barline(src, tot, maxs, color="#8b5cf6", text=f"{done} / {tot}")
 
             # ── 种子状态 ──
-            with ui.row().classes("items-center gap-3 mt-3 pl-1"):
+            with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("种子状态").classes("text-sm font-bold")
+                ui.label("各状态种子计数（含 qB 实时态）").classes("text-xs text-gray-400")
                 _dla = ui.button("补下全部", icon="download", on_click=_download_all).props(
                     "outline color=primary size=sm").style("font-size:12px")
                 _dla.set_enabled(config.QB_ENABLED)
@@ -102,7 +103,8 @@ def anime_page(t: str = "manage"):
                 ("备用数", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
                 ("未知集", ps["unknown"], "purple", "批量/未知集，后台不自动下，需在详情页手动下"),
-                ("跳过数", ov["status"]["skipped"], "blue-grey", None),
+                ("跳过数", ov["status"]["skipped"], "blue-grey",
+                 "同集已有别版在下/已下被去重，或忽略番的积压；换源兜底时可能被复活"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的种子"),
                 ("种子数", k["torrents"], "grey", "全部种子数（各状态之和）"),
             ]
@@ -126,8 +128,9 @@ def anime_page(t: str = "manage"):
 
             # ── 采集状态 / 源组 ──
             enr, tot = ov["enriched"]
-            with ui.row().classes("items-center gap-3 mt-3 pl-1"):
+            with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("采集状态").classes("text-sm font-bold")
+                ui.label("后台采集与 bgm 识别的运行情况").classes("text-xs text-gray-400")
                 with ui.button("重新识别", icon="sync").props("outline color=primary size=sm").style("font-size:12px"):
                     with ui.menu():
                         ui.menu_item("识别当季", on_click=_reident(1))

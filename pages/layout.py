@@ -95,11 +95,11 @@ def kpi_cards(cards) -> None:
         with ui.row().classes("gap-3 flex-wrap p-1"):
             for card in groups[0]:
                 _card(card, grow=False)
-    else:                                  # 多组：每组打包、左右平铺满宽，窄了整组换行成上下布局
+    else:                                  # 多组：每组一个 grid，够宽 n 列一排、窄了折成 2×2、再窄整组换行；绝不裁掉右边
         with ui.row().classes("w-full gap-4 flex-wrap items-stretch p-1"):
             for group in groups:
-                n = len(group)   # 组宽按卡数分配，跨组各卡等宽（4+4 或 4+2 都不偏）
-                with ui.row().classes("gap-3 flex-wrap items-stretch").style(f"flex:{n} 0 {n * 110}px"):
+                with ui.element("div").classes("kpi-group items-stretch").style(
+                        f"flex:1 1 200px;--kpi-n:{len(group)}"):
                     for card in group:
                         _card(card, grow=True)
 
@@ -342,7 +342,10 @@ def frame(active: str = ""):
         "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
         ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}"
         ".q-table tbody td,.q-table thead th,.q-table .q-badge{font-size:14px}"
-        "</style>")   # 新入库表：表体(默认13)/表头(默认12)/状态徽标(默认12) 统一抬到 14
+        # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
+        ".kpi-group{display:grid;gap:.75rem;grid-template-columns:repeat(2,minmax(0,1fr))}"
+        "@media(min-width:860px){.kpi-group{grid-template-columns:repeat(var(--kpi-n,4),minmax(0,1fr))}}"
+        "</style>")
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.07);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）

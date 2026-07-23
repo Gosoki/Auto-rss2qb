@@ -286,6 +286,7 @@ def movies_page(t: str = "list"):
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-300"),
                        "|",
                        ("已下", k["downloaded"], "green", None, "green-400"),
+                       ("待下载", ov["status"]["pending"], "blue", None, "green-400"),
                        ("失败", ov["status"]["error"], "red", None, "green-400"),
                        ("版本", k["versions"], "", None, "green-400")])
             if not ov["config"]["qb"]:
@@ -301,11 +302,14 @@ def movies_page(t: str = "list"):
                     barline(engine.quarter_label(qk), tot, maxv, lw="w-36", text=f"{tot}")
 
             # ── 种子状态 ──（剧场版逐版本人工下，无待确认/首选/备用概念，只列库态计数）
-            ui.label("种子状态").classes("text-sm font-bold mt-3 pl-1")
+            with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
+                ui.label("种子状态").classes("text-sm font-bold")
+                ui.label("各状态种子计数（含 qB 实时态）").classes("text-xs text-gray-400")
             chips = [
                 ("已下载", ov["status"]["downloaded"], "green", None),
                 ("待下", ov["status"]["pending"], "orange", "还没下的版本，进详情逐条下"),
-                ("跳过数", ov["status"]["skipped"], "blue-grey", None),
+                ("跳过数", ov["status"]["skipped"], "blue-grey",
+                 "已忽略剧场版留下的种子；恢复时若一版都没下过会放回待下"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的版本"),
                 ("版本数", k["versions"], "grey", "全部种子/版本数（各状态之和）"),
             ]
@@ -325,7 +329,9 @@ def movies_page(t: str = "list"):
                         ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=teal").classes("text-sm")
 
             # ── 采集状态 ──（剧场版=Mikan 季度扫描；开关/间隔在『订阅源』tab 调）
-            ui.label("采集状态").classes("text-sm font-bold mt-3 pl-1")
+            with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
+                ui.label("采集状态").classes("text-sm font-bold")
+                ui.label("后台采集与 bgm 识别的运行情况").classes("text-xs text-gray-400")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 ui.badge("扫描开启" if config.MOVIE_SCAN_ENABLED else "扫描暂停").props(
                     f"color={'green' if config.MOVIE_SCAN_ENABLED else 'red'}").classes("text-sm").tooltip(
