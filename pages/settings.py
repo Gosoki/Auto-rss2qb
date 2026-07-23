@@ -89,7 +89,7 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str) -> No
 def settings():
     with frame("settings"):
         ui.label("设置").classes("text-2xl font-bold")
-        ui.label("改动存进数据库、保存即时生效（页面刷新可见）。仅 Web 端口改动需重启。").classes(
+        ui.label("保存即时生效、页面刷新可见；仅 Web 绑定地址/端口改动需重启。").classes(
             "text-xs text-gray-400 mb-2")
 
         f: dict = {}  # 表单控件，key = .env 键名
@@ -130,13 +130,10 @@ def settings():
             _switch("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
-            ui.label("默认关：解析不出番名的种子直接进『待识别』。开了才尝试从括号块猜番名——best-effort，"
-                     "偶尔可能猜错，拿不准会自动跳过；大组(ANi/Lilith 等)永不受影响。可在『解析测试』页粘标题验证。").classes(
-                "text-xs text-gray-500")
-            ui.label("Bangumi 识别：项目恒开（规范名/季度/日语文件夹名统一采用 bgm）。").classes(
-                "text-xs text-gray-500")
-            ui.label("源组（feed/策略/优先级/字幕组白名单）都在『源管理』页配置，改完下一轮生效。").classes(
-                "text-xs text-gray-500")
+            ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
+                     "大组不受影响），可在『解析测试』页验证。").classes("text-xs text-gray-500")
+            ui.label("Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。").classes("text-xs text-gray-500")
+            ui.label("源组（feed/策略/优先级/字幕组）在『源管理』页配置。").classes("text-xs text-gray-500")
 
             ui.separator()
             ui.label("Bangumi 重试（识别不到时）").classes("font-bold text-sm")
@@ -145,9 +142,9 @@ def settings():
                 _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
                 _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
                 _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
-            ui.label("识别不到 bgm 的番进『待识别』：即时重试挡网络抖动；之后按指数退避后台再试——每失败一次"
-                     "等待翻倍（默认 30分→60→120→…封顶 1440分=24h），满『最多次数』就停（留手动，进详情页点"
-                     "『重新识别』即清零重来）。查到 bgm 自动升『待确认』。").classes("text-xs text-gray-500")
+            ui.label("认不到 bgm 的番进『待识别』：先即时重试挡抖动，再指数退避后台重试（每失败翻倍、封顶 24h），"
+                     "满次数就停、留手动（详情页『重新识别』清零重来）。查到 bgm 自动升『待确认』。").classes(
+                "text-xs text-gray-500")
 
         with ui.card().classes("w-full"):
             ui.label("下载 / qBittorrent").classes("font-bold")
@@ -159,19 +156,16 @@ def settings():
                 _num("QB_SYNC_BACKSTOP_MIN", "保底自查间隔（分钟）", config.QB_SYNC_BACKSTOP_MIN)
                 _num("QB_ACTIVE_FLOOR_KBPS", "慢速地板（KB/s）", config.QB_ACTIVE_FLOOR_KBPS)
                 _num("QB_SLOW_ROUNDS", "判慢轮次", config.QB_SLOW_ROUNDS)
-            ui.label("开状态跟踪：事件驱动——种子交给 qB 时立刻开始跟、按活跃间隔拉进度，全下完就休眠、不再打扰 qB；"
-                     "下完/做种/文件缺失/卡住无源/慢过地板 的种子都不再高频轮询，只由保底间隔偶尔兜底（默认 180=3 小时）。"
-                     "慢速地板 20KB/s + 连续 3 轮判慢：某种子长期龟速也能让循环休眠；但只要还有别的种子在真下，"
-                     "每轮批量刷新会顺便把慢的一起更新。关状态跟踪：发送过去即当『已下』，一次 qB 都不查（零轮询、看不到进度）。").classes(
+            ui.label("开=跟 qB 实时进度：交付即跟、全下完休眠；『慢速地板+判慢轮次』判定种子是否还在真下、"
+                     "决定何时休眠，长期不动的靠保底间隔兜底。关=发送即当『已下』、完全不查 qB（看不到进度）。").classes(
                 "text-xs text-gray-500")
 
             ui.separator()
             ui.label("完成回调（可选·精确兜底）").classes("font-bold text-sm")
-            _text("QB_CALLBACK_TOKEN", "回调 token（可选，防被乱调；填了下面命令会自动带上 &t=，改完记得点保存）",
+            _text("QB_CALLBACK_TOKEN", "回调 token（可选，防乱调；填了下面命令会自动带 &t=）",
                   config.QB_CALLBACK_TOKEN)
-            ui.label("把下面这行填进 qB → Options → Downloads → 『Run external program on torrent finished』，"
-                     "种子一下完 qB 就回调、精确把这一集标『已下』（%I 由 qB 替换成种子 hash）：").classes(
-                "text-xs text-gray-500")
+            ui.label("把下面这行填进 qB → Options → Downloads →『Run external program on torrent finished』："
+                     "下完即回调、精确标『已下』（%I=qB 替换的种子 hash）。").classes("text-xs text-gray-500")
 
             @ui.refreshable
             def _cb_cmd():
@@ -191,10 +185,8 @@ def settings():
 
             _cb_cmd()
             f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 一改，命令即时跟着变
-            ui.label("为什么需要它：种子若长期龟速/卡住被降级停跟，又恰好在休眠里下完并被 qB『完成即删种』删掉，"
-                     "我们看不到它到 100%，会把它标成『失败』。配了这个回调就能精确兜底标成『已下』。"
-                     "不配也行——这种情况很少（多半是剧场版没源慢下），标失败后手动补一下即可。"
-                     "仅当 qB 与本程序在同一台机器（回调打 127.0.0.1）时可用。").classes("text-xs text-gray-500")
+            ui.label("可选兜底：慢速种子在休眠期间下完、又被 qB『完成即删种』删掉，会被误标『失败』；配了它就精确标"
+                     "『已下』。不配也行（少见）。仅 qB 与本程序同机时可用。").classes("text-xs text-gray-500")
 
             _text("QB_URL", "qB 地址", config.QB_URL)
             _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
@@ -232,7 +224,7 @@ def settings():
             with ui.element("div").classes("field-grid w-full"):
                 _num("ANIME_PAGE_YEARS", "番剧表 · 年", config.ANIME_PAGE_YEARS, 1, 5)
                 _num("MOVIE_PAGE_YEARS", "剧场版 · 年", config.MOVIE_PAGE_YEARS, 1, 5)
-            ui.label("1 年 = 4 个季度。改完保存，下次进列表即生效。").classes("text-xs text-gray-500")
+            ui.label("1 年 = 4 个季度。").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随『季度文件夹命名』模板。",
                              config.QUARTER_FMT_UI)
@@ -252,9 +244,8 @@ def settings():
             ui.label("绑定地址：127.0.0.1=仅本机；0.0.0.0=整个局域网可访问。改绑定地址/端口写 .env、需重启；"
                      "非法地址保存时会被拦下，留空=回落 127.0.0.1。").classes("text-xs text-gray-500")
             ui.label("⚠ 本工具无鉴权、本页含 qB 密码。绑 0.0.0.0 时用『允许网段』把访问限定在可信内网（如 "
-                     "192.168.1.0/24，多个用逗号）——即时生效、无需重启，留空=不限制。本机 127.0.0.1 恒放行；"
-                     "保存时会检测你当前访问的 IP，不在新网段内就拦下、防止把自己锁在外（换设备/换网段访问仍需自行确认覆盖）。"
-                     "经反向代理访问时对端 IP 是代理，此项应留空、改在代理层做鉴权。").classes(
+                     "192.168.1.0/24，多个用逗号），即时生效、留空=不限制。本机恒放行；若新网段会把你当前访问挡在门外，"
+                     "保存时会被拦下。经反向代理时对端是代理 IP，此项应留空、鉴权交给代理。").classes(
                 "text-xs text-amber-500")
 
         with ui.card().classes("w-full"):
@@ -265,8 +256,8 @@ def settings():
                     _num("NOTIFY_TIMEOUT", "通知推送超时（秒）", config.NOTIFY_TIMEOUT)
                 _text("MIKAN_BASE", "Mikan 站点根地址", config.MIKAN_BASE)
                 _text("BGM_API", "Bangumi API 根地址", config.BGM_API)
-                ui.label("一般保持默认，保存即时生效。超时：网络慢可调大。站点地址：仅当官方站被墙／用镜像时才改，"
-                         "改错会导致识别或抓取全部失败；结尾别带斜杠 /。").classes("text-xs text-gray-500")
+                ui.label("一般不用改。超时：网络慢可调大。站点地址：换镜像时才改，改错会导致识别/抓取全挂，"
+                         "结尾别带 /。").classes("text-xs text-gray-500")
 
         async def _save():
             updates = {}
