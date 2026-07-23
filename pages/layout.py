@@ -335,6 +335,8 @@ def frame(active: str = ""):
     """
     ui.dark_mode(True)
     ui.colors(primary="#2196f3")   # 全站主色＝『将下载』的蓝，所有 color=primary 的按钮/徽标随之统一
+    # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
+    ui.add_head_html('<meta name="referrer" content="no-referrer">')
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
     ui.add_head_html(
         "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"

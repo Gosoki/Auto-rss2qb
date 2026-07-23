@@ -76,23 +76,25 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label("（还没有种子）").classes("text-gray-400")
             return
         for t in ts:
-            with ui.row().classes("items-center gap-2 w-full py-1 text-sm").style(
+            with ui.column().classes("w-full gap-1 py-1").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
-                ui.label(engine.torrent_time(t)).classes("w-28 text-gray-400 text-xs")
-                ui.label(t.raw_title or t.source).classes("grow break-all")
-                live = qb_live_text(t)
-                if live:  # 完成(做种/100%)才绿，下载中用 teal
-                    _done = (t.qb_progress or 0) >= 1
-                    ui.badge(live).props(f"color={'green' if _done else 'teal'}").tooltip(
-                        "qB 实时状态")
-                else:  # 无 qB 实时态：刚交付未同步→下载中；其余按状态
-                    ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
-                        "color=blue-grey")
-                ui.button("下载", icon="download", on_click=_force(t.id)).props(
-                    "size=sm flat dense").style("font-size:12px").tooltip("强制下这一版本到文件夹")
-                if t.status in ("downloaded", "downloading"):
-                    ui.button(icon="delete_forever", on_click=_del(t.id)).props(
-                        "size=sm flat dense color=negative").tooltip("删除这一版本的文件（qB+硬盘，不可撤销）")
+                with ui.row().classes("items-center gap-2 w-full text-sm"):
+                    ui.label(engine.torrent_time(t)).classes("shrink-0 text-gray-400 text-xs")
+                    ui.label(t.raw_title or t.source).classes("grow break-all")
+                with ui.row().classes("items-center gap-2"):   # 状态标签 + 下载：统一左下
+                    live = qb_live_text(t)
+                    if live:  # 完成(做种/100%)才绿，下载中用 teal
+                        _done = (t.qb_progress or 0) >= 1
+                        ui.badge(live).props(f"color={'green' if _done else 'teal'}").tooltip(
+                            "qB 实时状态")
+                    else:  # 无 qB 实时态：刚交付未同步→下载中；其余按状态
+                        ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
+                            "color=blue-grey")
+                    ui.button("下载", icon="download", on_click=_force(t.id)).props(
+                        "size=sm flat dense").style("font-size:12px").tooltip("强制下这一版本到文件夹")
+                    if t.status in ("downloaded", "downloading"):
+                        ui.button(icon="delete_forever", on_click=_del(t.id)).props(
+                            "size=sm flat dense color=negative").tooltip("删除这一版本的文件（qB+硬盘，不可撤销）")
 
     def _after():
         body.refresh()
