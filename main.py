@@ -3,7 +3,6 @@
 运行： python main.py    然后浏览器打开 http://<host>:8080
 """
 import asyncio
-import logging
 
 from nicegui import app, ui
 
@@ -11,30 +10,11 @@ import config
 import pages  # noqa: F401  导入即注册页面
 from config import WEB_PORT
 from core import anime, engine, movies
+from core.logsetup import setup_logging
 from core.worker import run_movie_scan, run_qb_sync, run_reenrich_retry, run_worker
 from db import init_db
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-
-class _SuppressDeletedSlot(logging.Filter):
-    """滤掉 NiceGUI 在客户端断开瞬间偶发的一族良性报错——面板 30s 自动刷新的 ui.timer、或断连后
-    async 处理器回来时 ui.notify/refresh 访问已删元素/客户端，都会抛这几条兄弟消息。客户端已走、不影响
-    功能，只是刷屏并掩盖真错，故按消息精确过滤。三条 needle 都足够特指，不会误吞真正的错误。"""
-    _NEEDLES = (
-        "parent slot of the element has been deleted",
-        "The client this element belongs to has been deleted",
-        "The client this outbox belongs to has been deleted",
-    )
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        exc = record.exc_info[1] if record.exc_info else None
-        text = record.getMessage() + " " + str(exc or "")
-        return not any(n in text for n in self._NEEDLES)
-
-
-for _h in logging.getLogger().handlers:
-    _h.addFilter(_SuppressDeletedSlot())
+setup_logging()   # 控制台 + 滚动文件(data/autorss.log) + 内存环形缓冲(供 /logs 页实时看)
 
 
 @app.on_startup

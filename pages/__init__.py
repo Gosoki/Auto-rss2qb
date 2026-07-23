@@ -2,4 +2,4 @@
 
 anime_detail 是详情组件（渲染进列表页悬浮框），无独立路由，由 anime.py 按需导入，不在此登记。
 """
-from . import anime, api, movies, parse_test, settings, sources  # noqa: F401
+from . import anime, api, logs, movies, parse_test, settings, sources  # noqa: F401
