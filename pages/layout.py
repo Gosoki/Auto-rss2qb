@@ -337,8 +337,8 @@ def frame(active: str = ""):
     yield 出顶栏右侧的容器，页面可往里放全局动作按钮（如刷新/补下）；不放就是空的。
     """
     ui.dark_mode(True)
-    # 全站主色＝Tailwind blue-500，负色＝red-400（与徽标/图表同一套 palette 的 sRGB 值）
-    ui.colors(primary="#2b7fff", negative="#ff6467")
+    # 全站主色＝blue-400、负色＝red-400，用 oklch（跟徽标/链接同源，P3 屏上也完全同色，不走 sRGB 夹紧）
+    ui.colors(primary="oklch(70.7% 0.165 254.624)", negative="oklch(70.4% 0.191 22.216)")
     # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
     ui.add_head_html('<meta name="referrer" content="no-referrer">')
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
