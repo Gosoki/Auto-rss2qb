@@ -107,3 +107,29 @@ class QBittorrent:
             return True
         log.error("删除下载任务失败 %s: %s", resp.status_code, resp.text[:80])
         return False
+
+    async def set_location(self, hashes: list[str], location: str) -> int | None:
+        """把这些种子的保存路径整批移到 location（qB 后台搬文件，autoTMM=false 的不会被分类路径覆盖）。
+
+        返回 HTTP 状态码：200 成功 / 400 空路径 / 403 无写权限 / 409 建目录失败；连不上返回 None、空 hashes 返回 200。
+        403/409 是路径级失败（对整批一致）——调用方据此『只提醒、不动状态』。
+        """
+        hashes = [h for h in hashes if h]
+        if not hashes:
+            return 200
+        client = await self._login()
+        if client is None:
+            return None
+        try:
+            resp = await client.post("/api/v2/torrents/setLocation", data={
+                "hashes": "|".join(hashes),
+                "location": location,
+            })
+        except httpx.HTTPError as e:
+            log.error("移动种子位置失败: %s", e)
+            return None
+        finally:
+            await client.aclose()
+        if resp.status_code != 200:
+            log.error("移动种子位置失败 %s: %s", resp.status_code, resp.text[:80])
+        return resp.status_code

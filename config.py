@@ -61,6 +61,10 @@ _SPEC = {
     "NOTIFY_URL": (str, ""),
     "NOTIFY_TIMEOUT": (int, 10),
     "ENRICH_TIMEOUT": (int, 15),
+    "ENRICH_RETRY_TIMES": (int, 3),          # bgm 请求瞬时失败(超时/连接)的即时重试次数
+    "REENRICH_RETRY_BASE": (int, 30),        # 『待识别』番延迟重试基准等待（分钟），每失败一次翻倍（默认 30 分钟）
+    "REENRICH_RETRY_MAX": (int, 1440),       # 延迟重试等待上限（分钟），翻倍到此封顶（默认 1440=24 小时）
+    "REENRICH_MAX_TRIES": (int, 12),         # 每部『待识别』番最多自动重试几次（满则停自动、留手动）
     "ANI_RSS_URL": (str, "https://nyaa.si/?page=rss&u=ANiTorrent"),
     "MIKAN_ENABLED": (bool, False),
     "MIKAN_RSS_URL": (str, "https://mikanani.me/RSS/Classic"),

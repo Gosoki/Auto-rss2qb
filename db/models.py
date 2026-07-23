@@ -64,7 +64,10 @@ class Anime(SQLModel, table=True):
     # ---- 下载控制 ----
     confirmed: bool = Field(default=True)             # 确认状态（待确认源默认 False，等人工确认）；确认即自动下
     rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『拒绝』页恢复）
-    pref_source: str | None = Field(default=None)     # 锁定下载源（子串匹配 torrent.source）；空=按优先级多源兜底，非空=只下这个组、缺集不兜底
+    pref_source: str | None = Field(default=None)     # 锁定下载源（精确匹配 torrent.source：锁哪个组只下哪个；联合发布如"喵萌&LoliHouse"视作独立源、要单独锁，入库照收）；空=按优先级多源兜底
+    pref_keyword: str | None = Field(default=None)    # 版本关键词（大小写不敏感子串命中 raw_title，如 繁日/简日/1080p）：与锁定源叠加、只下命中的版本；空=不限
+    enrich_tries: int = Field(default=0)              # bgm 未识别番的后台重试次数（满 REENRICH_MAX_TRIES 停自动重试，留手动；手动重识别清零）
+    last_enrich_at: datetime | None = Field(default=None)  # 上次后台重试 bgm 的时刻（指数退避调度：下次到点=此刻+BASE*2^tries，封顶 MAX）
     created_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -95,6 +98,7 @@ class AnimeTorrent(SQLModel, table=True):
     quarter: str = Field(default="")
     status: str = Field(default="pending")      # 应用侧生命周期：pending/downloading/downloaded/error/skipped
     download_url: str = Field(default="")
+    save_path: str = Field(default="")          # 交 qB 时的实际保存路径；改季度/重绑后据此移动或提醒旧位置
     release_time: datetime | None = Field(default=None)
     priority: int = Field(default=0)            # 来源组优先级（缓冲窗口到点时按此选下哪一份）
     created_at: datetime = Field(default_factory=datetime.now)

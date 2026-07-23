@@ -242,7 +242,7 @@ def pick_best(torrents, pref=None):
     """
     cands = torrents
     if pref:
-        cands = [t for t in torrents if pref in (t.source or "")] or torrents
+        cands = [t for t in torrents if pref == (t.source or "")] or torrents
     return sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))[0]
 
 

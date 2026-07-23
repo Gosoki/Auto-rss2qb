@@ -6,6 +6,7 @@ feed 可以是 nyaa 用户名（自动拼 RSS）或一条完整 RSS URL（应对
 import logging
 import re
 from datetime import datetime
+from urllib.parse import quote
 
 import feedparser
 import httpx
@@ -28,6 +29,12 @@ def nyaa_feed_url(feed: str) -> str:
     if feed.startswith(("http://", "https://")):
         return feed
     return f"https://nyaa.si/?page=rss&u={feed}&c=1_0"
+
+
+def nyaa_search_url(query: str) -> str:
+    """nyaa 搜索 RSS：按关键词搜全站动漫（c=1_0 覆盖各语言字幕）。补齐(backfill)用；
+    返回的 RSS 与用户订阅同格式（含 nyaa_infohash），NyaaSource._parse 直接吃。"""
+    return f"https://nyaa.si/?page=rss&q={quote(query)}&c=1_0&f=0"
 
 
 class NyaaSource(Source):
