@@ -354,6 +354,24 @@ def frame(active: str = ""):
         ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
         "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
         "</style>")
+    # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。绿/红用 -500（-400 太亮），其余用 -400。
+    # 必须放进 @layer overrides —— Quasar 的 .bg-* !important 在 quasar_importants 层里；分层后 !important 比的是
+    # 「层序（靠前的赢）」而非特异度，overrides 层排在 quasar_importants 之前，故能压过它。裸样式会输、失效。
+    # 只作用于 .q-badge（按钮是 .q-btn，不受影响）；白字沿用 Quasar 徽标默认。
+    ui.add_head_html(
+        "<style>@layer overrides{"
+        ".q-badge.bg-green{background:oklch(72.3% 0.219 149.579)!important}"               # green-500（绿单独调暗）
+        ".q-badge.bg-red{background:oklch(63.7% 0.237 25.331)!important}"                  # red-500（红单独调暗）
+        ".q-badge.bg-blue,.q-badge.bg-primary{background:oklch(70.7% 0.165 254.624)!important}"  # blue-400
+        ".q-badge.bg-blue-grey,.q-badge.bg-grey{background:oklch(70.7% 0.022 261.325)!important}"  # 中性灰统一：gray-400
+        ".q-badge.bg-orange{background:oklch(75% 0.183 55.934)!important}"                 # orange-400
+        ".q-badge.bg-purple{background:oklch(71.4% 0.203 305.504)!important}"              # purple-400
+        ".q-badge.bg-teal{background:oklch(77.7% 0.152 181.912)!important}"                # teal-400
+        ".q-badge.bg-indigo{background:oklch(67.3% 0.182 276.935)!important}"              # indigo-400
+        ".q-badge.bg-deep-purple{background:oklch(70.2% 0.183 293.541)!important}"         # violet-400
+        ".q-badge.bg-amber{background:oklch(82.8% 0.189 84.429)!important}"                # amber-400
+        ".q-badge.bg-pink{background:oklch(71.8% 0.202 349.761)!important}"                # pink-400
+        "}</style>")
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.07);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）
