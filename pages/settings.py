@@ -60,8 +60,10 @@ _QUARTER_PRESETS = {
 }
 
 
-def _quarter_setting(f: dict, key: str, title: str, note: str, value: str) -> None:
-    """季度模板设置块：标题 + 说明 + 模板输入 + 实时预览 + 预设下拉。控件写入 f[key]。"""
+def _quarter_setting(f: dict, key: str, title: str, note: str, value: str,
+                     empty_hint: str = "留空＝用默认") -> None:
+    """季度模板设置块：标题 + 说明 + 模板输入 + 实时预览 + 预设下拉。控件写入 f[key]。
+    empty_hint：模板留空时预览处显示什么（文件夹项=不分类；季度显示项=跟随）。"""
     ui.separator()
     ui.label(title).classes("font-bold text-sm")
     inp = ui.input("季度模板", value=value).props("dense outlined").classes("w-full")
@@ -71,8 +73,11 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str) -> No
     preview = ui.label().classes("text-sm text-blue-400")
 
     def _prev():
+        if not (inp.value or "").strip():
+            preview.text = "预览： " + empty_hint
+            return
         preview.text = "预览： " + " ／ ".join(
-            format_quarter("26" + c, inp.value or "") for c in "ABCD")
+            format_quarter("26" + c, inp.value) for c in "ABCD")
 
     inp.on_value_change(lambda e: _prev())
 
@@ -120,8 +125,8 @@ def settings():
         def _password(key, label):
             f[key] = ui.input(label, value="", password=True).props("dense outlined").classes("w-full")  # 不回填现值
 
-        _inherit_ph = (f"留空=用工作目录 {config.DOWN_PATH}" if config.DOWN_PATH
-                       else "工作目录未设，此处需填绝对路径")
+        _sub_ph = ("留空=直接落工作目录；或填相对目录名（如 番剧）" if config.DOWN_PATH
+                   else "工作目录未设，此处须填绝对路径")
 
         # ========== 折叠 ① 通用（默认展开）==========
         with ui.card().classes("w-full"), ui.expansion(
@@ -174,15 +179,15 @@ def settings():
 
             ui.separator()
             ui.label("保存 & 命名").classes("font-bold text-sm")
-            _text("DOWN_PATH", "工作目录（下载根，两侧默认都落它下面）", config.DOWN_PATH)
-            _text("ANIME_DOWN_PATH", "动漫下载目录", config.ANIME_DOWN_PATH, _inherit_ph)
-            _text("MOVIE_DOWN_PATH", "电影下载目录", config.MOVIE_DOWN_PATH, _inherit_ph)
-            ui.label("三者都是下载根。动漫/电影留空=继承工作目录（各自归到 番剧//剧场版/ 下）；填了=下到该绝对路径，"
-                     "两个可以是完全不同的盘。工作目录与某侧都空则无处下载、保存会被拦下。").classes(
-                "text-xs text-gray-500")
+            _text("DOWN_PATH", "工作目录（下载根）", config.DOWN_PATH)
+            _text("ANIME_DOWN_PATH", "动漫下载目录", config.ANIME_DOWN_PATH, _sub_ph)
+            _text("MOVIE_DOWN_PATH", "电影下载目录", config.MOVIE_DOWN_PATH, _sub_ph)
+            ui.label("有工作目录时，动漫/电影目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
+                     "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，动漫/电影须各填【绝对】路径（可不同盘）。"
+                     "两侧都空又无工作目录=无处下载、保存拦下。").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的季度文件夹命名。",
-                             config.QUARTER_FMT_UI)
+                             config.QUARTER_FMT_UI, empty_hint="留空＝跟随番剧季度文件夹命名")
 
             ui.separator()
             ui.label("网络 / 通知").classes("font-bold text-sm")
@@ -252,7 +257,8 @@ def settings():
             ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
                      "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT", "季度文件夹命名（只控制下载文件夹）",
-                             "番剧按季度建下载文件夹时，季度目录名怎么写。", config.QUARTER_FMT)
+                             "番剧按季度建下载文件夹时，季度目录名怎么写；留空＝不建季度目录、直接放番名。",
+                             config.QUARTER_FMT, empty_hint="留空＝不建季度目录，直接 …/番剧/番名/")
 
             ui.separator()
             ui.label("番剧表显示").classes("font-bold text-sm")
@@ -274,8 +280,8 @@ def settings():
             ui.label("默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
                      "自动扫描开关/间隔在『剧场版页 → 订阅源』里。").classes("text-xs text-gray-500")
             _quarter_setting(f, "MOVIE_QUARTER_FMT", "下载文件夹命名（默认按年份）",
-                             "电影按此建下载文件夹（默认年份，如 2026；同年电影归一个文件夹）。",
-                             config.MOVIE_QUARTER_FMT)
+                             "电影按此建下载文件夹（默认年份，如 2026；同年归一个文件夹）；留空＝不分类、直接放片名。",
+                             config.MOVIE_QUARTER_FMT, empty_hint="留空＝不建年份目录，直接 …/片名/")
 
         async def _save():
             updates = {}

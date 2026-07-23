@@ -62,19 +62,26 @@ def prev_quarter(q: str) -> str:
 
 
 def build_save_path(quarter: str, folder_name: str, season: int | None = None,
-                    top: str = "", root: str = "", quarter_fmt: str = "") -> str | None:
-    """下载保存路径：根/[分类]/季度目录/番名[/Season N]。做 realpath 包含校验，越界返回 None。
+                    sub_dir: str = "", quarter_fmt: str | None = None) -> str | None:
+    """下载保存路径：根/[季度目录]/名字[/Season N]。做 realpath 包含校验，越界返回 None。
 
-    root=下载根（空=config.DOWN_PATH）。top=分类顶层目录（番剧/剧场版）——仅在用默认根时加；
-    若给了独立 root（如电影专属目录），该 root 本身就是专属目录，不再套分类层。越界校验按实际根来。
-    quarter_fmt=季度目录命名模板（空=config.QUARTER_FMT，即番剧默认；电影传 MOVIE_QUARTER_FMT=年份）。
+    据工作目录(config.DOWN_PATH)与该侧目录 sub_dir(ANIME_DOWN_PATH/MOVIE_DOWN_PATH) 定根：
+      有工作目录：sub_dir 作『相对』路径拼其下（sub_dir 空=直接落工作目录，不额外分类）；
+      无工作目录：sub_dir 即『绝对』路径（须非空；两者皆空=无处下载，返回 None）。
+    quarter_fmt=季度/年份目录模板（None=用 config.QUARTER_FMT；留空 ''=不建季度/年份目录，直接放名字）。
     """
-    base = root or config.DOWN_PATH
+    work = config.DOWN_PATH
+    if work:
+        base = os.path.join(work, sub_dir.lstrip("/\\")) if sub_dir else work
+    else:
+        base = sub_dir
+    if not base:            # 工作目录与该侧都空——无处下载
+        return None
     parts = [base]
-    if top and not root:
-        parts.append(safe_name(top))
-    parts += [safe_name(format_quarter(quarter or "unknown", quarter_fmt or config.QUARTER_FMT)),
-              safe_name(folder_name)]
+    fmt = config.QUARTER_FMT if quarter_fmt is None else quarter_fmt
+    if fmt:   # 模板非空才建季度/年份目录；留空=不分类（format_quarter 对空模板有回退，故此处先判空）
+        parts.append(safe_name(format_quarter(quarter or "unknown", fmt)))
+    parts.append(safe_name(folder_name))
     if season is not None and config.ANIME_SEASON_SUBFOLDER:
         parts.append(f"Season {int(season)}")
     save_path = os.path.join(*parts)

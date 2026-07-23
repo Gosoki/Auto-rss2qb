@@ -443,7 +443,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
             quarter = (m.quarter if m else "") or "unknown"
             folder = (m and (m.jp_name or m.display_name)) or t.raw_title or "movie"
 
-    save_path = engine.build_save_path(quarter, folder, top="剧场版", root=config.MOVIE_DOWN_PATH,
+    save_path = engine.build_save_path(quarter, folder, sub_dir=config.MOVIE_DOWN_PATH,
                                        quarter_fmt=config.MOVIE_QUARTER_FMT)
     if save_path is None:
         log.error("拒绝越界保存路径 - movie torrent %s", mt_id)
