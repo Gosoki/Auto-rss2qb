@@ -51,27 +51,32 @@ def group_by_quarter(items):
 
 
 def kpi_cards(cards) -> None:
-    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') / (…, on_click) / (…, on_click, 标签色), ...]；
-    给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签色用来把同类卡分组（种子维度用绿字）。
-    列表里放字符串 "|" 会在该处竖一根分隔线，把左右不同维度的卡分组。"""
-    with ui.row().classes("gap-3 flex-wrap p-1"):
-        for card in cards:
-            if card == "|":                # 维度分隔竖线
-                ui.element("div").classes("self-stretch w-px bg-white/20 mx-1")
-                continue
-            label, val, hi = card[:3]
-            on_click = card[3] if len(card) > 3 else None
-            label_color = card[4] if len(card) > 4 else None   # 说明文字颜色，缺省灰
-            c = ui.card().classes("items-center px-3 py-2" + (
-                " cursor-pointer hover:bg-white/5" if on_click else ""))
-            with c:
-                cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
-                ui.label(str(val)).classes(cls).style(  # 预留 5 位数宽度：数字增减时卡不抖、各卡等宽
-                    "min-width:5ch;text-align:center;font-variant-numeric:tabular-nums")
-                ui.label(label).classes(
-                    "text-xs " + (f"text-{label_color}-400" if label_color else "text-gray-400"))
-            if on_click:
-                c.on("click", on_click)
+    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') / (…, on_click) / (…, on_click, 标签色带深浅如'pink-300'), ...]；
+    给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签色用来把同类卡分组。
+    列表里放字符串 "|" 会把左右拆成两组分别打包：够宽时并排，窄了整组换行成上下布局。"""
+    groups: list[list] = [[]]
+    for card in cards:
+        if card == "|":
+            groups.append([])
+        else:
+            groups[-1].append(card)
+    pack = "shrink-0" if len(groups) > 1 else ""   # 多组：每组打包不被挤散（整组换行）；单组维持自由换行
+    with ui.row().classes("gap-x-6 gap-y-3 flex-wrap p-1 items-start"):
+        for group in groups:
+            with ui.row().classes(f"gap-3 flex-wrap {pack}"):
+                for label, val, hi, *rest in group:
+                    on_click = rest[0] if rest else None
+                    label_color = rest[1] if len(rest) > 1 else None   # 说明文字颜色，缺省灰
+                    c = ui.card().classes("items-center px-3 py-2" + (
+                        " cursor-pointer hover:bg-white/5" if on_click else ""))
+                    with c:
+                        cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
+                        ui.label(str(val)).classes(cls).style(  # 预留 5 位数宽度：数字增减时卡不抖、各卡等宽
+                            "min-width:5ch;text-align:center;font-variant-numeric:tabular-nums")
+                        ui.label(label).classes(
+                            "text-xs " + (f"text-{label_color}" if label_color else "text-gray-400"))
+                    if on_click:
+                        c.on("click", on_click)
 
 
 def qb_disabled_banner(text: str) -> None:
