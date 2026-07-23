@@ -175,7 +175,7 @@ async def process_item(item) -> bool:
     if (config.ANIME_TOP_PRIORITY_INSTANT and should_download
             and item.episode != -2
             and (item.priority or 0) >= _top_priority()
-            and (not lock or lock in (item.source or ""))):
+            and (not lock or lock == (item.source or ""))):
         await download_anime_torrent(torrent_id)
     return True
 
@@ -336,7 +336,7 @@ async def flush_ready_downloads() -> int:
             if t.anime_id not in auto_ids:
                 continue
             lock = pref_map.get(t.anime_id)
-            if lock and lock not in (t.source or ""):
+            if lock and lock != (t.source or ""):
                 continue  # 锁定源：这部番只收锁定组的种子（硬锁、不兜底）；别的源一律不自动下
             if t.episode is None or t.episode < 0:
                 if t.episode == -1:
@@ -809,7 +809,7 @@ async def download_pending_for_anime(anime_id: int) -> int:
     have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}  # deleted 也算已处理，不重下
     pending = [t for t in all_rows if t.status in ("pending", "error")]
     if pref:  # 锁定源：只补锁定组的待下集（硬锁、不兜底）
-        pending = [t for t in pending if pref in (t.source or "")]
+        pending = [t for t in pending if pref == (t.source or "")]
     chosen = _select_downloads(pending, pref, have_eps)
     n = 0
     for t in chosen:
@@ -833,7 +833,7 @@ def download_plan(anime_id: int) -> set[int]:
     have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}  # deleted 也算已处理，不重下
     pending = [t for t in all_rows if t.status in ("pending", "error")]
     if pref:
-        pending = [t for t in pending if pref in (t.source or "")]
+        pending = [t for t in pending if pref == (t.source or "")]
     return {t.id for t in _select_downloads(pending, pref, have_eps)}
 
 
@@ -858,7 +858,7 @@ def download_plan_for_ids(anime_ids) -> set[int]:
     for aid, pending in by_anime.items():
         lock = pref_map.get(aid)
         if lock:
-            pending = [t for t in pending if lock in (t.source or "")]
+            pending = [t for t in pending if lock == (t.source or "")]
         plan |= {t.id for t in _select_downloads(pending, lock, have_by_anime.get(aid))}
     return plan
 
@@ -979,7 +979,7 @@ async def download_all_pending() -> int:
     for aid, pending in by_anime.items():
         lock = pref_map.get(aid)
         if lock:  # 锁定源：只补锁定组
-            pending = [t for t in pending if lock in (t.source or "")]
+            pending = [t for t in pending if lock == (t.source or "")]
         for t in _select_downloads(pending, lock, have_by_anime.get(aid)):
             if await download_anime_torrent(t.id):
                 n += 1
@@ -1025,7 +1025,7 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
     # 目标源(组名)+站点：锁定源→只补该源；没锁→补最高优先级的源（Mikan 群组同优先级即并列全取）
     tors = [(t.source, t.site, t.priority or 0) for t in rows if t.source]
     if pref:
-        targets = [(src, site) for src, site, _ in tors if pref in (src or "")]
+        targets = [(src, site) for src, site, _ in tors if pref == (src or "")]
     else:
         maxpri = max((pr for _, _, pr in tors), default=0)
         targets = [(src, site) for src, site, pr in tors if pr == maxpri]
