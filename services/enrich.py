@@ -198,7 +198,7 @@ def _subject_to_info(bgm_id, meta: dict) -> dict:
 async def fetch_by_id(bgm_id: int) -> dict | None:
     """按明确的 bgm subject id 直接取元数据（『富集失败』页手动绑定用）。取不到返回 None。"""
     try:
-        async with httpx.AsyncClient(**config.http_client_kwargs(config.ENRICH_TIMEOUT)) as client:
+        async with httpx.AsyncClient(**config.http_client_kwargs(max(1, config.ENRICH_TIMEOUT))) as client:
             r = await _retryable(lambda: client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
             if r.status_code != 200:
                 return None
@@ -226,7 +226,7 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
         est = release_time - timedelta(weeks=int(episode) - 1)
 
     try:
-        async with httpx.AsyncClient(**config.http_client_kwargs(config.ENRICH_TIMEOUT)) as client:
+        async with httpx.AsyncClient(**config.http_client_kwargs(max(1, config.ENRICH_TIMEOUT))) as client:
             # ① 多名搜 bgm，统计投票（被几个名字命中）+ 记录日期贴合度
             votes: Counter = Counter()
             gap: dict = {}

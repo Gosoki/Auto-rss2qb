@@ -3,12 +3,14 @@
 绝大多数项写进数据库 settings 表并热更新内存（config.set_many），保存即生效、不必重启。
 仅 WEB_PORT 这类绑定项仍走 .env（_RESTART_ONLY），改了要重启。数字项做校验，避免写入非数字。
 """
-from nicegui import ui
+import ipaddress
 
-from core import anime, engine
+from nicegui import context, ui
+
+from core import anime, engine, netguard
 import config
 from sources.parse import format_quarter
-from .layout import frame
+from .layout import confirm, frame
 
 _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
@@ -17,6 +19,30 @@ _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_S
             "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT"}
 _PASSWORD = {"QB_PASSWORD"}
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}  # 绑监听地址/端口，仍走 .env、改了要重启；其余都进 DB 即时生效
+
+
+def _valid_host(v: str) -> bool:
+    """绑定地址：合法 IP（含 0.0.0.0 / ::）或 localhost 才算有效。"""
+    if v == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(v)
+        return True
+    except ValueError:
+        return False
+
+
+def _bad_cidrs(v: str) -> list:
+    """返回无法解析的 CIDR 条目（空列表=全合法）。与 netguard._parse 同源规则。"""
+    bad = []
+    for part in v.split(","):
+        part = part.strip()
+        if part:
+            try:
+                ipaddress.ip_network(part, strict=False)
+            except ValueError:
+                bad.append(part)
+    return bad
 
 _QUARTER_PRESETS = {
     "{yy}{q}": "字母  → 26C",
@@ -191,7 +217,8 @@ def settings():
                 _num("MOVIE_PAGE_YEARS", "剧场版 · 年", config.MOVIE_PAGE_YEARS, 1, 5)
             ui.label("1 年 = 4 个季度。改完保存，下次进列表即生效。").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
-                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。", config.QUARTER_FMT_UI)
+                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随『季度文件夹命名』模板。",
+                             config.QUARTER_FMT_UI)
 
         with ui.card().classes("w-full"):
             ui.label("网络 / 通知").classes("font-bold")
@@ -206,10 +233,11 @@ def settings():
                 _num("WEB_PORT", "Web 端口", config.WEB_PORT)
                 _text("WEB_ALLOW_CIDRS", "允许网段(CIDR)", config.WEB_ALLOW_CIDRS)
             ui.label("绑定地址：127.0.0.1=仅本机；0.0.0.0=整个局域网可访问。改绑定地址/端口写 .env、需重启；"
-                     "留空或填错地址下次启动回落 127.0.0.1。").classes("text-xs text-gray-500")
+                     "非法地址保存时会被拦下，留空=回落 127.0.0.1。").classes("text-xs text-gray-500")
             ui.label("⚠ 本工具无鉴权、本页含 qB 密码。绑 0.0.0.0 时用『允许网段』把访问限定在可信内网（如 "
-                     "192.168.1.0/24，多个用逗号）——即时生效、无需重启；本机 127.0.0.1 恒放行，不会把自己锁在外面。"
-                     "留空=不限制。经反向代理访问时对端 IP 是代理，此项应留空、改在代理层做鉴权。").classes(
+                     "192.168.1.0/24，多个用逗号）——即时生效、无需重启，留空=不限制。本机 127.0.0.1 恒放行；"
+                     "保存时会检测你当前访问的 IP，不在新网段内就拦下、防止把自己锁在外（换设备/换网段访问仍需自行确认覆盖）。"
+                     "经反向代理访问时对端 IP 是代理，此项应留空、改在代理层做鉴权。").classes(
                 "text-xs text-amber-500")
 
         with ui.card().classes("w-full"):
@@ -241,6 +269,30 @@ def settings():
                         return
                 else:
                     updates[key] = str(v).strip()
+            # 保存前校验绑定项：非法值提前拦下，别写进 .env/库导致启动失败或静默锁死
+            port = updates.get("WEB_PORT")
+            if port is not None and not (1 <= int(port) <= 65535):
+                ui.notify("Web 端口需在 1~65535 之间，已取消保存", type="negative")
+                return
+            host = updates.get("WEB_HOST", "")
+            if host and not _valid_host(host):
+                ui.notify(f"绑定地址 {host!r} 不是合法 IP（如 127.0.0.1 / 0.0.0.0），已取消保存",
+                          type="negative")
+                return
+            bad = _bad_cidrs(updates.get("WEB_ALLOW_CIDRS", ""))
+            if bad:
+                ui.notify(f"允许网段无法解析：{', '.join(bad)}（示例 192.168.1.0/24），已取消保存",
+                          type="negative")
+                return
+            # 存前自锁检测：新网段若把你当前访问的 IP 挡在外（回环恒放行），拦下保存，别让人把自己锁死
+            try:
+                my_ip = context.client.ip
+            except Exception:
+                my_ip = ""      # 取不到就不拦（无法判定）
+            if my_ip and not netguard.would_allow(my_ip, updates.get("WEB_ALLOW_CIDRS", "")):
+                ui.notify(f"你正从 {my_ip} 访问，该地址不在要保存的允许网段内——保存后会立刻把你自己挡在门外。"
+                          f"已取消保存；请把 {my_ip} 所在网段一并加入（或留空=不限制）。", type="negative")
+                return
             db_updates = {k: v for k, v in updates.items() if k not in _RESTART_ONLY}
             env_updates = {k: v for k, v in updates.items() if k in _RESTART_ONLY}
             if db_updates:
@@ -268,11 +320,22 @@ def settings():
             msg = "已保存，即时生效" + ("（Web 绑定地址/端口改动需重启）" if env_updates else "")
             ui.notify(msg, type="positive")
 
+        _reenrich_busy = {"v": False}
+
         async def _reenrich():
-            ui.notify("正在重新识别全部…（走 bgm，可能要一会儿）")
-            n = await anime.reenrich_all()
-            ui.notify(f"重新识别完成：{n} 部命中", type="positive")
+            if _reenrich_busy["v"]:
+                return                       # 防抖：跑着时连点直接忽略，别叠多遍并发全库扫描
+            if not await confirm("对全部番重跑 bgm 识别？", "会逐部走 bgm，番多时可能要几分钟。"):
+                return
+            _reenrich_busy["v"] = True
+            reenrich_btn.props("loading")
+            try:
+                n = await anime.reenrich_all()
+                ui.notify(f"重新识别完成：{n} 部命中", type="positive")
+            finally:
+                _reenrich_busy["v"] = False
+                reenrich_btn.props(remove="loading")
 
         with ui.row().classes("items-center gap-2 mt-2"):
             ui.button("保存", icon="save", on_click=_save).props("color=primary unelevated")
-            ui.button("重新识别全部", icon="refresh", on_click=_reenrich).props("flat")
+            reenrich_btn = ui.button("重新识别全部", icon="refresh", on_click=_reenrich).props("flat")

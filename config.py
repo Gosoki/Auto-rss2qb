@@ -4,6 +4,7 @@
 （那样会在导入时绑死快照，改了不生效）。设置页保存 → 写库 + 更新内存 → 即时生效。
 例外：DB_PATH（开库前提）、WEB_PORT（绑端口）本质上就得重启，走 .env/硬编码默认，不进 settings 表。
 """
+import ipaddress
 import os
 import re
 import tempfile
@@ -27,10 +28,17 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "autorss.db"))
 try:
     WEB_PORT = int(os.getenv("WEB_PORT", "8080") or "8080")
+    if not (1 <= WEB_PORT <= 65535):     # 超范围端口 ui.run 会绑定失败起不来 → 回落默认
+        WEB_PORT = 8080
 except ValueError:
     WEB_PORT = 8080
 # 监听地址：空/未设=只本机(127.0.0.1)。0.0.0.0=整个局域网可访问——本工具无鉴权、含 qB 密码，慎改（见设置页提示）
 WEB_HOST = os.getenv("WEB_HOST") or "127.0.0.1"
+try:
+    ipaddress.ip_address(WEB_HOST)       # 拼错的绑定地址（非法 IP）→回落 127，别让 ui.run 绑定失败起不来
+except ValueError:
+    if WEB_HOST != "localhost":
+        WEB_HOST = "127.0.0.1"
 
 # ---- 可热改设置：{键: (类型, 默认值)}，类型 bool/int/str/list ----
 _SPEC = {

@@ -45,6 +45,17 @@ def _allowed(ip_str, nets: tuple) -> bool:
             or any(ip in n for n in nets if n.version == ip.version))
 
 
+def would_allow(ip: str, raw_cidrs: str) -> bool:
+    """给定白名单串，该 IP 是否会被放行——供设置页『存前自锁检测』复用与中间件完全相同的规则。
+
+    空串=不限制=一律放行；否则回环恒放行、白名单内放行。ip 为空(取不到)时返回 True（无法判定不拦）。
+    """
+    raw = (raw_cidrs or "").strip()
+    if not raw or not ip:
+        return True
+    return _allowed(ip, _parse(raw))
+
+
 class SubnetGuard:
     """ASGI 中间件：WEB_ALLOW_CIDRS 非空时，非白名单网段的 HTTP/WS 一律拒；空=放行一切。
 
