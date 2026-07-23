@@ -119,7 +119,7 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
         <q-td :props="props">
             {name_top}
             <div class="text-grey-6"
-                 style="font-size:11px;white-space:normal;word-break:break-all">
+                 style="font-size:10px;white-space:normal;word-break:break-all">
                 {{{{ props.row.raw }}}}
             </div>
         </q-td>
@@ -324,7 +324,8 @@ def frame(active: str = ""):
     ui.add_head_html(
         "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
         ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}"
-        ".q-table tbody td{font-size:14px}</style>")   # q-table 表体默认 13px，抬成 14 与全站 12/14 统一
+        ".q-table tbody td,.q-table thead th,.q-table .q-badge{font-size:14px}"
+        "</style>")   # 新入库表：表体(默认13)/表头(默认12)/状态徽标(默认12) 统一抬到 14
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.07);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）

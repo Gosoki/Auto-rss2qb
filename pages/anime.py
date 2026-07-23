@@ -63,10 +63,10 @@ def anime_page(t: str = "manage"):
                        ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm"), "pink-300"),
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-300"),
                        "|",
-                       ("已下集", k["done"], "green", None, "green-400"),
+                       ("已下载", k["done"], "green", None, "green-400"),
                        ("未知集", ps["unknown"], "purple", _open_unknown, "green-400"),
-                       ("失败", ov["status"]["error"], "red", _open_failed, "green-400"),
-                       ("种子", k["torrents"], "", None, "green-400")])
+                       ("失败数", ov["status"]["error"], "red", _open_failed, "green-400"),
+                       ("种子数", k["torrents"], "", None, "green-400")])
 
             # ── qB 未启用提醒 ──
             if not ov["config"]["qb"]:
@@ -104,20 +104,20 @@ def anime_page(t: str = "manage"):
             with ui.row().classes("items-center gap-3 mt-3 pl-1"):
                 ui.label("种子状态").classes("text-sm font-bold")
                 _dla = ui.button("补下全部", icon="download", on_click=_download_all).props(
-                    "outline color=primary size=sm")
+                    "outline color=primary size=sm").style("font-size:12px")
                 _dla.set_enabled(config.QB_ENABLED)
                 _dla.tooltip("订阅中所有待下集立即下" if config.QB_ENABLED
                              else "qB 未启用，去设置页开启后可下载")
             # 待下拆 将下载/备用/待确认/未知（库态『下载中』恒≈0、与 qB 实时态重复不单列）；失败、种子总数一并列出，与 KPI 卡呼应
             chips = [
-                ("已下", ov["status"]["downloaded"], "green", None),
+                ("已下载", ov["status"]["downloaded"], "green", None),
                 ("将下载", ps["will"], "blue", "已确认番·本集首选（含特别篇），会自动下"),
-                ("备用", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
+                ("备用数", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
-                ("未知", ps["unknown"], "purple", "批量/未知集，后台不自动下，需在详情页手动下"),
-                ("跳过", ov["status"]["skipped"], "blue-grey", None),
-                ("失败", ov["status"]["error"], "red", "下载出错的种子"),
-                ("种子总数", k["torrents"], "grey", "全部种子数（各状态之和）"),
+                ("未知集", ps["unknown"], "purple", "批量/未知集，后台不自动下，需在详情页手动下"),
+                ("跳过数", ov["status"]["skipped"], "blue-grey", None),
+                ("失败数", ov["status"]["error"], "red", "下载出错的种子"),
+                ("种子数", k["torrents"], "grey", "全部种子数（各状态之和）"),
             ]
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
@@ -141,7 +141,7 @@ def anime_page(t: str = "manage"):
             enr, tot = ov["enriched"]
             with ui.row().classes("items-center gap-3 mt-3 pl-1"):
                 ui.label("采集状态").classes("text-sm font-bold")
-                with ui.button("重新识别", icon="sync").props("outline color=primary size=sm"):
+                with ui.button("重新识别", icon="sync").props("outline color=primary size=sm").style("font-size:12px"):
                     with ui.menu():
                         ui.menu_item("识别当季", on_click=_reident(1))
                         ui.menu_item("识别半年（近 2 季）", on_click=_reident(2))
