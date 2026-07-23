@@ -59,9 +59,9 @@ def anime_page(t: str = "manage"):
             # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
             # 番维度四卡（粉字）与种子维度四卡（绿字）各自打包，"|" 分组，窄了整组换行成上下布局；数字保持各自语义色
             kpi_cards([("订阅中", k["tracking"], "", None, "pink-300"),
-                       ("待识别", k["fail"], "red", None, "pink-300"),
-                       ("待确认", k["confirm"], "orange", None, "pink-300"),
-                       ("已忽略", k["rejected"], "", None, "pink-300"),
+                       ("待识别", k["fail"], "red", lambda: tabs.set_value("fail"), "pink-300"),
+                       ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm"), "pink-300"),
+                       ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-300"),
                        "|",
                        ("已下集", k["done"], "green", None, "green-400"),
                        ("未知集", ps["unknown"], "purple", _open_unknown, "green-400"),
