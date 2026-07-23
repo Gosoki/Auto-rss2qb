@@ -438,7 +438,7 @@ def movies_page(t: str = ""):
                         text, color = _mov_live_status(r["status"], r["qb_state"], r["qb_progress"],
                                                        r["qb_synced_at"], r["qb_dlspeed"])
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
-                                "border-bottom:1px solid rgba(255,255,255,.06)"):
+                                "border-bottom:1px solid rgba(255,255,255,.08)"):
                             ui.label(r["name"]).classes("grow break-all")
                             ui.badge(text).props(f"color={color}")
 
@@ -469,8 +469,8 @@ def movies_page(t: str = ""):
                 for b in mov.year_brief():
                     stats = [
                         (b["matched"], "已识别", "text-blue-400"),
-                        (b["fail"], "待识别", "text-red-400" if b["fail"] else "text-gray-600"),
-                        (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-600"),
+                        (b["fail"], "待识别", "text-red-400" if b["fail"] else "text-gray-500"),
+                        (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-500"),
                     ]
                     with ui.card().classes("gap-2 py-3").style("flex:1 1 300px"):
                         with ui.row().classes("items-center gap-2 flex-wrap"):

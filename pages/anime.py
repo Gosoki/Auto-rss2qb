@@ -93,7 +93,7 @@ def anime_page(t: str = ""):
                                     "w-36 shrink-0 truncate").tooltip(engine.quarter_label(q))
                                 # 满宽 100% 的比例条，按订阅/审核/忽略切三段（0 段跳过）
                                 with ui.element("div").classes("grow rounded overflow-hidden flex min-w-0").style(
-                                        "height:13px;background:rgba(255,255,255,.06)"):
+                                        "height:13px;background:rgba(255,255,255,.08)"):
                                     for _val, _c, _n in ((sub, "oklch(70.7% 0.165 254.624)", "订阅"),    # blue-400
                                                          (rev, "oklch(75% 0.183 55.934)", "审核"),        # orange-400
                                                          (ign, "oklch(70.7% 0.022 261.325)", "忽略")):    # gray-400
@@ -115,14 +115,14 @@ def anime_page(t: str = ""):
                                       "#00d3f3", "#fb64b6", "#9ae600", "#c27aff", "#00d5be"],
                             "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} 种子 · {d}%"},
                             "legend": {"type": "scroll", "orient": "vertical", "right": "2%",
-                                       "top": "middle", "textStyle": {"color": "#9ca3af"}},
+                                       "top": "middle", "textStyle": {"color": "#99a1af"}},  # gray-400(灰2)
                             "series": [{
                                 "name": "种子来源", "type": "pie",
                                 "radius": ["45%", "72%"], "center": ["32%", "50%"],
                                 "avoidLabelOverlap": False,
                                 "itemStyle": {"borderColor": "#1a1c22", "borderWidth": 2},
                                 "label": {"show": False, "position": "center"},
-                                "emphasis": {"label": {"show": True, "color": "#e5e7eb",
+                                "emphasis": {"label": {"show": True, "color": "#d1d5dc",
                                                        "fontSize": 14, "fontWeight": "bold",
                                                        "formatter": "{b}\n{c}"}},
                                 "data": [{"name": src, "value": tot} for src, tot, _ in ov["by_source"]],
@@ -298,7 +298,7 @@ def anime_page(t: str = ""):
                         text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
                                                   r["qb_synced_at"], r["qb_dlspeed"])
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
-                                "border-bottom:1px solid rgba(255,255,255,.06)"):
+                                "border-bottom:1px solid rgba(255,255,255,.08)"):
                             ui.label(f'{r["name"]}  第{ep_str(r["episode"])}集').classes(
                                 "grow break-all")
                             ui.badge(text).props(f"color={color}")
@@ -342,9 +342,9 @@ def anime_page(t: str = ""):
                 for b in anime.quarter_brief():
                     stats = [
                         (b["shows"], "订阅中", "text-blue-400"),
-                        (b["confirm"], "待确认", "text-orange-400" if b["confirm"] else "text-gray-600"),
-                        (b["fail"], "待识别", "text-red-400" if b["fail"] else "text-gray-600"),
-                        (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-600"),
+                        (b["confirm"], "待确认", "text-orange-400" if b["confirm"] else "text-gray-500"),
+                        (b["fail"], "待识别", "text-red-400" if b["fail"] else "text-gray-500"),
+                        (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-500"),
                     ]
                     with ui.card().classes("gap-2 py-3").style("flex:1 1 300px"):
                         with ui.row().classes("items-center gap-2"):

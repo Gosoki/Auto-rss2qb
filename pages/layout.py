@@ -57,7 +57,7 @@ def barline(label, value, maxv, color="oklch(70.7% 0.165 254.624)", lw="w-32", t
     with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
         ui.label(str(label)).classes(f"{lw} shrink-0 truncate").tooltip(str(label))
         with ui.element("div").classes("grow rounded min-w-0").style(
-                "background:rgba(255,255,255,.07);height:12px"):
+                "background:rgba(255,255,255,.08);height:12px"):
             ui.element("div").style(
                 f"width:{pct:.1f}%;height:12px;background:{color};border-radius:6px")
         ui.label(text if text is not None else str(value)).classes(
@@ -135,7 +135,7 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
     tbl.add_slot("body-cell-name", f'''
         <q-td :props="props">
             {name_top}
-            <div class="text-grey-6"
+            <div class="text-gray-400"
                  style="font-size:10px;white-space:normal;word-break:break-all">
                 {{{{ props.row.raw }}}}
             </div>
@@ -180,8 +180,8 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                             ui.element("div")
                             continue
                         kk, vv = pair
-                        ui.label(kk).classes("text-sm text-gray-400")   # 标签、值统一 14px，基线对齐
-                        ui.label(str(vv) if vv not in (None, "") else "—").classes("text-sm")
+                        ui.label(kk).classes("text-sm text-gray-400")   # 左侧 key=灰2；右侧值=灰1，跟简介同色
+                        ui.label(str(vv) if vv not in (None, "") else "—").classes("text-sm text-gray-300")
                 if bangumi_id:  # bgm 链接：mt-auto 贴到中列底部；kv 顶满时被顶着往下走
                     ui.link(f"bgm.tv/subject/{bangumi_id}",
                             f"https://bgm.tv/subject/{bangumi_id}").props(
@@ -308,7 +308,7 @@ def expand_collapse_bar(state: dict, refresh) -> None:
     with ui.row().classes("items-center gap-4 pl-1 pb-2"):
         for text, val in (("全部展开", True), ("全部收起", False)):
             ui.label(text).classes(
-                "cursor-pointer text-sm text-gray-500 hover:text-gray-200 transition-colors").on(
+                "cursor-pointer text-sm text-gray-500 hover:text-gray-300 transition-colors").on(
                 "click", lambda v=val: _set(v))
 
 
@@ -373,20 +373,21 @@ def frame(active: str = ""):
         ".q-badge.bg-deep-purple{background:oklch(70.2% 0.183 293.541)!important}"         # violet-400
         ".q-badge.bg-amber{background:oklch(82.8% 0.189 84.429)!important}"                # amber-400
         ".q-badge.bg-pink{background:oklch(71.8% 0.202 349.761)!important}"                # pink-400
+        ".q-btn.text-grey{color:oklch(70.7% 0.022 261.325)!important}"                     # 次级灰按钮→gray-400(灰2)
         "}</style>")
     with ui.header().classes("p-0").style(
-            "background:#15171c;border-bottom:1px solid rgba(255,255,255,.07);box-shadow:none"):
+            "background:#15171c;border-bottom:1px solid rgba(255,255,255,.08);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）
         with ui.row().classes("items-center gap-2 w-full px-4").style(
                 "height:56px;overflow-x:auto;overflow-y:hidden"):   # 窄屏导航横向可滚，不再裁掉够不着
             with ui.row().classes("items-center gap-2 mr-2 sm:mr-6"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
                 ui.label("autorss").classes("text-lg font-bold hidden sm:block").style(
-                    "color:#f3f4f6;letter-spacing:.5px")   # 站名窄屏隐去、留图标腾出导航空间
+                    "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去、留图标腾出导航空间
             for key, label, path in NAV:
                 cls = "cursor-pointer text-sm px-2 transition-colors "
                 cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
-                        if key == active else "text-gray-400 hover:text-gray-100")
+                        if key == active else "text-gray-400 hover:text-gray-300")
                 ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
             ui.space()
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位
