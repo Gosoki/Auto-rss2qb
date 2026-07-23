@@ -27,8 +27,9 @@ _TAB_KEYS = ("overview", "manage", "confirm", "fail", "reject", "sources")
 
 
 @ui.page("/")
-def anime_page(t: str = "manage"):
-    """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。"""
+def anime_page(t: str = ""):
+    """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。
+    默认空串：顶栏导航进来（无 ?t=）时留给下面按 ANIME_DEFAULT_TAB 决定默认停哪个 tab。"""
     with frame("manage"):  # 本页用 tab + 30s 定时刷新，不往顶栏右侧放自定义动作
         manage_page = {"n": 1, "expand": None}  # 番剧表：分页页码 + 一键展开/收起意图（None=按默认）
 

@@ -195,8 +195,9 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
 
 
 @ui.page("/movies")
-def movies_page(t: str = "list"):
-    """t = 当前 tab（写在 URL ?t= 里），刷新后停在同一 tab。"""
+def movies_page(t: str = ""):
+    """t = 当前 tab（写在 URL ?t= 里），刷新后停在同一 tab。
+    默认空串：顶栏导航进来（无 ?t=）时留给下面按 MOVIE_DEFAULT_TAB 决定默认停哪个 tab。"""
     with frame("movies"):
         list_page = {"n": 1, "expand": None}  # 剧场版列表：分页页码 + 一键展开/收起意图（None=默认全开）
         detail_dlg = ui.dialog()
