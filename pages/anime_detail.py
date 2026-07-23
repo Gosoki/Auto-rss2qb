@@ -68,18 +68,16 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         ], cur.bangumi_id, cur.summary, rating=cur.rating)
 
         # 下载类操作（重新识别/忽略在上面的元操作行）
-        with ui.row().classes("items-center gap-3 flex-wrap"):
+        with ui.row().classes("items-stretch gap-3 flex-wrap"):
             if sources:  # 下载源放最前：按优先级=多源兜底；选具体组=锁定，之后只下这个组
-                ui.select(source_options(sources, "按优先级·多源兜底"),
-                          value=(cur.pref_source or ""), label="下载源",
+                ui.select(source_options(sources, "下载源：按优先级·多源兜底"),
+                          value=(cur.pref_source or ""),
                           on_change=_set_source).props("dense outlined").classes("min-w-52").tooltip(
                     "『按优先级』= 多源自动挑、缺集用别的源兜底；"
                     "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）")
             if not cur.rejected and not cur.confirmed:
-                ui.button("确认下载", on_click=_confirm).props("size=sm color=primary").style(
-                    "font-size:12px")
-            _dln = ui.button("下载该源", icon="download", on_click=_download).props(
-                "flat dense size=sm").style("font-size:12px")
+                ui.button("确认下载", on_click=_confirm).props("color=primary unelevated")
+            _dln = ui.button("下载该源", icon="download", on_click=_download).props("flat")
             _dln.set_enabled(config.QB_ENABLED)
             _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
                          else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过")

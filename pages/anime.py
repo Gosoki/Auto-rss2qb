@@ -179,11 +179,11 @@ def anime_page(t: str = "manage"):
                                     ui.badge(sl).props("color=blue-grey")
                                 platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
                                 ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
-                            with ui.row().classes("items-center gap-2 flex-wrap"):
+                            with ui.row().classes("items-stretch gap-3 flex-wrap"):
                                 sel = ui.select(source_options(srcs, "从哪下：按优先级"),
                                                 value="").props("dense outlined").classes("min-w-48")
-                                ui.button("确认下载", on_click=_confirm(a.id, sel)).props("size=sm color=primary")
-                                ui.button("忽略", on_click=_reject(a.id)).props("size=sm flat color=grey")
+                                ui.button("确认下载", on_click=_confirm(a.id, sel)).props("color=primary unelevated")
+                                ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
         @ui.refreshable
         def reject_panel():
@@ -194,24 +194,26 @@ def anime_page(t: str = "manage"):
             for i, (q, items) in enumerate(group_by_quarter(rej)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
-                        with ui.row().classes("items-center gap-3 pl-2 py-1 flex-wrap"):
-                            ui.badge("已忽略").props("color=grey")
-                            ui.label(name_of(a)).classes(
-                                "cursor-pointer text-blue hover:underline").on(
-                                "click", lambda aid=a.id: open_detail(aid))
-                            sl = season_label(a)
-                            if sl:
-                                ui.badge(sl).props("color=blue-grey")
-                            ui.label("来源: " + (" · ".join(anime.anime_sources(a.id)) or "—")).classes(
-                                "text-xs text-gray-400")
-                            ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
-                                "size=sm flat color=primary")
-                            nf = anime.downloaded_count(a.id)
-                            if nf:  # 只有确实下过文件才给『删除文件』
-                                ui.button("删除文件", icon="delete_forever",
-                                          on_click=_del_files(a.id, name_of(a), nf)).props(
-                                    "size=sm flat color=negative").tooltip(
-                                    "连同 qB 里的硬盘文件一起删（不可撤销）")
+                        with ui.card().classes("w-full"):
+                            with ui.row().classes("items-center gap-3 flex-wrap"):
+                                ui.badge("已忽略").props("color=grey")
+                                ui.label(name_of(a)).classes(
+                                    "cursor-pointer text-blue hover:underline").on(
+                                    "click", lambda aid=a.id: open_detail(aid))
+                                sl = season_label(a)
+                                if sl:
+                                    ui.badge(sl).props("color=blue-grey")
+                                ui.label("来源: " + (" · ".join(anime.anime_sources(a.id)) or "—")).classes(
+                                    "text-xs text-gray-400")
+                            with ui.row().classes("items-stretch gap-3 flex-wrap"):
+                                ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
+                                    "color=primary unelevated")
+                                nf = anime.downloaded_count(a.id)
+                                if nf:  # 只有确实下过文件才给『删除文件』
+                                    ui.button("删除文件", icon="delete_forever",
+                                              on_click=_del_files(a.id, name_of(a), nf)).props(
+                                        "flat color=negative").tooltip(
+                                        "连同 qB 里的硬盘文件一起删（不可撤销）")
 
         @ui.refreshable
         def fail_panel():
@@ -239,13 +241,13 @@ def anime_page(t: str = "manage"):
                         ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
                         ui.link("去 bgm 搜", f"https://bgm.tv/subject_search/{quote(a.title)}?cat=2").props(
                             "target=_blank").classes("text-xs")
-                    with ui.row().classes("items-center gap-2 flex-wrap"):
+                    with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         inp = ui.input(
                             placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").props(
                             "dense outlined").classes("min-w-96")
-                        ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("size=sm color=primary")
-                        ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("size=sm flat")
-                        ui.button("忽略", on_click=_reject(a.id)).props("size=sm flat color=grey")
+                        ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("color=primary unelevated")
+                        ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("flat color=grey")
+                        ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
         @ui.refreshable
         def inflight_panel():
