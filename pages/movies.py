@@ -18,6 +18,24 @@ from .layout import (WEEKDAY_CN, barline, confirm, expand_collapse_bar, frame,
 _TABS = ("overview", "list", "fail", "reject", "sources")
 
 
+def _season_toggle_btn(key: str, name: str, selected: set) -> None:
+    """季度点选按钮：在 selected 集里=填充蓝，不在=描边灰；点击切换。比多选下拉直观，不用展开。"""
+    b = ui.button(name)
+
+    def _restyle():
+        if key in selected:
+            b.props(remove="outline").props("unelevated color=primary")
+        else:
+            b.props(remove="unelevated").props("outline color=blue-grey")
+
+    def _toggle():
+        selected.discard(key) if key in selected else selected.add(key)
+        _restyle()
+
+    b.on("click", _toggle)
+    _restyle()
+
+
 def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> None:
     """把某剧场版详情渲染进当前容器：元信息 + 版本列表（逐条下/删）+ 识别/忽略。
     on_close：非空则在标题行右侧渲染 X 关闭键（关掉外层 dialog）。"""
@@ -188,9 +206,9 @@ def movies_page(t: str = "list"):
             detail_dlg.open()
 
         # ---- 事件 ----
-        async def _scan(year_in, seas_in):
+        async def _scan(year_in, sel):
             yr = int(year_in.value or datetime.now().year)
-            letters = [x for x in (seas_in.value or []) if x in SEASON_CN]
+            letters = [k for k in SEASON_CN if k in sel]   # 按 A/B/C/D 顺序取选中的
             if not letters:
                 ui.notify("至少选一个季度", type="warning")
                 return
@@ -504,12 +522,15 @@ def movies_page(t: str = "list"):
             # 手动立即扫描（可指定年份/季度回填历史）
             with ui.card().classes("w-full"):
                 ui.label("手动立即扫描").classes("font-bold")
-                with ui.row().classes("items-end gap-3 flex-wrap"):
-                    year = ui.number("年份", value=datetime.now().year, format="%d").classes("w-28")
-                    seas = ui.select(SEASON_CN, multiple=True, value=list(SEASON_CN),
-                                     label="季度").props("dense outlined").classes("min-w-64")
+                sel_seasons = set(SEASON_CN)   # 默认全选（A/B/C/D）
+                with ui.row().classes("items-stretch gap-3 flex-wrap"):
+                    year = ui.number("年份", value=datetime.now().year, format="%d").props(
+                        "dense outlined").classes("w-28")
+                    with ui.row().classes("items-stretch gap-2"):
+                        for _k, _v in SEASON_CN.items():
+                            _season_toggle_btn(_k, _v, sel_seasons)
                     ui.button("立即扫描", icon="travel_explore",
-                              on_click=lambda: _scan(year, seas)).props("color=primary unelevated")
+                              on_click=lambda: _scan(year, sel_seasons)).props("color=primary unelevated")
                 ui.label("想补抓往年的剧场版就改年份手动扫；日常交给上面的自动扫描即可。").classes(
                     "text-xs text-gray-500")
 
