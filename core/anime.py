@@ -755,10 +755,13 @@ async def reenrich_scope(seasons: int | None = None) -> int:
             quarters.add(q)
             q = engine.prev_quarter(q)
     with get_session() as s:
+        # 跳过已忽略的番：批量重识别不该 reenrich 忽略番——否则它拿到 bgm_id 触发身份合并、
+        # union-active 会把『已忽略』静默复活成『追番中』。要刷新某忽略番元数据可进其详情页单独点『重新识别』。
+        base = select(Anime.id).where(Anime.rejected.is_not(True))
         if quarters is None:
-            ids = list(s.exec(select(Anime.id)))
+            ids = list(s.exec(base))
         else:
-            ids = list(s.exec(select(Anime.id).where(Anime.quarter.in_(quarters))))
+            ids = list(s.exec(base.where(Anime.quarter.in_(quarters))))
     n = 0
     for aid in ids:
         try:
