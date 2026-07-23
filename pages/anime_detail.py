@@ -119,7 +119,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _neg = t.episode == -2                            # 解析也可能写错正整数(把分辨率/季号当集号)
                         ui.label(ep_txt).classes(
                             "shrink-0 cursor-pointer hover:underline"
-                            + (" text-blue" if _neg else "")).on(
+                            + (" text-blue-400" if _neg else "")).on(
                             "click", _set_ep(t.id)).tooltip(
                             "集号没解析出来；点这里改" if _neg else "集号不对？点这里改")
                     else:
@@ -240,7 +240,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                      "改后可把已下文件移到新目录。").classes("text-xs text-gray-400")
             inp = ui.input("季度键", value=(cur.quarter if cur else "")).props(
                 "dense outlined autofocus").classes("min-w-60")
-            prev = ui.label().classes("text-sm text-blue")
+            prev = ui.label().classes("text-sm text-blue-400")
 
             def _pv():
                 q = (inp.value or "").strip().upper()

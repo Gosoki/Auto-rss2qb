@@ -51,7 +51,7 @@ def group_by_quarter(items):
     return [(q, by_q[q]) for q in quarters]
 
 
-def barline(label, value, maxv, color="#2196f3", lw="w-32", text=None) -> None:
+def barline(label, value, maxv, color="oklch(70.7% 0.165 254.624)", lw="w-32", text=None) -> None:
     """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认取 value）。番剧/剧场版共用。"""
     pct = (value / maxv * 100) if maxv else 0
     with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
@@ -84,7 +84,8 @@ def kpi_cards(cards) -> None:
         if grow:
             c.style("flex:1 1 0")          # 组内各卡等宽铺满，左右平衡
         with c:
-            cls = "text-2xl font-bold" + (f" text-{hi}-400" if hi and val else "")
+            shade = "500" if hi == "green" else "400"   # 绿跟徽标同档(-500)，红及其余 -400
+            cls = "text-2xl font-bold" + (f" text-{hi}-{shade}" if hi and val else "")
             ui.label(str(val)).classes(cls).style(  # 预留 5 位数宽度：数字增减时卡不抖、各卡等宽
                 "min-width:5ch;text-align:center;font-variant-numeric:tabular-nums")
             ui.label(label).classes(
@@ -106,11 +107,11 @@ def kpi_cards(cards) -> None:
 
 
 def qb_disabled_banner(text: str) -> None:
-    """qB 未启用时的黄色提醒横幅；text 为各页自定文案。"""
+    """qB 未启用时的 amber 提醒横幅；text 为各页自定文案。"""
     with ui.row().classes("items-center gap-2 p-2 rounded w-full").style(
-            "background:rgba(234,179,8,.12)"):
-        ui.icon("warning").classes("text-yellow-500")
-        ui.label(text).classes("text-sm text-yellow-200")
+            "background:oklch(82.8% 0.189 84.429 / .12)"):   # amber-400 @ 12%
+        ui.icon("warning").classes("text-amber-400")
+        ui.label(text).classes("text-sm text-amber-400")
 
 
 def recent_table(rows, name_label: str, on_row_click=None) -> None:
@@ -128,7 +129,7 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
         rows=rows, row_key="id",
     ).classes("w-full")
     # 番名：可点则染蓝加手型、点击 $emit 回传整行给 Python；不可点则纯文本。原始名恒为灰色小字。
-    name_top = ('<div class="cursor-pointer text-blue" '
+    name_top = ('<div class="cursor-pointer text-blue-400" '
                 "@click=\"() => $parent.$emit('opendetail', props.row)\">{{ props.row.name }}</div>"
                 ) if on_row_click else "<div>{{ props.row.name }}</div>"
     tbl.add_slot("body-cell-name", f'''
@@ -336,7 +337,8 @@ def frame(active: str = ""):
     yield 出顶栏右侧的容器，页面可往里放全局动作按钮（如刷新/补下）；不放就是空的。
     """
     ui.dark_mode(True)
-    ui.colors(primary="#2196f3")   # 全站主色＝『将下载』的蓝，所有 color=primary 的按钮/徽标随之统一
+    # 全站主色＝Tailwind blue-500，负色＝red-400（与徽标/图表同一套 palette 的 sRGB 值）
+    ui.colors(primary="#2b7fff", negative="#ff6467")
     # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
     ui.add_head_html('<meta name="referrer" content="no-referrer">')
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
@@ -354,14 +356,14 @@ def frame(active: str = ""):
         ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
         "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
         "</style>")
-    # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。绿/红用 -500（-400 太亮），其余用 -400。
+    # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。绿用 -500（-400 太亮），其余（含红）用 -400。
     # 必须放进 @layer overrides —— Quasar 的 .bg-* !important 在 quasar_importants 层里；分层后 !important 比的是
     # 「层序（靠前的赢）」而非特异度，overrides 层排在 quasar_importants 之前，故能压过它。裸样式会输、失效。
     # 只作用于 .q-badge（按钮是 .q-btn，不受影响）；白字沿用 Quasar 徽标默认。
     ui.add_head_html(
         "<style>@layer overrides{"
         ".q-badge.bg-green{background:oklch(72.3% 0.219 149.579)!important}"               # green-500（绿单独调暗）
-        ".q-badge.bg-red{background:oklch(63.7% 0.237 25.331)!important}"                  # red-500（红单独调暗）
+        ".q-badge.bg-red{background:oklch(70.4% 0.191 22.216)!important}"                  # red-400（红单独调暗）
         ".q-badge.bg-blue,.q-badge.bg-primary{background:oklch(70.7% 0.165 254.624)!important}"  # blue-400
         ".q-badge.bg-blue-grey,.q-badge.bg-grey{background:oklch(70.7% 0.022 261.325)!important}"  # 中性灰统一：gray-400
         ".q-badge.bg-orange{background:oklch(75% 0.183 55.934)!important}"                 # orange-400
@@ -378,12 +380,12 @@ def frame(active: str = ""):
         with ui.row().classes("items-center gap-2 w-full px-4").style(
                 "height:56px;overflow-x:auto;overflow-y:hidden"):   # 窄屏导航横向可滚，不再裁掉够不着
             with ui.row().classes("items-center gap-2 mr-2 sm:mr-6"):
-                ui.icon("live_tv").classes("text-2xl").style("color:#60a5fa")
+                ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
                 ui.label("autorss").classes("text-lg font-bold hidden sm:block").style(
                     "color:#f3f4f6;letter-spacing:.5px")   # 站名窄屏隐去、留图标腾出导航空间
             for key, label, path in NAV:
                 cls = "cursor-pointer text-sm px-2 transition-colors "
-                cls += ("text-blue font-semibold underline underline-offset-8 decoration-2"
+                cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
                         if key == active else "text-gray-400 hover:text-gray-100")
                 ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
             ui.space()

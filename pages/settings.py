@@ -67,7 +67,7 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str) -> No
     f[key] = inp
     ui.label(note + "  占位：{yy}=26 {yyyy}=2026 {q}=C {season}=夏 {m}=7").classes(
         "text-xs text-gray-500")
-    preview = ui.label().classes("text-sm text-blue")
+    preview = ui.label().classes("text-sm text-blue-400")
 
     def _prev():
         preview.text = "预览： " + " ／ ".join(
@@ -246,7 +246,7 @@ def settings():
             ui.label("⚠ 本工具无鉴权、本页含 qB 密码。绑 0.0.0.0 时用『允许网段』把访问限定在可信内网（如 "
                      "192.168.1.0/24，多个用逗号），即时生效、留空=不限制。本机恒放行；若新网段会把你当前访问挡在门外，"
                      "保存时会被拦下。经反向代理时对端是代理 IP，此项应留空、鉴权交给代理。").classes(
-                "text-xs text-amber-500")
+                "text-xs text-amber-400")
 
         with ui.card().classes("w-full"):
             with ui.expansion("高级（超时 / 站点地址 · 一般不用动）", icon="tune").classes(

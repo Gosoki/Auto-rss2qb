@@ -76,7 +76,9 @@ def anime_page(t: str = ""):
                     with ui.row().classes("items-center gap-3 flex-wrap w-full"):
                         ui.label(f"各季度番剧 · {len(bqs)} 季").classes("text-sm font-bold")
                         with ui.row().classes("items-center gap-3 flex-wrap ml-auto"):  # 图例靠右
-                            for _lab, _c in (("订阅", "#2196f3"), ("审核", "#f59e0b"), ("忽略", "#6b7280")):
+                            for _lab, _c in (("订阅", "oklch(70.7% 0.165 254.624)"),        # blue-400
+                                             ("审核", "oklch(75% 0.183 55.934)"),            # orange-400
+                                             ("忽略", "oklch(70.7% 0.022 261.325)")):        # gray-400
                                 with ui.row().classes("items-center gap-1 text-xs text-gray-400"):
                                     ui.element("div").style(
                                         f"width:9px;height:9px;border-radius:2px;background:{_c}")
@@ -92,8 +94,9 @@ def anime_page(t: str = ""):
                                 # 满宽 100% 的比例条，按订阅/审核/忽略切三段（0 段跳过）
                                 with ui.element("div").classes("grow rounded overflow-hidden flex min-w-0").style(
                                         "height:13px;background:rgba(255,255,255,.06)"):
-                                    for _val, _c, _n in ((sub, "#2196f3", "订阅"), (rev, "#f59e0b", "审核"),
-                                                         (ign, "#6b7280", "忽略")):
+                                    for _val, _c, _n in ((sub, "oklch(70.7% 0.165 254.624)", "订阅"),    # blue-400
+                                                         (rev, "oklch(75% 0.183 55.934)", "审核"),        # orange-400
+                                                         (ign, "oklch(70.7% 0.022 261.325)", "忽略")):    # gray-400
                                         if _val and total:
                                             ui.element("div").style(
                                                 f"width:{_val / total * 100:.1f}%;height:100%;background:{_c}"
@@ -107,8 +110,9 @@ def anime_page(t: str = ""):
                     else:
                         # 环图：各源的种子占比（悬停切片→环心显示源名+数量）。ov['by_source']=[(源,种子数,已下)…]
                         ui.echart({
-                            "color": ["#2196f3", "#8b5cf6", "#10b981", "#f59e0b", "#ef4444",
-                                      "#06b6d4", "#ec4899", "#84cc16", "#a855f7", "#14b8a6"],
+                            # Tailwind -400 十色（sRGB hex；ECharts canvas 不吃 oklch）
+                            "color": ["#50a2ff", "#a684ff", "#00d492", "#ff8904", "#ff6467",
+                                      "#00d3f3", "#fb64b6", "#9ae600", "#c27aff", "#00d5be"],
                             "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} 种子 · {d}%"},
                             "legend": {"type": "scroll", "orient": "vertical", "right": "2%",
                                        "top": "middle", "textStyle": {"color": "#9ca3af"}},
@@ -200,7 +204,7 @@ def anime_page(t: str = ""):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
                                 ui.badge("待确认").props("color=orange")
                                 ui.label(name_of(a)).classes(
-                                    "cursor-pointer text-blue hover:underline").on(
+                                    "cursor-pointer text-blue-400 hover:underline").on(
                                     "click", lambda aid=a.id: open_detail(aid))
                                 sl = season_label(a)
                                 if sl:
@@ -226,7 +230,7 @@ def anime_page(t: str = ""):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
                                 ui.badge("已忽略").props("color=grey")
                                 ui.label(name_of(a)).classes(
-                                    "cursor-pointer text-blue hover:underline").on(
+                                    "cursor-pointer text-blue-400 hover:underline").on(
                                     "click", lambda aid=a.id: open_detail(aid))
                                 sl = season_label(a)
                                 if sl:
@@ -259,7 +263,7 @@ def anime_page(t: str = ""):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
                         ui.badge("未匹配").props("color=red")
                         ui.label(name_of(a)).classes(
-                            "cursor-pointer text-blue hover:underline").on(
+                            "cursor-pointer text-blue-400 hover:underline").on(
                             "click", lambda aid=a.id: open_detail(aid))
                         sl = season_label(a)
                         if sl:
@@ -337,7 +341,7 @@ def anime_page(t: str = ""):
             with ui.row().classes("w-full gap-3 flex-wrap mb-3 items-stretch"):
                 for b in anime.quarter_brief():
                     stats = [
-                        (b["shows"], "订阅中", "text-blue"),
+                        (b["shows"], "订阅中", "text-blue-400"),
                         (b["confirm"], "待确认", "text-orange-400" if b["confirm"] else "text-gray-600"),
                         (b["fail"], "待识别", "text-red-400" if b["fail"] else "text-gray-600"),
                         (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-600"),
@@ -435,7 +439,7 @@ def anime_page(t: str = ""):
                     with ui.column().classes("gap-0 w-full py-1").style(
                             "border-bottom:1px solid rgba(255,255,255,.08)"):
                         ui.label(r["name"]).classes(
-                            "text-sm text-blue cursor-pointer hover:underline").on(
+                            "text-sm text-blue-400 cursor-pointer hover:underline").on(
                             "click", lambda aid=r["anime_id"]: open_detail(aid))  # 不关本弹窗，详情叠上面
                         ui.label(r["raw"] or "—").classes("text-xs text-gray-500 break-all")
                 ui.button("关闭", on_click=list_dlg.close).props("flat")
@@ -528,7 +532,7 @@ def anime_page(t: str = ""):
                     ui.badge("已忽略").props("color=grey")
                 elif not a.confirmed:
                     ui.badge("待确认").props("color=orange")
-                color = "text-gray-500 line-through" if a.rejected else "text-blue"
+                color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
                 ui.label(name_of(a)).classes(
                     f"cursor-pointer {color} hover:underline").on(
                     "click", lambda aid=a.id: open_detail(aid))
