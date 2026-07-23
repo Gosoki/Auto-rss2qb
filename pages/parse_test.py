@@ -112,6 +112,6 @@ def parse_test_page():
                 with ui.row().classes("items-baseline gap-2 no-wrap w-full"):
                     ui.badge(tag).props("color=blue-grey").classes("shrink-0")
                     ui.label(ex).classes(
-                        "cursor-pointer text-xs text-blue-400 hover:underline break-all").on(
+                        "cursor-pointer text-xs text-blue hover:underline break-all").on(
                         "click", lambda e=ex: _fill(e))
         result()

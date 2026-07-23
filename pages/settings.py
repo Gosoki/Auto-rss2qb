@@ -32,7 +32,7 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str) -> No
     f[key] = inp
     ui.label(note + "  占位：{yy}=26 {yyyy}=2026 {q}=C {season}=夏 {m}=7").classes(
         "text-xs text-gray-500")
-    preview = ui.label().classes("text-sm text-blue-300")
+    preview = ui.label().classes("text-sm text-blue")
 
     def _prev():
         preview.text = "预览： " + " ／ ".join(

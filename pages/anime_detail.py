@@ -27,7 +27,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         with ui.row().classes("items-start gap-2 w-full no-wrap"):
             with ui.row().classes("items-center gap-2 flex-wrap grow min-w-0"):
                 ui.label(name_of(cur)).classes("text-2xl font-bold")
-                ui.button(icon="edit", on_click=_bind).props("flat round dense size=sm").tooltip(
+                ui.button(icon="edit", on_click=_bind).props("flat round dense size=sm color=primary").tooltip(
                     "认错了？手动绑定正确的 bgm（粘链接或 ID）")
                 _sl = season_label(cur)
                 if _sl:
@@ -100,7 +100,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _neg = t.episode == -2                            # 解析也可能写错正整数(把分辨率/季号当集号)
                         ui.label(ep_txt).classes(
                             "shrink-0 cursor-pointer hover:underline"
-                            + (" text-blue-400" if _neg else "")).on(
+                            + (" text-blue" if _neg else "")).on(
                             "click", _set_ep(t.id)).tooltip(
                             "集号没解析出来；点这里改" if _neg else "集号不对？点这里改")
                     else:

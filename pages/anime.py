@@ -23,7 +23,7 @@ def _state_rank(a):
     return 1 if not a.confirmed else 0
 
 
-def _barline(label, value, maxv, extra="", color="#3b82f6", lw="w-32", text=None):
+def _barline(label, value, maxv, extra="", color="#2196f3", lw="w-32", text=None):
     """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认 value+extra）。"""
     pct = (value / maxv * 100) if maxv else 0
     with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
@@ -172,7 +172,7 @@ def anime_page(t: str = "manage"):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
                                 ui.badge("待确认").props("color=orange")
                                 ui.label(name_of(a)).classes(
-                                    "cursor-pointer text-blue-400 hover:underline").on(
+                                    "cursor-pointer text-blue hover:underline").on(
                                     "click", lambda aid=a.id: open_detail(aid))
                                 sl = season_label(a)
                                 if sl:
@@ -197,7 +197,7 @@ def anime_page(t: str = "manage"):
                         with ui.row().classes("items-center gap-3 pl-2 py-1 flex-wrap"):
                             ui.badge("已忽略").props("color=grey")
                             ui.label(name_of(a)).classes(
-                                "cursor-pointer text-blue-400 hover:underline").on(
+                                "cursor-pointer text-blue hover:underline").on(
                                 "click", lambda aid=a.id: open_detail(aid))
                             sl = season_label(a)
                             if sl:
@@ -229,7 +229,7 @@ def anime_page(t: str = "manage"):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
                         ui.badge("未匹配").props("color=red")
                         ui.label(name_of(a)).classes(
-                            "cursor-pointer text-blue-400 hover:underline").on(
+                            "cursor-pointer text-blue hover:underline").on(
                             "click", lambda aid=a.id: open_detail(aid))
                         sl = season_label(a)
                         if sl:
@@ -307,7 +307,7 @@ def anime_page(t: str = "manage"):
             with ui.row().classes("w-full gap-3 flex-wrap mb-3 items-stretch"):
                 for b in anime.quarter_brief():
                     stats = [
-                        (b["shows"], "订阅中", "text-blue-300"),
+                        (b["shows"], "订阅中", "text-blue"),
                         (b["confirm"], "待确认", "text-orange-400" if b["confirm"] else "text-gray-600"),
                         (b["fail"], "待识别", "text-red-400" if b["fail"] else "text-gray-600"),
                         (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-600"),
@@ -315,7 +315,7 @@ def anime_page(t: str = "manage"):
                     with ui.card().classes("gap-2 py-3").style("flex:1 1 300px"):
                         with ui.row().classes("items-center gap-2"):
                             ui.badge(b["tag"]).props(
-                                f"color={'primary' if b['tag'] == '当季' else 'blue-grey'}")
+                                f"color={'primary' if b['tag'] == '当季' else 'blue-grey'}").classes("text-sm")
                             ui.label(engine.quarter_label(b["key"])).classes("font-bold text-base")
                         with ui.row().classes("gap-6"):
                             for num, lbl, color in stats:
@@ -405,7 +405,7 @@ def anime_page(t: str = "manage"):
                     with ui.column().classes("gap-0 w-full py-1").style(
                             "border-bottom:1px solid rgba(255,255,255,.08)"):
                         ui.label(r["name"]).classes(
-                            "text-sm text-blue-400 cursor-pointer hover:underline").on(
+                            "text-sm text-blue cursor-pointer hover:underline").on(
                             "click", lambda aid=r["anime_id"]: open_detail(aid))  # 不关本弹窗，详情叠上面
                         ui.label(r["raw"] or "—").classes("text-xs text-gray-500 break-all")
                 ui.button("关闭", on_click=list_dlg.close).props("flat")
@@ -498,7 +498,7 @@ def anime_page(t: str = "manage"):
                     ui.badge("已忽略").props("color=grey")
                 elif not a.confirmed:
                     ui.badge("待确认").props("color=orange")
-                color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
+                color = "text-gray-500 line-through" if a.rejected else "text-blue"
                 ui.label(name_of(a)).classes(
                     f"cursor-pointer {color} hover:underline").on(
                     "click", lambda aid=a.id: open_detail(aid))

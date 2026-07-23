@@ -112,7 +112,7 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
         rows=rows, row_key="id",
     ).classes("w-full")
     # 番名：可点则染蓝加手型、点击 $emit 回传整行给 Python；不可点则纯文本。原始名恒为灰色小字。
-    name_top = ('<div class="cursor-pointer text-blue-4" '
+    name_top = ('<div class="cursor-pointer text-blue" '
                 "@click=\"() => $parent.$emit('opendetail', props.row)\">{{ props.row.name }}</div>"
                 ) if on_row_click else "<div>{{ props.row.name }}</div>"
     tbl.add_slot("body-cell-name", f'''
@@ -320,6 +320,7 @@ def frame(active: str = ""):
     yield 出顶栏右侧的容器，页面可往里放全局动作按钮（如刷新/补下）；不放就是空的。
     """
     ui.dark_mode(True)
+    ui.colors(primary="#2196f3")   # 全站主色＝『将下载』的蓝，所有 color=primary 的按钮/徽标随之统一
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
     ui.add_head_html(
         "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
@@ -335,7 +336,7 @@ def frame(active: str = ""):
                 ui.label("autorss").classes("text-lg font-bold").style("color:#f3f4f6;letter-spacing:.5px")
             for key, label, path in NAV:
                 cls = "cursor-pointer text-sm px-2 transition-colors "
-                cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
+                cls += ("text-blue font-semibold underline underline-offset-8 decoration-2"
                         if key == active else "text-gray-400 hover:text-gray-100")
                 ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
             ui.space()
