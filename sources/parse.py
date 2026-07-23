@@ -28,11 +28,12 @@ ONE_COUR = 12
 # 批量/合集/蓝光整理帖 或 连续集范围(01-12)——不是周更单集。
 # · BDMV/BD Remux/Vol.N/第N巻/TV+SP：蓝光盘/卷/整季合集，非周更单集（不含歧义的『第N季/クール』，那些有周更单集）。
 # · EP01-28 与裸 01-12 范围：连续集合集；两侧都要 ≥2 位（真·合集用零填充），才不把『第二季 - 03』的 "2 - 03"
-#   误判成范围而丢单集；裸范围两侧还须被非字母数字包围，才不把 "x264-10bit" 的 "264-10" 误判成范围。
+#   误判成范围而丢单集；裸范围两侧还须被【非连字符】的非字母数字包围，才不把 "x264-10bit" 的 "264-10"、
+#   或日期 "[2024-05-10]" 的 "05-10" 误判成范围（相邻连字符＝编码残段/日期分段，都不是合集）。
 _BATCH_RE = re.compile(
     r"合集|整理|搬运|BD-?RIP|BDMV|BD\s?Remux|\bBatch\b|Vol\.\s*\d+|\bTV\s*\+\s*SP\b|第\s*\d+\s*[巻卷]"
     r"|(?<![A-Za-z])EP\d{1,3}\s*[-~〜]\s*\d{1,3}"
-    r"|(?<![A-Za-z0-9])\d{2,3}\s*[-~〜]\s*\d{2,3}(?![A-Za-z0-9])", re.I)
+    r"|(?<![-A-Za-z0-9])\d{2,3}\s*[-~〜]\s*\d{2,3}(?![-A-Za-z0-9])", re.I)
 
 # 集数识别（按优先级）：'- 07'/'- 11.5'/'- 07v2' → S02E07 → 第07話/第二十三话 → [07]/[07v2]
 # 第1条用负向后顾避免吃到范围 01-12 的第二个数，并容忍 v2 版本后缀；第3条兼中文数字；第4条限 1~3 位避免命中 [2024]
@@ -122,8 +123,10 @@ def _clean_name(name_part: str) -> str:
 
 
 def estimate_premiere(release_time: datetime, episode, season: int) -> datetime:
-    """用集数倒推首播日（只对第一季、且一个 cour 内可靠，否则用当集时间）。"""
-    if season == 1 and 1 <= episode <= ONE_COUR:
+    """用集数倒推首播日（只对第一季、且一个 cour 内可靠，否则用当集时间）。
+    小数集（如 11.5 特别篇）不倒推：它们不在正片周更序列上，倒推会落到错季度、拆散归档目录。"""
+    is_special = isinstance(episode, float) and episode != int(episode)
+    if season == 1 and not is_special and 1 <= episode <= ONE_COUR:
         return release_time - timedelta(weeks=episode - 1)
     return release_time
 

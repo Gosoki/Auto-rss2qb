@@ -385,7 +385,8 @@ async def enrich_movie(movie_id: int) -> bool:
         m = s.get(Movie, movie_id)
         if m is None:
             return False
-        engine.apply_bgm_meta(m, info, keep_quarter=_has_downloads(s, movie_id))
+        # 手动重识别：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
+        engine.apply_bgm_meta(m, info, keep_quarter=False)
         s.add(m)
         s.commit()
         if m.bangumi_id is not None:
@@ -404,13 +405,96 @@ async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
         m = s.get(Movie, movie_id)
         if m is None:
             return False
-        engine.apply_bgm_meta(m, info, keep_quarter=_has_downloads(s, movie_id))
+        # 手动纠正绑定：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
+        engine.apply_bgm_meta(m, info, keep_quarter=False)
         s.add(m)
         s.commit()
         for other in list(s.exec(select(Movie).where(
                 Movie.bangumi_id == bgm_id, Movie.id != m.id))):
             _merge_movie(s, other.id, m.id)
     return True
+
+
+def movie_save_path(movie_id: int) -> str | None:
+    """该剧场版当前的归档目录（build_save_path 结果：[子目录]/[季度]/片名）；算不出返回 None。
+
+    取值与 download_movie_torrent 一致：季度用 m.quarter，片名 jp_name→display_name→title。剧场版不建 Season 子目录。
+    """
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None:
+            return None
+        quarter = (m.quarter or "unknown")
+        folder = (m.jp_name or m.display_name) or m.title or "movie"
+    return engine.build_save_path(quarter, folder, sub_dir=config.MOVIE_DOWN_PATH,
+                                  quarter_fmt=config.MOVIE_QUARTER_FMT)
+
+
+async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
+    """把该剧场版已下/在下的种子移到当前归档目录（改季度/重绑后调用；调用方应已落新 m.quarter/名）。
+
+    对齐番剧 relocate_anime：qB 跟踪该种子 → setLocation 原地搬 + 更新 save_path；qB 关/连不上/不跟踪
+    (remove-on-complete) → 清完成状态待人工重下到新目录；setLocation 报 403/409(新目录不可写) → 只报告、不动状态。
+    返回 {new_path, old_path, moved, redownload, untracked, failed, fail_code?, error?}。
+    """
+    new_path = movie_save_path(movie_id)
+    rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
+           "redownload": 0, "untracked": 0, "failed": 0}
+    if new_path is None:
+        rep["error"] = "算不出新路径（越界或无片）"
+        return rep
+    with get_session() as s:
+        pairs = [(t.id, t.info_hash) for t in s.exec(select(MovieTorrent).where(
+            MovieTorrent.movie_id == movie_id,
+            MovieTorrent.status.in_(["downloaded", "downloading"])))]
+    if not pairs:
+        return rep
+
+    def _clear(ids):   # 清完成状态→pending，等人工重下到新目录
+        with get_session() as s:
+            for tid in ids:
+                t = s.get(MovieTorrent, tid)
+                if t is not None and t.status in ("downloaded", "downloading"):
+                    t.status = "pending"
+                    s.add(t)
+            s.commit()
+
+    def _mark_moved(ids):
+        with get_session() as s:
+            for tid in ids:
+                t = s.get(MovieTorrent, tid)
+                if t is not None:
+                    t.save_path = new_path
+                    s.add(t)
+            s.commit()
+
+    all_ids = [tid for tid, _ in pairs]
+    if not config.QB_ENABLED:   # qB 关：只能清状态待重下 + 提醒
+        _clear(all_ids)
+        rep["redownload"] = len(all_ids)
+        return rep
+    info = await engine.qb.torrents_info([h for _, h in pairs])
+    if info is None:            # qB 连不上：同上
+        _clear(all_ids)
+        rep["redownload"] = len(all_ids)
+        return rep
+    tracked = [(tid, h) for tid, h in pairs if h in info]
+    untracked = [tid for tid, h in pairs if h not in info]
+    if untracked:               # remove-on-complete 等：qB 已不认识 → 清状态待重下
+        _clear(untracked)
+        rep["untracked"] = rep["redownload"] = len(untracked)
+    if tracked:
+        code = await engine.qb.set_location([h for _, h in tracked], new_path)
+        if code == 200:
+            _mark_moved([tid for tid, _ in tracked])
+            rep["moved"] = len(tracked)
+        elif code is None:      # 中途连不上：退回清状态待重下
+            _clear([tid for tid, _ in tracked])
+            rep["redownload"] += len(tracked)
+        else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
+            rep["failed"] = len(tracked)
+            rep["fail_code"] = code
+    return rep
 
 
 # ---------------- 下载 ----------------
@@ -462,6 +546,12 @@ async def download_movie_torrent(mt_id: int) -> bool:
     if not ok:
         _set_status(mt_id, "error")
         return False
+    with get_session() as s:   # 记实际保存路径：改季度/重绑后据此移动或提醒旧位置
+        t = s.get(MovieTorrent, mt_id)
+        if t is not None:
+            t.save_path = save_path
+            s.add(t)
+            s.commit()
     if config.QB_SYNC_STATUS:
         _set_status(mt_id, "downloaded")
         engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子

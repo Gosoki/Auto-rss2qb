@@ -328,6 +328,15 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if _bf_busy["v"]:
             ui.notify("正在补齐中，请稍候…", type="info")
             return
+        cur = anime.get_anime(anime_id)
+        if cur is not None and cur.confirmed and not cur.rejected:
+            # 已确认番：补齐入库新种子会把整部番退回『待确认』，后台从此暂停自动下新集，直到重新确认——先告知
+            if not await confirm(
+                    "补齐会暂停这部番的自动下载",
+                    "这部番当前『已确认』、正在自动追。补齐入库新种子后会把它退回『待确认』，"
+                    "后台将暂停自动下新集，直到你去『待确认』页重新点确认。继续？",
+                    ok_label="继续补齐", ok_icon="playlist_add", ok_color="primary"):
+                return
         _bf_busy["v"] = True
         ui.notify("正在搜索补齐…（去 nyaa/Mikan 按名搜，请稍候）")
         try:
@@ -407,7 +416,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
     def _exclude(torrent_id):
         async def h():
             if not await confirm("排除这一条？",
-                                 "从待下里直接排除（终态：不再下、不再挂在未知集，RSS 再遇到同种子也不重收）。",
+                                 "从待下里排除：不再自动下、不再挂在未知集，RSS 再遇到同种子也不重收；"
+                                 "排除后可随时点『恢复』放回待下。",
                                  ok_label="排除", ok_icon="block"):
                 return
             ok = anime.exclude_torrent(torrent_id)

@@ -220,6 +220,8 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             # 跨表【不】去重：番剧/剧场版各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer（曾致删/下竞态静默丢文件）。
             # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）。
+            # 注：deleted 不进去重集——用户删的是"那一条种子"，同集来了新 hash 允许照常自动下（deleted 本身
+            # 状态非 pending、flush 不会自动选它，同 hash 也在入库处去重，故被删的那条不会自动回来；force 例外）。
             # 含特别篇 -1（每番只放一份，与 flush 的 have_special 意图一致）；-2 未知集按设计逐个下、不去重。
             if not force and isinstance(episode, (int, float)) and (episode >= 0 or episode == -1) and anime_id:
                 dup = s.exec(select(AnimeTorrent).where(
@@ -346,6 +348,8 @@ async def flush_ready_downloads() -> int:
         kw_map = {a.id: a.pref_keyword for a in auto if a.pref_keyword}
         if not auto_ids:
             return 0
+        # 只算真正已下的集（deleted 不算已处理）：删了某集后，同集来了新 hash 的种子仍允许自动下——
+        # 用户要的是"删的那条种子不自动回来"（它状态非 pending、本就不会被自动选），而非"整集永久拉黑"。
         downloaded = {
             (t.anime_id, t.episode)
             for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.status == "downloaded"))

@@ -42,6 +42,44 @@ def _season_toggle_btn(key: str, name: str, selected: set) -> None:
     _restyle()
 
 
+def _notify_relocate_movie(rep):
+    """把 relocate_movie 结果转成用户提示（对齐番剧 _notify_relocate）。"""
+    if rep.get("error"):
+        ui.notify(f"移动失败：{rep['error']}", type="negative")
+        return
+    parts = []
+    if rep.get("moved"):
+        parts.append(f"已移动 {rep['moved']} 个版本到新目录")
+    if rep.get("redownload"):
+        parts.append(f"{rep['redownload']} 个版本 qB 未跟踪/连不上 → 已清状态待重下到新目录")
+    if rep.get("failed"):
+        parts.append(f"{rep['failed']} 个版本移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
+    msg = "；".join(parts) or "无需移动"
+    warn = bool(rep.get("redownload") or rep.get("failed"))
+    if rep.get("redownload") and rep.get("old_path"):
+        msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
+    ui.notify(msg, type="warning" if warn else "positive")
+
+
+async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
+    """重绑/重识别改了季度后：归档目录变了且有已下版本就问是否搬迁，并按结果提示（对齐番剧）。"""
+    new_path = mov.movie_save_path(movie_id)
+    if not new_path or new_path == old_path:
+        return   # 路径没变，无需移动
+    dl = [t for t in mov.movie_torrents(movie_id) if t.status in ("downloaded", "downloading")]
+    if not dl:
+        ui.notify("归档目录已更新（无已下文件，新版本将下到新目录）", type="positive")
+        return
+    if not await confirm("归档目录变了，移动已下文件？",
+                         f"{len(dl)} 个版本已下，移到新目录：{new_path}",
+                         ok_label="移动文件", ok_icon="drive_file_move"):
+        ui.notify("已更新记录，未移动文件（新版本将下到新目录，旧文件留在原处）", type="warning")
+        return
+    rep = await mov.relocate_movie(movie_id, old_path)
+    refresh_cb()
+    _notify_relocate_movie(rep)
+
+
 def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> None:
     """把某剧场版详情渲染进当前容器：元信息 + 版本列表（逐条下/删）+ 识别/忽略。
     on_close：非空则在标题行右侧渲染 X 关闭键（关掉外层 dialog）。"""
@@ -129,9 +167,12 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             refresh_outer()
 
     async def _enrich():
+        old_path = mov.movie_save_path(movie_id)
         ok = await mov.enrich_movie(movie_id)
         _after()
         ui.notify("识别成功" if ok else "未识别到（可粘贴 bgm 链接绑定）")
+        if ok:
+            await _maybe_relocate_movie(movie_id, old_path, _after)
 
     def _reject():
         mov.reject_movie(movie_id)
@@ -186,10 +227,13 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         if bid is None:
             ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
             return
+        old_path = mov.movie_save_path(movie_id)
         ok = await mov.bind_movie_bgm(movie_id, bid)
         _after()
         ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
                   type="positive" if ok else "negative")
+        if ok:
+            await _maybe_relocate_movie(movie_id, old_path, _after)
 
     body()
 
@@ -247,18 +291,24 @@ def movies_page(t: str = ""):
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
+                old_path = mov.movie_save_path(movie_id)
                 ok = await mov.bind_movie_bgm(movie_id, bid)
                 refresh_all()
                 ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
                           type="positive" if ok else "negative")
+                if ok:
+                    await _maybe_relocate_movie(movie_id, old_path, refresh_all)
             return h
 
         def _refail(movie_id):
             async def h():
+                old_path = mov.movie_save_path(movie_id)
                 ok = await mov.enrich_movie(movie_id)
                 refresh_all()
                 ui.notify("识别成功 ✓" if ok else "还是没识别到（可粘贴 bgm 链接绑定）",
                           type="positive" if ok else "warning")
+                if ok:
+                    await _maybe_relocate_movie(movie_id, old_path, refresh_all)
             return h
 
         def _save_scan(f):

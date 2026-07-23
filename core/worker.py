@@ -113,8 +113,11 @@ async def run_qb_sync() -> None:
     """
     log.info("qB 状态同步启动（事件驱动，活跃间隔 %ds，保底 %d 分钟）",
              config.QB_SYNC_INTERVAL, config.QB_SYNC_BACKSTOP_MIN)
-    if engine.has_inflight():
-        engine.qb_kick.set()          # 启动即自查：接上重启前遗留的『在下的』种子
+    try:
+        if engine.has_inflight():
+            engine.qb_kick.set()      # 启动即自查：接上重启前遗留的『在下的』种子
+    except Exception as e:
+        log.error("qB 同步启动自查异常（忽略，靠保底兜住）: %s", e)
     while True:
         try:
             await asyncio.wait_for(engine.qb_kick.wait(),
@@ -123,16 +126,20 @@ async def run_qb_sync() -> None:
             pass                       # 保底到点：没人 kick 也醒来自查一遍
         engine.qb_kick.clear()
         idle = 0                            # 连续几轮没在真下（局部计数，本次唤醒周期内累加、下次唤醒清零，无需入库）
-        while config.QB_ENABLED and config.QB_SYNC_STATUS and engine.has_inflight():
-            try:
-                await anime.sync_qb_status()   # 每轮批量刷新所有在下的：有活种子时慢的/stalled 的也顺便一起更新
-                await movies.sync_qb_status()
-            except Exception as e:
-                log.error("qB 状态同步异常: %s", e)
-            if engine.has_active_downloading():
-                idle = 0
-            else:
-                idle += 1
-                if idle >= max(1, config.QB_SLOW_ROUNDS):
-                    break   # 连续 N 轮没一个在真下(全 stalled/排队/慢速爬行) → 退出高频轮询，回等 kick/保底、休眠
-            await asyncio.sleep(max(5, config.QB_SYNC_INTERVAL))
+        try:
+            while config.QB_ENABLED and config.QB_SYNC_STATUS and engine.has_inflight():
+                try:
+                    await anime.sync_qb_status()   # 每轮批量刷新所有在下的：有活种子时慢的/stalled 的也顺便一起更新
+                    await movies.sync_qb_status()
+                except Exception as e:
+                    log.error("qB 状态同步异常: %s", e)
+                if engine.has_active_downloading():
+                    idle = 0
+                else:
+                    idle += 1
+                    if idle >= max(1, config.QB_SLOW_ROUNDS):
+                        break   # 连续 N 轮没一个在真下(全 stalled/排队/慢速爬行) → 退出高频轮询，回等 kick/保底、休眠
+                await asyncio.sleep(max(5, config.QB_SYNC_INTERVAL))
+        except Exception as e:
+            # has_inflight()/has_active_downloading() 若因 DB 锁等抛错，别让它掀翻 while True（否则 qB 同步永久死掉）
+            log.error("qB 同步内层循环异常（回退休眠，等下次 kick/保底）: %s", e)

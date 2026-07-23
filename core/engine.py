@@ -403,6 +403,8 @@ async def sync_qb_status(model_cls) -> int:
     if info is None:
         return 0   # 只在『连不上/出错』(None) 本轮不动。空 dict {} 是『qB 在线但这批一个都不在』——
                    # 须落到下面逐行走 d is None 落定(全被删/移除时)，否则它们永久 in-flight、循环永不休眠。
+    if not config.QB_SYNC_STATUS:
+        return 0   # await 期间用户关了跟踪（这批已由 settle_inflight_off 落定）——别用陈旧 qB 数据把它们覆写回在下态
     now = datetime.now()
     updated = 0
     with get_session() as s:

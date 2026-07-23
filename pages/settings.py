@@ -316,15 +316,19 @@ def settings():
                 ui.notify(f"允许网段无法解析：{', '.join(bad)}（示例 192.168.1.0/24），已取消保存",
                           type="negative")
                 return
-            # 存前自锁检测：新网段若把你当前访问的 IP 挡在外（回环恒放行），拦下保存，别让人把自己锁死
-            try:
-                my_ip = context.client.ip
-            except Exception:
-                my_ip = ""      # 取不到就不拦（无法判定）
-            if my_ip and not netguard.would_allow(my_ip, updates.get("WEB_ALLOW_CIDRS", "")):
-                ui.notify(f"你正从 {my_ip} 访问，该地址不在要保存的允许网段内——保存后会立刻把你自己挡在门外。"
-                          f"已取消保存；请把 {my_ip} 所在网段一并加入（或留空=不限制）。", type="negative")
-                return
+            # 存前自锁检测：设了网段限制时，拿不到你的 IP 或你的 IP 不在网段内 → 一律拦下保存
+            # （fail-closed，别让人把自己锁死；回环恒放行，本机保存不受影响。空网段=不限制、无自锁风险）
+            new_cidrs = updates.get("WEB_ALLOW_CIDRS", "").strip()
+            if new_cidrs:
+                try:
+                    my_ip = context.client.ip
+                except Exception:
+                    my_ip = ""
+                if not (my_ip and netguard.would_allow(my_ip, new_cidrs)):
+                    where = f"你正从 {my_ip} 访问，该地址不在" if my_ip else "无法确认你当前访问 IP 是否在"
+                    ui.notify(f"{where}要保存的允许网段内——保存后可能把你自己挡在门外，已取消保存。"
+                              f"请把你所在网段一并加入（或留空=不限制）。", type="negative")
+                    return
             # 路径防呆：每侧有效根 =(该侧目录 or 工作目录)不能为空，否则无处下载
             work = updates.get("DOWN_PATH", "")
             for side, key in (("动漫", "ANIME_DOWN_PATH"), ("电影", "MOVIE_DOWN_PATH")):

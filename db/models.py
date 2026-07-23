@@ -155,6 +155,7 @@ class MovieTorrent(SQLModel, table=True):
     raw_title: str = Field(default="")          # 原始种子完整标题（区分版本）
     status: str = Field(default="pending")      # 应用侧生命周期：pending/downloading/downloaded/error/skipped
     download_url: str = Field(default="")
+    save_path: str = Field(default="")          # 交 qB 时的实际保存路径；改季度/重绑后据此移动或提醒旧位置
     release_time: datetime | None = Field(default=None)
     priority: int = Field(default=0)
     created_at: datetime = Field(default_factory=datetime.now)
