@@ -328,11 +328,11 @@ def movies_page(t: str = "list"):
                 ui.label("各状态种子计数（含 qB 实时态）").classes("text-xs text-gray-400")
             chips = [
                 ("已下载", ov["status"]["downloaded"], "green", None),
-                ("待下", ov["status"]["pending"], "orange", "还没下的版本，进详情逐条下"),
+                ("可下载", ov["status"]["pending"], "blue", "还没下的版本，进详情逐条下"),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
                  "已忽略剧场版留下的种子；恢复时若一版都没下过会放回待下"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的版本"),
-                ("版本数", k["versions"], "grey", "全部种子/版本数（各状态之和）"),
+                ("种子数", k["versions"], "blue-grey", "全部种子/版本数（各状态之和）"),
             ]
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
@@ -357,7 +357,7 @@ def movies_page(t: str = "list"):
                 ui.badge("扫描开启" if config.MOVIE_SCAN_ENABLED else "扫描暂停").props(
                     f"color={'green' if config.MOVIE_SCAN_ENABLED else 'red'}").classes("text-sm").tooltip(
                     "后台是否定期扫 Mikan 剧场版/OVA 桶（『订阅源』页切换）")
-                ui.badge(f"识别 {k['matched']}/{k['total']}").props("color=indigo").classes("text-sm").tooltip(
+                ui.badge(f"识别 {k['matched']}/{k['total']}").props("color=blue").classes("text-sm").tooltip(
                     "已匹配到 bgm 的 / 全部")
                 ui.badge(f"扫描间隔 {config.MOVIE_SCAN_INTERVAL // 3600}h").props(
                     "color=blue-grey").classes("text-sm")

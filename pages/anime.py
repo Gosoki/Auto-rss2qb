@@ -141,7 +141,7 @@ def anime_page(t: str = "manage"):
                 ui.badge("采集开启" if ov["config"]["poll_on"] else "采集暂停").props(
                     f"color={'green' if ov['config']['poll_on'] else 'red'}").classes("text-sm").tooltip(
                     "后台是否在抓取（在设置页『采集』开关切换）")
-                ui.badge(f"识别番数 {enr}/{tot}").props("color=indigo").classes("text-sm").tooltip(
+                ui.badge(f"识别番数 {enr}/{tot}").props("color=blue").classes("text-sm").tooltip(
                     "已匹配到 bgm 的番 / 全部")
                 ui.badge(f"轮询间隔 {ov['config']['poll']}s").props("color=blue-grey").classes("text-sm").tooltip(
                     "后台每隔这么久抓一次源（设置页可改）")
