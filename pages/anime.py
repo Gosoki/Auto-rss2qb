@@ -72,13 +72,14 @@ def anime_page(t: str = "manage"):
             with ui.row().classes("w-full gap-6 flex-wrap mt-3"):
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
                     bqs = ov["by_quarter_state"]
-                    with ui.row().classes("items-center gap-3 flex-wrap"):
+                    with ui.row().classes("items-center gap-3 flex-wrap w-full"):
                         ui.label(f"各季度番剧 · {len(bqs)} 季").classes("text-sm font-bold")
-                        for _lab, _c in (("订阅", "#2196f3"), ("审核", "#f59e0b"), ("忽略", "#6b7280")):
-                            with ui.row().classes("items-center gap-1 text-xs text-gray-400"):
-                                ui.element("div").style(
-                                    f"width:9px;height:9px;border-radius:2px;background:{_c}")
-                                ui.label(_lab)
+                        with ui.row().classes("items-center gap-3 flex-wrap ml-auto"):  # 图例靠右
+                            for _lab, _c in (("订阅", "#2196f3"), ("审核", "#f59e0b"), ("忽略", "#6b7280")):
+                                with ui.row().classes("items-center gap-1 text-xs text-gray-400"):
+                                    ui.element("div").style(
+                                        f"width:9px;height:9px;border-radius:2px;background:{_c}")
+                                    ui.label(_lab)
                     with ui.column().classes("w-full gap-0").style("max-height:200px;overflow-y:auto"):
                         if not bqs:
                             ui.label("—").classes("text-gray-500 text-sm")
