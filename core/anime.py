@@ -429,6 +429,13 @@ def overview() -> dict:
         qs.append("未知")
     by_quarter = [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs]
 
+    # 各季度番剧按流水线 3 桶：订阅(已确认)/审核(未确认待处理=待确认+待识别)/忽略(已拒绝)，互斥、和=该季总番数
+    nonrej_ids = {a.id for a in animes}
+    sub_by_q = Counter((a.quarter or "未知") for a in animes if a.confirmed)
+    rev_by_q = Counter((a.quarter or "未知") for a in animes if not a.confirmed)
+    ign_by_q = Counter(aid_q[aid] for aid, _ in all_aq if aid not in nonrej_ids)
+    by_quarter_state = [(q, sub_by_q.get(q, 0), rev_by_q.get(q, 0), ign_by_q.get(q, 0)) for q in qs]
+
     # 各来源：种子数 + 已下
     by_source = sorted((((src or "?"), cnt, src_done.get(src, 0)) for src, cnt in src_total.items()),
                        key=lambda x: -x[1])
@@ -446,6 +453,7 @@ def overview() -> dict:
                    ("downloaded", "downloading", "pending", "error", "skipped")},
         "pending_split": split,
         "by_quarter": by_quarter,
+        "by_quarter_state": by_quarter_state,
         "by_source": by_source,
         "enriched": (sum(1 for a in animes if a.bangumi_id), len(animes)),
         "groups": [(g.name, g.site, g.policy, g.priority, g.enabled)

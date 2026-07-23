@@ -9,7 +9,7 @@ from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (barline, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
+from .layout import (confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, qb_disabled_banner, recent_table, season_label,
                      source_options)
@@ -71,21 +71,57 @@ def anime_page(t: str = "manage"):
             # ── 下载番剧 / 种子来源（左右分开，窄屏自动堆叠）──
             with ui.row().classes("w-full gap-6 flex-wrap mt-3"):
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
-                    ui.label(f"下载番剧（下载 / 总番）· {len(ov['by_quarter'])}").classes("text-sm font-bold")
-                    with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
-                        maxdl = max((dn for _, _, dn in ov["by_quarter"]), default=1) or 1  # 按下载数缩放
-                        if not ov["by_quarter"]:
+                    bqs = ov["by_quarter_state"]
+                    with ui.row().classes("items-center gap-3 flex-wrap"):
+                        ui.label(f"各季度番剧 · {len(bqs)} 季").classes("text-sm font-bold")
+                        for _lab, _c in (("订阅", "#2196f3"), ("审核", "#f59e0b"), ("忽略", "#6b7280")):
+                            with ui.row().classes("items-center gap-1 text-xs text-gray-400"):
+                                ui.element("div").style(
+                                    f"width:9px;height:9px;border-radius:2px;background:{_c}")
+                                ui.label(_lab)
+                    with ui.column().classes("w-full gap-0").style("max-height:200px;overflow-y:auto"):
+                        if not bqs:
                             ui.label("—").classes("text-gray-500 text-sm")
-                        for q, shows, done in ov["by_quarter"]:
-                            barline(engine.quarter_label(q), done, maxdl, lw="w-36", text=f"{done} / {shows}")
+                        for q, sub, rev, ign in bqs:
+                            total = sub + rev + ign
+                            with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
+                                ui.label(engine.quarter_label(q)).classes(
+                                    "w-36 shrink-0 truncate").tooltip(engine.quarter_label(q))
+                                # 满宽 100% 的比例条，按订阅/审核/忽略切三段（0 段跳过）
+                                with ui.element("div").classes("grow rounded overflow-hidden flex min-w-0").style(
+                                        "height:13px;background:rgba(255,255,255,.06)"):
+                                    for _val, _c, _n in ((sub, "#2196f3", "订阅"), (rev, "#f59e0b", "审核"),
+                                                         (ign, "#6b7280", "忽略")):
+                                        if _val and total:
+                                            ui.element("div").style(
+                                                f"width:{_val / total * 100:.1f}%;height:100%;background:{_c}"
+                                            ).tooltip(f"{_n} {_val}")
+                                ui.label(f"{total} 部").classes(
+                                    "shrink-0 text-gray-400 text-right text-xs").style("min-width:3rem")
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
-                    ui.label(f"种子来源（已下 / 种子）· {len(ov['by_source'])}").classes("text-sm font-bold")
-                    with ui.column().classes("w-full gap-0").style("max-height:220px;overflow-y:auto"):
-                        maxs = max((tot for _, tot, _ in ov["by_source"]), default=1)
-                        if not ov["by_source"]:
-                            ui.label("—").classes("text-gray-500 text-sm")
-                        for src, tot, done in ov["by_source"]:
-                            barline(src, tot, maxs, color="#8b5cf6", text=f"{done} / {tot}")
+                    ui.label(f"种子来源 · {len(ov['by_source'])} 个源").classes("text-sm font-bold")
+                    if not ov["by_source"]:
+                        ui.label("—").classes("text-gray-500 text-sm")
+                    else:
+                        # 环图：各源的种子占比（悬停切片→环心显示源名+数量）。ov['by_source']=[(源,种子数,已下)…]
+                        ui.echart({
+                            "color": ["#2196f3", "#8b5cf6", "#10b981", "#f59e0b", "#ef4444",
+                                      "#06b6d4", "#ec4899", "#84cc16", "#a855f7", "#14b8a6"],
+                            "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} 种子 · {d}%"},
+                            "legend": {"type": "scroll", "orient": "vertical", "right": "2%",
+                                       "top": "middle", "textStyle": {"color": "#9ca3af"}},
+                            "series": [{
+                                "name": "种子来源", "type": "pie",
+                                "radius": ["45%", "72%"], "center": ["32%", "50%"],
+                                "avoidLabelOverlap": False,
+                                "itemStyle": {"borderColor": "#1a1c22", "borderWidth": 2},
+                                "label": {"show": False, "position": "center"},
+                                "emphasis": {"label": {"show": True, "color": "#e5e7eb",
+                                                       "fontSize": 14, "fontWeight": "bold",
+                                                       "formatter": "{b}\n{c}"}},
+                                "data": [{"name": src, "value": tot} for src, tot, _ in ov["by_source"]],
+                            }],
+                        }).classes("w-full").style("height:220px")
 
             # ── 种子状态 ──
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
