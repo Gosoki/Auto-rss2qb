@@ -169,9 +169,9 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
             if cover_url:
                 ui.html(f'<img src="{cover_url}" style="height:18.5rem;width:auto" '
                         f'class="rounded">').classes("shrink-0 w-fit")
-            # 中列：两列 kv 网格 + bgm 快捷方式(subject id + 跳转图标) 摆在『来源』下面
-            with ui.column().classes("gap-1 grow min-w-0"):
-                with ui.grid(columns=2).classes("w-full gap-x-8 gap-y-1").style(
+            # 中列：两列 kv 网格 + bgm 链接。self-stretch 让本列撑到封面等高，bgm 链接 mt-auto 贴底
+            with ui.column().classes("gap-1 grow min-w-0 self-stretch"):
+                with ui.grid(columns=2).classes("w-full gap-x-8 gap-y-1 items-baseline").style(
                         "grid-template-columns:auto minmax(0,1fr)"):
                     for pair in kv_pairs:
                         if pair is None:                 # 分隔行：留一点空当，把非 bgm 字段隔开
@@ -179,12 +179,12 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                             ui.element("div")
                             continue
                         kk, vv = pair
-                        ui.label(kk).classes("text-xs text-gray-400")
-                        ui.label(str(vv) if vv not in (None, "") else "—")
-                if bangumi_id:  # bgm 链接，摆在『来源』下面
+                        ui.label(kk).classes("text-sm text-gray-400")   # 标签、值统一 14px，基线对齐
+                        ui.label(str(vv) if vv not in (None, "") else "—").classes("text-sm")
+                if bangumi_id:  # bgm 链接：mt-auto 贴到中列底部；kv 顶满时被顶着往下走
                     ui.link(f"bgm.tv/subject/{bangumi_id}",
                             f"https://bgm.tv/subject/{bangumi_id}").props(
-                        "target=_blank").classes("text-xs")
+                        "target=_blank").classes("text-xs mt-auto")
             # 右列：大号分数 / 中文评价，竖排右对齐
             if rating:
                 with ui.column().classes("gap-0.5 shrink-0 items-end"):
@@ -279,7 +279,7 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
         if status == "pending":
             if not confirmed:
                 return "待确认", "orange"
-            return ("将下载", "blue") if in_plan else ("备用", "blue-grey")
+            return ("将下载", "blue") if in_plan else ("备用项", "blue-grey")
         if status == "error":
             return ("失败·可补下", "orange") if in_plan else ("失败", "red")
     return torrent_status_cn(status, qb_progress, qb_synced_at), "blue-grey"

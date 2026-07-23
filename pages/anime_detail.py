@@ -141,7 +141,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             ui.badge("将下载").props("color=blue").tooltip(
                                 "这一集的首选版本，补下/自动下会下它")
                         elif t.episode in covered or t.episode < 0:
-                            ui.badge("备用").props("color=blue-grey").tooltip(
+                            ui.badge("备用项").props("color=blue-grey").tooltip(
                                 "同集已有『将下载/已下』的更优版本；要这条就点右边下载")
                         else:  # 该集没有任何将下/已下版本——被锁定源/版本过滤光了=真·缺集
                             ui.badge("缺集·仅非锁源").props("color=orange").tooltip(

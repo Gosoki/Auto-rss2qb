@@ -136,7 +136,7 @@ def anime_page(t: str = "manage"):
             chips = [
                 ("已下载", ov["status"]["downloaded"], "green", None),
                 ("将下载", ps["will"], "blue", "已确认番·本集首选（含特别篇），会自动下"),
-                ("备用数", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
+                ("备用项", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
                 ("未知集", ps["unknown"], "purple", "批量/未知集，后台不自动下，需在详情页手动下"),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
