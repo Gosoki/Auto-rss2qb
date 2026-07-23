@@ -46,15 +46,15 @@ def anime_page(t: str = ""):
 
             # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
             # 番维度四卡（粉字）与种子维度四卡（绿字）各自打包，"|" 分组，窄了整组换行成上下布局；数字保持各自语义色
-            kpi_cards([("订阅中", k["tracking"], "", None, "pink-300"),
-                       ("待识别", k["fail"], "red", lambda: tabs.set_value("fail"), "pink-300"),
-                       ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm"), "pink-300"),
-                       ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-300"),
+            kpi_cards([("订阅中", k["tracking"], "", None, "pink-400"),
+                       ("待识别", k["fail"], "red", lambda: tabs.set_value("fail"), "pink-400"),
+                       ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm"), "pink-400"),
+                       ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-400"),
                        "|",
-                       ("已下载", k["done"], "green", None, "green-400"),
-                       ("未知集", ps["unknown"], "purple", _open_unknown, "green-400"),
-                       ("失败数", ov["status"]["error"], "red", _open_failed, "green-400"),
-                       ("种子数", k["torrents"], "", None, "green-400")])
+                       ("已下载", k["done"], "green", None, "green-500"),
+                       ("未知集", ps["unknown"], "purple", _open_unknown, "green-500"),
+                       ("失败数", ov["status"]["error"], "red", _open_failed, "green-500"),
+                       ("种子数", k["torrents"], "", None, "green-500")])
 
             # ── qB 未启用提醒 ──
             if not ov["config"]["qb"]:
