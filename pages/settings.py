@@ -240,10 +240,16 @@ def settings():
                      config.ANIME_DOWNLOAD_GRACE_MIN)
             _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
                     config.ANIME_TOP_PRIORITY_INSTANT)
-            _text("ANIME_START_DATE", "开始使用日（YYYY-MM-DD，空=不限）", config.ANIME_START_DATE,
-                  "如 2026-07-01。改了要先点『保存』；改开始日【不】自动动你已有的番，需点下面『应用』才生效（更可控）。"
-                  "只有新入库的自动源老番会在建库时自动判超期忽略、不下（种子照常入库，拒绝页可看/恢复）。"
-                  "反悔：把开始日清空（或调很早）再点『应用』，就会把超期忽略的番全放回待确认。")
+            _switch("ANIME_MULTIBRACKET_PARSE",
+                    "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
+                    config.ANIME_MULTIBRACKET_PARSE)
+            ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
+                     "大组不受影响），可在『解析测试』页验证。").classes("text-xs text-gray-500")
+            ui.label("Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在"
+                     "『源管理』页配置。").classes("text-xs text-gray-500")
+
+            ui.separator()
+            ui.label("开始使用日 · 老番过滤").classes("font-bold text-sm")
 
             async def _apply_filter():   # 应用：开播早于开始日的番（含正在追的）全判超期忽略；开始日空/改早则相反释放
                 # 不拦空开始日：空=没有番算超期→apply_start_date_filter 会把所有超期忽略放回待确认（=释放/反悔）
@@ -256,15 +262,16 @@ def settings():
                 ui.notify(f"已应用：{n} 部番状态变更" if n else "没有需要变更的番",
                           type="positive" if n else "info")
 
-            ui.button("应用开始使用日过滤", icon="filter_alt", on_click=_apply_filter).props(
-                "dense size=sm color=primary unelevated").classes("text-xs self-start")
-            _switch("ANIME_MULTIBRACKET_PARSE",
-                    "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
-                    config.ANIME_MULTIBRACKET_PARSE)
-            ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
-                     "大组不受影响），可在『解析测试』页验证。").classes("text-xs text-gray-500")
-            ui.label("Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在"
-                     "『源管理』页配置。").classes("text-xs text-gray-500")
+            with ui.row().classes("items-center gap-3"):   # 日期框 + 应用按钮同一行，按钮在右
+                _text("ANIME_START_DATE", "开始使用日", config.ANIME_START_DATE, "YYYY-MM-DD，空=不限")
+                f["ANIME_START_DATE"].classes(remove="w-full", add="w-56")   # 收窄到定宽，给右侧按钮腾位
+                ui.button("应用开始使用日过滤", icon="filter_alt", on_click=_apply_filter).props(
+                    "dense size=sm color=primary unelevated").classes("text-xs")
+            ui.label("排除开播早于此日的老番、不自动下（种子照常入库，『已忽略』页可看/恢复）。改了要先点上方『保存』。"
+                     "新入库的自动源老番建库时即自动判超期忽略；对【已有】的番不自动动，需点右侧『应用』才重算——"
+                     "【含当前正在追(已确认)的老番也会被判超期忽略】。"
+                     "反悔：把开始日清空（或调很早）再点『应用』，就把超期忽略的番全放回待确认。").classes(
+                "text-xs text-gray-500")
 
             ui.separator()
             ui.label("Bangumi 重试（识别不到时）").classes("font-bold text-sm")
