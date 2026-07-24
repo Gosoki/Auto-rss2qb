@@ -185,6 +185,10 @@ def settings():
             ui.label("有工作目录时，动漫/电影目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
                      "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，动漫/电影须各填【绝对】路径（可不同盘）。"
                      "两侧都空又无工作目录=无处下载、保存拦下。").classes("text-xs text-gray-500")
+            if config.QB_ENABLED and not engine.qb_is_local():
+                ui.label("⚠️ qB 在远程主机（非 127.0.0.1）：以上路径是【qB 主机上】的绝对路径，不是本机路径。"
+                         "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。").classes(
+                    "text-xs text-orange-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的季度文件夹命名。",
                              config.QUARTER_FMT_UI, empty_hint="留空＝跟随番剧季度文件夹命名")

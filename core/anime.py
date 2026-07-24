@@ -240,6 +240,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             s.add(t)
             s.commit()
             url = t.download_url
+            info_hash = t.info_hash
             a = s.get(Anime, anime_id) if anime_id else None
             # 季度与季号都以 bgm 纠正后的 Anime 为准：种子行的 quarter/季号是入库时快照，重识别后会过时，
             # 沿用会把同一部番的新旧集散到两个季度目录（有下载时 keep_quarter 已锁死 a.quarter 保持稳定）。
@@ -258,7 +259,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
-        ok = await engine.add_to_qb(data, save_path, f"autoRSS {quarter}", quarter)
+        ok = await engine.add_to_qb(data, save_path, f"autoRSS {quarter}", quarter, info_hash=info_hash)
     except asyncio.CancelledError:
         _set_status(torrent_id, "pending")  # 被取消（关停等）→ 复位，别永久卡 downloading
         raise
@@ -307,13 +308,14 @@ def _revive_orphaned_skipped() -> None:
             return
         rows = list(s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id.in_(auto_ids),
-            AnimeTorrent.status.in_(["error", "skipped", "downloaded", "downloading", "deleted"]))))
+            AnimeTorrent.status.in_(["error", "skipped", "downloaded", "downloading", "deleted", "stalled"]))))
         by_ep: dict = {}
         for t in rows:
             by_ep.setdefault((t.anime_id, t.episode), set()).add(t.status)
-        # 目标集：有 error，且无 downloaded/downloading/deleted（首选已败、该集尚无可用或已删的下载）
+        # 目标集：有 error，且无 downloaded/downloading/deleted/stalled（首选已败、该集尚无可用/已删/停滞的下载）。
+        # stalled 也算『已处理』→ 不复活兄弟源：停滞的那条留人工处理，不自动换源（与 flush 阻断口径一致）。
         revive = {k for k, sts in by_ep.items()
-                  if "error" in sts and not ({"downloaded", "downloading", "deleted"} & sts)}
+                  if "error" in sts and not ({"downloaded", "downloading", "deleted", "stalled"} & sts)}
         if not revive:
             return
         changed = 0
@@ -348,11 +350,12 @@ async def flush_ready_downloads() -> int:
         kw_map = {a.id: a.pref_keyword for a in auto if a.pref_keyword}
         if not auto_ids:
             return 0
-        # 只算真正已下的集（deleted 不算已处理）：删了某集后，同集来了新 hash 的种子仍允许自动下——
-        # 用户要的是"删的那条种子不自动回来"（它状态非 pending、本就不会被自动选），而非"整集永久拉黑"。
+        # 『该集已有一份』阻断自动换源的集：downloaded（已下/在下的交付）+ stalled（停滞异常，留着人工处理，
+        # 不自动抓另一个源顶上）。deleted 不算——删的那条不自动回来，但同集来新 hash 仍允许自动下（非整集拉黑）。
         downloaded = {
             (t.anime_id, t.episode)
-            for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.status == "downloaded"))
+            for t in s.exec(select(AnimeTorrent).where(
+                AnimeTorrent.status.in_(["downloaded", "stalled"])))
         }
         groups: dict = {}
         special_groups: dict = {}          # anime_id -> [特别篇(-1)种子]，按番去重只放一份
@@ -1044,8 +1047,8 @@ def unknown_episode_rows() -> list[dict]:
 
 
 def failed_rows() -> list[dict]:
-    """status==error（下载失败过）的种子，供 KPI『失败』点开查看 / 进详情补下重试。"""
-    return _torrent_rows(AnimeTorrent.status == "error")
+    """status∈{error, stalled}（下载失败过 / 长期停滞的异常）的种子，供 KPI『失败』点开查看 / 进详情处理。"""
+    return _torrent_rows(AnimeTorrent.status.in_(["error", "stalled"]))
 
 
 def set_torrent_episode(torrent_id: int, episode: float) -> bool:
@@ -1330,8 +1333,8 @@ async def delete_anime_torrent(torrent_id: int) -> bool:
     """
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in ("downloaded", "downloading"):
-            return False
+        if t is None or t.status not in ("downloaded", "downloading", "stalled"):
+            return False  # stalled(停滞异常) 也允许删：清掉 qB 里卡死的残缺文件
         h = t.info_hash
     if engine.hash_owned_elsewhere(h, MovieTorrent):
         _set_status(torrent_id, "deleted")  # 剧场版侧还持有同一种子 → 只脱手，不删文件
@@ -1352,7 +1355,7 @@ async def delete_anime_files(anime_id: int) -> int:
     with get_session() as s:
         rows = list(s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(["downloaded", "downloading"]),
+            AnimeTorrent.status.in_(["downloaded", "downloading", "stalled"]),  # 含停滞异常，一并清
         )))
         pairs = [(t.id, t.info_hash) for t in rows]
     if not pairs:

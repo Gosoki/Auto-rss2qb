@@ -108,6 +108,7 @@ class AnimeTorrent(SQLModel, table=True):
     qb_dlspeed: int = Field(default=0)          # 下载速度 B/s
     qb_size: int = Field(default=0)             # 种子总大小 B
     qb_synced_at: datetime | None = Field(default=None)  # 最近一次从 qB 同步的时间
+    qb_progress_at: datetime | None = Field(default=None)  # 进度上次推进的时间；长期不推进→标停滞(异常)判定用
 
 
 class Movie(SQLModel, table=True):
@@ -165,3 +166,4 @@ class MovieTorrent(SQLModel, table=True):
     qb_dlspeed: int = Field(default=0)
     qb_size: int = Field(default=0)
     qb_synced_at: datetime | None = Field(default=None)
+    qb_progress_at: datetime | None = Field(default=None)  # 进度上次推进的时间；长期不推进→标停滞(异常)判定用

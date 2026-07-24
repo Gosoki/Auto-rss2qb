@@ -262,14 +262,45 @@ def hash_owned_elsewhere(info_hash: str, other_model) -> bool:
             other_model.status.in_(["downloaded", "downloading"]))).first() is not None
 
 
-async def add_to_qb(data: bytes, save_path: str, category: str, tags: str) -> bool:
-    """尽力建目录（跨用户的 qB 需要，失败不阻断）+ 把种子加入 qB。返回是否成功。"""
+def qb_is_local() -> bool:
+    """qB 是否与本工具同机（QB_URL 指向 loopback）——决定要不要在本地预建保存目录。
+    远程 qB（LAN IP / 域名）在本地建目录既无意义（是另一台机器的文件系统）又会落一堆空目录，故只对 loopback 建。"""
     try:
-        os.makedirs(save_path, exist_ok=True)
-        os.chmod(save_path, 0o777)
-    except OSError:
-        pass
-    return await qb.add_torrent(data, save_path, category, tags)
+        host = (httpx.URL(config.QB_URL).host or "").strip("[]")
+    except Exception:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
+                    info_hash: str = "") -> bool:
+    """把种子加入 qB。返回是否成功。
+
+    qB 同机(loopback)时本地预建目录 + chmod（跨用户 qB 需要）；qB 远程时跳过——真正建目录的是 qB 自己
+    （实测 qB add 会按 savepath 建目录），本地建只会在错的机器上落空目录。
+
+    幂等兜底：qB 对【已存在的 hash】的 add 会返回失败(200 'Fails.')——跨表同 hash / 重复提交 / 重下一个
+    qB 里仍在的种子都会撞上。此时若 info_hash 已在 qB，视作交付成功（物理种子确实在，标 error 反而误伤，
+    并使各下载路径注释所称『重复提交也接受』成立）。仅当 qB 在线且确认 hash 存在才兜底；连不上不误判。"""
+    if qb_is_local():
+        try:
+            os.makedirs(save_path, exist_ok=True)
+            os.chmod(save_path, 0o777)
+        except OSError:
+            pass
+    if await qb.add_torrent(data, save_path, category, tags):
+        return True
+    if info_hash:
+        info = await qb.torrents_info([info_hash])   # None=连不上(真失败)；dict 里有该 hash=已在 qB
+        if info and info_hash.lower() in info:
+            log.info("add 被 qB 拒但该 hash 已在 qB（重复提交/跨表同种）→ 视作已交付 - %s", info_hash[:12])
+            return True
+    return False
 
 
 # ---------------- qB 实时态（对 AnimeTorrent / MovieTorrent 通用） ----------------
@@ -429,15 +460,26 @@ async def sync_qb_status(model_cls) -> int:
                 updated += 1
                 continue
             state = d.get("state", "") or ""
+            prev_progress = t.qb_progress or 0.0
             t.qb_state = state
             t.qb_progress = float(d.get("progress", 0) or 0)
             t.qb_dlspeed = int(d.get("dlspeed", 0) or 0)
             t.qb_size = int(d.get("size", 0) or 0)
             t.qb_synced_at = now
+            if t.qb_progress > prev_progress or t.qb_progress_at is None:
+                t.qb_progress_at = now      # 进度推进(或首见)→ 刷新『上次推进时间』，作停滞判定基准
             if state == "error":
                 t.status = "error"          # qB 侧真错误 → 回传；missingFiles 有意不回传（只镜像显示）
             elif t.status == "downloading" and t.qb_progress >= 1.0:
                 t.status = "downloaded"     # 兼容旧的 downloading 占位（正常已在交付时置 downloaded）
+            elif (config.QB_STALL_TIMEOUT_MIN > 0 and t.qb_progress < 1.0
+                  and t.qb_progress_at is not None
+                  and now - t.qb_progress_at > timedelta(minutes=config.QB_STALL_TIMEOUT_MIN)):
+                # 已交付但进度长期(默认1天)零推进 → 标『停滞(异常)』：脱离 in-flight、【不自动换源】、供人工处理。
+                # 只看进度是否推进：慢但在动的种子 qb_progress_at 持续刷新→不会误杀；真卡死(无源0速)才中招。
+                t.status = "stalled"
+                log.warning("种子停滞标为异常（%d 分钟进度无推进，%.1f%%）- %s",
+                            config.QB_STALL_TIMEOUT_MIN, t.qb_progress * 100, h[:12])
             s.add(t)
             updated += 1
         s.commit()

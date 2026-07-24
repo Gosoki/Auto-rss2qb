@@ -524,6 +524,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
             s.add(t)
             s.commit()
             url = t.download_url
+            info_hash = t.info_hash
             quarter = (m.quarter if m else "") or "unknown"
             folder = (m and (m.jp_name or m.display_name)) or t.raw_title or "movie"
 
@@ -535,7 +536,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
-        ok = await engine.add_to_qb(data, save_path, f"autoRSS-movie {quarter}", quarter)
+        ok = await engine.add_to_qb(data, save_path, f"autoRSS-movie {quarter}", quarter, info_hash=info_hash)
     except asyncio.CancelledError:
         _set_status(mt_id, "pending")
         raise
@@ -569,8 +570,8 @@ async def delete_movie_torrent(mt_id: int) -> bool:
     """
     with get_session() as s:
         t = s.get(MovieTorrent, mt_id)
-        if t is None or t.status not in ("downloaded", "downloading"):
-            return False
+        if t is None or t.status not in ("downloaded", "downloading", "stalled"):
+            return False  # stalled(停滞异常) 也允许删：清掉 qB 里卡死的残缺文件
         h = t.info_hash
     if engine.hash_owned_elsewhere(h, AnimeTorrent):
         _set_status(mt_id, "deleted")  # TV 侧还持有同一种子 → 只脱手，不删文件

@@ -119,11 +119,18 @@ async def run_qb_sync() -> None:
     except Exception as e:
         log.error("qB 同步启动自查异常（忽略，靠保底兜住）: %s", e)
     while True:
+        # 三档节奏：① 高频轮询在下面内层 while（有活跃下载，每 QB_SYNC_INTERVAL 秒）；② 还有没下完的在下种子
+        # 但都不活跃(慢/stalled/暂停) → 每 QB_IDLE_RECHECK_MIN 分钟自查一次，别等一个保底周期才发现完成；
+        # ③ 全无在下 → 睡到保底 QB_SYNC_BACKSTOP_MIN。任一 kick 立即打断醒来。
         try:
-            await asyncio.wait_for(engine.qb_kick.wait(),
-                                   timeout=max(60, config.QB_SYNC_BACKSTOP_MIN * 60))
+            has_unfinished = engine.has_inflight()
+        except Exception:
+            has_unfinished = True      # 拿不准(DB 锁等) → 用中档短超时，宁可多查一次
+        wait_min = config.QB_IDLE_RECHECK_MIN if has_unfinished else config.QB_SYNC_BACKSTOP_MIN
+        try:
+            await asyncio.wait_for(engine.qb_kick.wait(), timeout=max(60, wait_min * 60))
         except asyncio.TimeoutError:
-            pass                       # 保底到点：没人 kick 也醒来自查一遍
+            pass                       # 到点：没人 kick 也醒来自查一遍
         engine.qb_kick.clear()
         idle = 0                            # 连续几轮没在真下（局部计数，本次唤醒周期内累加、下次唤醒清零，无需入库）
         try:

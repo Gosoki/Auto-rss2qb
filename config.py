@@ -45,9 +45,13 @@ _SPEC = {
     "QB_ENABLED": (bool, True),
     "QB_SYNC_STATUS": (bool, True),         # 开=读 qB 实时态(下载中/进度/做种…)；关=发送过去即『已下』、完全不轮询 qB
     "QB_SYNC_INTERVAL": (int, 20),          # 有种子在下时的活跃轮询间隔（秒）——只在下载窗口内轮询
-    "QB_SYNC_BACKSTOP_MIN": (int, 180),     # 保底自查间隔（分钟）：没被事件唤醒也每隔这么久兜底扫一次，默认 3 小时
+    "QB_SYNC_BACKSTOP_MIN": (int, 180),     # 保底自查间隔（分钟）：全无在下时才睡这么久，默认 3 小时
+    "QB_IDLE_RECHECK_MIN": (int, 10),       # 中档自查间隔（分钟）：还有没下完的在下种子但都不活跃(慢/stalled/暂停)时，
+                                            # 每隔这么久自查一次（介于高频轮询与保底长睡之间），别等一个保底周期才发现完成
     "QB_ACTIVE_FLOOR_KBPS": (int, 20),      # 慢速地板（KB/s）：下载慢于此算『没在真下』；0=只要有速度就算
     "QB_SLOW_ROUNDS": (int, 3),             # 连续几轮都没在真下才退出高频轮询、休眠（防单次抖动误判）
+    "QB_STALL_TIMEOUT_MIN": (int, 1440),    # 停滞超时（分钟）：已交付的在下种子若进度连续这么久无推进，标『停滞(异常)』
+                                            # 供人工处理——不自动换源、脱离轮询。默认 1 天；0=关闭该检测
     "QB_CALLBACK_TOKEN": (str, ""),         # qB 完成回调 /api/qb/done 的校验 token（空=不校验；填了 qB 命令里要带 &t=）
     "QB_URL": (str, "http://127.0.0.1:8080"),
     "QB_USERNAME": (str, ""),
