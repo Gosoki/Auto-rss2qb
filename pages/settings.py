@@ -61,17 +61,31 @@ _QUARTER_PRESETS = {
 }
 
 
+def _help(text: str) -> None:
+    """标题旁的帮助 ⓘ：点击弹出说明（替代常驻灰色说明文，让页面更清爽）。"""
+    with ui.button(icon="help_outline").props("flat round dense size=sm color=grey"):
+        with ui.menu():
+            ui.label(text).classes("text-xs text-gray-300 p-3").style(
+                "max-width:26rem;white-space:pre-line;line-height:1.6")
+
+
+def _section(title: str, help: str = "") -> None:
+    """小节标题；有 help 就在标题右侧放帮助 ⓘ（点击弹出），替代常驻说明文。"""
+    with ui.row().classes("items-center gap-1 no-wrap"):
+        ui.label(title).classes("font-bold text-sm")
+        if help:
+            _help(help)
+
+
 def _quarter_setting(f: dict, key: str, title: str, note: str, value: str,
                      empty_hint: str = "留空＝用默认", tpl_label: str = "命名模板") -> None:
-    """模板设置块：标题 + 说明 + 模板输入 + 实时预览 + 预设下拉。控件写入 f[key]。
+    """模板设置块：标题(带帮助 ⓘ) + 模板输入 + 实时预览 + 预设下拉。控件写入 f[key]。
     empty_hint：模板留空时预览处显示什么（文件夹项=不分类；季度显示项=跟随）。
     tpl_label：模板输入框标签（文件夹命名用『命名模板』；季度显示项传『季度模板』）。"""
     ui.separator()
-    ui.label(title).classes("font-bold text-sm")
+    _section(title, note + "\n\n占位：{yy}=26  {yyyy}=2026  {q}=C  {season}=夏  {m}=7")
     inp = ui.input(tpl_label, value=value).props("dense outlined").classes("w-full")
     f[key] = inp
-    ui.label(note + "  占位：{yy}=26 {yyyy}=2026 {q}=C {season}=夏 {m}=7").classes(
-        "text-xs text-gray-500")
     preview = ui.label().classes("text-sm text-blue-400")
 
     def _prev():
@@ -137,14 +151,16 @@ def settings():
         with ui.card().classes("w-full"), ui.expansion(
                 "通用（站点 / qB / 保存 / 网络 / Web / 高级）", icon="tune", value=True).classes(
                 "w-full").props("dense"):
-            ui.label("站点").classes("font-bold text-sm")
+            _section("站点", "显示在顶栏左上角与浏览器标签页标题。保存后刷新页面即变。")
             with ui.element("div").classes("field-grid w-full"):
                 _text("SITE_NAME", "站点名", config.SITE_NAME, "空=autorss")
-            ui.label("显示在顶栏左上角与浏览器标签页标题。保存后刷新页面即变。").classes(
-                "text-xs text-gray-500")
 
             ui.separator()
-            ui.label("下载 / qBittorrent").classes("font-bold text-sm")
+            _section("下载 / qBittorrent",
+                     "开=跟 qB 实时进度：交付即跟、活跃时高频轮询、有未完成但不活跃时按『中档自查』兜、全下完休眠；"
+                     "『慢速地板+判慢轮次』判定是否还在真下。关=发送即当『已下』、完全不查 qB。"
+                     "『停滞超时』：进度连续这么久无推进→标『停滞(异常)』供人工处理（不自动换源）。"
+                     "『完成归档』：完成超这么多天→从 qB 移除【留文件】、标『已归档』、不再跟踪。")
             _switch("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
             _switch("QB_SYNC_STATUS", "读取 qB 实时状态（关=发送过去即『已下』，完全不轮询 qB）",
                     config.QB_SYNC_STATUS)
@@ -156,18 +172,15 @@ def settings():
                 _num("QB_SLOW_ROUNDS", "判慢轮次", config.QB_SLOW_ROUNDS)
                 _num("QB_STALL_TIMEOUT_MIN", "停滞超时（分钟，0=关）", config.QB_STALL_TIMEOUT_MIN)
                 _num("QB_ARCHIVE_AFTER_DAYS", "完成归档（天，0=关）", config.QB_ARCHIVE_AFTER_DAYS)
-            ui.label("开=跟 qB 实时进度：交付即跟、活跃时高频轮询、有未完成但不活跃时按『中档自查』兜、全下完休眠；"
-                     "『慢速地板+判慢轮次』判定是否还在真下。关=发送即当『已下』、完全不查 qB。"
-                     "『停滞超时』：进度连续这么久无推进→标『停滞(异常)』供人工处理（不自动换源）。"
-                     "『完成归档』：完成超这么多天→从 qB 移除【留文件】、标『已归档』、不再跟踪。").classes(
-                "text-xs text-gray-500")
 
             ui.separator()
-            ui.label("完成回调（可选·精确兜底）").classes("font-bold text-sm")
+            _section("完成回调（可选·精确兜底）",
+                     "把下方命令填进 qB → Options → Downloads →『Run external program on torrent finished』："
+                     "下完即回调、精确标『已下』（%I=qB 替换的种子 hash）。\n\n"
+                     "可选兜底：慢速种子在休眠期间下完、又被 qB『完成即删种』删掉，会被误标『失败』；配了它就精确标"
+                     "『已下』。不配也行（少见）。仅 qB 与本程序同机时可用。")
             _text("QB_CALLBACK_TOKEN", "回调 token（可选，防乱调；填了下面命令会自动带 &t=）",
                   config.QB_CALLBACK_TOKEN)
-            ui.label("把下面这行填进 qB → Options → Downloads →『Run external program on torrent finished』："
-                     "下完即回调、精确标『已下』（%I=qB 替换的种子 hash）。").classes("text-xs text-gray-500")
 
             @ui.refreshable
             def _cb_cmd():
@@ -187,21 +200,19 @@ def settings():
 
             _cb_cmd()
             f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 一改，命令即时跟着变
-            ui.label("可选兜底：慢速种子在休眠期间下完、又被 qB『完成即删种』删掉，会被误标『失败』；配了它就精确标"
-                     "『已下』。不配也行（少见）。仅 qB 与本程序同机时可用。").classes("text-xs text-gray-500")
 
             _text("QB_URL", "qB 地址", config.QB_URL)
             _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
             _password("QB_PASSWORD", "qB 密码（留空=不修改）")
 
             ui.separator()
-            ui.label("保存 & 命名").classes("font-bold text-sm")
+            _section("保存 & 命名",
+                     "有工作目录时，动漫/电影目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
+                     "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，动漫/电影须各填【绝对】路径（可不同盘）。"
+                     "两侧都空又无工作目录=无处下载、保存拦下。")
             _text("DOWN_PATH", "工作目录（下载根）", config.DOWN_PATH)
             _text("ANIME_DOWN_PATH", "动漫下载目录", config.ANIME_DOWN_PATH, _sub_ph)
             _text("MOVIE_DOWN_PATH", "电影下载目录", config.MOVIE_DOWN_PATH, _sub_ph)
-            ui.label("有工作目录时，动漫/电影目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
-                     "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，动漫/电影须各填【绝对】路径（可不同盘）。"
-                     "两侧都空又无工作目录=无处下载、保存拦下。").classes("text-xs text-gray-500")
             if config.QB_ENABLED and not engine.qb_is_local():
                 ui.label("⚠️ qB 在远程主机（非 127.0.0.1）：以上路径是【qB 主机上】的绝对路径，不是本机路径。"
                          "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。").classes(
@@ -217,32 +228,34 @@ def settings():
             _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL)
 
             ui.separator()
-            ui.label("Web 访问").classes("font-bold text-sm")
+            _section("Web 访问",
+                     "绑定地址：127.0.0.1=仅本机；0.0.0.0=整个局域网可访问。改绑定地址/端口写 .env、需重启；"
+                     "非法地址保存时会被拦下，留空=回落 127.0.0.1。")
             with ui.element("div").classes("field-grid w-full"):
                 _text("WEB_HOST", "绑定地址", config.WEB_HOST)
                 _num("WEB_PORT", "Web 端口", config.WEB_PORT)
                 _text("WEB_ALLOW_CIDRS", "允许网段(CIDR)", config.WEB_ALLOW_CIDRS)
-            ui.label("绑定地址：127.0.0.1=仅本机；0.0.0.0=整个局域网可访问。改绑定地址/端口写 .env、需重启；"
-                     "非法地址保存时会被拦下，留空=回落 127.0.0.1。").classes("text-xs text-gray-500")
             ui.label("⚠ 本工具无鉴权、本页含 qB 密码。绑 0.0.0.0 时用『允许网段』把访问限定在可信内网（如 "
                      "192.168.1.0/24，多个用逗号），即时生效、留空=不限制。本机恒放行；若新网段会把你当前访问挡在门外，"
                      "保存时会被拦下。经反向代理时对端是代理 IP，此项应留空、鉴权交给代理。").classes(
                 "text-xs text-amber-400")
 
             ui.separator()
-            ui.label("高级（超时 / 站点地址 · 一般不用动）").classes("font-bold text-sm")
+            _section("高级（超时 / 站点地址 · 一般不用动）",
+                     "一般不用改。超时：网络慢可调大。站点地址：换镜像时才改，改错会导致识别/抓取全挂，结尾别带 /。")
             with ui.element("div").classes("field-grid w-full"):
                 _num("ENRICH_TIMEOUT", "Bangumi 请求超时（秒）", config.ENRICH_TIMEOUT)
                 _num("NOTIFY_TIMEOUT", "通知推送超时（秒）", config.NOTIFY_TIMEOUT)
             _text("MIKAN_BASE", "Mikan 站点根地址", config.MIKAN_BASE)
             _text("BGM_API", "Bangumi API 根地址", config.BGM_API)
-            ui.label("一般不用改。超时：网络慢可调大。站点地址：换镜像时才改，改错会导致识别/抓取全挂，"
-                     "结尾别带 /。").classes("text-xs text-gray-500")
 
         # ========== 折叠 ② 番剧 ==========
         with ui.card().classes("w-full"), ui.expansion(
                 "番剧", icon="movie").classes("w-full").props("dense"):
-            ui.label("采集").classes("font-bold text-sm")
+            _section("采集",
+                     "多括号命名回退：默认关，认不出番名的种子直接进『待识别』；开=尝试从括号块猜名（可能猜错，"
+                     "拿不准自动跳过；大组不受影响），可在『解析测试』页验证。\n\n"
+                     "Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在『源管理』页配置。")
             _switch("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
                     config.ANIME_POLL_ENABLED)
             with ui.element("div").classes("field-grid w-full"):
@@ -254,13 +267,13 @@ def settings():
             _switch("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
-            ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
-                     "大组不受影响），可在『解析测试』页验证。").classes("text-xs text-gray-500")
-            ui.label("Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在"
-                     "『源管理』页配置。").classes("text-xs text-gray-500")
 
             ui.separator()
-            ui.label("开始使用日 · 老番过滤").classes("font-bold text-sm")
+            _section("开始使用日 · 老番过滤",
+                     "排除开播早于此日的老番、不自动下（种子照常入库，『已忽略』页可看/恢复）。"
+                     "新入库的自动源老番建库时即自动判超期忽略；对【已有】的番不自动动，需点右侧『应用』——"
+                     "它会先存下这个日期、再按它重算【含当前正在追(已确认)的老番也会被判超期忽略】。\n\n"
+                     "反悔：把开始日清空（或调很早）再点『应用』，就把超期忽略的番全放回待确认。")
 
             async def _apply_filter():   # 应用：先存下输入框里的开始日（免得还得先去点下面『保存』），再按它重算
                 sd = (f["ANIME_START_DATE"].value or "").strip()
@@ -282,53 +295,47 @@ def settings():
                 f["ANIME_START_DATE"].classes(remove="w-full", add="w-56")   # 收窄到定宽，给右侧按钮腾位
                 ui.button("应用开始使用日过滤", icon="filter_alt", on_click=_apply_filter).props(
                     "color=primary unelevated no-caps").classes("text-xs")   # 不加 size=sm/dense → 随行拉伸到与输入框等高
-            ui.label("排除开播早于此日的老番、不自动下（种子照常入库，『已忽略』页可看/恢复）。"
-                     "新入库的自动源老番建库时即自动判超期忽略；对【已有】的番不自动动，需点右侧『应用』——"
-                     "它会先存下这个日期、再按它重算【含当前正在追(已确认)的老番也会被判超期忽略】。"
-                     "反悔：把开始日清空（或调很早）再点『应用』，就把超期忽略的番全放回待确认。").classes(
-                "text-xs text-gray-500")
 
             ui.separator()
-            ui.label("Bangumi 重试（识别不到时）").classes("font-bold text-sm")
+            _section("Bangumi 重试（识别不到时）",
+                     "认不到 bgm 的番进『待识别』：先即时重试挡抖动，再指数退避后台重试（每失败翻倍、封顶 24h），"
+                     "满次数就停、留手动（详情页『重新识别』清零重来）。查到 bgm 自动升『待确认』。")
             with ui.element("div").classes("field-grid w-full"):
                 _num("ENRICH_RETRY_TIMES", "即时重试次数（bgm 请求超时/连接错时）", config.ENRICH_RETRY_TIMES)
                 _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
                 _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
                 _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
-            ui.label("认不到 bgm 的番进『待识别』：先即时重试挡抖动，再指数退避后台重试（每失败翻倍、封顶 24h），"
-                     "满次数就停、留手动（详情页『重新识别』清零重来）。查到 bgm 自动升『待确认』。").classes(
-                "text-xs text-gray-500")
 
             ui.separator()
-            ui.label("归档").classes("font-bold text-sm")
+            _section("归档",
+                     "『Season N』子目录开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
+                     "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4")
             _switch("ANIME_SEASON_SUBFOLDER",
                     "番名目录下再建『Season N』二级子目录（关=番剧文件直接放番名目录）",
                     config.ANIME_SEASON_SUBFOLDER)
-            ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
-                     "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT", "下载文件夹命名（默认按季度）",
                              "番剧按季度建下载文件夹时，季度目录名怎么写；留空＝不建季度目录、直接放番名。",
                              config.QUARTER_FMT, empty_hint="留空＝不建季度目录，直接 …/番剧/番名/")
 
             ui.separator()
-            ui.label("番剧表显示").classes("font-bold text-sm")
+            _section("番剧表显示",
+                     "番剧表默认只显示订阅中，上两项决定要不要带上『待确认/已忽略』。默认标签页=进番剧页先落哪个标签"
+                     "（地址带 ?t= 时以其为准）。分页：1 年=4 个季度。")
             _switch("ANIME_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.ANIME_SHOW_PENDING)
             _switch("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
             with ui.element("div").classes("field-grid w-full"):
                 _select("ANIME_DEFAULT_TAB", "默认标签页", _ANIME_TABS, config.ANIME_DEFAULT_TAB)
                 _num("ANIME_PAGE_YEARS", "分页 · 每页年数", config.ANIME_PAGE_YEARS, 1, 5)
-            ui.label("番剧表默认只显示订阅中，上两项决定要不要带上『待确认/已忽略』。默认标签页=进番剧页先落哪个标签"
-                     "（地址带 ?t= 时以其为准）。分页：1 年=4 个季度。").classes("text-xs text-gray-500")
 
         # ========== 折叠 ③ 剧场版 ==========
         with ui.card().classes("w-full"), ui.expansion(
                 "剧场版", icon="theaters").classes("w-full").props("dense"):
-            ui.label("列表显示").classes("font-bold text-sm")
+            _section("列表显示",
+                     "默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
+                     "自动扫描开关/间隔在『剧场版页 → 订阅源』里。")
             with ui.element("div").classes("field-grid w-full"):
                 _select("MOVIE_DEFAULT_TAB", "默认标签页", _MOVIE_TABS, config.MOVIE_DEFAULT_TAB)
                 _num("MOVIE_PAGE_YEARS", "分页 · 每页年数", config.MOVIE_PAGE_YEARS, 1, 5)
-            ui.label("默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
-                     "自动扫描开关/间隔在『剧场版页 → 订阅源』里。").classes("text-xs text-gray-500")
             _quarter_setting(f, "MOVIE_QUARTER_FMT", "下载文件夹命名（默认按年份）",
                              "电影按此建下载文件夹（默认年份，如 2026；同年归一个文件夹）；留空＝不分类、直接放片名。",
                              config.MOVIE_QUARTER_FMT, empty_hint="留空＝不建年份目录，直接 …/片名/")
