@@ -102,6 +102,24 @@ def apply_start_date_filter() -> int:
     return changed
 
 
+def ignore_confirmed_before_start() -> int:
+    """一次性：把『开始使用日之前开播、当前已确认(追番中)』的番也转为超期忽略(rejected=True, confirmed=False)。
+    供设置里手动触发——自动确认与人工确认都是 confirmed=True、无法区分，故这步须用户显式执行；执行后想留哪部再单独恢复。
+    未设开始使用日则不动。返回处理数。"""
+    if not _parse_date(config.ANIME_START_DATE):
+        return 0
+    changed = 0
+    with get_session() as s:
+        for a in s.exec(select(Anime).where(Anime.confirmed == True, Anime.rejected.is_not(True))):  # noqa: E712
+            if _aired_before_start(a.air_date):
+                a.confirmed, a.rejected = False, True
+                s.add(a); changed += 1
+        if changed:
+            s.commit()
+            log.info("一次性：把 %d 部开始日前的已确认老番转为超期忽略", changed)
+    return changed
+
+
 def _kw_match(kw: str, raw: str) -> bool:
     """版本关键词是否命中种子原名？大小写不敏感子串（繁日/简日/1080p 等）。调用方保证 kw 非空。"""
     return kw.lower() in (raw or "").lower()
@@ -159,7 +177,9 @@ async def _resolve_anime(item) -> int:
                 title=item.anime_title, season=item.season, quarter=item.quarter,
                 confirmed=auto,
             )
-            _apply_bgm(anime, info)
+            _apply_bgm(anime, info)   # 落 air_date 等 bgm 字段（下面判超期要用）
+            if anime.confirmed and _aired_before_start(anime.air_date):
+                anime.confirmed, anime.rejected = False, True   # 自动确认但早于开始使用日 → 超期忽略，不自动下
             s.add(anime)
             s.commit()          # Anime 无唯一约束，(title,季) 的去重由 AnimeAlias 负责，此处不会撞约束
             s.refresh(anime)
@@ -384,7 +404,6 @@ async def flush_ready_downloads() -> int:
     config.ANIME_DOWNLOAD_GRACE_MIN 分钟才放行，到点从该集所有种子挑优先级最高的下一份（错误的排后，
     留作降级）。特别篇/未知集不做集去重，逐个下。返回实际触发下载的数量。
     """
-    apply_start_date_filter()    # 先按『开始使用日』重算超期忽略（含晚到 bgm 后补判/日期变更），超期番不进下面的自动下
     _revive_orphaned_skipped()   # 先把『首选源已失败、该集无其它下载』的 skipped 兄弟放回 pending，本轮即可换源
     grace = timedelta(minutes=max(0, config.ANIME_DOWNLOAD_GRACE_MIN))  # 负值会使门槛永假、废掉多源补齐，钳到 0
     now = datetime.now()

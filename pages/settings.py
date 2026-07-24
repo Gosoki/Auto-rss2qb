@@ -241,7 +241,23 @@ def settings():
             _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
                     config.ANIME_TOP_PRIORITY_INSTANT)
             _text("ANIME_START_DATE", "开始使用日（YYYY-MM-DD，空=不限）", config.ANIME_START_DATE,
-                  "如 2026-07-01：早于这天开播的番自动判『超期忽略』、不自动下（种子照常入库，可在拒绝页看/恢复）")
+                  "如 2026-07-01。改了要先点『保存』；改开始日【不】自动动你已有的番，需点下面『应用』才生效（更可控）。"
+                  "只有新入库的自动源老番会在建库时自动判超期忽略、不下（种子照常入库，拒绝页可看/恢复）。"
+                  "反悔：把开始日清空（或调很早）再点『应用』，就会把超期忽略的番全放回待确认。")
+
+            async def _apply_filter():   # 应用：开播早于开始日的番（含正在追的）全判超期忽略；开始日空/改早则相反释放
+                # 不拦空开始日：空=没有番算超期→apply_start_date_filter 会把所有超期忽略放回待确认（=释放/反悔）
+                if not await confirm("应用开始使用日过滤？",
+                                     "把『开播早于开始使用日』的番都判为超期忽略、停止自动下载——【包括当前正在追(已确认)的老番】。"
+                                     "若把开始日改早/清空后再点，则相反：把进入范围的超期忽略放回待确认。想单独保留哪部，之后去『拒绝页』恢复。",
+                                     ok_label="应用", ok_icon="filter_alt", ok_color="primary"):
+                    return
+                n = anime.apply_start_date_filter() + anime.ignore_confirmed_before_start()  # 待确认↔超期 + 追番中→超期
+                ui.notify(f"已应用：{n} 部番状态变更" if n else "没有需要变更的番",
+                          type="positive" if n else "info")
+
+            ui.button("应用开始使用日过滤", icon="filter_alt", on_click=_apply_filter).props(
+                "dense size=sm color=primary unelevated").classes("text-xs self-start")
             _switch("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
@@ -358,8 +374,7 @@ def settings():
                 sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
                 qb_was_on = config.QB_ENABLED
                 config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
-                if "ANIME_START_DATE" in db_updates:
-                    anime.apply_start_date_filter()   # 开始使用日变了 → 立即重算超期忽略（可逆，只动待确认/超期番）
+                # 注：改开始使用日【不】自动重算已有番——由用户在设置里点『应用』按钮显式触发（更可控）
                 # qB 发送开着 → 保存后测一次连接：连不上就自动关掉开关（免得停在『开着却下不了』的迷惑态）
                 if config.QB_ENABLED:
                     client = await engine.qb._login()
