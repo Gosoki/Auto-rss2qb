@@ -239,6 +239,43 @@ def reset_downloading(model_cls) -> None:
         s.commit()
 
 
+async def archive_old_completed() -> int:
+    """完成归档：把『下载完成已超过 QB_ARCHIVE_AFTER_DAYS 天』的种子从 qB 移除【只删种子、留文件】，
+    盖 archived_at、清 qb_state（不再跟踪）。status 保持 downloaded 不变——归档的仍是已下的一集，去重/统计
+    /不重下等一切沿用 downloaded 语义，只是从 qB 列表清出、UI 显示『已归档』。
+
+    完成时间以 qb_synced_at 为准：种子完成即脱离轮询、该时间冻结在完成点。跨表同 hash 安全：只删种子不删文件，
+    另一侧下轮各自归档（qb.delete 对已不在的 hash 幂等）。qB 连不上/删失败则本轮跳过、下轮再来。返回归档数。"""
+    days = config.QB_ARCHIVE_AFTER_DAYS
+    if days <= 0 or not config.QB_ENABLED:
+        return 0
+    cutoff = datetime.now() - timedelta(days=days)
+    n = 0
+    for model_cls in (AnimeTorrent, MovieTorrent):
+        with get_session() as s:
+            rows = [(t.id, t.info_hash) for t in s.exec(select(model_cls).where(
+                model_cls.status == "downloaded",
+                model_cls.qb_progress >= 1.0,
+                model_cls.archived_at.is_(None),
+                model_cls.qb_synced_at.is_not(None),
+                model_cls.qb_synced_at < cutoff,
+            )) if t.info_hash]
+        for tid, h in rows:
+            if not await qb.delete([h], delete_files=False):  # 只删种子、保留硬盘文件
+                continue
+            now = datetime.now()
+            with get_session() as s:
+                t = s.get(model_cls, tid)
+                if t is not None and t.status == "downloaded" and t.archived_at is None:
+                    t.archived_at, t.qb_state = now, ""    # 标已归档 + 清实时态（脱离 qB 跟踪与做种统计）
+                    s.add(t)
+                    s.commit()
+                    n += 1
+    if n:
+        log.info("完成归档：%d 个完成超 %d 天的种子已从 qB 移除(留文件)、标已归档", n, days)
+    return n
+
+
 def pick_best(torrents, pref=None):
     """从候选种子里挑一份：钉了首选源就优先它（没有才退回全部），再按（优先级降序, 入库时间升序）取第一。
 

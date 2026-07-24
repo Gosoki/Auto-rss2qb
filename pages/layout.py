@@ -253,6 +253,8 @@ def human_size(n) -> str:
 
 def qb_live_text(t) -> str:
     """种子的 qB 实时态一行文案，如『下载中 45% ↓2.1MB/s』/『做种 100%』；无实时态返回 ''。"""
+    if getattr(t, "archived_at", None):
+        return "已归档"          # 完成后已从 qB 移除(留文件)、不再跟踪
     if not getattr(t, "qb_state", ""):
         return ""
     parts = [qb_state_cn(t.qb_state)]

@@ -132,6 +132,10 @@ async def run_qb_sync() -> None:
         except asyncio.TimeoutError:
             pass                       # 到点：没人 kick 也醒来自查一遍
         engine.qb_kick.clear()
+        try:
+            await engine.archive_old_completed()   # 顺手做完成归档（完成超 N 天→从 qB 移除留文件、标已归档；关则空转）
+        except Exception as e:
+            log.error("完成归档异常（忽略，下轮再来）: %s", e)
         idle = 0                            # 连续几轮没在真下（局部计数，本次唤醒周期内累加、下次唤醒清零，无需入库）
         try:
             while config.QB_ENABLED and config.QB_SYNC_STATUS and engine.has_inflight():

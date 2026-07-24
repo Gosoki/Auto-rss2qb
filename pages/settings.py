@@ -14,6 +14,7 @@ from .layout import confirm, frame
 
 _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
+            "QB_IDLE_RECHECK_MIN", "QB_STALL_TIMEOUT_MIN", "QB_ARCHIVE_AFTER_DAYS",
             "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
             "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES",
             "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT"}
@@ -138,11 +139,16 @@ def settings():
                     config.QB_SYNC_STATUS)
             with ui.element("div").classes("field-grid w-full"):
                 _num("QB_SYNC_INTERVAL", "活跃轮询间隔（秒）", config.QB_SYNC_INTERVAL)
+                _num("QB_IDLE_RECHECK_MIN", "中档自查间隔（分钟）", config.QB_IDLE_RECHECK_MIN)
                 _num("QB_SYNC_BACKSTOP_MIN", "保底自查间隔（分钟）", config.QB_SYNC_BACKSTOP_MIN)
                 _num("QB_ACTIVE_FLOOR_KBPS", "慢速地板（KB/s）", config.QB_ACTIVE_FLOOR_KBPS)
                 _num("QB_SLOW_ROUNDS", "判慢轮次", config.QB_SLOW_ROUNDS)
-            ui.label("开=跟 qB 实时进度：交付即跟、全下完休眠；『慢速地板+判慢轮次』判定种子是否还在真下、"
-                     "决定何时休眠，长期不动的靠保底间隔兜底。关=发送即当『已下』、完全不查 qB（看不到进度）。").classes(
+                _num("QB_STALL_TIMEOUT_MIN", "停滞超时（分钟，0=关）", config.QB_STALL_TIMEOUT_MIN)
+                _num("QB_ARCHIVE_AFTER_DAYS", "完成归档（天，0=关）", config.QB_ARCHIVE_AFTER_DAYS)
+            ui.label("开=跟 qB 实时进度：交付即跟、活跃时高频轮询、有未完成但不活跃时按『中档自查』兜、全下完休眠；"
+                     "『慢速地板+判慢轮次』判定是否还在真下。关=发送即当『已下』、完全不查 qB。"
+                     "『停滞超时』：进度连续这么久无推进→标『停滞(异常)』供人工处理（不自动换源）。"
+                     "『完成归档』：完成超这么多天→从 qB 移除【留文件】、标『已归档』、不再跟踪。").classes(
                 "text-xs text-gray-500")
 
             ui.separator()
