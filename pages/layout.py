@@ -350,10 +350,14 @@ def frame(active: str = ""):
     #   q-tab/指示器默认过渡会在加载时淡色/滑动（怪动效）→ 关掉（切 tab 时指示器改为瞬移，更跟手）。
     ui.add_head_html(
         "<style>"
-        "html{background:#121212}"
-        ".q-header{transition:none!important}"
-        ".q-tab,.q-tab__indicator,.q-tabs__content{transition:none!important}"
-        "</style>")
+        "html,body{background:#121212}"                                  # html+body 都上暗底，重载瞬间不白闪
+        ".q-header{transition:none!important}"                            # 顶栏底色不白→灰淡入
+        ".q-tab,.q-tab__indicator,.q-tabs__content{transition:none!important}"  # 标签/指示器不做加载动效
+        "html.preload *{transition:none!important}"                      # 加载期禁掉一切过渡，防浅灰→白之类的淡入卡顿
+        "</style>"
+        "<script>document.documentElement.classList.add('preload');"
+        "addEventListener('load',function(){setTimeout(function(){"
+        "document.documentElement.classList.remove('preload')},600)});</script>")
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
     ui.add_head_html(
         "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
