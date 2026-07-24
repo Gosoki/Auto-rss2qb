@@ -515,12 +515,15 @@ async def download_movie_torrent(mt_id: int) -> bool:
     async with _dl_lock:
         with get_session() as s:
             t = s.get(MovieTorrent, mt_id)
-            if t is None or t.status in ("downloading", "downloaded"):
-                return False  # 已在下/已下 → 幂等短路，防并发（详情页多次点同一版本）重复交 qB
+            if t is None or (t.status in ("downloading", "downloaded") and t.archived_at is None):
+                return False  # 已在下/已下 → 幂等短路，防并发重复交 qB；例外：已归档的可重新下（重新交回 qB）
             # 跨表【不】去重：剧场版/番剧各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer。
             m = s.get(Movie, t.movie_id)
             t.status = "downloading"
+            # 重新下：清归档标记 + 重置 qB 实时态，作『全新在下』重新跟踪、从新完成点重算归档倒计时（否则会被立刻再归档）
+            t.archived_at = None
+            t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 0.0, "", None, None
             s.add(t)
             s.commit()
             url = t.download_url

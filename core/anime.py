@@ -209,8 +209,8 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             t = s.get(AnimeTorrent, torrent_id)
             if t is None:
                 return False
-            if t.status in ("downloading", "downloaded"):
-                return False  # 已在下/已下：幂等短路（force 也不例外），防重复交 qB / 把已下回写污染成 error
+            if t.status in ("downloading", "downloaded") and not (force and t.archived_at is not None):
+                return False  # 已在下/已下：幂等短路（force 也不例外）。例外：已归档的可 force 重新下（重新交回 qB）
             if not force and t.status not in ("pending", "error"):
                 return False  # 非 force：只放行 pending/error；skipped/deleted 需 force 才强制下
             anime_id = t.anime_id
@@ -237,6 +237,10 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
                     log.info("跳过重复集 - %s 第%s季 第%s集（已有一份在下/已下）", title, season, episode)
                     return False
             t.status = "downloading"  # 原子占位（锁内，别的协程看得到）
+            # 重新下：清归档标记 + 重置 qB 实时态，让它作为『全新在下』被重新跟踪、从新完成点重算归档倒计时——
+            # 否则重下已归档的种子会带着旧 qb_progress=1/旧完成时间，被下一轮完成归档立刻再归档掉。
+            t.archived_at = None
+            t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 0.0, "", None, None
             s.add(t)
             s.commit()
             url = t.download_url
