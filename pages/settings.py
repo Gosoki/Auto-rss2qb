@@ -18,7 +18,7 @@ _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_S
             "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
             "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES",
             "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT"}
-_PASSWORD = {"QB_PASSWORD"}
+_PASSWORD = {"QB_PASSWORD", "PROXY_PASS"}
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}  # 绑监听地址/端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
 
@@ -174,36 +174,40 @@ def settings():
                 _num("QB_ARCHIVE_AFTER_DAYS", "完成归档（天，0=关）", config.QB_ARCHIVE_AFTER_DAYS)
 
             ui.separator()
-            _section("完成回调（可选·精确兜底）",
-                     "把下方命令填进 qB → Options → Downloads →『Run external program on torrent finished』："
-                     "下完即回调、精确标『已下』（%I=qB 替换的种子 hash）。\n\n"
-                     "可选兜底：慢速种子在休眠期间下完、又被 qB『完成即删种』删掉，会被误标『失败』；配了它就精确标"
-                     "『已下』。不配也行（少见）。仅 qB 与本程序同机时可用。")
-            _text("QB_CALLBACK_TOKEN", "回调 token（可选，防乱调；填了下面命令会自动带 &t=）",
-                  config.QB_CALLBACK_TOKEN)
+            with ui.element("div").classes(   # qB 连接 与 完成回调 左右并排两列，窄屏自动堆叠
+                    "grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 w-full items-start"):
+                with ui.column().classes("gap-2 min-w-0"):   # 左列：完成回调（可选兜底）
+                    _section("完成回调（可选·精确兜底）",
+                             "可选兜底：慢速种子在休眠期间下完、又被 qB『完成即删种』删掉，会被误标『失败』；"
+                             "配了它就精确标『已下』。不配也行（少见）。仅 qB 与本程序同机时可用。")
+                    _text("QB_CALLBACK_TOKEN", "回调 token（可选，防乱调；填了命令会自动带 &t=）",
+                          config.QB_CALLBACK_TOKEN)
 
-            @ui.refreshable
-            def _cb_cmd():
-                tok = (f["QB_CALLBACK_TOKEN"].value or "").strip()   # 读输入框实时值，不是已保存值
-                cmd = (f'curl -s -X POST "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
-                       + (f'&t={tok}' if tok else '') + '"')
+                    @ui.refreshable
+                    def _cb_cmd():
+                        tok = (f["QB_CALLBACK_TOKEN"].value or "").strip()   # 读输入框实时值，不是已保存值
+                        cmd = (f'curl -s -X POST "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
+                               + (f'&t={tok}' if tok else '') + '"')
 
-                async def _copy(c=cmd):
-                    await ui.clipboard.write(c)
-                    ui.notify("已复制命令到剪贴板", type="positive")
+                        async def _copy(c=cmd):
+                            await ui.clipboard.write(c)
+                            ui.notify("已复制命令到剪贴板", type="positive")
 
-                with ui.row().classes("items-center gap-2 w-full no-wrap"):
-                    ui.input(value=cmd).props("dense outlined readonly").classes(
-                        "grow font-mono").style("font-size:12px")
-                    ui.button(icon="content_copy", on_click=_copy).props(
-                        "flat round dense color=primary").tooltip("复制命令")
+                        with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                            ui.input(value=cmd).props("dense outlined readonly").classes(
+                                "grow font-mono min-w-0").style("font-size:12px")
+                            ui.button(icon="content_copy", on_click=_copy).props(
+                                "flat round dense color=primary").tooltip("复制命令")
 
-            _cb_cmd()
-            f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 一改，命令即时跟着变
-
-            _text("QB_URL", "qB 地址", config.QB_URL)
-            _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
-            _password("QB_PASSWORD", "qB 密码（留空=不修改）")
+                    _cb_cmd()
+                    f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 改则命令跟着变
+                    ui.label("↑ 复制这行填进 qB → Options → Downloads →『Run external program on torrent "
+                             "finished』（%I=种子 hash）").classes("text-xs text-gray-500")
+                with ui.column().classes("gap-2 min-w-0"):   # 右列：qB 连接
+                    _section("qB 连接")
+                    _text("QB_URL", "qB 地址", config.QB_URL)
+                    _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
+                    _password("QB_PASSWORD", "qB 密码（留空=不修改）")
 
             ui.separator()
             _section("保存 & 命名",
@@ -222,9 +226,15 @@ def settings():
                              config.QUARTER_FMT_UI, empty_hint="留空＝跟随番剧下载文件夹命名", tpl_label="季度模板")
 
             ui.separator()
-            ui.label("网络 / 通知").classes("font-bold text-sm")
+            _section("网络 / 通知",
+                     "代理支持 http:// / https://；socks5:// 需另装 socksio 包（未装时填 socks5:// 会在请求时出错）。"
+                     "代理账号/密码仅『需认证的代理』才填，留空=不认证。通知 URL：留空=关闭推送。")
             _switch("OPEN_PROXY", "启用代理", config.OPEN_PROXY)
-            _text("PROXY_URL", "代理地址", config.PROXY_URL)
+            with ui.element("div").classes("field-grid w-full"):
+                _text("PROXY_URL", "代理地址", config.PROXY_URL, "http://… 或 https://…（socks5 需装 socksio）")
+                f["PROXY_URL"].classes(add="col-span-2")   # 代理地址占 1/2（4 列栅格里跨 2 格）
+                _text("PROXY_USER", "代理账号", config.PROXY_USER, "留空=不认证")
+                _password("PROXY_PASS", "代理密码（留空=不改）")
             _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL)
 
             ui.separator()

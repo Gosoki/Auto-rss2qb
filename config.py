@@ -80,7 +80,9 @@ _SPEC = {
     "ANIME_START_DATE": (str, ""),          # 开始使用日 YYYY-MM-DD：早于这天开播的番自动判『超期忽略』、不自动下载
                                             # （种子照常入库）；空=不限。改日期可逆，只动待确认/超期番，不碰人工确认/拒绝
     "OPEN_PROXY": (bool, False),
-    "PROXY_URL": (str, ""),
+    "PROXY_URL": (str, ""),                  # 代理地址：支持 http:// / https://；socks5:// 需另装 socksio 包
+    "PROXY_USER": (str, ""),                 # 代理账号（需认证的代理才填；空=不认证）
+    "PROXY_PASS": (str, ""),                 # 代理密码（同上）
     "WEB_ALLOW_CIDRS": (str, ""),   # Web 访问网段白名单(CIDR,逗号分隔;空=不限)——绑 0.0.0.0 时限定可信内网,本机恒放行,即时生效
     "NOTIFY_URL": (str, ""),
     "NOTIFY_TIMEOUT": (int, 10),
@@ -144,11 +146,17 @@ def __getattr__(name):
 
 
 def http_client_kwargs(timeout: int = 30) -> dict:
-    """httpx.AsyncClient 的公共 kwargs：超时 + 跟随重定向 +（启用时）代理。各处抓取统一走它。"""
+    """httpx.AsyncClient 的公共 kwargs：超时 + 跟随重定向 +（启用时）代理。各处抓取统一走它。
+    代理账号/密码任一非空时走带认证的 httpx.Proxy；socks5:// 需自行装 socksio，否则请求时报错。"""
     kwargs = {"timeout": timeout, "follow_redirects": True}
     proxy = __getattr__("PROXY")
     if proxy:
-        kwargs["proxy"] = proxy
+        user, pw = _v["PROXY_USER"], _v["PROXY_PASS"]
+        if user or pw:
+            import httpx
+            kwargs["proxy"] = httpx.Proxy(url=proxy, auth=(user, pw))
+        else:
+            kwargs["proxy"] = proxy
     return kwargs
 
 
