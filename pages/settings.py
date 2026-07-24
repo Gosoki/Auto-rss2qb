@@ -176,7 +176,12 @@ def settings():
             ui.separator()
             with ui.element("div").classes(   # qB 连接 与 完成回调 左右并排两列，窄屏自动堆叠
                     "grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 w-full items-start"):
-                with ui.column().classes("gap-2 min-w-0"):   # 左列：完成回调（可选兜底）
+                with ui.column().classes("gap-2 min-w-0"):   # 左列：qB 连接
+                    _section("qB 连接")
+                    _text("QB_URL", "qB 地址", config.QB_URL)
+                    _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
+                    _password("QB_PASSWORD", "qB 密码（留空=不修改）")
+                with ui.column().classes("gap-2 min-w-0"):   # 右列：完成回调（可选兜底）
                     _section("完成回调（可选·精确兜底）",
                              "可选兜底：慢速种子在休眠期间下完、又被 qB『完成即删种』删掉，会被误标『失败』；"
                              "配了它就精确标『已下』。不配也行（少见）。仅 qB 与本程序同机时可用。")
@@ -203,11 +208,6 @@ def settings():
                     f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 改则命令跟着变
                     ui.label("↑ 复制这行填进 qB → Options → Downloads →『Run external program on torrent "
                              "finished』（%I=种子 hash）").classes("text-xs text-gray-500")
-                with ui.column().classes("gap-2 min-w-0"):   # 右列：qB 连接
-                    _section("qB 连接")
-                    _text("QB_URL", "qB 地址", config.QB_URL)
-                    _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
-                    _password("QB_PASSWORD", "qB 密码（留空=不修改）")
 
             ui.separator()
             _section("保存 & 命名",
@@ -263,8 +263,6 @@ def settings():
         with ui.card().classes("w-full"), ui.expansion(
                 "番剧", icon="movie").classes("w-full").props("dense"):
             _section("采集",
-                     "多括号命名回退：默认关，认不出番名的种子直接进『待识别』；开=尝试从括号块猜名（可能猜错，"
-                     "拿不准自动跳过；大组不受影响），可在『解析测试』页验证。\n\n"
                      "Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在『源管理』页配置。")
             _switch("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
                     config.ANIME_POLL_ENABLED)
@@ -277,6 +275,8 @@ def settings():
             _switch("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
+            ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
+                     "大组不受影响），可在『解析测试』页验证。").classes("text-xs text-gray-500")
 
             ui.separator()
             _section("开始使用日 · 老番过滤",
@@ -317,12 +317,12 @@ def settings():
                 _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
 
             ui.separator()
-            _section("归档",
-                     "『Season N』子目录开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
-                     "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4")
+            _section("归档")
             _switch("ANIME_SEASON_SUBFOLDER",
                     "番名目录下再建『Season N』二级子目录（关=番剧文件直接放番名目录）",
                     config.ANIME_SEASON_SUBFOLDER)
+            ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
+                     "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
             _quarter_setting(f, "QUARTER_FMT", "下载文件夹命名（默认按季度）",
                              "番剧按季度建下载文件夹时，季度目录名怎么写；留空＝不建季度目录、直接放番名。",
                              config.QUARTER_FMT, empty_hint="留空＝不建季度目录，直接 …/番剧/番名/")
