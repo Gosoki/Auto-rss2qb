@@ -64,7 +64,7 @@ def anime_page(t: str = ""):
             ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 for name, site, policy, priority, enabled in ov["groups"]:
-                    pol = "全下" if policy == "auto" else "待确认"
+                    pol = "自动下载" if policy == "auto" else "人工审核"
                     tail = "" if enabled else " · 停用"
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
                         f"color={'blue-grey' if enabled else 'grey'}").classes("text-sm")
