@@ -39,7 +39,7 @@ def anime_page(t: str = ""):
 
         # ---- 刷新（页面局部，闭包内共享）----
         @ui.refreshable
-        def overview_panel():
+        def overview_head():   # KPI + 订阅源组（计数，随定时器刷新，无交互态可丢）
             ov = anime.overview()
             k = ov["kpi"]
             ps = ov["pending_split"]
@@ -69,6 +69,31 @@ def anime_page(t: str = ""):
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
                         f"color={'blue-grey' if enabled else 'grey'}").classes("text-sm")
 
+        # 环图图例选择的持久化：用户点图例排除某字幕组后存下选择态，重建时塞回 legend.selected，
+        # 任何刷新路径（定时器/用户操作/重识别）重建环图都不会把排除的源刷回来。
+        _legend_sel: dict = {}
+
+        def _remember_legend(e):
+            a = e.args[0] if isinstance(e.args, list) and e.args else e.args
+            if not isinstance(a, dict):
+                return
+            if isinstance(a.get("selected"), dict):
+                sel = a["selected"]                                  # {selected:{…}} 或全量事件对象
+            elif a and all(isinstance(v, bool) for v in a.values()):
+                sel = a                                              # 直接就是 {源名: bool}
+            else:
+                return
+            _legend_sel.clear()
+            _legend_sel.update(sel)
+            # 关键：把最新选择写进当前环图元素的 props 并推给前端。定时器每 30s 刷 head/tail，
+            # 前端据此重挂载环图时读的是元素 props——props 不更新就会用建图时的旧 selected 把排除态刷回来。
+            el = e.sender
+            el.options.setdefault("legend", {})["selected"] = dict(_legend_sel)
+            el.update()
+
+        @ui.refreshable
+        def charts_panel():   # 图表单独一个 refreshable：不被 30s 定时器刷，避免环图重建丢交互态（悬停/图例翻页）
+            ov = anime.overview()
             # ── 下载番剧 / 种子来源（左右分开，窄屏自动堆叠）──
             with ui.row().classes("w-full gap-6 flex-wrap mt-3"):
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
@@ -115,7 +140,8 @@ def anime_page(t: str = ""):
                                       "#00d3f3", "#fb64b6", "#9ae600", "#c27aff", "#00d5be"],
                             "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} 种子 · {d}%"},
                             "legend": {"type": "scroll", "orient": "vertical", "right": "2%",
-                                       "top": "middle", "textStyle": {"color": "#99a1af"}},  # gray-400(灰2)
+                                       "top": "middle", "textStyle": {"color": "#99a1af"},  # gray-400(灰2)
+                                       "selected": dict(_legend_sel)},  # 回填用户的图例排除态
                             "series": [{
                                 "name": "种子来源", "type": "pie",
                                 "radius": ["45%", "72%"], "center": ["32%", "50%"],
@@ -127,8 +153,14 @@ def anime_page(t: str = ""):
                                                        "formatter": "{b}\n{c}"}},
                                 "data": [{"name": src, "value": tot} for src, tot, _ in ov["by_source"]],
                             }],
-                        }).classes("w-full").style("height:220px")
+                        }).classes("w-full").style("height:220px").on(
+                            "chart:legendselectchanged", _remember_legend, args=["selected"])
 
+        @ui.refreshable
+        def overview_tail():   # 种子状态(含 qB 实时徽标) + 采集状态：随定时器刷新，qB 进度要 30s 更新
+            ov = anime.overview()
+            k = ov["kpi"]
+            ps = ov["pending_split"]
             # ── 种子状态 ──
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("种子状态").classes("text-sm font-bold")
@@ -405,9 +437,17 @@ def anime_page(t: str = ""):
                 else:
                     _exp.on_value_change(lambda e, f=_fill: f() if e.value else None)
 
+        def _refresh_overview(charts):
+            # 刷新仪表盘：head(计数)+tail(种子状态/qB实时)恒刷；charts(图表)仅 charts=True 时刷。
+            # 定时器传 charts=False → 不重建环图，保住悬停/图例翻页等交互态。
+            overview_head.refresh()
+            if charts:
+                charts_panel.refresh()
+            overview_tail.refresh()
+
         def refresh_dynamic():
             # 用户操作后的全动态刷新：含『待确认/待识别』，好让确认/绑定/忽略后的番立即从对应列表流转。
-            overview_panel.refresh()
+            _refresh_overview(charts=True)   # 用户操作不在悬停图表，可连图表一起刷
             inflight_panel.refresh()
             confirm_panel.refresh()
             reject_panel.refresh()
@@ -418,7 +458,7 @@ def anime_page(t: str = ""):
             # 刷新某 tab 的只读实时区：overview 的实时状态/新入库、reject 列表。其余 tab 无实时区，不动。
             # 不含 confirm/fail——它们有用户正在输入的绑定框/源下拉，重建会清空半途输入。
             if tab == "overview":
-                overview_panel.refresh()
+                _refresh_overview(charts=False)   # 30s 定时器不碰图表，环图交互态不被打断
                 inflight_panel.refresh()
                 recent_panel.refresh()
             elif tab == "reject":
@@ -542,7 +582,7 @@ def anime_page(t: str = ""):
                 scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
                 ui.notify(f"正在重新识别（{scope}）…走 bgm，可能要一会儿")
                 cnt = await anime.reenrich_scope(seasons)
-                overview_panel.refresh()
+                _refresh_overview(charts=True)   # 重识别改了数据，连图表一起刷
                 ui.notify(f"识别完成：{cnt} 部命中", type="positive")
             return h
 
@@ -576,7 +616,8 @@ def anime_page(t: str = ""):
         # 懒加载：首屏只构建当前 tab 的内容；切到别的 tab 首次才建（6 个面板 → 1 个，砍首屏构建/推送）。
         # 面板都是 @ui.refreshable，未构建过的 .refresh() 是安全 no-op，所以刷新逻辑无需改动。
         _builders = {
-            "overview": lambda: (overview_panel(), inflight_panel(), recent_panel()),
+            "overview": lambda: (overview_head(), charts_panel(), overview_tail(),
+                                 inflight_panel(), recent_panel()),
             "manage": manage_panel, "confirm": confirm_panel,
             "fail": fail_panel, "reject": reject_panel, "sources": render_sources,
         }

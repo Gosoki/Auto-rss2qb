@@ -360,7 +360,9 @@ def frame(active: str = ""):
         "document.documentElement.classList.remove('preload')},600)});</script>")
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
     ui.add_head_html(
-        "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
+        "<style>"
+        "body{font-size:18px}"   # 基础字号 18px：只影响没显式定大小的继承文字（如番名）；text-sm/xs/2xl 是 rem 跟 html 走，不受影响
+        ".q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
         ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}"
         ".q-table tbody td,.q-table thead th,.q-table .q-badge{font-size:14px}"
         # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
