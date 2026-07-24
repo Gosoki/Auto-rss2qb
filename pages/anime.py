@@ -592,10 +592,9 @@ def anime_page(t: str = ""):
 
         start = t if t in _TAB_KEYS else (
             config.ANIME_DEFAULT_TAB if config.ANIME_DEFAULT_TAB in _TAB_KEYS else "manage")
-        with ui.tab_panels(tabs, value=start).classes("w-full"):
+        with ui.tab_panels(tabs, value=start).props("keep-alive transition-prev=fade transition-next=fade transition-duration=120").classes("w-full"):
             for _k in _TAB_KEYS:
-                with ui.tab_panel(_k):
-                    _slots[_k] = ui.element("div").classes("w-full")   # 空占位，按需填充
+                _slots[_k] = ui.tab_panel(_k)   # 空面板本身作容器，懒建时直接填入（不套内层 div，保持 tab-panel 原生行距）
 
         def _on_tab(e):   # 切 tab：写 URL(不重载，刷新后仍停在此 tab) + 首次构建；已建过的切回来刷新实时区显示最新
             ui.run_javascript(f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))")

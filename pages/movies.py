@@ -662,10 +662,9 @@ def movies_page(t: str = ""):
 
         start = t if t in _TABS else (
             config.MOVIE_DEFAULT_TAB if config.MOVIE_DEFAULT_TAB in _TABS else "list")
-        with ui.tab_panels(tabs, value=start).classes("w-full"):
+        with ui.tab_panels(tabs, value=start).props("keep-alive transition-prev=fade transition-next=fade transition-duration=120").classes("w-full"):
             for _k in _TABS:
-                with ui.tab_panel(_k):
-                    _slots[_k] = ui.element("div").classes("w-full")   # 空占位，按需填充
+                _slots[_k] = ui.tab_panel(_k)   # 空面板本身作容器，懒建时直接填入（不套内层 div，保持 tab-panel 原生行距）
 
         def _on_tab(e):   # 切 tab：写 URL(不重载) + 首次构建该 tab
             ui.run_javascript(f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))")

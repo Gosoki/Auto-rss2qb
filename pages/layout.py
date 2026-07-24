@@ -344,6 +344,16 @@ def frame(active: str = ""):
     ui.colors(primary="oklch(70.7% 0.165 254.624)", negative="oklch(70.4% 0.191 22.216)")
     # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
     ui.add_head_html('<meta name="referrer" content="no-referrer">')
+    # 整页重载防白闪 + 顶栏/标签不做加载时的怪过渡：
+    #   html 直接上暗底（HTML 一解析就是暗的，不等 JS 的 dark_mode）；
+    #   q-header 默认 transition:all 会把底色从白淡入到 #15171c（就是那下"变白再变灰"）→ 关掉；
+    #   q-tab/指示器默认过渡会在加载时淡色/滑动（怪动效）→ 关掉（切 tab 时指示器改为瞬移，更跟手）。
+    ui.add_head_html(
+        "<style>"
+        "html{background:#121212}"
+        ".q-header{transition:none!important}"
+        ".q-tab,.q-tab__indicator,.q-tabs__content{transition:none!important}"
+        "</style>")
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
     ui.add_head_html(
         "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
