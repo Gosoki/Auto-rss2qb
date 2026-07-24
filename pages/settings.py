@@ -113,7 +113,7 @@ def settings():
         with header_right:   # 顶栏右侧快捷保存：功能同页面底部『保存』（_save 在下方定义，lambda 延迟到点击时解析）
             ui.button(icon="save", on_click=lambda: _save()).props(
                 "flat round dense color=white").tooltip("保存设置（同页面底部『保存』）")
-        ui.label("设置").classes("text-2xl font-bold")
+        ui.label("全局设置").classes("text-2xl font-bold")
         ui.label("保存即时生效、页面刷新可见；仅 Web 绑定地址/端口改动需重启。").classes(
             "text-xs text-gray-400 mb-2")
 

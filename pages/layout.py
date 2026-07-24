@@ -11,7 +11,7 @@ import config
 
 NAV = [("manage", "动漫番剧", "/"), ("movies", "OVA・剧场版", "/movies"),
        ("parse", "解析测试", "/parse"), ("logs", "运行日志", "/logs"),
-       ("settings", "设置", "/settings")]
+       ("settings", "全局设置", "/settings")]
 
 # 应用侧种子状态 → 中文（番剧表/剧场版/详情/新入库共用）
 STATUS_CN = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
@@ -409,18 +409,34 @@ def frame(active: str = ""):
                         mi = ui.menu_item(label, on_click=lambda p=path: ui.navigate.to(p))
                         if key == active:
                             mi.classes("text-blue-400 font-semibold")
+                    qb = (config.QB_URL or "").strip()   # qB 网页版：外链新标签打开
+                    if qb:
+                        ui.menu_item("qB 后台 ↗", on_click=lambda u=qb: ui.navigate.to(u, new_tab=True))
             # 品牌：手机绝对居中(.brand-center)，≥640 静态靠左跟导航同排
             with ui.row().classes("items-center gap-2 mr-2 sm:mr-6 brand-center"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
                 ui.label(config.SITE_NAME or "AutoRSS").classes("text-lg font-bold max-sm:hidden").style(
                     "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去，只留居中图标
-            # 桌面端(≥640px)：内联导航；max-sm:hidden＝<640 隐藏（此向可靠，hidden+sm:flex 在本环境无法复原）
-            with ui.row().classes("items-center gap-2 max-sm:hidden"):
+            # 桌面端(≥640px)：内联导航，绝对定位在顶栏水平居中（不受左侧品牌/右侧按钮宽度影响）；
+            # max-sm:hidden＝<640 隐藏改走汉堡菜单（此向可靠，hidden+sm:flex 在本环境无法复原）
+            with ui.row().classes("items-center gap-2 max-sm:hidden absolute left-1/2 top-1/2 "
+                                  "-translate-x-1/2 -translate-y-1/2"):
                 for key, label, path in NAV:
                     cls = "cursor-pointer text-sm px-2 transition-colors "
                     cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
                             if key == active else "text-gray-400 hover:text-gray-300")
                     ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
+                # qB 网页版：外链，新标签打开设置里填的 qB 地址（每次渲染读，改地址即时生效）
+                qb = (config.QB_URL or "").strip()
+                qcls = ("cursor-pointer text-gray-400 hover:text-gray-300" if qb else "text-gray-600")
+                with ui.row().classes(
+                        f"items-center gap-0.5 text-sm px-2 transition-colors {qcls}") as _qbnav:
+                    ui.label("qB 后台")
+                    ui.icon("open_in_new").style("font-size:14px")
+                if qb:
+                    _qbnav.on("click", lambda u=qb: ui.navigate.to(u, new_tab=True))
+                else:
+                    _qbnav.tooltip("先在『全局设置』里填 qB 地址")
 
             ui.space()
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位
