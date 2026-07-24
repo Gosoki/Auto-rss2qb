@@ -42,6 +42,7 @@ except ValueError:
 
 # ---- 可热改设置：{键: (类型, 默认值)}，类型 bool/int/str/list ----
 _SPEC = {
+    "SITE_NAME": (str, "autorss"),          # 站点名：顶栏站名 + 浏览器标签页标题（空=回落 autorss）
     "QB_ENABLED": (bool, True),
     "QB_SYNC_STATUS": (bool, True),         # 开=读 qB 实时态(下载中/进度/做种…)；关=发送过去即『已下』、完全不轮询 qB
     "QB_SYNC_INTERVAL": (int, 20),          # 有种子在下时的活跃轮询间隔（秒）——只在下载窗口内轮询

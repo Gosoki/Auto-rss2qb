@@ -340,6 +340,7 @@ def frame(active: str = ""):
     yield 出顶栏右侧的容器，页面可往里放全局动作按钮（如刷新/补下）；不放就是空的。
     """
     ui.dark_mode(True)
+    ui.page_title(config.SITE_NAME or "autorss")   # 浏览器标签页标题＝站点名（每次渲染读，改了刷新即变）
     # 全站主色＝blue-400、负色＝red-400，用 oklch（跟徽标/链接同源，P3 屏上也完全同色，不走 sRGB 夹紧）
     ui.colors(primary="oklch(70.7% 0.165 254.624)", negative="oklch(70.4% 0.191 22.216)")
     # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
@@ -385,7 +386,8 @@ def frame(active: str = ""):
                 "height:56px;overflow-x:auto;overflow-y:hidden"):   # 窄屏导航横向可滚，不再裁掉够不着
             with ui.row().classes("items-center gap-2 mr-2 sm:mr-6"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
-                ui.label("autorss").classes("text-lg font-bold hidden sm:block").style(
+                ui.label(config.SITE_NAME or "autorss").classes(
+                    "text-lg font-bold hidden sm:block").style(
                     "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去、留图标腾出导航空间
             for key, label, path in NAV:
                 cls = "cursor-pointer text-sm px-2 transition-colors "

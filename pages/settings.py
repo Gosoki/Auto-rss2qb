@@ -135,8 +135,15 @@ def settings():
 
         # ========== 折叠 ① 通用（默认展开）==========
         with ui.card().classes("w-full"), ui.expansion(
-                "通用（qB / 保存 / 网络 / Web / 高级）", icon="tune", value=True).classes(
+                "通用（站点 / qB / 保存 / 网络 / Web / 高级）", icon="tune", value=True).classes(
                 "w-full").props("dense"):
+            ui.label("站点").classes("font-bold text-sm")
+            with ui.element("div").classes("field-grid w-full"):
+                _text("SITE_NAME", "站点名", config.SITE_NAME, "空=autorss")
+            ui.label("显示在顶栏左上角与浏览器标签页标题。保存后刷新页面即变。").classes(
+                "text-xs text-gray-500")
+
+            ui.separator()
             ui.label("下载 / qBittorrent").classes("font-bold text-sm")
             _switch("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
             _switch("QB_SYNC_STATUS", "读取 qB 实时状态（关=发送过去即『已下』，完全不轮询 qB）",
