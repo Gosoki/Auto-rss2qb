@@ -345,9 +345,25 @@ def frame(active: str = ""):
     ui.colors(primary="oklch(70.7% 0.165 254.624)", negative="oklch(70.4% 0.191 22.216)")
     # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
     ui.add_head_html('<meta name="referrer" content="no-referrer">')
+    # 整页重载防白闪 + 顶栏/标签不做加载时的怪过渡：
+    #   html 直接上暗底（HTML 一解析就是暗的，不等 JS 的 dark_mode）；
+    #   q-header 默认 transition:all 会把底色从白淡入到 #15171c（就是那下"变白再变灰"）→ 关掉；
+    #   q-tab/指示器默认过渡会在加载时淡色/滑动（怪动效）→ 关掉（切 tab 时指示器改为瞬移，更跟手）。
+    ui.add_head_html(
+        "<style>"
+        "html,body{background:#121212}"                                  # html+body 都上暗底，重载瞬间不白闪
+        ".q-header{transition:none!important}"                            # 顶栏底色不白→灰淡入
+        ".q-tab,.q-tab__indicator,.q-tabs__content{transition:none!important}"  # 标签/指示器不做加载动效
+        "html.preload *{transition:none!important}"                      # 加载期禁掉一切过渡，防浅灰→白之类的淡入卡顿
+        "</style>"
+        "<script>document.documentElement.classList.add('preload');"
+        "addEventListener('load',function(){setTimeout(function(){"
+        "document.documentElement.classList.remove('preload')},600)});</script>")
     # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
     ui.add_head_html(
-        "<style>.q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
+        "<style>"
+        "body{font-size:18px}"   # 基础字号 18px：只影响没显式定大小的继承文字（如番名）；text-sm/xs/2xl 是 rem 跟 html 走，不受影响
+        ".q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
         ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}"
         ".q-table tbody td,.q-table thead th,.q-table .q-badge{font-size:14px}"
         # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
@@ -359,6 +375,9 @@ def frame(active: str = ""):
         # 设置页数字项栅格：桌面每格 1/4 宽（4 列），窄屏落到 2 列；顶端对齐（标签在框上、行高不齐也整齐）
         ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
         "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
+        # 顶栏品牌：手机(<640)绝对居中（汉堡在左、刷新在右，品牌图标居中）；≥640 静态靠左跟导航同排
+        "@media(max-width:639px){.brand-center{position:absolute;left:50%;top:50%;"
+        "transform:translate(-50%,-50%);margin:0!important}}"
         "</style>")
     # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。绿用 -500（-400 太亮），其余（含红）用 -400。
     # 必须放进 @layer overrides —— Quasar 的 .bg-* !important 在 quasar_importants 层里；分层后 !important 比的是
@@ -382,18 +401,27 @@ def frame(active: str = ""):
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.08);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）
-        with ui.row().classes("items-center gap-2 w-full px-4").style(
-                "height:56px;overflow-x:auto;overflow-y:hidden"):   # 窄屏导航横向可滚，不再裁掉够不着
-            with ui.row().classes("items-center gap-2 mr-2 sm:mr-6"):
+        with ui.row().classes("items-center gap-2 w-full px-4 relative flex-nowrap").style("height:56px"):
+            # 移动端(<640px)：导航收进汉堡菜单（sm:hidden＝≥640 隐藏），避免链接横向溢出
+            with ui.button(icon="menu").props("flat round dense color=white").classes("sm:hidden"):
+                with ui.menu().props("dark"):
+                    for key, label, path in NAV:
+                        mi = ui.menu_item(label, on_click=lambda p=path: ui.navigate.to(p))
+                        if key == active:
+                            mi.classes("text-blue-400 font-semibold")
+            # 品牌：手机绝对居中(.brand-center)，≥640 静态靠左跟导航同排
+            with ui.row().classes("items-center gap-2 mr-2 sm:mr-6 brand-center"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
-                ui.label(config.SITE_NAME or "autorss").classes(
-                    "text-lg font-bold hidden sm:block").style(
-                    "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去、留图标腾出导航空间
-            for key, label, path in NAV:
-                cls = "cursor-pointer text-sm px-2 transition-colors "
-                cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
-                        if key == active else "text-gray-400 hover:text-gray-300")
-                ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
+                ui.label(config.SITE_NAME or "AutoRSS").classes("text-lg font-bold max-sm:hidden").style(
+                    "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去，只留居中图标
+            # 桌面端(≥640px)：内联导航；max-sm:hidden＝<640 隐藏（此向可靠，hidden+sm:flex 在本环境无法复原）
+            with ui.row().classes("items-center gap-2 max-sm:hidden"):
+                for key, label, path in NAV:
+                    cls = "cursor-pointer text-sm px-2 transition-colors "
+                    cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
+                            if key == active else "text-gray-400 hover:text-gray-300")
+                    ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
+
             ui.space()
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位
             ui.button(icon="refresh", on_click=lambda: ui.navigate.reload()).props(

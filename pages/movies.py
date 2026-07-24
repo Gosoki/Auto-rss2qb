@@ -11,7 +11,7 @@ import config
 from core import engine, movies as mov
 from sources.parse import SEASON_CN
 from .layout import (WEEKDAY_CN, barline, confirm, expand_collapse_bar, frame,
-                     group_by_quarter, human_size, kpi_cards, live_status, meta_card,
+                     human_size, kpi_cards, live_status, meta_card,
                      name_of, paginate, parse_bgm_id, qb_disabled_banner, qb_live_text,
                      recent_table, torrent_status_cn)
 
@@ -22,6 +22,24 @@ def _mov_live_status(*a):
     """剧场版把库态 pending 的『待下』显示为蓝色『可下载』（与影片页术语/配色统一）；其余同 live_status。"""
     text, color = live_status(*a)
     return ("可下载", "blue") if text == "待下" else (text, color)
+
+
+def _group_by_year_quarter(items):
+    """两级分组：先按年份、年内再按季度。季度 key 形如 '26C'（前两位=年）。
+    返回 [(年份2位, [(季度, [movie...]), ...]), ...]，年份倒序、季度倒序、未知垫底。"""
+    from collections import defaultdict
+    by_year: dict = defaultdict(lambda: defaultdict(list))
+    for it in items:
+        q = it.quarter or "未知"
+        year = q[:2] if (q != "未知" and len(q) >= 2 and q[:2].isdigit()) else "未知"
+        by_year[year][q].append(it)
+    out = []
+    for year in sorted(by_year, key=lambda y: (1, 0) if y == "未知" else (0, -int(y))):
+        qs = sorted(by_year[year], reverse=True)
+        if "未知" in qs:                       # 未知季度垫到年内最后
+            qs.remove("未知"); qs.append("未知")
+        out.append((year, [(q, by_year[year][q]) for q in qs]))
+    return out
 
 
 def _season_toggle_btn(key: str, name: str, selected: set) -> None:
@@ -493,8 +511,8 @@ def movies_page(t: str = ""):
                 ui.label("还没有剧场版/OVA。去『订阅源』tab 点『扫描』从 Mikan 拉取。").classes(
                     "text-gray-400 p-4")
                 return
-            yrs = max(1, config.MOVIE_PAGE_YEARS)  # 防 0（每页 0 季会除零）
-            shown, total_pages, page = paginate(group_by_quarter(items), list_page["n"], yrs * 4)
+            yrs = max(1, config.MOVIE_PAGE_YEARS)  # 防 0（每页 0 年会除零）
+            shown, total_pages, page = paginate(_group_by_year_quarter(items), list_page["n"], yrs)
             list_page["n"] = page
             with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
                 expand_collapse_bar(list_page, list_panel.refresh)
@@ -502,13 +520,32 @@ def movies_page(t: str = ""):
                     ui.pagination(1, total_pages, direction_links=True, value=page,
                                   on_change=_list_goto).props("size=sm")
                     ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
-            exp = list_page["expand"]  # None=默认全开；True/False=一键全展开/收起(跨页一致)
-            tmap = mov.torrents_by_movie([m.id for _, grp in shown for m in grp])  # 本页种子一次查齐
-            for q, grp in shown:
-                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(grp)} 部",
-                                  value=(exp if exp is not None else True)).classes("w-full"):
-                    for m in grp:
-                        _movie_card(m, tmap.get(m.id, []))
+            exp = list_page["expand"]  # None=默认仅最新年展开(年内季度全铺开)；True/False=一键全展开/收起(跨页一致)
+            tmap = mov.torrents_by_movie(
+                [m.id for _, qs in shown for _, grp in qs for m in grp])  # 本页种子一次查齐
+            for i, (year, quarters) in enumerate(shown):
+                year_open = exp if exp is not None else i == 0   # 一级(年份)可折叠，默认仅最新年展开
+                year_total = sum(len(grp) for _, grp in quarters)
+                year_exp = ui.expansion(f"20{year} 年   ·   {year_total} 部",
+                                        value=year_open).classes("w-full")
+                # 懒加载在『年』这级：年展开才建内容。二级『季度』不折叠——小标题 + 卡直接全铺开。
+                _fl = {"built": False}
+
+                def _fill(qs=quarters, box=year_exp, fl=_fl):
+                    if fl["built"]:
+                        return
+                    fl["built"] = True
+                    with box:
+                        for q, grp in qs:
+                            ui.label(f"{engine.quarter_label(q)}   ·   {len(grp)} 部").classes(
+                                "text-sm font-bold text-gray-400 mt-3 mb-1 pl-1")  # 二级季度小标题(不可折叠)
+                            for m in grp:
+                                _movie_card(m, tmap.get(m.id, []))
+
+                if year_open:
+                    _fill()
+                else:
+                    year_exp.on_value_change(lambda e, f=_fill: f() if e.value else None)
 
         @ui.refreshable
         def fail_panel():
@@ -607,20 +644,30 @@ def movies_page(t: str = ""):
             ui.tab("fail", "待识别", "sync_problem")
             ui.tab("reject", "已忽略", "block")
             ui.tab("sources", "订阅源", "rss_feed")
-        tabs.on_value_change(lambda e: ui.run_javascript(
-            f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))"))
+        # 懒加载：首屏只构建当前 tab，切到别的 tab 首次才建（未建过的 .refresh() 是安全 no-op）
+        _builders = {
+            "overview": lambda: (overview_panel(), inflight_panel(), recent_panel()),
+            "list": list_panel, "fail": fail_panel,
+            "reject": reject_panel, "sources": sources_panel,
+        }
+        _slots: dict = {}
+        _built: set = set()
+
+        def _build_tab(key):
+            if key in _built or key not in _slots:
+                return
+            _built.add(key)
+            with _slots[key]:
+                _builders[key]()
+
         start = t if t in _TABS else (
             config.MOVIE_DEFAULT_TAB if config.MOVIE_DEFAULT_TAB in _TABS else "list")
-        with ui.tab_panels(tabs, value=start).classes("w-full"):
-            with ui.tab_panel("overview"):
-                overview_panel()
-                inflight_panel()
-                recent_panel()
-            with ui.tab_panel("list"):
-                list_panel()
-            with ui.tab_panel("fail"):
-                fail_panel()
-            with ui.tab_panel("reject"):
-                reject_panel()
-            with ui.tab_panel("sources"):
-                sources_panel()
+        with ui.tab_panels(tabs, value=start).props("keep-alive transition-prev=fade transition-next=fade transition-duration=120").classes("w-full"):
+            for _k in _TABS:
+                _slots[_k] = ui.tab_panel(_k)   # 空面板本身作容器，懒建时直接填入（不套内层 div，保持 tab-panel 原生行距）
+
+        def _on_tab(e):   # 切 tab：写 URL(不重载) + 首次构建该 tab
+            ui.run_javascript(f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))")
+            _build_tab(e.value)
+        tabs.on_value_change(_on_tab)
+        _build_tab(start)   # 构建首屏 tab

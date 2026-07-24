@@ -1,4 +1,4 @@
-"""源管理：增删源组、切策略(全下/待确认)、调优先级、开关。
+"""源管理：增删源组、切策略(自动下载/人工审核)、调优先级、开关。
 
 worker 每轮从这里读，改完下一轮就生效，不用重启。
 render_sources() 抽出来复用：/sources 独立页 与 番剧列表『订阅源』tab 都调它。
@@ -9,7 +9,7 @@ from core import anime
 from .layout import frame, confirm
 
 SITE_OPTS = {"nyaa": "nyaa", "mikan": "mikan"}
-POLICY_OPTS = {"auto": "全下", "review": "待确认"}
+POLICY_OPTS = {"auto": "自动下载", "review": "人工审核"}
 
 
 def render_sources() -> None:
@@ -30,9 +30,9 @@ def render_sources() -> None:
             with ui.card().classes("w-full"):
                 with ui.row().classes("items-center gap-2 w-full flex-wrap"):
                     name = ui.input("名字", value=g.name).props("dense outlined").classes("w-32")
-                    site = ui.select(SITE_OPTS, value=g.site, label="类型").props("dense outlined").classes("w-24")
-                    policy = ui.select(POLICY_OPTS, value=g.policy, label="策略").props("dense outlined").classes("w-24")
-                    priority = ui.number("优先级", value=g.priority, format="%d").props("dense outlined").classes("w-24")
+                    site = ui.select(SITE_OPTS, value=g.site, label="类型").props("dense outlined").classes("w-32")
+                    policy = ui.select(POLICY_OPTS, value=g.policy, label="策略").props("dense outlined").classes("w-32")
+                    priority = ui.number("优先级", value=g.priority, format="%d").props("dense outlined").classes("w-32")
                     enabled = ui.switch("启用", value=g.enabled).props("dense")
                 feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).props("dense outlined").classes("w-full")
                 subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）",
@@ -51,9 +51,9 @@ def render_sources() -> None:
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center gap-2 w-full flex-wrap"):
                 n_name = ui.input("名字").props("dense outlined").classes("w-32")
-                n_site = ui.select(SITE_OPTS, value="nyaa", label="类型").props("dense outlined").classes("w-24")
-                n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").props("dense outlined").classes("w-24")
-                n_priority = ui.number("优先级", value=50, format="%d").props("dense outlined").classes("w-24")
+                n_site = ui.select(SITE_OPTS, value="nyaa", label="类型").props("dense outlined").classes("w-32")
+                n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").props("dense outlined").classes("w-32")
+                n_priority = ui.number("优先级", value=50, format="%d").props("dense outlined").classes("w-32")
             n_feed = ui.input("feed（nyaa 用户名如 Lilith-Raws，或完整 RSS URL）").props("dense outlined").classes("w-full")
             n_subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）").props("dense outlined").classes("w-full")
             n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").props("dense outlined").classes("w-full")

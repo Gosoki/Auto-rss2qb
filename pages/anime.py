@@ -39,7 +39,7 @@ def anime_page(t: str = ""):
 
         # ---- 刷新（页面局部，闭包内共享）----
         @ui.refreshable
-        def overview_panel():
+        def overview_head():   # KPI + 订阅源组（计数，随定时器刷新，无交互态可丢）
             ov = anime.overview()
             k = ov["kpi"]
             ps = ov["pending_split"]
@@ -64,11 +64,36 @@ def anime_page(t: str = ""):
             ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 for name, site, policy, priority, enabled in ov["groups"]:
-                    pol = "全下" if policy == "auto" else "待确认"
+                    pol = "自动下载" if policy == "auto" else "人工审核"
                     tail = "" if enabled else " · 停用"
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
                         f"color={'blue-grey' if enabled else 'grey'}").classes("text-sm")
 
+        # 环图图例选择的持久化：用户点图例排除某字幕组后存下选择态，重建时塞回 legend.selected，
+        # 任何刷新路径（定时器/用户操作/重识别）重建环图都不会把排除的源刷回来。
+        _legend_sel: dict = {}
+
+        def _remember_legend(e):
+            a = e.args[0] if isinstance(e.args, list) and e.args else e.args
+            if not isinstance(a, dict):
+                return
+            if isinstance(a.get("selected"), dict):
+                sel = a["selected"]                                  # {selected:{…}} 或全量事件对象
+            elif a and all(isinstance(v, bool) for v in a.values()):
+                sel = a                                              # 直接就是 {源名: bool}
+            else:
+                return
+            _legend_sel.clear()
+            _legend_sel.update(sel)
+            # 关键：把最新选择写进当前环图元素的 props 并推给前端。定时器每 30s 刷 head/tail，
+            # 前端据此重挂载环图时读的是元素 props——props 不更新就会用建图时的旧 selected 把排除态刷回来。
+            el = e.sender
+            el.options.setdefault("legend", {})["selected"] = dict(_legend_sel)
+            el.update()
+
+        @ui.refreshable
+        def charts_panel():   # 图表单独一个 refreshable：不被 30s 定时器刷，避免环图重建丢交互态（悬停/图例翻页）
+            ov = anime.overview()
             # ── 下载番剧 / 种子来源（左右分开，窄屏自动堆叠）──
             with ui.row().classes("w-full gap-6 flex-wrap mt-3"):
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
@@ -115,7 +140,8 @@ def anime_page(t: str = ""):
                                       "#00d3f3", "#fb64b6", "#9ae600", "#c27aff", "#00d5be"],
                             "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} 种子 · {d}%"},
                             "legend": {"type": "scroll", "orient": "vertical", "right": "2%",
-                                       "top": "middle", "textStyle": {"color": "#99a1af"}},  # gray-400(灰2)
+                                       "top": "middle", "textStyle": {"color": "#99a1af"},  # gray-400(灰2)
+                                       "selected": dict(_legend_sel)},  # 回填用户的图例排除态
                             "series": [{
                                 "name": "种子来源", "type": "pie",
                                 "radius": ["45%", "72%"], "center": ["32%", "50%"],
@@ -127,8 +153,14 @@ def anime_page(t: str = ""):
                                                        "formatter": "{b}\n{c}"}},
                                 "data": [{"name": src, "value": tot} for src, tot, _ in ov["by_source"]],
                             }],
-                        }).classes("w-full").style("height:220px")
+                        }).classes("w-full").style("height:220px").on(
+                            "chart:legendselectchanged", _remember_legend, args=["selected"])
 
+        @ui.refreshable
+        def overview_tail():   # 种子状态(含 qB 实时徽标) + 采集状态：随定时器刷新，qB 进度要 30s 更新
+            ov = anime.overview()
+            k = ov["kpi"]
+            ps = ov["pending_split"]
             # ── 种子状态 ──
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("种子状态").classes("text-sm font-bold")
@@ -276,7 +308,7 @@ def anime_page(t: str = ""):
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         inp = ui.input(
                             placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").props(
-                            "dense outlined").classes("min-w-96")
+                            "dense outlined").classes("w-96 min-w-0 max-sm:w-full")   # 桌面 384px；手机满卡宽(min-w-0 让 q-input 真能收缩，否则撑破卡片横向溢出)
                         ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("color=primary unelevated")
                         ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("flat color=grey")
                         ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
@@ -386,27 +418,55 @@ def anime_page(t: str = ""):
                     ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
             exp = manage_page["expand"]  # None=各季按默认(仅最新季开)；True/False=一键全展开/收起(跨页一致)
             for i, (q, items) in enumerate(groups):
-                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                  value=(exp if exp is not None else i == 0)).classes("w-full"):
-                    for a in items:
-                        _anime_row(a, src_map.get(a.id))
+                _open = exp if exp is not None else i == 0
+                _exp = ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
+                                    value=_open).classes("w-full")
+                # 懒加载：折叠的季度先不建行（省首建成本）；首次展开时才建，之后不再重建
+                _fl = {"built": False}
+
+                def _fill(qi=items, box=_exp, fl=_fl):
+                    if fl["built"]:
+                        return
+                    fl["built"] = True
+                    with box:
+                        for a in qi:
+                            _anime_row(a, src_map.get(a.id))
+
+                if _open:
+                    _fill()
+                else:
+                    _exp.on_value_change(lambda e, f=_fill: f() if e.value else None)
+
+        def _refresh_overview(charts):
+            # 刷新仪表盘：head(计数)+tail(种子状态/qB实时)恒刷；charts(图表)仅 charts=True 时刷。
+            # 定时器传 charts=False → 不重建环图，保住悬停/图例翻页等交互态。
+            overview_head.refresh()
+            if charts:
+                charts_panel.refresh()
+            overview_tail.refresh()
 
         def refresh_dynamic():
             # 用户操作后的全动态刷新：含『待确认/待识别』，好让确认/绑定/忽略后的番立即从对应列表流转。
-            overview_panel.refresh()
+            _refresh_overview(charts=True)   # 用户操作不在悬停图表，可连图表一起刷
             inflight_panel.refresh()
             confirm_panel.refresh()
             reject_panel.refresh()
             fail_panel.refresh()
             recent_panel.refresh()
 
+        def _refresh_live(tab):
+            # 刷新某 tab 的只读实时区：overview 的实时状态/新入库、reject 列表。其余 tab 无实时区，不动。
+            # 不含 confirm/fail——它们有用户正在输入的绑定框/源下拉，重建会清空半途输入。
+            if tab == "overview":
+                _refresh_overview(charts=False)   # 30s 定时器不碰图表，环图交互态不被打断
+                inflight_panel.refresh()
+                recent_panel.refresh()
+            elif tab == "reject":
+                reject_panel.refresh()
+
         def refresh_timer():
-            # 30s 定时器专用：排除 confirm_panel/fail_panel——它们含用户正在输入的 bgm 绑定框/源下拉，
-            # 定时重建会清空半途输入。后台新发现的待确认/待识别番在下次用户操作或整页刷新时显现（KPI 计数仍每 30s 更新）。
-            overview_panel.refresh()
-            inflight_panel.refresh()
-            reject_panel.refresh()
-            recent_panel.refresh()
+            # 30s 定时器：只刷『当前可见 tab』的实时区，隐藏 tab 不动（省 CPU、消除每 30s 的周期性卡顿）。
+            _refresh_live(tabs.value)
 
         def refresh_all():
             refresh_dynamic()
@@ -522,28 +582,34 @@ def anime_page(t: str = ""):
                 scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
                 ui.notify(f"正在重新识别（{scope}）…走 bgm，可能要一会儿")
                 cnt = await anime.reenrich_scope(seasons)
-                overview_panel.refresh()
+                _refresh_overview(charts=True)   # 重识别改了数据，连图表一起刷
                 ui.notify(f"识别完成：{cnt} 部命中", type="positive")
             return h
 
         def _anime_row(a, sources=None):
-            with ui.row().classes("items-center gap-3 pl-2 py-1"):
+            # 块级容器 + 行内徽标/标题：徽标贴着标题同排，标题过长时标题自己换行（徽标不再被挤到单独一行）。
+            # q-badge 默认 display:inline，这里统一 inline-block+align-middle 才能既随文流动又跟首行文字居中对齐。
+            with ui.element("div").classes("pl-2 py-2 leading-relaxed"):
                 if sources:   # 源徽标放最前：多源(>1)蓝 / 单源(==1)灰
                     n = len(sources)
                     _lab, _c = (f"多源 {n}", "blue") if n > 1 else (f"单源 {n}", "blue-grey")
-                    ui.badge(_lab).props(f"color={_c}").tooltip("来源: " + " · ".join(sources))
+                    ui.badge(_lab).props(f"color={_c}").classes(
+                        "inline-block align-middle mr-2").tooltip("来源: " + " · ".join(sources))
                 if a.rejected:                       # 状态徽标（互斥，最多一个）
-                    ui.badge("已忽略").props("color=grey")
+                    ui.badge("已忽略").props("color=grey").classes("inline-block align-middle mr-2")
                 elif not a.confirmed:
-                    ui.badge("待确认").props("color=orange")
+                    ui.badge("待确认").props("color=orange").classes("inline-block align-middle mr-2")
                 color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
                 ui.label(name_of(a)).classes(
-                    f"cursor-pointer {color} hover:underline").on(
+                    f"inline align-middle cursor-pointer {color} hover:underline").on(
                     "click", lambda aid=a.id: open_detail(aid))
                 sl = season_label(a)
                 if sl:
-                    ui.badge(sl).props("color=purple")
-                platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
+                    ui.badge(sl).props("color=purple").classes("inline-block align-middle ml-2")
+                p = getattr(a, "platform", None)   # 内联原 platform_badge：bgm 判定非 TV(剧场版/OVA…)紫标，好带上行内排版类
+                if p and p != "TV":
+                    ui.badge(p).props("color=deep-purple").classes(
+                        "inline-block align-middle ml-2").tooltip("bgm 判定的类型（非 TV）")
 
         # ---- 页面布局 ----
         with ui.tabs().classes("w-full") as tabs:
@@ -553,25 +619,37 @@ def anime_page(t: str = ""):
             ui.tab("fail", "待识别", "sync_problem")
             ui.tab("reject", "已忽略", "block")
             ui.tab("sources", "订阅源", "rss_feed")
-        # 切 tab 时把当前 tab 写进 URL（不重载），这样『刷新』重载后仍停在该 tab
-        tabs.on_value_change(lambda e: ui.run_javascript(
-            f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))"))
+        # 懒加载：首屏只构建当前 tab 的内容；切到别的 tab 首次才建（6 个面板 → 1 个，砍首屏构建/推送）。
+        # 面板都是 @ui.refreshable，未构建过的 .refresh() 是安全 no-op，所以刷新逻辑无需改动。
+        _builders = {
+            "overview": lambda: (overview_head(), charts_panel(), overview_tail(),
+                                 inflight_panel(), recent_panel()),
+            "manage": manage_panel, "confirm": confirm_panel,
+            "fail": fail_panel, "reject": reject_panel, "sources": render_sources,
+        }
+        _slots: dict = {}
+        _built: set = set()
+
+        def _build_tab(key):
+            if key in _built or key not in _slots:
+                return
+            _built.add(key)
+            with _slots[key]:
+                _builders[key]()
+
         start = t if t in _TAB_KEYS else (
             config.ANIME_DEFAULT_TAB if config.ANIME_DEFAULT_TAB in _TAB_KEYS else "manage")
-        with ui.tab_panels(tabs, value=start).classes("w-full"):
-            with ui.tab_panel("overview"):
-                overview_panel()
-                inflight_panel()
-                recent_panel()
-            with ui.tab_panel("manage"):
-                manage_panel()
-            with ui.tab_panel("confirm"):
-                confirm_panel()
-            with ui.tab_panel("fail"):
-                fail_panel()
-            with ui.tab_panel("reject"):
-                reject_panel()
-            with ui.tab_panel("sources"):
-                render_sources()
+        with ui.tab_panels(tabs, value=start).props("keep-alive transition-prev=fade transition-next=fade transition-duration=120").classes("w-full"):
+            for _k in _TAB_KEYS:
+                _slots[_k] = ui.tab_panel(_k)   # 空面板本身作容器，懒建时直接填入（不套内层 div，保持 tab-panel 原生行距）
 
-        ui.timer(30.0, refresh_timer)  # 只刷只读实时区，不重建管理页/含输入的待确认待识别（避免重置展开、清空输入）
+        def _on_tab(e):   # 切 tab：写 URL(不重载，刷新后仍停在此 tab) + 首次构建；已建过的切回来刷新实时区显示最新
+            ui.run_javascript(f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))")
+            already = e.value in _built
+            _build_tab(e.value)
+            if already:
+                _refresh_live(e.value)
+        tabs.on_value_change(_on_tab)
+        _build_tab(start)   # 构建首屏 tab
+
+        ui.timer(30.0, refresh_timer)  # 只刷当前可见 tab 的实时区（见 refresh_timer）
