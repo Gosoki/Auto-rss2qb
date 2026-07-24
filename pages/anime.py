@@ -587,23 +587,29 @@ def anime_page(t: str = ""):
             return h
 
         def _anime_row(a, sources=None):
-            with ui.row().classes("items-center gap-3 pl-2 py-1"):
+            # 块级容器 + 行内徽标/标题：徽标贴着标题同排，标题过长时标题自己换行（徽标不再被挤到单独一行）。
+            # q-badge 默认 display:inline，这里统一 inline-block+align-middle 才能既随文流动又跟首行文字居中对齐。
+            with ui.element("div").classes("pl-2 py-2 leading-relaxed"):
                 if sources:   # 源徽标放最前：多源(>1)蓝 / 单源(==1)灰
                     n = len(sources)
                     _lab, _c = (f"多源 {n}", "blue") if n > 1 else (f"单源 {n}", "blue-grey")
-                    ui.badge(_lab).props(f"color={_c}").tooltip("来源: " + " · ".join(sources))
+                    ui.badge(_lab).props(f"color={_c}").classes(
+                        "inline-block align-middle mr-2").tooltip("来源: " + " · ".join(sources))
                 if a.rejected:                       # 状态徽标（互斥，最多一个）
-                    ui.badge("已忽略").props("color=grey")
+                    ui.badge("已忽略").props("color=grey").classes("inline-block align-middle mr-2")
                 elif not a.confirmed:
-                    ui.badge("待确认").props("color=orange")
+                    ui.badge("待确认").props("color=orange").classes("inline-block align-middle mr-2")
                 color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
                 ui.label(name_of(a)).classes(
-                    f"cursor-pointer {color} hover:underline").on(
+                    f"inline align-middle cursor-pointer {color} hover:underline").on(
                     "click", lambda aid=a.id: open_detail(aid))
                 sl = season_label(a)
                 if sl:
-                    ui.badge(sl).props("color=purple")
-                platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
+                    ui.badge(sl).props("color=purple").classes("inline-block align-middle ml-2")
+                p = getattr(a, "platform", None)   # 内联原 platform_badge：bgm 判定非 TV(剧场版/OVA…)紫标，好带上行内排版类
+                if p and p != "TV":
+                    ui.badge(p).props("color=deep-purple").classes(
+                        "inline-block align-middle ml-2").tooltip("bgm 判定的类型（非 TV）")
 
         # ---- 页面布局 ----
         with ui.tabs().classes("w-full") as tabs:
