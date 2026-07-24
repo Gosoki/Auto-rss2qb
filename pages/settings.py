@@ -252,25 +252,29 @@ def settings():
             ui.separator()
             ui.label("开始使用日 · 老番过滤").classes("font-bold text-sm")
 
-            async def _apply_filter():   # 应用：开播早于开始日的番（含正在追的）全判超期忽略；开始日空/改早则相反释放
-                # 不拦空开始日：空=没有番算超期→apply_start_date_filter 会把所有超期忽略放回待确认（=释放/反悔）
-                if not await confirm("应用开始使用日过滤？",
-                                     "把『开播早于开始使用日』的番都判为超期忽略、停止自动下载——【包括当前正在追(已确认)的老番】。"
-                                     "若把开始日改早/清空后再点，则相反：把进入范围的超期忽略放回待确认。想单独保留哪部，之后去『拒绝页』恢复。",
-                                     ok_label="应用", ok_icon="filter_alt", ok_color="primary"):
+            async def _apply_filter():   # 应用：先存下输入框里的开始日（免得还得先去点下面『保存』），再按它重算
+                sd = (f["ANIME_START_DATE"].value or "").strip()
+                if sd and anime._parse_date(sd) is None:   # 空=不限（合法）；非空则须能解析
+                    ui.notify("开始使用日格式不对（应为 YYYY-MM-DD，如 2026-07-01）", type="negative")
                     return
+                # 不拦空开始日：空=没有番算超期→apply_start_date_filter 会把所有超期忽略放回待确认（=释放/反悔）
+                if not await confirm("保存并应用开始使用日？",
+                                     "先把这个开始日存下，再把『开播早于它』的番都判为超期忽略、停止自动下载——【包括当前正在追(已确认)的老番】。"
+                                     "若把开始日改早/清空后再点，则相反：把进入范围的超期忽略放回待确认。想单独保留哪部，之后去『已忽略』页恢复。",
+                                     ok_label="保存并应用", ok_icon="filter_alt", ok_color="primary"):
+                    return
+                config.set_many({"ANIME_START_DATE": sd})   # 存 DB + 热更内存，下面重算即读它
                 n = anime.apply_start_date_filter() + anime.ignore_confirmed_before_start()  # 待确认↔超期 + 追番中→超期
-                ui.notify(f"已应用：{n} 部番状态变更" if n else "没有需要变更的番",
-                          type="positive" if n else "info")
+                ui.notify(f"已保存并应用：{n} 部番状态变更" if n else "已保存；没有需要变更的番", type="positive")
 
-            with ui.row().classes("items-center gap-3"):   # 日期框 + 应用按钮同一行，按钮在右
+            with ui.row().classes("items-stretch gap-3"):   # 日期框 + 应用按钮同一行、等高，按钮在右
                 _text("ANIME_START_DATE", "开始使用日", config.ANIME_START_DATE, "YYYY-MM-DD，空=不限")
                 f["ANIME_START_DATE"].classes(remove="w-full", add="w-56")   # 收窄到定宽，给右侧按钮腾位
                 ui.button("应用开始使用日过滤", icon="filter_alt", on_click=_apply_filter).props(
-                    "dense size=sm color=primary unelevated").classes("text-xs")
-            ui.label("排除开播早于此日的老番、不自动下（种子照常入库，『已忽略』页可看/恢复）。改了要先点上方『保存』。"
-                     "新入库的自动源老番建库时即自动判超期忽略；对【已有】的番不自动动，需点右侧『应用』才重算——"
-                     "【含当前正在追(已确认)的老番也会被判超期忽略】。"
+                    "color=primary unelevated no-caps").classes("text-xs")   # 不加 size=sm/dense → 随行拉伸到与输入框等高
+            ui.label("排除开播早于此日的老番、不自动下（种子照常入库，『已忽略』页可看/恢复）。"
+                     "新入库的自动源老番建库时即自动判超期忽略；对【已有】的番不自动动，需点右侧『应用』——"
+                     "它会先存下这个日期、再按它重算【含当前正在追(已确认)的老番也会被判超期忽略】。"
                      "反悔：把开始日清空（或调很早）再点『应用』，就把超期忽略的番全放回待确认。").classes(
                 "text-xs text-gray-500")
 
