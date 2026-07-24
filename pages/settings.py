@@ -62,12 +62,13 @@ _QUARTER_PRESETS = {
 
 
 def _quarter_setting(f: dict, key: str, title: str, note: str, value: str,
-                     empty_hint: str = "留空＝用默认") -> None:
-    """季度模板设置块：标题 + 说明 + 模板输入 + 实时预览 + 预设下拉。控件写入 f[key]。
-    empty_hint：模板留空时预览处显示什么（文件夹项=不分类；季度显示项=跟随）。"""
+                     empty_hint: str = "留空＝用默认", tpl_label: str = "命名模板") -> None:
+    """模板设置块：标题 + 说明 + 模板输入 + 实时预览 + 预设下拉。控件写入 f[key]。
+    empty_hint：模板留空时预览处显示什么（文件夹项=不分类；季度显示项=跟随）。
+    tpl_label：模板输入框标签（文件夹命名用『命名模板』；季度显示项传『季度模板』）。"""
     ui.separator()
     ui.label(title).classes("font-bold text-sm")
-    inp = ui.input("季度模板", value=value).props("dense outlined").classes("w-full")
+    inp = ui.input(tpl_label, value=value).props("dense outlined").classes("w-full")
     f[key] = inp
     ui.label(note + "  占位：{yy}=26 {yyyy}=2026 {q}=C {season}=夏 {m}=7").classes(
         "text-xs text-gray-500")
@@ -196,8 +197,8 @@ def settings():
                          "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。").classes(
                     "text-xs text-orange-500")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
-                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的季度文件夹命名。",
-                             config.QUARTER_FMT_UI, empty_hint="留空＝跟随番剧季度文件夹命名")
+                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的下载文件夹命名。",
+                             config.QUARTER_FMT_UI, empty_hint="留空＝跟随番剧下载文件夹命名", tpl_label="季度模板")
 
             ui.separator()
             ui.label("网络 / 通知").classes("font-bold text-sm")
@@ -291,7 +292,7 @@ def settings():
                     config.ANIME_SEASON_SUBFOLDER)
             ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
                      "　｜　关：… / 番剧 / … / 番名 / 番剧.mp4").classes("text-xs text-gray-500")
-            _quarter_setting(f, "QUARTER_FMT", "季度文件夹命名（只控制下载文件夹）",
+            _quarter_setting(f, "QUARTER_FMT", "下载文件夹命名（默认按季度）",
                              "番剧按季度建下载文件夹时，季度目录名怎么写；留空＝不建季度目录、直接放番名。",
                              config.QUARTER_FMT, empty_hint="留空＝不建季度目录，直接 …/番剧/番名/")
 
