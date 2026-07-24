@@ -240,6 +240,8 @@ def settings():
                      config.ANIME_DOWNLOAD_GRACE_MIN)
             _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
                     config.ANIME_TOP_PRIORITY_INSTANT)
+            _text("ANIME_START_DATE", "开始使用日（YYYY-MM-DD，空=不限）", config.ANIME_START_DATE,
+                  "如 2026-07-01：早于这天开播的番自动判『超期忽略』、不自动下（种子照常入库，可在拒绝页看/恢复）")
             _switch("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
@@ -346,12 +348,18 @@ def settings():
                     ui.notify(f"{side}下载目录与工作目录都为空——无处下载。请填工作目录，或填这一侧的绝对路径。",
                               type="negative")
                     return
+            sd = updates.get("ANIME_START_DATE", "").strip()
+            if sd and anime._parse_date(sd) is None:
+                ui.notify("开始使用日格式不对（应为 YYYY-MM-DD，如 2026-07-01），已取消保存", type="negative")
+                return
             db_updates = {k: v for k, v in updates.items() if k not in _RESTART_ONLY}
             env_updates = {k: v for k, v in updates.items() if k in _RESTART_ONLY}
             if db_updates:
                 sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
                 qb_was_on = config.QB_ENABLED
                 config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
+                if "ANIME_START_DATE" in db_updates:
+                    anime.apply_start_date_filter()   # 开始使用日变了 → 立即重算超期忽略（可逆，只动待确认/超期番）
                 # qB 发送开着 → 保存后测一次连接：连不上就自动关掉开关（免得停在『开着却下不了』的迷惑态）
                 if config.QB_ENABLED:
                     client = await engine.qb._login()

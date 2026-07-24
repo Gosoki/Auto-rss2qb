@@ -76,6 +76,8 @@ _SPEC = {
     "ANIME_POLL_INTERVAL": (int, 1200),
     "ANIME_DOWNLOAD_GRACE_MIN": (int, 120),
     "ANIME_TOP_PRIORITY_INSTANT": (bool, True),
+    "ANIME_START_DATE": (str, ""),          # 开始使用日 YYYY-MM-DD：早于这天开播的番自动判『超期忽略』、不自动下载
+                                            # （种子照常入库）；空=不限。改日期可逆，只动待确认/超期番，不碰人工确认/拒绝
     "OPEN_PROXY": (bool, False),
     "PROXY_URL": (str, ""),
     "WEB_ALLOW_CIDRS": (str, ""),   # Web 访问网段白名单(CIDR,逗号分隔;空=不限)——绑 0.0.0.0 时限定可信内网,本机恒放行,即时生效

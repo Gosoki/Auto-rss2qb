@@ -62,6 +62,46 @@ def _is_auto(kind: str) -> bool:
     return kind == "auto"
 
 
+def _parse_date(s):
+    """把 'YYYY-MM-DD'(或 'YYYY-MM'/'YYYY') 解析成 date；解析不出返回 None。"""
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _aired_before_start(air_date) -> bool:
+    """该番开播日是否早于『开始使用日』(config.ANIME_START_DATE)。开始日空/开播日未知 → False(不判超期)。"""
+    start = _parse_date(config.ANIME_START_DATE)
+    aired = _parse_date(air_date)
+    return bool(start and aired and aired < start)
+
+
+def apply_start_date_filter() -> int:
+    """按『开始使用日』重算超期忽略。超期忽略 = (rejected=True, confirmed=False)——人工拒绝必是 confirmed=True，
+    故此组合唯一表示超期忽略、可与人工决定区分。可逆、只动该动的番：
+    · 超期(开播<开始日) 且 仍待确认(未确认未拒) → 判超期忽略(置 rejected，confirmed 保持 False)，不自动下；
+    · 已不超期(改早开始日/未知开播日/关闭) 且 当前是超期忽略 → 释放回待确认(清 rejected)。
+    人工确认(confirmed=True)、人工拒绝(rejected 且 confirmed=True) 一律不碰——改日期不会掀翻用户的手动决定。返回变更数。"""
+    changed = 0
+    with get_session() as s:
+        for a in s.exec(select(Anime)):
+            out = _aired_before_start(a.air_date)
+            if out and not a.rejected and not a.confirmed:      # 超期 + 待确认 → 判超期忽略
+                a.rejected = True
+                s.add(a); changed += 1
+            elif not out and a.rejected and not a.confirmed:    # 不再超期 + 当前是超期忽略 → 释放回待确认
+                a.rejected = False
+                s.add(a); changed += 1
+        if changed:
+            s.commit()
+            log.info("开始使用日过滤：%d 部番超期状态变更", changed)
+    return changed
+
+
 def _kw_match(kw: str, raw: str) -> bool:
     """版本关键词是否命中种子原名？大小写不敏感子串（繁日/简日/1080p 等）。调用方保证 kw 非空。"""
     return kw.lower() in (raw or "").lower()
@@ -175,7 +215,10 @@ async def process_item(item) -> bool:
         # 救回『review/泛 feed 先建番把 auto 主力番静默压进待确认』与『bgm 瞬时失败先建的番』。
         if (a is not None and not a.confirmed and not a.rejected
                 and a.bangumi_id is not None and _is_auto(item.source_kind)):
-            a.confirmed = True
+            if _aired_before_start(a.air_date):
+                a.rejected = True   # 超期(早于开始使用日) → 判超期忽略(rejected 且 confirmed 仍 False)，不自动下（种子照常入库）
+            else:
+                a.confirmed = True
             s.add(a)
             s.commit()
         should_download = bool(a and a.confirmed and not a.rejected)
@@ -341,6 +384,7 @@ async def flush_ready_downloads() -> int:
     config.ANIME_DOWNLOAD_GRACE_MIN 分钟才放行，到点从该集所有种子挑优先级最高的下一份（错误的排后，
     留作降级）。特别篇/未知集不做集去重，逐个下。返回实际触发下载的数量。
     """
+    apply_start_date_filter()    # 先按『开始使用日』重算超期忽略（含晚到 bgm 后补判/日期变更），超期番不进下面的自动下
     _revive_orphaned_skipped()   # 先把『首选源已失败、该集无其它下载』的 skipped 兄弟放回 pending，本轮即可换源
     grace = timedelta(minutes=max(0, config.ANIME_DOWNLOAD_GRACE_MIN))  # 负值会使门槛永假、废掉多源补齐，钳到 0
     now = datetime.now()
@@ -668,7 +712,7 @@ def reject_anime(anime_id: int) -> None:
         if a is None:
             return
         a.rejected = True
-        a.confirmed = True
+        a.confirmed = True   # 人工拒绝置 confirmed=True → 与『超期忽略(confirmed=False)』区分，改开始日不会掀翻它
         s.add(a)
         for t in s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
@@ -689,7 +733,7 @@ def restore_anime(anime_id: int) -> None:
         if a is None:
             return
         a.rejected = False
-        a.confirmed = True
+        a.confirmed = True   # 恢复=确认，confirmed=True → 改开始日不会再把它判超期忽略（超期忽略需 confirmed=False）
         s.add(a)
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
         # deleted 也算『该集已处理过』：用户特意删过的集，其去重落选的 skipped 兄弟不该被复活重下。

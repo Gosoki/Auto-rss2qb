@@ -33,7 +33,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 if _sl:
                     ui.badge(_sl).props("color=purple")
                 if cur.rejected:
-                    ui.badge("已忽略").props("color=grey")
+                    ui.badge("超期忽略" if not cur.confirmed else "已忽略").props("color=grey")
                 else:
                     ui.badge("✓ 已确认" if cur.confirmed else "⏳ 待确认").props(
                         f"color={'green' if cur.confirmed else 'orange'}")

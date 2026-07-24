@@ -64,6 +64,8 @@ class Anime(SQLModel, table=True):
     # ---- 下载控制 ----
     confirmed: bool = Field(default=True)             # 确认状态（待确认源默认 False，等人工确认）；确认即自动下
     rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『拒绝』页恢复）
+    # 注：『开始使用日超期忽略』复用此二字段编码为 (rejected=True, confirmed=False)——人工拒绝必是 confirmed=True，
+    # 故该组合唯一表示"超期忽略"，随开始日可逆、不与人工拒绝混淆，无需额外字段。见 core.anime.apply_start_date_filter
     pref_source: str | None = Field(default=None)     # 锁定下载源（精确匹配 torrent.source：锁哪个组只下哪个；联合发布如"喵萌&LoliHouse"视作独立源、要单独锁，入库照收）；空=按优先级多源兜底
     pref_keyword: str | None = Field(default=None)    # 版本关键词（大小写不敏感子串命中 raw_title，如 繁日/简日/1080p）：与锁定源叠加、只下命中的版本；空=不限
     enrich_tries: int = Field(default=0)              # bgm 未识别番的后台重试次数（满 REENRICH_MAX_TRIES 停自动重试，留手动；手动重识别清零）
