@@ -403,7 +403,7 @@ def frame(active: str = ""):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）
         with ui.row().classes("items-center gap-2 w-full px-4 relative flex-nowrap").style("height:56px"):
             # 移动端(<640px)：导航收进汉堡菜单（sm:hidden＝≥640 隐藏），避免链接横向溢出
-            with ui.button(icon="menu").props("flat round dense color=white").classes("sm:hidden"):
+            with ui.button(icon="menu").props("flat round dense color=white").classes("md:hidden"):
                 with ui.menu().props("dark"):
                     for key, label, path in NAV:
                         mi = ui.menu_item(label, on_click=lambda p=path: ui.navigate.to(p))
@@ -417,20 +417,23 @@ def frame(active: str = ""):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
                 ui.label(config.SITE_NAME or "AutoRSS").classes("text-lg font-bold max-sm:hidden").style(
                     "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去，只留居中图标
-            # 桌面端(≥640px)：内联导航，绝对定位在顶栏水平居中（不受左侧品牌/右侧按钮宽度影响）；
-            # max-sm:hidden＝<640 隐藏改走汉堡菜单（此向可靠，hidden+sm:flex 在本环境无法复原）
-            with ui.row().classes("items-center gap-2 max-sm:hidden absolute left-1/2 top-1/2 "
-                                  "-translate-x-1/2 -translate-y-1/2"):
+            # 桌面端(≥768px)：内联导航，绝对定位在顶栏水平居中（不受左侧品牌/右侧按钮宽度影响）。
+            # w-max 必须有：绝对元素 left-1/2 的收缩宽度只有父宽 50%，不锁 max-content 会被压缩、把每个项文字挤成两行。
+            # flex-nowrap + whitespace-nowrap 双保险，行不换、字不折。
+            # max-md:hidden＝<768 隐藏改走汉堡菜单（此向可靠，hidden+md:flex 在本环境无法复原）。
+            with ui.row().classes("items-center gap-2 flex-nowrap whitespace-nowrap w-max max-md:hidden "
+                                  "absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"):
                 for key, label, path in NAV:
                     cls = "cursor-pointer text-sm px-2 transition-colors "
                     cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
                             if key == active else "text-gray-400 hover:text-gray-300")
                     ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
-                # qB 网页版：外链，新标签打开设置里填的 qB 地址（每次渲染读，改地址即时生效）
+                # qB 后台：外链，新标签打开设置里填的 qB 地址（每次渲染读，改地址即时生效）。
+                # max-lg:hidden＝窄于 1024 时先让它消失（它可有可无），给核心导航腾出居中空间。
                 qb = (config.QB_URL or "").strip()
                 qcls = ("cursor-pointer text-gray-400 hover:text-gray-300" if qb else "text-gray-600")
                 with ui.row().classes(
-                        f"items-center gap-0.5 text-sm px-2 transition-colors {qcls}") as _qbnav:
+                        f"items-center gap-0.5 text-sm px-2 transition-colors max-lg:hidden {qcls}") as _qbnav:
                     ui.label("qB 后台")
                     ui.icon("open_in_new").style("font-size:14px")
                 if qb:
