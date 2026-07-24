@@ -261,7 +261,7 @@ def settings():
 
         # ========== 折叠 ② 番剧 ==========
         with ui.card().classes("w-full"), ui.expansion(
-                "番剧", icon="movie").classes("w-full").props("dense"):
+                "番剧", icon="movie", value=True).classes("w-full").props("dense"):
             _section("采集",
                      "Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在『源管理』页配置。")
             _switch("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
@@ -339,7 +339,7 @@ def settings():
 
         # ========== 折叠 ③ 剧场版 ==========
         with ui.card().classes("w-full"), ui.expansion(
-                "剧场版", icon="theaters").classes("w-full").props("dense"):
+                "剧场版", icon="theaters", value=True).classes("w-full").props("dense"):
             _section("列表显示",
                      "默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
                      "自动扫描开关/间隔在『剧场版页 → 订阅源』里。")
