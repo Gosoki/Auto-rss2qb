@@ -374,6 +374,9 @@ def frame(active: str = ""):
         # 设置页数字项栅格：桌面每格 1/4 宽（4 列），窄屏落到 2 列；顶端对齐（标签在框上、行高不齐也整齐）
         ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
         "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
+        # 顶栏品牌：手机(<640)绝对居中（汉堡在左、刷新在右，品牌图标居中）；≥640 静态靠左跟导航同排
+        "@media(max-width:639px){.brand-center{position:absolute;left:50%;top:50%;"
+        "transform:translate(-50%,-50%);margin:0!important}}"
         "</style>")
     # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。绿用 -500（-400 太亮），其余（含红）用 -400。
     # 必须放进 @layer overrides —— Quasar 的 .bg-* !important 在 quasar_importants 层里；分层后 !important 比的是
@@ -397,17 +400,26 @@ def frame(active: str = ""):
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.08);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）
-        with ui.row().classes("items-center gap-2 w-full px-4").style(
-                "height:56px;overflow-x:auto;overflow-y:hidden"):   # 窄屏导航横向可滚，不再裁掉够不着
-            with ui.row().classes("items-center gap-2 mr-2 sm:mr-6"):
+        with ui.row().classes("items-center gap-2 w-full px-4 relative flex-nowrap").style("height:56px"):
+            # 移动端(<640px)：导航收进汉堡菜单（sm:hidden＝≥640 隐藏），避免链接横向溢出
+            with ui.button(icon="menu").props("flat round dense color=white").classes("sm:hidden"):
+                with ui.menu().props("dark"):
+                    for key, label, path in NAV:
+                        mi = ui.menu_item(label, on_click=lambda p=path: ui.navigate.to(p))
+                        if key == active:
+                            mi.classes("text-blue-400 font-semibold")
+            # 品牌：手机绝对居中(.brand-center)，≥640 静态靠左跟导航同排
+            with ui.row().classes("items-center gap-2 mr-2 sm:mr-6 brand-center"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
-                ui.label("autorss").classes("text-lg font-bold hidden sm:block").style(
-                    "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去、留图标腾出导航空间
-            for key, label, path in NAV:
-                cls = "cursor-pointer text-sm px-2 transition-colors "
-                cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
-                        if key == active else "text-gray-400 hover:text-gray-300")
-                ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
+                ui.label("autorss").classes("text-lg font-bold max-sm:hidden").style(
+                    "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去，只留居中图标
+            # 桌面端(≥640px)：内联导航；max-sm:hidden＝<640 隐藏（此向可靠，hidden+sm:flex 在本环境无法复原）
+            with ui.row().classes("items-center gap-2 max-sm:hidden"):
+                for key, label, path in NAV:
+                    cls = "cursor-pointer text-sm px-2 transition-colors "
+                    cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
+                            if key == active else "text-gray-400 hover:text-gray-300")
+                    ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
             ui.space()
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位
             ui.button(icon="refresh", on_click=lambda: ui.navigate.reload()).props(
