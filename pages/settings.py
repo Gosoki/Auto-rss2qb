@@ -273,7 +273,7 @@ def settings():
             _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
                     config.ANIME_TOP_PRIORITY_INSTANT)
             _switch("ANIME_MULTIBRACKET_PARSE",
-                    "多括号命名回退捕获（沸羊羊/悠哈/GM-Team 等 [组][番名][集] 格式）",
+                    "多括号命名回退捕获（识别 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
             ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
                      "大组不受影响），可在『解析测试』页验证。").classes("text-xs text-gray-500")
