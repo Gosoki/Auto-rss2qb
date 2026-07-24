@@ -354,7 +354,7 @@ def movies_page(t: str = ""):
                         with ui.row().classes("items-center gap-2 flex-wrap"):
                             ui.badge(m.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定
                             ui.label(name_of(m)).classes(
-                                "cursor-pointer text-blue-400 hover:underline font-bold").on(
+                                "text-lg cursor-pointer text-blue-400 hover:underline font-bold").on(
                                 "click", lambda mid=m.id: open_detail(mid))
                             if not m.bangumi_id:
                                 ui.badge("未识别").props("color=red").tooltip("bgm 没匹配上，去『待识别』手动绑定")
@@ -561,7 +561,7 @@ def movies_page(t: str = ""):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
                         ui.badge("未识别").props("color=red")
                         ui.label(name_of(m)).classes(
-                            "cursor-pointer text-blue-400 hover:underline").on(
+                            "text-lg cursor-pointer text-blue-400 hover:underline").on(
                             "click", lambda mid=m.id: open_detail(mid))
                         ui.label("来源: " + (" · ".join(mov.movie_sources(m.id)) or "—")).classes(
                             "text-xs text-gray-400")
@@ -583,7 +583,7 @@ def movies_page(t: str = ""):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
                         ui.badge("已忽略").props("color=grey")
                         ui.label(name_of(m)).classes(
-                            "cursor-pointer text-blue-400 hover:underline").on(
+                            "text-lg cursor-pointer text-blue-400 hover:underline").on(
                             "click", lambda mid=m.id: open_detail(mid))
                         ui.label("来源: " + (" · ".join(mov.movie_sources(m.id)) or "—")).classes(
                             "text-xs text-gray-400")

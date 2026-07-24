@@ -236,7 +236,7 @@ def anime_page(t: str = ""):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
                                 ui.badge("待确认").props("color=orange")
                                 ui.label(name_of(a)).classes(
-                                    "cursor-pointer text-blue-400 hover:underline").on(
+                                    "text-lg cursor-pointer text-blue-400 hover:underline").on(
                                     "click", lambda aid=a.id: open_detail(aid))
                                 sl = season_label(a)
                                 if sl:
@@ -262,7 +262,7 @@ def anime_page(t: str = ""):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
                                 ui.badge("已忽略").props("color=grey")
                                 ui.label(name_of(a)).classes(
-                                    "cursor-pointer text-blue-400 hover:underline").on(
+                                    "text-lg cursor-pointer text-blue-400 hover:underline").on(
                                     "click", lambda aid=a.id: open_detail(aid))
                                 sl = season_label(a)
                                 if sl:
@@ -295,7 +295,7 @@ def anime_page(t: str = ""):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
                         ui.badge("未匹配").props("color=red")
                         ui.label(name_of(a)).classes(
-                            "cursor-pointer text-blue-400 hover:underline").on(
+                            "text-lg cursor-pointer text-blue-400 hover:underline").on(
                             "click", lambda aid=a.id: open_detail(aid))
                         sl = season_label(a)
                         if sl:
@@ -601,7 +601,7 @@ def anime_page(t: str = ""):
                     ui.badge("待确认").props("color=orange").classes("inline-block align-middle mr-2")
                 color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
                 ui.label(name_of(a)).classes(
-                    f"inline align-middle cursor-pointer {color} hover:underline").on(
+                    f"text-lg inline align-middle cursor-pointer {color} hover:underline").on(
                     "click", lambda aid=a.id: open_detail(aid))
                 sl = season_label(a)
                 if sl:
