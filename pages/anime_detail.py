@@ -93,15 +93,21 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
                          else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过")
             _bf1 = ui.button("补齐该源", icon="playlist_add", on_click=_backfill_loose).props(
-                "flat dense size=sm").style("font-size:12px")
+                "flat dense size=sm").style("font-size:14px")
             _bf1.tooltip("去 nyaa/Mikan 按名搜『当前下载源』的种子补漏收（季度过滤，你人工审核）。"
                          "入库后转『待确认』，点『确认下载』才下。")
             _bf2 = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_strict).props(
-                "flat dense size=sm").style("font-size:12px")
+                "flat dense size=sm").style("font-size:14px")
             _bf2.tooltip("同『补齐该源』，但额外用番名近似过滤挡掉同名衍生作/别的季，更少需人工把关。")
 
-        # 分集 / 种子（每条可单独强制下载）
-        ui.label(f"分集 / 种子（{len(eps)}）").classes("text-sm font-bold mt-2")
+        # 分集 / 种子（每条可单独强制下载）；标题右侧灰字标注会发送给 qB 的保存目录（按规则算出，全番同一目录）
+        with ui.row().classes("items-center gap-2 w-full mt-2 flex-wrap"):
+            ui.label(f"分集 / 种子（{len(eps)}）").classes("text-sm font-bold shrink-0")
+            ui.space()
+            _sp = anime.anime_save_path(anime_id)
+            ui.label(f"↓ {_sp}" if _sp else "↓ 未配置下载目录").classes(
+                "text-gray-500 text-xs break-all min-w-0 text-right").tooltip(
+                "下载时发送给 qB 的保存目录（按 工作目录/季度/番名/Season 规则算出）")
         if not eps:
             ui.label("（还没有种子）").classes("text-gray-400")
             return
