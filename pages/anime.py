@@ -386,10 +386,24 @@ def anime_page(t: str = ""):
                     ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
             exp = manage_page["expand"]  # None=各季按默认(仅最新季开)；True/False=一键全展开/收起(跨页一致)
             for i, (q, items) in enumerate(groups):
-                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                  value=(exp if exp is not None else i == 0)).classes("w-full"):
-                    for a in items:
-                        _anime_row(a, src_map.get(a.id))
+                _open = exp if exp is not None else i == 0
+                _exp = ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
+                                    value=_open).classes("w-full")
+                # 懒加载：折叠的季度先不建行（省首建成本）；首次展开时才建，之后不再重建
+                _fl = {"built": False}
+
+                def _fill(qi=items, box=_exp, fl=_fl):
+                    if fl["built"]:
+                        return
+                    fl["built"] = True
+                    with box:
+                        for a in qi:
+                            _anime_row(a, src_map.get(a.id))
+
+                if _open:
+                    _fill()
+                else:
+                    _exp.on_value_change(lambda e, f=_fill: f() if e.value else None)
 
         def refresh_dynamic():
             # 用户操作后的全动态刷新：含『待确认/待识别』，好让确认/绑定/忽略后的番立即从对应列表流转。
@@ -400,13 +414,19 @@ def anime_page(t: str = ""):
             fail_panel.refresh()
             recent_panel.refresh()
 
+        def _refresh_live(tab):
+            # 刷新某 tab 的只读实时区：overview 的实时状态/新入库、reject 列表。其余 tab 无实时区，不动。
+            # 不含 confirm/fail——它们有用户正在输入的绑定框/源下拉，重建会清空半途输入。
+            if tab == "overview":
+                overview_panel.refresh()
+                inflight_panel.refresh()
+                recent_panel.refresh()
+            elif tab == "reject":
+                reject_panel.refresh()
+
         def refresh_timer():
-            # 30s 定时器专用：排除 confirm_panel/fail_panel——它们含用户正在输入的 bgm 绑定框/源下拉，
-            # 定时重建会清空半途输入。后台新发现的待确认/待识别番在下次用户操作或整页刷新时显现（KPI 计数仍每 30s 更新）。
-            overview_panel.refresh()
-            inflight_panel.refresh()
-            reject_panel.refresh()
-            recent_panel.refresh()
+            # 30s 定时器：只刷『当前可见 tab』的实时区，隐藏 tab 不动（省 CPU、消除每 30s 的周期性卡顿）。
+            _refresh_live(tabs.value)
 
         def refresh_all():
             refresh_dynamic()
@@ -553,25 +573,37 @@ def anime_page(t: str = ""):
             ui.tab("fail", "待识别", "sync_problem")
             ui.tab("reject", "已忽略", "block")
             ui.tab("sources", "订阅源", "rss_feed")
-        # 切 tab 时把当前 tab 写进 URL（不重载），这样『刷新』重载后仍停在该 tab
-        tabs.on_value_change(lambda e: ui.run_javascript(
-            f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))"))
+        # 懒加载：首屏只构建当前 tab 的内容；切到别的 tab 首次才建（6 个面板 → 1 个，砍首屏构建/推送）。
+        # 面板都是 @ui.refreshable，未构建过的 .refresh() 是安全 no-op，所以刷新逻辑无需改动。
+        _builders = {
+            "overview": lambda: (overview_panel(), inflight_panel(), recent_panel()),
+            "manage": manage_panel, "confirm": confirm_panel,
+            "fail": fail_panel, "reject": reject_panel, "sources": render_sources,
+        }
+        _slots: dict = {}
+        _built: set = set()
+
+        def _build_tab(key):
+            if key in _built or key not in _slots:
+                return
+            _built.add(key)
+            with _slots[key]:
+                _builders[key]()
+
         start = t if t in _TAB_KEYS else (
             config.ANIME_DEFAULT_TAB if config.ANIME_DEFAULT_TAB in _TAB_KEYS else "manage")
         with ui.tab_panels(tabs, value=start).classes("w-full"):
-            with ui.tab_panel("overview"):
-                overview_panel()
-                inflight_panel()
-                recent_panel()
-            with ui.tab_panel("manage"):
-                manage_panel()
-            with ui.tab_panel("confirm"):
-                confirm_panel()
-            with ui.tab_panel("fail"):
-                fail_panel()
-            with ui.tab_panel("reject"):
-                reject_panel()
-            with ui.tab_panel("sources"):
-                render_sources()
+            for _k in _TAB_KEYS:
+                with ui.tab_panel(_k):
+                    _slots[_k] = ui.element("div").classes("w-full")   # 空占位，按需填充
 
-        ui.timer(30.0, refresh_timer)  # 只刷只读实时区，不重建管理页/含输入的待确认待识别（避免重置展开、清空输入）
+        def _on_tab(e):   # 切 tab：写 URL(不重载，刷新后仍停在此 tab) + 首次构建；已建过的切回来刷新实时区显示最新
+            ui.run_javascript(f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))")
+            already = e.value in _built
+            _build_tab(e.value)
+            if already:
+                _refresh_live(e.value)
+        tabs.on_value_change(_on_tab)
+        _build_tab(start)   # 构建首屏 tab
+
+        ui.timer(30.0, refresh_timer)  # 只刷当前可见 tab 的实时区（见 refresh_timer）
