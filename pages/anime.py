@@ -528,9 +528,9 @@ def anime_page(t: str = ""):
 
         def _anime_row(a, sources=None):
             with ui.row().classes("items-center gap-3 pl-2 py-1"):
-                if sources:   # 源徽标放最前：多源(>1)绿 / 单源(==1)蓝
+                if sources:   # 源徽标放最前：多源(>1)蓝 / 单源(==1)灰
                     n = len(sources)
-                    _lab, _c = (f"多源 {n}", "green") if n > 1 else (f"单源 {n}", "blue")
+                    _lab, _c = (f"多源 {n}", "blue") if n > 1 else (f"单源 {n}", "blue-grey")
                     ui.badge(_lab).props(f"color={_c}").tooltip("来源: " + " · ".join(sources))
                 if a.rejected:                       # 状态徽标（互斥，最多一个）
                     ui.badge("已忽略").props("color=grey")
