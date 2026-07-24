@@ -23,6 +23,8 @@ _SEASON_WORD_RE = re.compile(                            # 3rd Season / Season 3
 _SEASON_EN_RE = re.compile(r"[Ss](\d{1,2})[Ee]\d")       # S02E07 → 第2季
 _GROUP_RE = re.compile(r"^[\[【]([^\]】]+)[\]】]")          # [组] 或 【组】
 _SLASH_RE = re.compile(r"\s+/\s+")                        # 语言分隔『罗马音 / 中文』，不吃番名内部的裸 /
+_HAN_RE = re.compile(r"[一-鿿]")                           # CJK 汉字
+_KANA_RE = re.compile(r"[぀-ヿ]")                          # 平/片假名（3040–30FF）＝日文段特征
 ONE_COUR = 12
 
 # 批量/合集/蓝光整理帖 或 连续集范围(01-12)——不是周更单集。
@@ -172,23 +174,31 @@ def format_quarter(quarter: str, fmt: str) -> str:
         return quarter
 
 
+def _is_chinese(s: str) -> bool:
+    """判『中文段』：有汉字、无假名——用于多语言标题优先取中文番名。
+    ANi 是 罗马音/中文（中文在后），但别的字幕组常把中文放前面，故按内容挑而非按位置。"""
+    return bool(_HAN_RE.search(s)) and not _KANA_RE.search(s)
+
+
 def parse_title(raw_title: str):
     """从各家字幕组标题提取 (组名, 番名, 季, 集)。
 
-    番名取自 '/' 之后（有则）或组名括号之后，剥掉标签块与集数段；繁转简 + 去季名。
+    多语言标题（形如 [组] A / B - EE [tags]）：番名**优先取中文段**（含汉字、无假名），
+    没有中文才回退取末段（ANi 惯例 罗马音/中文，中文在末段）；集数从整体正文抽，不受挑哪段影响。
+    繁转简 + 去季名。
     """
     m = _GROUP_RE.match(raw_title)
     group = m.group(1).strip() if m else ""
+    body = raw_title[m.end():] if m else raw_title   # 去开头 [组] 块，免得它混进第一段语言
 
-    if _SLASH_RE.search(raw_title):
-        name_part = _SLASH_RE.split(raw_title, 1)[1]   # 『罗马音 / 中文』取中文段
-    elif m:
-        name_part = raw_title[m.end():]   # 组名括号之后（避免误用结尾 tag 的 ]）
+    if _SLASH_RE.search(body):
+        segs = _SLASH_RE.split(body)                 # 各语言段（罗马音/日文/中文，2~3 段）
+        name_part = next((s for s in segs if _is_chinese(s)), segs[-1])  # 优先中文段，没有则末段（ANi=中文）
     else:
-        name_part = raw_title
+        name_part = body
 
     season = extract_season(raw_title)
-    episode = extract_episode(name_part)
+    episode = extract_episode(body)                  # 集数从整体正文抽：中文段在前时也不丢 '- EE'
     anime_title = strip_season(t2s(_clean_name(name_part)))
     return group, anime_title, season, episode
 
