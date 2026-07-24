@@ -462,7 +462,7 @@ def overview() -> dict:
             "torrents": total_torrents,
         },
         "status": {k: status.get(k, 0) for k in
-                   ("downloaded", "downloading", "pending", "error", "skipped")},
+                   ("downloaded", "downloading", "pending", "error", "skipped", "stalled")},
         "pending_split": split,
         "by_quarter": by_quarter,
         "by_quarter_state": by_quarter_state,
@@ -1278,7 +1278,8 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
     with get_session() as s:
         pairs = [(t.id, t.info_hash) for t in s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(["downloaded", "downloading"])))]
+            AnimeTorrent.status.in_(["downloaded", "downloading"]),
+            AnimeTorrent.archived_at.is_(None)))]   # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
     if not pairs:
         return rep
 
@@ -1337,8 +1338,8 @@ async def delete_anime_torrent(torrent_id: int) -> bool:
     """
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in ("downloaded", "downloading", "stalled"):
-            return False  # stalled(停滞异常) 也允许删：清掉 qB 里卡死的残缺文件
+        if t is None or t.status not in ("downloaded", "downloading", "stalled") or t.archived_at is not None:
+            return False  # stalled 也允许删；已归档(archived_at)不删——已不在 qB、代删不到文件，须先『重新下载』再删
         h = t.info_hash
     if engine.hash_owned_elsewhere(h, MovieTorrent):
         _set_status(torrent_id, "deleted")  # 剧场版侧还持有同一种子 → 只脱手，不删文件
@@ -1360,6 +1361,7 @@ async def delete_anime_files(anime_id: int) -> int:
         rows = list(s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
             AnimeTorrent.status.in_(["downloaded", "downloading", "stalled"]),  # 含停滞异常，一并清
+            AnimeTorrent.archived_at.is_(None),  # 已归档的跳过：不在 qB、代删不到文件
         )))
         pairs = [(t.id, t.info_hash) for t in rows]
     if not pairs:

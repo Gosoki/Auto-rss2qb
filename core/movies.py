@@ -200,7 +200,7 @@ def overview() -> dict:
         },
         "by_quarter": [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs],
         "status": {k: status.get(k, 0) for k in
-                   ("downloaded", "downloading", "pending", "error", "skipped")},
+                   ("downloaded", "downloading", "pending", "error", "skipped", "stalled")},
         "qb": engine.qb_summary(MovieTorrent),
         "config": {"qb": config.QB_ENABLED},
     }
@@ -446,7 +446,8 @@ async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
     with get_session() as s:
         pairs = [(t.id, t.info_hash) for t in s.exec(select(MovieTorrent).where(
             MovieTorrent.movie_id == movie_id,
-            MovieTorrent.status.in_(["downloaded", "downloading"])))]
+            MovieTorrent.status.in_(["downloaded", "downloading"]),
+            MovieTorrent.archived_at.is_(None)))]   # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
     if not pairs:
         return rep
 
@@ -573,8 +574,8 @@ async def delete_movie_torrent(mt_id: int) -> bool:
     """
     with get_session() as s:
         t = s.get(MovieTorrent, mt_id)
-        if t is None or t.status not in ("downloaded", "downloading", "stalled"):
-            return False  # stalled(停滞异常) 也允许删：清掉 qB 里卡死的残缺文件
+        if t is None or t.status not in ("downloaded", "downloading", "stalled") or t.archived_at is not None:
+            return False  # stalled 也允许删；已归档(archived_at)不删——已不在 qB、代删不到文件，须先『重新下载』再删
         h = t.info_hash
     if engine.hash_owned_elsewhere(h, AnimeTorrent):
         _set_status(mt_id, "deleted")  # TV 侧还持有同一种子 → 只脱手，不删文件

@@ -157,7 +157,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     _vdl.set_enabled(config.QB_ENABLED)
                     _vdl.tooltip("强制下这一版本到文件夹" if config.QB_ENABLED
                                  else "qB 未启用，去设置页开启后可下载")
-                    if t.status in ("downloaded", "downloading"):
+                    if t.status in ("downloaded", "downloading") and not t.archived_at:  # 已归档不在 qB、代删不到文件
                         ui.button(icon="delete_forever", on_click=_del(t.id)).props(
                             "size=sm flat dense color=negative").tooltip("删除这一版本的文件（qB+硬盘，不可撤销）")
 
