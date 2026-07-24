@@ -308,7 +308,7 @@ def anime_page(t: str = ""):
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         inp = ui.input(
                             placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").props(
-                            "dense outlined").classes("min-w-96")
+                            "dense outlined").classes("w-96 min-w-0 max-sm:w-full")   # 桌面 384px；手机满卡宽(min-w-0 让 q-input 真能收缩，否则撑破卡片横向溢出)
                         ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("color=primary unelevated")
                         ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("flat color=grey")
                         ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
