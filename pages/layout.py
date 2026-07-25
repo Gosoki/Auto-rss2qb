@@ -439,19 +439,22 @@ def frame(active: str = ""):
                     cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
                             if key == active else "text-gray-400 hover:text-gray-300")
                     ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
-                # 跳转到：外链下拉（qB后台/Nyaa/Mikan/Bangumi），【鼠标悬浮即弹出】、各项新标签打开。保留 ↗ 符号。
-                # no-parent-event＝不靠点击触发，由下面 mouseenter 手动 open()；QMenu 会 portal 到 body、不被顶栏裁剪。
-                # max-lg:hidden＝窄于 1024 时先让它消失（可有可无），给核心导航腾出居中空间（窄屏走汉堡菜单）。
-                with ui.row().classes(
-                        "items-center gap-0.5 text-sm px-2 transition-colors cursor-pointer "
-                        "text-gray-400 hover:text-gray-300 max-lg:hidden") as _jrow:
-                    ui.label("跳转到")
-                    ui.icon("open_in_new").style("font-size:14px")
-                    _jmenu = ui.menu().props("no-parent-event anchor='bottom middle' self='top middle'")
-                    with _jmenu:
-                        for _name, _url in _jump_targets():
-                            ui.menu_item(_name, on_click=lambda u=_url: ui.navigate.to(u, new_tab=True))
-                _jrow.on("mouseenter", lambda: _jmenu.open())
+                # 跳转到：外链下拉（qB后台/Nyaa/Mikan/Bangumi）。纯 CSS group-hover——【鼠标悬浮即显示、移开即收起】，
+                # 天然跟随焦点、不用点击、不会被顶栏裁剪。max-lg:hidden＝窄于 1024 隐藏（走汉堡菜单）。保留 ↗ 符号。
+                with ui.element("div").classes("relative group max-lg:hidden"):
+                    with ui.row().classes("items-center gap-0.5 text-sm px-2 cursor-pointer "
+                                          "text-gray-400 group-hover:text-gray-300 transition-colors"):
+                        ui.label("跳转到")
+                        ui.icon("open_in_new").style("font-size:14px")
+                    # 外层带 pt-1 透明桥（补触发行与菜单之间的缝，鼠标可平移过去不断 hover）；内层才是可见菜单框
+                    with ui.element("div").classes(
+                            "hidden group-hover:block absolute left-1/2 -translate-x-1/2 top-full z-50 pt-1"):
+                        with ui.column().classes("min-w-max gap-0 rounded overflow-hidden shadow-xl").style(
+                                "background:#1b1e24;border:1px solid rgba(255,255,255,.14)"):
+                            for _name, _url in _jump_targets():
+                                ui.label(_name).classes(
+                                    "px-4 py-2 text-sm text-gray-300 hover:bg-white/10 cursor-pointer "
+                                    "whitespace-nowrap").on("click", lambda u=_url: ui.navigate.to(u, new_tab=True))
 
             ui.space()
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位

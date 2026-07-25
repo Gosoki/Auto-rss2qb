@@ -125,10 +125,3 @@ async def identify_folder(bgm_input: str) -> dict:
         return {"ok": False, "error": "算不出保存目录（越界 / 未配置下载目录）"}
     return {"ok": True, "name": info.get("display_name") or folder,
             "quarter": quarter, "season": season, "path": path}
-
-
-async def relocate_manual(info_hash: str, new_path: str) -> int | None:
-    """把已下的手动种子（按 info_hash）移到 new_path（qB setLocation 原地搬）。返回状态码(200成功)/None(连不上)。"""
-    if not (info_hash and new_path):
-        return None
-    return await engine.qb.set_location([info_hash], new_path)
