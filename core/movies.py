@@ -368,17 +368,51 @@ def restore_movie(movie_id: int) -> None:
         s.commit()
 
 
-def deleted_movie_torrent_rows() -> list[dict]:
-    """已删除(deleted)的剧场版种子——供『已忽略』页底部『已删除种子』折叠展示 + 重新下载找回。
-    与番剧 deleted_torrent_rows 对称：deleted 是用户主动删文件的终态、不会自动重下，这里给集中入口找回。"""
+def _terminal_movie_torrent_rows(status: str) -> list[dict]:
+    """某终态(deleted/excluded)的剧场版种子行（片名/原名），供『已忽略』页底部折叠展示。"""
     with get_session() as s:
-        ts = list(s.exec(select(MovieTorrent).where(MovieTorrent.status == "deleted")
+        ts = list(s.exec(select(MovieTorrent).where(MovieTorrent.status == status)
                          .order_by(MovieTorrent.created_at.desc())))
         ids = {t.movie_id for t in ts if t.movie_id}
         names = ({m.id: (m.display_name or m.title) for m in
                   s.exec(select(Movie).where(Movie.id.in_(ids)))} if ids else {})
     return [{"id": t.id, "movie_id": t.movie_id,
              "name": names.get(t.movie_id) or "?", "raw": t.raw_title or ""} for t in ts]
+
+
+def deleted_movie_torrent_rows() -> list[dict]:
+    """已删除(deleted)的剧场版种子——『已删除种子』折叠 + 重新下载找回（与番剧对称）。"""
+    return _terminal_movie_torrent_rows("deleted")
+
+
+def excluded_movie_torrent_rows() -> list[dict]:
+    """已排除(excluded)的剧场版种子——『已排除种子』折叠 + 恢复放回可下（与番剧对称）。"""
+    return _terminal_movie_torrent_rows("excluded")
+
+
+def exclude_movie_torrent(mt_id: int) -> bool:
+    """排除一条不想要的待下剧场版版本：置终态 excluded（不删文件、不碰 qB，只改状态）——
+    不再显示在可下队列、RSS 再遇到同 hash 也不重收；可用 unexclude_movie_torrent 撤销。只动 pending/error。"""
+    with get_session() as s:
+        t = s.get(MovieTorrent, mt_id)
+        if t is None or t.status not in ("pending", "error"):
+            return False
+        t.status = "excluded"
+        s.add(t)
+        s.commit()
+    return True
+
+
+def unexclude_movie_torrent(mt_id: int) -> bool:
+    """取消排除：把 excluded 的剧场版种子放回 pending。返回是否放回了。"""
+    with get_session() as s:
+        t = s.get(MovieTorrent, mt_id)
+        if t is None or t.status != "excluded":
+            return False
+        t.status = "pending"
+        s.add(t)
+        s.commit()
+    return True
 
 
 async def enrich_movie(movie_id: int) -> bool:

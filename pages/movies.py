@@ -178,6 +178,13 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     if t.status in ("downloaded", "downloading") and not t.archived_at:  # 已归档不在 qB、代删不到文件
                         ui.button(icon="delete_forever", on_click=_del(t.id)).props(
                             "size=sm flat dense color=negative").tooltip("删除这一版本的文件（qB+硬盘，不可撤销）")
+                    if t.status in ("pending", "error"):   # 未下载的可直接排除
+                        ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
+                            "size=sm flat dense color=grey").style("font-size:12px").tooltip(
+                            "不想要这版本：从可下排除（不删文件，只改状态；可恢复）")
+                    if t.status == "excluded":   # 已排除：给『恢复』放回可下
+                        ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
+                            "size=sm flat dense color=primary").style("font-size:12px").tooltip("放回可下")
 
     def _after():
         body.refresh()
@@ -224,6 +231,25 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             _after()
             ui.notify("已删除该版本文件" if ok else "没删成（qB 未连上或无文件）",
                       type="positive" if ok else "warning")
+        return h
+
+    def _exclude(mt_id):
+        async def h():
+            if not await confirm("排除这一版本？",
+                                 "从可下里排除：不再显示为可下、RSS 再遇到同种子也不重收；可随时点『恢复』放回。",
+                                 ok_label="排除", ok_icon="block"):
+                return
+            ok = mov.exclude_movie_torrent(mt_id)
+            _after()
+            ui.notify("已排除" if ok else "排除失败（已下载的用『删除文件』）",
+                      type="positive" if ok else "warning")
+        return h
+
+    def _unexclude(mt_id):
+        def h():
+            mov.unexclude_movie_torrent(mt_id)
+            _after()
+            ui.notify("已恢复到可下")
         return h
 
     async def _bind():
@@ -309,6 +335,13 @@ def movies_page(t: str = ""):
                 refresh_all()
                 ui.notify("已重新下载" if ok else "重新下载失败（qB 未连上 / 种子不可用）",
                           type="positive" if ok else "warning")
+            return h
+
+        def _unexclude_mv(mt_id):
+            def h():   # 取消排除：把 excluded 放回可下
+                mov.unexclude_movie_torrent(mt_id)
+                refresh_all()
+                ui.notify("已恢复到可下")
             return h
 
         def _bind(movie_id, inp):
@@ -582,8 +615,9 @@ def movies_page(t: str = ""):
         @ui.refreshable
         def reject_panel():
             rej = mov.list_rejected_movies()
-            dels = mov.deleted_movie_torrent_rows()   # 已删除种子（放本页最底的独立折叠）
-            if not rej and not dels:
+            dels = mov.deleted_movie_torrent_rows()      # 已删除种子（本页最底折叠①）
+            excls = mov.excluded_movie_torrent_rows()    # 已排除种子（本页最底折叠②）
+            if not rej and not dels and not excls:
                 ui.label("没有已忽略的剧场版。（列表里点『忽略』会进这里，可随时恢复）").classes(
                     "text-gray-400 p-4")
                 return
@@ -619,6 +653,23 @@ def movies_page(t: str = ""):
                             _rb.set_enabled(config.QB_ENABLED)
                             _rb.tooltip("强制重新下这一版本到原目录（找回删掉的文件）" if config.QB_ENABLED
                                         else "qB 未启用，去设置页开启后可下载")
+
+            # 已排除的种子：独立折叠，可『恢复』放回可下（与番剧侧对称）
+            if excls:
+                with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block").classes(
+                        "w-full mt-2").props("dense"):
+                    ui.label("你从可下里主动排除的剧场版版本（不显示为可下、RSS 再遇到也不重收）。点『恢复』放回。").classes(
+                        "text-xs text-gray-500 p-1")
+                    for x in excls:
+                        with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
+                                "border-bottom:1px solid rgba(255,255,255,.06)"):
+                            ui.label(x["name"]).classes(
+                                "shrink-0 cursor-pointer text-blue-400 hover:underline").on(
+                                "click", lambda mid=x["movie_id"]: open_detail(mid))
+                            ui.label(x["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
+                            ui.button("恢复", icon="undo", on_click=_unexclude_mv(x["id"])).props(
+                                "flat dense size=sm color=primary").style("font-size:14px").tooltip(
+                                "放回可下")
 
         @ui.refreshable
         def sources_panel():

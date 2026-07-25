@@ -1141,11 +1141,10 @@ def failed_rows() -> list[dict]:
     return _torrent_rows(AnimeTorrent.status.in_(["error", "stalled"]))
 
 
-def deleted_torrent_rows() -> list[dict]:
-    """已删除(deleted)的种子——供『已忽略』页底部『已删除种子』折叠展示 + 重新下载找回。含番名/集号/原名。
-    deleted 是用户主动删文件的终态（不会自动重下）；这里给一个集中入口能看到、并 force 重下找回。"""
+def _terminal_torrent_rows(status: str) -> list[dict]:
+    """某终态(deleted/excluded)的种子行（番名/集号/原名），供『已忽略』页底部折叠展示。"""
     with get_session() as s:
-        ts = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.status == "deleted")
+        ts = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.status == status)
                          .order_by(AnimeTorrent.created_at.desc())))
         ids = {t.anime_id for t in ts if t.anime_id}
         names = ({a.id: (a.display_name or a.title) for a in
@@ -1153,6 +1152,16 @@ def deleted_torrent_rows() -> list[dict]:
     return [{"id": t.id, "anime_id": t.anime_id,
              "name": names.get(t.anime_id) or (t.anime_title or "?"),
              "episode": t.episode, "raw": t.raw_title or ""} for t in ts]
+
+
+def deleted_torrent_rows() -> list[dict]:
+    """已删除(deleted)的种子——『已删除种子』折叠 + 重新下载找回（deleted 是删文件的终态、不自动重下）。"""
+    return _terminal_torrent_rows("deleted")
+
+
+def excluded_torrent_rows() -> list[dict]:
+    """已排除(excluded)的种子——『已排除种子』折叠 + 恢复放回待下（excluded 是主动排除的待下终态）。"""
+    return _terminal_torrent_rows("excluded")
 
 
 def set_torrent_episode(torrent_id: int, episode: float) -> bool:

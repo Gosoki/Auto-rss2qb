@@ -253,8 +253,9 @@ def anime_page(t: str = ""):
         @ui.refreshable
         def reject_panel():
             rej = anime.list_rejected_anime()
-            dels = anime.deleted_torrent_rows()   # 已删除种子（放本页最底的独立折叠）
-            if not rej and not dels:
+            dels = anime.deleted_torrent_rows()      # 已删除种子（本页最底折叠①）
+            excls = anime.excluded_torrent_rows()    # 已排除种子（本页最底折叠②）
+            if not rej and not dels and not excls:
                 ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番 N+1
@@ -302,6 +303,24 @@ def anime_page(t: str = ""):
                             _rb.set_enabled(config.QB_ENABLED)
                             _rb.tooltip("强制重新下这条到原目录（找回删掉的文件）" if config.QB_ENABLED
                                         else "qB 未启用，去设置页开启后可下载")
+
+            # 已排除的种子：独立折叠，可『恢复』放回待下（excluded 是主动从待下排除的终态）
+            if excls:
+                with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block").classes(
+                        "w-full mt-2").props("dense"):
+                    ui.label("你从待下里主动排除的种子（不自动下、RSS 再遇到也不重收）。点『恢复』放回待下。").classes(
+                        "text-xs text-gray-500 p-1")
+                    for x in excls:
+                        with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
+                                "border-bottom:1px solid rgba(255,255,255,.06)"):
+                            ui.label(x["name"]).classes(
+                                "shrink-0 cursor-pointer text-blue-400 hover:underline").on(
+                                "click", lambda aid=x["anime_id"]: open_detail(aid))
+                            ui.label(f"第{ep_str(x['episode'])}集").classes("shrink-0 text-gray-400")
+                            ui.label(x["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
+                            ui.button("恢复", icon="undo", on_click=_unexclude(x["id"])).props(
+                                "flat dense size=sm color=primary").style("font-size:14px").tooltip(
+                                "放回待下，重新参与下载/去重")
 
         @ui.refreshable
         def fail_panel():
@@ -583,6 +602,13 @@ def anime_page(t: str = ""):
                 refresh_all()
                 ui.notify("已重新下载" if ok else "重新下载失败（qB 未连上 / 种子不可用）",
                           type="positive" if ok else "warning")
+            return h
+
+        def _unexclude(tid):
+            def h():   # 取消排除：把 excluded 放回待下
+                anime.unexclude_torrent(tid)
+                refresh_all()
+                ui.notify("已恢复到待下")
             return h
 
         def _bind(anime_id, inp):
