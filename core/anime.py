@@ -26,6 +26,26 @@ log = logging.getLogger("autorss")
 # 串行化『选集→占位下载』，防止 worker flush 与 UI 补下并发对同一集重复放行
 _download_lock = asyncio.Lock()
 
+# 『该集已有一份、不再自动下』的权威判据（flush/plan/详情 covered/补下 统一用它）：
+#   downloaded/downloading=已交付或在下；stalled=停滞异常(留人工处理、不自动换源)。
+#   【不含 deleted】——用户删的那条不回来（靠其自身 deleted 终态：flush/plan 只挑 pending/error，永不选它），
+#   但同集来了新 hash 照常自动下（该集此时无 downloaded/downloading/stalled → 不被挡）。
+HAVE_STATUSES = ("downloaded", "downloading", "stalled")
+# 『该集已处理过、不复活去重落选的 skipped 兄弟』的判据（restore/换源兜底用）：在上者基础上【+deleted】——
+#   用户特意删过的集，其 skipped 兄弟不该被复活重下（与"deleted 不重下"一致）。
+_HANDLED_STATUSES = HAVE_STATUSES + ("deleted",)
+
+
+def _anime_path_parts(a, t=None):
+    """该番保存路径三要素 (季度, 文件夹名, 季号)——下载入口(带种子行 t)与显示/relocate 入口(anime_save_path)
+    统一走它，消除两处回退链不一致（B2）。季度：a.quarter → t.quarter → 'unknown'；名字：bgm 日文/中文名
+    → 种子解析名 → a.title → 'unknown'；季号：有 a 用 a.season，否则用 t.season。"""
+    quarter = ((a.quarter if a else "") or (t.quarter if t else "")) or "unknown"
+    folder = (((a.jp_name or a.display_name) if a else "")
+              or (t.anime_title if t else "") or (a.title if a else "") or "unknown")
+    season = a.season if a else (t.season if t else 1)
+    return quarter, folder, season
+
 
 def quarter_brief() -> list[dict]:
     """番剧列表页顶部小结：当季 + 上季 的番剧流水线分布 + 种子维度。"""
@@ -315,13 +335,9 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             url = t.download_url
             info_hash = t.info_hash
             a = s.get(Anime, anime_id) if anime_id else None
-            # 季度与季号都以 bgm 纠正后的 Anime 为准：种子行的 quarter/季号是入库时快照，重识别后会过时，
-            # 沿用会把同一部番的新旧集散到两个季度目录（有下载时 keep_quarter 已锁死 a.quarter 保持稳定）。
-            quarter = (a.quarter if (a and a.quarter) else t.quarter) or "unknown"
-            # 文件夹名统一用 bgm 日语原名，没有再退中文规范名，最后退种子解析番名
-            folder_name = (a and (a.jp_name or a.display_name)) or t.anime_title
-            if a is not None:
-                season = a.season  # 用 bgm 纠正后的季号建 Season 子目录（种子把续作季号常解析回 1）
+            # 季度/番名/季号统一由 _anime_path_parts 算（与 anime_save_path 同口径，B2）：季度/季号以 bgm 纠正后的
+            # Anime 为准（种子行是入库快照、重识别后会过时；有下载时 keep_quarter 已锁死 a.quarter）；名字优先 bgm 日文原名。
+            quarter, folder_name, season = _anime_path_parts(a, t)
 
     # 组装保存路径（含越界校验），TV 按设置可加 Season N 子目录
     save_path = engine.build_save_path(quarter, folder_name, season=season,
@@ -388,7 +404,7 @@ def _revive_orphaned_skipped() -> None:
         # 目标集：有 error，且无 downloaded/downloading/deleted/stalled（首选已败、该集尚无可用/已删/停滞的下载）。
         # stalled 也算『已处理』→ 不复活兄弟源：停滞的那条留人工处理，不自动换源（与 flush 阻断口径一致）。
         revive = {k for k, sts in by_ep.items()
-                  if "error" in sts and not ({"downloaded", "downloading", "deleted", "stalled"} & sts)}
+                  if "error" in sts and not (set(_HANDLED_STATUSES) & sts)}
         if not revive:
             return
         changed = 0
@@ -423,12 +439,13 @@ async def flush_ready_downloads() -> int:
         kw_map = {a.id: a.pref_keyword for a in auto if a.pref_keyword}
         if not auto_ids:
             return 0
-        # 『该集已有一份』阻断自动换源的集：downloaded（已下/在下的交付）+ stalled（停滞异常，留着人工处理，
-        # 不自动抓另一个源顶上）。deleted 不算——删的那条不自动回来，但同集来新 hash 仍允许自动下（非整集拉黑）。
+        # 『该集已有一份』阻断自动换源的集，统一用 HAVE_STATUSES（downloaded/downloading/stalled）：
+        # 含 downloading（在下的交付，不必再挑同集别的）+ stalled（停滞异常，留人工、不自动换源）。
+        # 不含 deleted——删的那条不自动回来，但同集来新 hash 仍允许自动下（非整集拉黑）。
         downloaded = {
             (t.anime_id, t.episode)
             for t in s.exec(select(AnimeTorrent).where(
-                AnimeTorrent.status.in_(["downloaded", "stalled"])))
+                AnimeTorrent.status.in_(HAVE_STATUSES)))
         }
         groups: dict = {}
         special_groups: dict = {}          # anime_id -> [特别篇(-1)种子]，按番去重只放一份
@@ -761,8 +778,8 @@ def restore_anime(anime_id: int) -> None:
         a.confirmed = True   # 恢复=确认，confirmed=True → 改开始日不会再把它判超期忽略（超期忽略需 confirmed=False）
         s.add(a)
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-        # deleted 也算『该集已处理过』：用户特意删过的集，其去重落选的 skipped 兄弟不该被复活重下。
-        have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}
+        # 复活 skipped 兄弟用 _HANDLED_STATUSES（含 deleted）：用户特意删过的集，其去重落选的兄弟不该被复活重下。
+        have_eps = {t.episode for t in all_rows if t.status in _HANDLED_STATUSES}
         for t in all_rows:
             # 只放回『该集尚无下载/未被删过』的 skipped（集去重留下的旧版本）；用户主动删过的记为 deleted，
             # 其集已进 have_eps 而被排除——免得恢复订阅时把用户特意删掉的文件又重新下回来。
@@ -1003,7 +1020,7 @@ async def download_pending_for_anime(anime_id: int) -> int:
             return 0
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-    have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}  # deleted 也算已处理，不重下
+    have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
     pending = [t for t in all_rows if t.status in ("pending", "error")]
     if pref:  # 锁定源：只补锁定组的待下集（硬锁、不兜底）
         pending = [t for t in pending if pref == (t.source or "")]
@@ -1029,7 +1046,7 @@ def download_plan(anime_id: int) -> set[int]:
             return set()
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-    have_eps = {t.episode for t in all_rows if t.status in ("downloaded", "downloading", "deleted")}  # deleted 也算已处理，不重下
+    have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
     pending = [t for t in all_rows if t.status in ("pending", "error")]
     if pref:
         pending = [t for t in pending if pref == (t.source or "")]
@@ -1055,7 +1072,7 @@ def download_plan_for_ids(anime_ids) -> set[int]:
     for t in rows:
         if t.status in ("pending", "error"):
             by_anime.setdefault(t.anime_id, []).append(t)
-        elif t.status in ("downloaded", "downloading", "deleted"):   # deleted 也算已处理，不重下
+        elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
     plan: set = set()
     for aid, pending in by_anime.items():
@@ -1124,6 +1141,20 @@ def failed_rows() -> list[dict]:
     return _torrent_rows(AnimeTorrent.status.in_(["error", "stalled"]))
 
 
+def deleted_torrent_rows() -> list[dict]:
+    """已删除(deleted)的种子——供『已忽略』页底部『已删除种子』折叠展示 + 重新下载找回。含番名/集号/原名。
+    deleted 是用户主动删文件的终态（不会自动重下）；这里给一个集中入口能看到、并 force 重下找回。"""
+    with get_session() as s:
+        ts = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.status == "deleted")
+                         .order_by(AnimeTorrent.created_at.desc())))
+        ids = {t.anime_id for t in ts if t.anime_id}
+        names = ({a.id: (a.display_name or a.title) for a in
+                  s.exec(select(Anime).where(Anime.id.in_(ids)))} if ids else {})
+    return [{"id": t.id, "anime_id": t.anime_id,
+             "name": names.get(t.anime_id) or (t.anime_title or "?"),
+             "episode": t.episode, "raw": t.raw_title or ""} for t in ts]
+
+
 def set_torrent_episode(torrent_id: int, episode: float) -> bool:
     """手动改一条种子的集号——把 -2 未知集 / 误判集号救回正常集，让它进正常下载+去重流程。
     只动未下载的(pending/error)；改完仍是待下，由 flush / 补下本番按新集号处理。返回是否改了。"""
@@ -1180,7 +1211,7 @@ async def download_all_pending() -> int:
     for t in rows:
         if t.status in ("pending", "error"):
             by_anime.setdefault(t.anime_id, []).append(t)
-        elif t.status in ("downloaded", "downloading", "deleted"):   # deleted 也算已处理，不重下
+        elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
     n = 0
     for aid, pending in by_anime.items():
@@ -1320,15 +1351,16 @@ async def sync_qb_status() -> int:
 def anime_save_path(anime_id: int) -> str | None:
     """该番当前的归档目录（build_save_path 结果：[子目录]/[季度]/番名/[Season N]）；算不出返回 None。
 
-    与 download_anime_torrent 的取值一致：季度用 a.quarter，番名 jp_name→display_name→title。
+    与 download_anime_torrent 【同口径】：都走 _anime_path_parts(a, 最新种子行)。缺 bgm 元数据(未识别)时
+    两处都回退到种子解析名，故显示/relocate 目标与实际落地一致（B2）。
     """
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is None:
             return None
-        quarter = a.quarter or "unknown"
-        folder = (a.jp_name or a.display_name) or a.title or "unknown"
-        season = a.season
+        t = s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)
+                   .order_by(AnimeTorrent.created_at.desc())).first()   # 最新种子行，供缺元数据时回退，同下载口径
+        quarter, folder, season = _anime_path_parts(a, t)
     return engine.build_save_path(quarter, folder, season=season,
                                   sub_dir=config.ANIME_DOWN_PATH)
 

@@ -226,12 +226,12 @@ def ep_str(e) -> str:
     return str(int(e)) if float(e).is_integer() else str(e)
 
 
-# qB 原始态 → 中文（做种态统一叫『做种』，暂停做种即『已完成』）
+# qB 原始态 → 中文（下载完成后的各种做种/暂停态一律显示『已完成』，不再对用户区分做种，见 B6）
 _QB_STATE_CN = {
     "downloading": "下载中", "forcedDL": "下载中", "metaDL": "取元数据",
     "forcedMetaDL": "取元数据", "stalledDL": "等待下载", "queuedDL": "排队下载",
-    "checkingDL": "校验中", "allocating": "分配空间", "uploading": "做种",
-    "forcedUP": "做种", "stalledUP": "做种", "queuedUP": "排队做种", "checkingUP": "校验中",
+    "checkingDL": "校验中", "allocating": "分配空间", "uploading": "已完成",
+    "forcedUP": "已完成", "stalledUP": "已完成", "queuedUP": "已完成", "checkingUP": "校验中",
     "pausedDL": "已暂停", "stoppedDL": "已暂停", "pausedUP": "已完成", "stoppedUP": "已完成",
     "checkingResumeData": "校验中", "moving": "移动中", "error": "错误",
     "missingFiles": "文件缺失", "unknown": "未知",
@@ -252,7 +252,7 @@ def human_size(n) -> str:
 
 
 def qb_live_text(t) -> str:
-    """种子的 qB 实时态一行文案，如『下载中 45% ↓2.1MB/s』/『做种 100%』；无实时态返回 ''。"""
+    """种子的 qB 实时态一行文案，如『下载中 45% ↓2.1MB/s』/『已完成 100%』；无实时态返回 ''。"""
     if getattr(t, "archived_at", None):
         return "已归档"          # 完成后已从 qB 移除(留文件)、不再跟踪
     if not getattr(t, "qb_state", ""):

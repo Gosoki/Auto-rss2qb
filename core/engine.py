@@ -528,7 +528,9 @@ async def sync_qb_status(model_cls) -> int:
 
 
 def qb_summary(model_cls) -> dict:
-    """某表已交付种子的 qB 实时态聚合：跟踪数 / 下载中 / 做种 / 下速 / 平均进度。
+    """某表已交付种子的 qB 实时态聚合：跟踪数 / 下载中 / 已完成 / 下速 / 平均进度。
+    completed = 处于做种/已完成暂停等『下载已完成』态的数（max_ratio 极小时下完即 stoppedUP）——
+    统一叫『已完成』而非『做种』，避免把下完停着的种子说成在上传做种（B6）。
 
     SQL 侧按 qb_state 分组聚合，只回十几种 state 的汇总行，不把整表已下种子整行拉进内存
     （已下是常态终态、只增不减，随挂机可累积到几千上万条）。qb_state='' 即未被 qB 跟踪，排除。"""
@@ -538,7 +540,7 @@ def qb_summary(model_cls) -> dict:
                    func.sum(model_cls.qb_progress))
             .where(model_cls.status.in_(["downloaded", "downloading"]), model_cls.qb_state != "")
             .group_by(model_cls.qb_state)).all()
-    tracked = downloading = seeding = dlspeed = 0
+    tracked = downloading = completed = dlspeed = 0
     prog_sum = 0.0
     for state, cnt, speed, psum in grp:
         cnt = cnt or 0
@@ -547,12 +549,12 @@ def qb_summary(model_cls) -> dict:
         if qb_is_downloading(state):
             downloading += cnt
             dlspeed += int(speed or 0)
-        if qb_is_seeding(state):
-            seeding += cnt
+        if qb_is_seeding(state):        # 做种态=下载已完成 → 计入『已完成』
+            completed += cnt
     return {
         "tracked": tracked,
         "downloading": downloading,
-        "seeding": seeding,
+        "completed": completed,
         "dlspeed": dlspeed,
         "avg_progress": (prog_sum / tracked) if tracked else 0.0,
     }

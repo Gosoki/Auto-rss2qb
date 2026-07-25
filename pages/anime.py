@@ -194,7 +194,7 @@ def anime_page(t: str = ""):
                     ui.badge(f"qB 跟踪 {q['tracked']}").props("color=teal").classes("text-sm").tooltip(
                         "qB 里正在跟踪的种子数（已交付给 qB 的）")
                     ui.badge(f"下载中 {q['downloading']}").props("color=teal").classes("text-sm")
-                    ui.badge(f"做种 {q['seeding']}").props("color=teal").classes("text-sm")
+                    ui.badge(f"已完成 {q['completed']}").props("color=green").classes("text-sm")
                     if q["dlspeed"]:
                         ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=teal").classes("text-sm")
                     ui.badge(f"平均 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").classes(
@@ -253,7 +253,8 @@ def anime_page(t: str = ""):
         @ui.refreshable
         def reject_panel():
             rej = anime.list_rejected_anime()
-            if not rej:
+            dels = anime.deleted_torrent_rows()   # 已删除种子（放本页最底的独立折叠）
+            if not rej and not dels:
                 ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番 N+1
@@ -280,6 +281,27 @@ def anime_page(t: str = ""):
                                               on_click=_del_files(a.id, name_of(a), nf)).props(
                                         "flat color=negative").tooltip(
                                         "连同 qB 里的硬盘文件一起删（不可撤销）")
+
+            # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（deleted 是终态、不会自动重下）
+            if dels:
+                with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline").classes(
+                        "w-full mt-2").props("dense"):
+                    ui.label("你手动删掉文件的种子（终态，不会自动重下）。需要就点『重新下载』找回。").classes(
+                        "text-xs text-gray-500 p-1")
+                    for d in dels:
+                        with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
+                                "border-bottom:1px solid rgba(255,255,255,.06)"):
+                            ui.label(d["name"]).classes(
+                                "shrink-0 cursor-pointer text-blue-400 hover:underline").on(
+                                "click", lambda aid=d["anime_id"]: open_detail(aid))
+                            ui.label(f"第{ep_str(d['episode'])}集").classes("shrink-0 text-gray-400")
+                            ui.label(d["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
+                            _rb = ui.button("重新下载", icon="download",
+                                            on_click=_redownload(d["id"])).props(
+                                "flat dense size=sm color=primary").style("font-size:14px")
+                            _rb.set_enabled(config.QB_ENABLED)
+                            _rb.tooltip("强制重新下这条到原目录（找回删掉的文件）" if config.QB_ENABLED
+                                        else "qB 未启用，去设置页开启后可下载")
 
         @ui.refreshable
         def fail_panel():
@@ -553,6 +575,14 @@ def anime_page(t: str = ""):
                 refresh_all()
                 ui.notify(f"已删除 {n} 个文件" if n else "没删成（qB 未连上或已无文件）",
                           type="positive" if n else "warning")
+            return h
+
+        def _redownload(tid):
+            async def h():   # force 重下一条已删除种子，找回文件
+                ok = await anime.download_anime_torrent(tid, force=True)
+                refresh_all()
+                ui.notify("已重新下载" if ok else "重新下载失败（qB 未连上 / 种子不可用）",
+                          type="positive" if ok else "warning")
             return h
 
         def _bind(anime_id, inp):

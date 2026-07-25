@@ -420,7 +420,7 @@ def movies_page(t: str = ""):
                     ui.badge(f"qB 跟踪 {q['tracked']}").props("color=teal").classes("text-sm").tooltip(
                         "qB 里正在跟踪的种子数（已交付给 qB 的）")
                     ui.badge(f"下载中 {q['downloading']}").props("color=teal").classes("text-sm")
-                    ui.badge(f"做种 {q['seeding']}").props("color=teal").classes("text-sm")
+                    ui.badge(f"已完成 {q['completed']}").props("color=green").classes("text-sm")
                     if q["dlspeed"]:
                         ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=teal").classes("text-sm")
 

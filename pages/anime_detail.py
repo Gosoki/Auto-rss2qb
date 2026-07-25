@@ -105,16 +105,26 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label(f"分集 / 种子（{len(eps)}）").classes("text-sm font-bold shrink-0")
             ui.space()
             _sp = anime.anime_save_path(anime_id)
-            ui.label(f"↓ {_sp}" if _sp else "↓ 未配置下载目录").classes(
-                "text-gray-500 text-xs break-all min-w-0 text-right").tooltip(
-                "下载时发送给 qB 的保存目录（按 工作目录/季度/番名/Season 规则算出）")
+            _unident = not (cur.jp_name or cur.display_name)   # 无 bgm 规范名/日文名 = 未识别/待绑定，目录名靠种子解析名兜底、可能不准
+            if not _sp:
+                ui.label("↓ 未配置下载目录").classes("text-gray-500 text-xs break-all min-w-0 text-right")
+            elif _unident:
+                ui.label(f"⚠ 未识别，暂用解析名：{_sp}").classes(
+                    "text-amber-400 text-xs break-all min-w-0 text-right").tooltip(
+                    "该番还没匹配到 bgm，保存目录暂用种子解析名（可能不准）。建议先『绑定 bgm』或『重新识别』再下，"
+                    "免得目录名不对、日后改季度/重绑还要搬文件")
+            else:
+                ui.label(f"↓ {_sp}").classes(
+                    "text-gray-500 text-xs break-all min-w-0 text-right").tooltip(
+                    "下载时发送给 qB 的保存目录（按 工作目录/季度/番名/Season 规则算出）")
         if not eps:
             ui.label("（还没有种子）").classes("text-gray-400")
             return
         plan = anime.download_plan(anime_id)  # 待下里『会真下』的那些（首选/锁定组），其余待下=备用
-        # 这一集是否『有着落』：有将下/已下/在下、或你曾删过。没着落的正集=真·缺集（被锁定源/版本过滤光了）
+        # 这一集是否『有着落』：将下(plan) 或 已有一份(HAVE_STATUSES：已下/在下/停滞)。与 flush 同口径——
+        # stalled 也算有着落(不再误报缺集，B4)；deleted 不算(删了同集新 hash 会当将下载来下)。
         covered = {t.episode for t in eps
-                   if t.id in plan or t.status in ("downloaded", "downloading", "deleted")}
+                   if t.id in plan or t.status in anime.HAVE_STATUSES}
         for t in eps:
             ep_txt = f"第{ep_str(t.episode)}集"
             with ui.column().classes("w-full gap-0 py-1").style(

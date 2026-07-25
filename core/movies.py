@@ -414,17 +414,27 @@ async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
     return True
 
 
+def _movie_folder(m, t=None):
+    """剧场版下载文件夹名——download_movie_torrent 与 movie_save_path 统一口径（B3）：
+    bgm 日文/中文名 → 种子原始标题 → m.title → 'movie'。缺 bgm 元数据时两处都回退到同一名字。"""
+    return (((m.jp_name or m.display_name) if m else "")
+            or (t.raw_title if t else "") or (m.title if m else "") or "movie")
+
+
 def movie_save_path(movie_id: int) -> str | None:
     """该剧场版当前的归档目录（build_save_path 结果：[子目录]/[季度]/片名）；算不出返回 None。
 
-    取值与 download_movie_torrent 一致：季度用 m.quarter，片名 jp_name→display_name→title。剧场版不建 Season 子目录。
+    与 download_movie_torrent 【同口径】：都走 _movie_folder(m, 最新种子行)。缺 bgm 元数据时都回退种子原始标题，
+    故显示/relocate 目标与实际落地一致（B3）。剧场版不建 Season 子目录。
     """
     with get_session() as s:
         m = s.get(Movie, movie_id)
         if m is None:
             return None
+        t = s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)
+                   .order_by(MovieTorrent.created_at.desc())).first()   # 最新种子行，缺元数据时回退，同下载口径
         quarter = (m.quarter or "unknown")
-        folder = (m.jp_name or m.display_name) or m.title or "movie"
+        folder = _movie_folder(m, t)
     return engine.build_save_path(quarter, folder, sub_dir=config.MOVIE_DOWN_PATH,
                                   quarter_fmt=config.MOVIE_QUARTER_FMT)
 
@@ -529,7 +539,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
             url = t.download_url
             info_hash = t.info_hash
             quarter = (m.quarter if m else "") or "unknown"
-            folder = (m and (m.jp_name or m.display_name)) or t.raw_title or "movie"
+            folder = _movie_folder(m, t)   # 与 movie_save_path 同口径（B3）
 
     save_path = engine.build_save_path(quarter, folder, sub_dir=config.MOVIE_DOWN_PATH,
                                        quarter_fmt=config.MOVIE_QUARTER_FMT)

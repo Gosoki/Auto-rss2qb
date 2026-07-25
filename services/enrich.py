@@ -141,7 +141,10 @@ async def _fetch_cast(client, bgm_id, limit=8) -> str | None:
     """取『主角』的声优名（去重、只要 CV 名不要角色名）→ '声优、声优…' 文本；失败/无主角返回 None。
     只抓主角、不存人物 URL（要全部演员表点 bgm 链接）。"""
     try:
-        r = await client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}/characters", headers=_UA)
+        # 与其它 bgm 调用一致走 _retryable（瞬时超时/连接/读错误按 ENRICH_RETRY_TIMES 指数退避）——
+        # 否则声优抓取遇一次瞬时超时即丢 cast，而规范名/放送日等字段会重试，口径不一（B8）。
+        r = await _retryable(lambda: client.get(
+            f"{config.BGM_API}/v0/subjects/{bgm_id}/characters", headers=_UA))
         if r.status_code != 200:
             return None
         data = r.json()
