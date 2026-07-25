@@ -116,6 +116,21 @@ class QBittorrent:
             "添加下载任务未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:80], save_path)
         return False
 
+    async def add_url(self, url: str, save_path: str, category: str, tags: str) -> bool:
+        """把 magnet 链接（或 http .torrent 链接）交给 qB 自己抓取下载（urls= 参数）。成功回 True。
+        用于手动下载的 magnet：qB 支持 urls 收 magnet/URL；判成功同 add_torrent(200 且响应体不含 fail)。"""
+        data = {"urls": url, "savepath": save_path, "autoTMM": "false", "paused": "false",
+                "category": category, "tags": tags}
+        resp = await self._request("POST", "/api/v2/torrents/add", data=data)
+        if resp is None:
+            return False
+        body = resp.text.strip().lower()
+        if resp.status_code == 200 and body and "fail" not in body:
+            return True
+        (log.warning if resp.status_code == 200 else log.error)(
+            "添加下载任务(url)未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:80], save_path)
+        return False
+
     async def torrents_info(self, hashes: list[str]) -> dict | None:
         """按 info_hash 批量查 qB 实时态，返回 {hash(小写): 种子dict}。连不上返回 None、无结果返回 {}。
 

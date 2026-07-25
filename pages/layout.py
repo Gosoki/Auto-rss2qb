@@ -10,8 +10,8 @@ from nicegui import ui
 import config
 
 NAV = [("manage", "动漫番剧", "/"), ("movies", "OVA・剧场版", "/movies"),
-       ("parse", "解析测试", "/parse"), ("logs", "运行日志", "/logs"),
-       ("settings", "全局设置", "/settings")]
+       ("parse", "解析测试", "/parse"), ("manual", "手动下载", "/manual"),
+       ("logs", "运行日志", "/logs"), ("settings", "全局设置", "/settings")]
 
 # 应用侧种子状态 → 中文（番剧表/剧场版/详情/新入库共用）
 STATUS_CN = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
