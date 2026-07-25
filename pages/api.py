@@ -22,6 +22,8 @@ from core import engine
 def qb_done(hash: str = "", t: str = "") -> dict:
     """qB 完成回调：hash=种子 info hash（%I），t=可选 token。标记成功返回 {'ok':True,'marked':True}。"""
     tok = config.QB_CALLBACK_TOKEN
-    if tok and not hmac.compare_digest(t, tok):   # 常量时间比较，堵掉计时侧信道（绑 0.0.0.0 时才有意义）
+    # 两侧编码成 bytes 再常量时间比较：str 版 compare_digest 遇非 ASCII 的 t（外部可控 query 参数）会抛
+    # TypeError→500 刷栈；bytes 版无此限制。仍是常量时间，堵计时侧信道（绑 0.0.0.0 时才有意义）。
+    if tok and not hmac.compare_digest(t.encode("utf-8"), tok.encode("utf-8")):
         return {"ok": False, "error": "bad token"}
     return {"ok": True, "marked": engine.mark_done_by_hash(hash)}

@@ -175,7 +175,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     _vdl.set_enabled(config.QB_ENABLED)
                     _vdl.tooltip("强制下这一版本到文件夹" if config.QB_ENABLED
                                  else "qB 未启用，去设置页开启后可下载")
-                    if t.status in ("downloaded", "downloading") and not t.archived_at:  # 已归档不在 qB、代删不到文件
+                    if t.status in ("downloaded", "downloading", "stalled") and not t.archived_at:  # 下过/在下/停滞(盘上有文件)且未归档才可删（delete 函数亦接受 stalled）
                         ui.button(icon="delete_forever", on_click=_del(t.id)).props(
                             "size=sm flat dense color=negative").tooltip("删除这一版本的文件（qB+硬盘，不可撤销）")
                     if t.status in ("pending", "error"):   # 未下载的可直接排除
@@ -567,7 +567,8 @@ def movies_page(t: str = ""):
             for i, (year, quarters) in enumerate(shown):
                 year_open = exp if exp is not None else i == 0   # 一级(年份)可折叠，默认仅最新年展开
                 year_total = sum(len(grp) for _, grp in quarters)
-                year_exp = ui.expansion(f"20{year} 年   ·   {year_total} 部",
+                _yt = "未知年份" if year == "未知" else f"20{year} 年"   # 未知季度别拼成『20未知 年』
+                year_exp = ui.expansion(f"{_yt}   ·   {year_total} 部",
                                         value=year_open).classes("w-full")
                 # 懒加载在『年』这级：年展开才建内容。二级『季度』不折叠——小标题 + 卡直接全铺开。
                 _fl = {"built": False}

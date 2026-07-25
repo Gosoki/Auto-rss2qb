@@ -306,6 +306,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             episode = t.episode
             season = t.season
             title = t.anime_title
+            orig_status = t.status   # 供失败恢复：force 从终态(deleted/excluded)重下若失败，别降级成会触发复活/重下的 error
             # 跨表【不】去重：番剧/剧场版各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer（曾致删/下竞态静默丢文件）。
             # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）。
@@ -339,12 +340,16 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             # Anime 为准（种子行是入库快照、重识别后会过时；有下载时 keep_quarter 已锁死 a.quarter）；名字优先 bgm 日文原名。
             quarter, folder_name, season = _anime_path_parts(a, t)
 
+    # 失败落定态：从用户终态(deleted/excluded) force 重下若失败，恢复原终态而非 error——
+    # 否则 deleted→error 会让该集不再含任何 _HANDLED 状态，被 _revive_orphaned_skipped 复活 skipped 兄弟、
+    # flush 自动把用户删过的集重新下回来（违反 deleted『不重下』）。pending/error/skipped/stalled 仍落 error。
+    fail_status = orig_status if orig_status in ("deleted", "excluded") else "error"
     # 组装保存路径（含越界校验），TV 按设置可加 Season N 子目录
     save_path = engine.build_save_path(quarter, folder_name, season=season,
                                        sub_dir=config.ANIME_DOWN_PATH)
     if save_path is None:
         log.error("拒绝越界保存路径 - %s -> %s / %s", title, quarter, folder_name)
-        _set_status(torrent_id, "error")
+        _set_status(torrent_id, fail_status)
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
@@ -352,13 +357,13 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     except asyncio.CancelledError:
         _set_status(torrent_id, "pending")  # 被取消（关停等）→ 复位，别永久卡 downloading
         raise
-    except Exception as e:  # 任何失败都回写 error，避免卡在 downloading
+    except Exception as e:  # 失败回写：终态重下失败恢复原态，其余落 error，避免卡在 downloading
         log.error("下载失败 - %s - %s", title, e)
-        _set_status(torrent_id, "error")
+        _set_status(torrent_id, fail_status)
         return False
 
     if not ok:
-        _set_status(torrent_id, "error")
+        _set_status(torrent_id, fail_status)
         return False
     with get_session() as s:   # 记实际保存路径：改季度/重绑后据此移动或提醒旧位置
         t = s.get(AnimeTorrent, torrent_id)
@@ -688,11 +693,12 @@ def anime_sources(anime_id: int) -> list[str]:
 
 
 def downloaded_count(anime_id: int) -> int:
-    """该番已下/在下（硬盘上有文件）的种子数——供 UI 决定要不要显示『删除文件』。"""
+    """该番硬盘上有文件的种子数（已下/在下/停滞=HAVE_STATUSES）——供 UI 决定要不要显示『删除文件』。
+    含 stalled：半成品文件在盘、delete_anime_files 也会删它，故也应计入使删除按钮出现（deleted 文件已删，不计）。"""
     with get_session() as s:
         return len(s.exec(select(AnimeTorrent.id).where(
             AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(["downloaded", "downloading"]),
+            AnimeTorrent.status.in_(HAVE_STATUSES),
         )).all())
 
 
@@ -827,13 +833,14 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
 
 
 def _has_downloads(s, anime_id: int) -> bool:
-    """该番是否已下过（在下/已下/曾删）——有则季度已落盘/曾落盘，不该被重识别改（避免散目录）。
+    """该番是否已下过（在下/已下/停滞/曾删）——有则季度已落盘/曾落盘，不该被重识别改（避免散目录）。
 
-    含 deleted：用户删过文件也算『季度已定』，否则全删后 keep_quarter 失效、重识别会把稳定季度冲掉。
+    用 _HANDLED_STATUSES（downloaded/downloading/stalled/deleted）：deleted=删过也算季度已定；
+    stalled=半成品仍在盘（save_path 按旧季度写过），更该锁季度——否则重识别把季度冲掉、停滞文件遗留旧目录、新集散两处。
     """
     return s.exec(select(AnimeTorrent).where(
         AnimeTorrent.anime_id == anime_id,
-        AnimeTorrent.status.in_(["downloading", "downloaded", "deleted"]),
+        AnimeTorrent.status.in_(_HANDLED_STATUSES),
     )).first() is not None
 
 

@@ -34,8 +34,10 @@ ONE_COUR = 12
 #   或日期 "[2024-05-10]" 的 "05-10" 误判成范围（相邻连字符＝编码残段/日期分段，都不是合集）。
 _BATCH_RE = re.compile(
     r"合集|整理|搬运|BD-?RIP|BDMV|BD\s?Remux|\bBatch\b|Vol\.\s*\d+|\bTV\s*\+\s*SP\b|第\s*\d+\s*[巻卷]"
-    r"|(?<![A-Za-z])EP\d{1,3}\s*[-~〜]\s*\d{1,3}"
-    r"|(?<![-A-Za-z0-9])\d{2,3}\s*[-~〜]\s*\d{2,3}(?![-A-Za-z0-9])", re.I)
+    r"|(?<![A-Za-z])EP\d{1,3}\s*[-~〜]\s*\d{1,3}", re.I)
+# 裸集号范围(01-12/01~12)：连续集合集。单独拆出 + 在 is_batch 里守卫：标题能抽出单集集号时(如
+# '[组] Show - 24 (最終回 23-24 総集編)' 的 '23-24')多是注解而非合集范围，不当合集静默丢弃整条。
+_BARE_RANGE_RE = re.compile(r"(?<![-A-Za-z0-9])\d{2,3}\s*[-~〜]\s*\d{2,3}(?![-A-Za-z0-9])")
 
 # 集数识别（按优先级）：'- 07'/'- 11.5'/'- 07v2' → S02E07 → 第07話/第二十三话 → [07]/[07v2]
 # 第1条用负向后顾避免吃到范围 01-12 的第二个数，并容忍 v2 版本后缀；第3条兼中文数字；第4条限 1~3 位避免命中 [2024]
@@ -59,7 +61,13 @@ _TAG_BLK_RE = re.compile(r"[\[【][^\]】]*[\]】]")
 
 def is_batch(title: str) -> bool:
     """批量/合集/蓝光/连续集范围帖——各源共用，抓到就丢。"""
-    return bool(_BATCH_RE.search(title))
+    if _BATCH_RE.search(title):
+        return True
+    # 裸集号范围(01-12) 仅在标题【抽不出单集集号】时才判合集：标准合集帖(如 'Show 01-12')抽不到单集→判合集；
+    # 而 'Show - 24 (23-24 総集編)' 能抽到第24集→那个 23-24 是注解，不误当合集把单集丢掉。
+    if _BARE_RANGE_RE.search(title) and extract_episode(title) < 0:
+        return True
+    return False
 
 
 def _cn_to_int(s: str) -> int:

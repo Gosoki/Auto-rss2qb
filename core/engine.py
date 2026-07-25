@@ -292,11 +292,13 @@ def hash_owned_elsewhere(info_hash: str, other_model) -> bool:
 
     TV 与剧场版两条独立管线偶有同一物理种子（同 hash，如某剧场版也被 ANi 按集发）。删文件前查一下：
     对面还在用就别 qB-delete(deleteFiles) 把共享的种子/硬盘文件一起端了，只在本表脱手即可。
+    持有判据须与『可删状态』(downloaded/downloading/stalled) 对齐：stalled 的行文件仍在盘、仍指向该 hash，
+    若不算持有会被本侧 deleteFiles 误删共享文件、留下永久悬空指针（deleted 是文件已删的终态，不计入）。
     """
     with get_session() as s:
         return s.exec(select(other_model).where(
             other_model.info_hash == info_hash,
-            other_model.status.in_(["downloaded", "downloading"]))).first() is not None
+            other_model.status.in_(["downloaded", "downloading", "stalled"]))).first() is not None
 
 
 def qb_is_local() -> bool:
@@ -411,7 +413,8 @@ def has_active_downloading() -> bool:
 
 def mark_done_by_hash(info_hash: str) -> bool:
     """把某 info_hash 的种子标记为『已下完』(qb_progress=1、脱离 in-flight)——供 qB『完成时回调』精确兜底。
-    只认我们自己表里已交付(downloaded/downloading)的种子；非法 hash / 非我们的 / 已终态 返回 False。"""
+    认我们表里 downloaded/downloading/stalled 的种子；非法 hash / 非我们的 / 已终态(deleted/skipped/excluded) 返回 False。
+    含 stalled：停滞种子被 sync 脱离轮询后再不复查，若它其实爬完了，只能靠此回调恢复为已下完。"""
     h = (info_hash or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", h):
         return False
@@ -420,8 +423,8 @@ def mark_done_by_hash(info_hash: str) -> bool:
             t = s.exec(select(model_cls).where(model_cls.info_hash == h)).first()
             if t is None:
                 continue
-            if t.status not in ("downloaded", "downloading"):
-                continue   # 这张表里是终态 → 跨表同 hash 可能另一表还在下，继续查下一张，别提前 return
+            if t.status not in ("downloaded", "downloading", "stalled"):
+                continue   # 这张表里是终态 → 跨表同 hash 可能另一表还在下/停滞，继续查下一张，别提前 return
             t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "downloaded", 1.0, "", datetime.now()
             s.add(t)
             s.commit()
@@ -497,6 +500,15 @@ async def sync_qb_status(model_cls) -> int:
                     t.status, t.qb_state, t.qb_synced_at = "error", "", now
                 else:                       # 从未被 qB 确认(刚交付未登记?) → 给一轮宽限，下轮仍无则上面→error
                     t.qb_synced_at = now
+                s.add(t)
+                updated += 1
+                continue
+            # 新鲜度守卫：await 期间该行可能被完成回调(/api/qb/done→mark_done_by_hash)或新交付落定为已下完
+            # (qb_progress=1、qb_state 清空)。此时 d 是 await 前发出的【陈旧】快照(progress<1、downloading)，
+            # 若无条件覆写会把它回退到在下态、UI 从『已下完』倒退，甚至下轮 d is None 被误标 error。
+            # 与 d is None 分支同款：已落定(进度满且态已清)的行不被陈旧快照回退。
+            if (t.qb_progress or 0.0) >= 0.999 and not t.qb_state:
+                t.qb_synced_at = now
                 s.add(t)
                 updated += 1
                 continue

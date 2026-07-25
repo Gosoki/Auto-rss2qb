@@ -178,7 +178,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "size=sm flat dense color=grey").style("font-size:12px").tooltip(
                             "不想要这条：从待下直接排除（不删文件，只改状态；可撤销）")
-                    if t.status in ("downloaded", "downloading") and not t.archived_at:  # 下过且未归档才给按集删（归档的不在 qB、代删不到文件）
+                    if t.status in ("downloaded", "downloading", "stalled") and not t.archived_at:  # 下过/在下/停滞(盘上有文件)且未归档才给按集删（归档的不在 qB、代删不到文件；delete 函数亦接受 stalled）
                         ui.button(icon="delete_forever", on_click=_del_one(t.id)).props(
                             "size=sm flat dense color=negative").tooltip(
                             "删除这一集的文件（qB+硬盘，不可撤销）")

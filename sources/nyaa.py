@@ -93,14 +93,12 @@ class NyaaSource(Source):
                 log.warning("集数解析失败 - %s", raw_title)
 
             release_time = None
-            published = entry.get("published")
-            if published:
-                try:
-                    release_time = datetime.strptime(
-                        published, "%a, %d %b %Y %H:%M:%S %z"
-                    ).replace(tzinfo=None)
-                except ValueError:
-                    pass
+            # 用 feedparser 已解析的 published_parsed（C 层解析、与进程 LC_TIME 无关），与 mikan 一致。
+            # 曾用 datetime.strptime(含 %a/%b 英文缩写)：非英文 locale(如 ja_JP.UTF-8)下会 ValueError→丢 release_time，
+            # 退化 bgm 季度识别、丢 quarter。published_parsed 已归一到 UTC，取前 6 位即 naive UTC，语义等价。
+            pp = entry.get("published_parsed")
+            if pp:
+                release_time = datetime(*pp[:6])
 
             quarter = ""
             if release_time is not None:
