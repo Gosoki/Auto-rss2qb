@@ -42,9 +42,9 @@ def render_sources() -> None:
                 with ui.row().classes("gap-2"):
                     ui.button("保存", icon="save",
                               on_click=_save(g.id, name, site, policy, priority, enabled, feed, subgroups, tfilter)
-                              ).props("size=sm color=primary unelevated")
+                              ).props("color=primary unelevated")
                     ui.button("删除", icon="delete",
-                              on_click=_delete(g.id)).props("size=sm flat color=grey")
+                              on_click=_delete(g.id)).props("flat color=grey")
 
         ui.separator().classes("my-2")
         ui.label("添加新组").classes("font-bold")
@@ -59,7 +59,7 @@ def render_sources() -> None:
             n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").props("dense outlined").classes("w-full")
             ui.button("添加", icon="add",
                       on_click=_add(n_name, n_site, n_policy, n_priority, n_feed, n_subgroups, n_tfilter)
-                      ).props("size=sm color=primary unelevated")
+                      ).props("color=primary unelevated")
 
     def _save(gid, name, site, policy, priority, enabled, feed, subgroups, tfilter):
         def h():
