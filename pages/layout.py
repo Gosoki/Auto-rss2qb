@@ -377,6 +377,14 @@ _HEAD_BASE_CSS = (
     # 顶栏品牌：手机(<640)绝对居中；≥640 静态靠左跟导航同排
     "@media(max-width:639px){.brand-center{position:absolute;left:50%;top:50%;"
     "transform:translate(-50%,-50%);margin:0!important}}"
+    # 顶栏『跳转到』悬浮下拉：自写 :hover 规则（不依赖 Tailwind 的 group-hover——它在本环境的 Tailwind 构建里不生成）。
+    # 菜单本体/条目也全用自写 CSS：block 条目撑满菜单宽，hover 高亮整行铺满（不再是浮在中间的圆角小块）。
+    ".jumpdd .jumpmenu{display:none}.jumpdd:hover .jumpmenu{display:block}"
+    ".jumplist{background:#1b1e24;border:1px solid rgba(255,255,255,.14);border-radius:8px;"
+    "overflow:hidden;padding:4px 0;box-shadow:0 8px 24px rgba(0,0,0,.45)}"
+    ".jumplist .jitem{display:block;padding:6px 18px;font-size:14px;line-height:1.5;"
+    "color:#d1d5dc;white-space:nowrap;cursor:pointer;transition:background .12s}"
+    ".jumplist .jitem:hover{background:rgba(255,255,255,.08)}"
     "</style>")
 # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。放 @layer overrides 才能压过 Quasar 的 .bg-* !important。
 _HEAD_BADGE_CSS = (
@@ -439,22 +447,20 @@ def frame(active: str = ""):
                     cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
                             if key == active else "text-gray-400 hover:text-gray-300")
                     ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
-                # 跳转到：外链下拉（qB后台/Nyaa/Mikan/Bangumi）。纯 CSS group-hover——【鼠标悬浮即显示、移开即收起】，
-                # 天然跟随焦点、不用点击、不会被顶栏裁剪。max-lg:hidden＝窄于 1024 隐藏（走汉堡菜单）。保留 ↗ 符号。
-                with ui.element("div").classes("relative group max-lg:hidden"):
+                # 跳转到：外链下拉（qB后台/Nyaa/Mikan/Bangumi）。自写 CSS『.jumpdd:hover .jumpmenu』控制显隐——
+                # 【鼠标悬浮即显示、移开即收起】，不用点击。max-lg:hidden＝窄于 1024 隐藏（走汉堡菜单）。保留 ↗ 符号。
+                with ui.element("div").classes("relative jumpdd max-lg:hidden"):
                     with ui.row().classes("items-center gap-0.5 text-sm px-2 cursor-pointer "
-                                          "text-gray-400 group-hover:text-gray-300 transition-colors"):
+                                          "text-gray-400 hover:text-gray-300 transition-colors"):
                         ui.label("跳转到")
                         ui.icon("open_in_new").style("font-size:14px")
-                    # 外层带 pt-1 透明桥（补触发行与菜单之间的缝，鼠标可平移过去不断 hover）；内层才是可见菜单框
-                    with ui.element("div").classes(
-                            "hidden group-hover:block absolute left-1/2 -translate-x-1/2 top-full z-50 pt-1"):
-                        with ui.column().classes("min-w-max gap-0 rounded overflow-hidden shadow-xl").style(
-                                "background:#1b1e24;border:1px solid rgba(255,255,255,.14)"):
+                    # jumpmenu 默认 display:none，父 .jumpdd:hover 时 display:block；pt-1 透明桥补触发行与菜单的缝。
+                    # 用普通 block div 装条目（非 flex column），条目 display:block 天然撑满、hover 整行铺满。
+                    with ui.element("div").classes("jumpmenu absolute left-0 top-full z-50 pt-1"):
+                        with ui.element("div").classes("jumplist min-w-max"):
                             for _name, _url in _jump_targets():
-                                ui.label(_name).classes(
-                                    "px-4 py-2 text-sm text-gray-300 hover:bg-white/10 cursor-pointer "
-                                    "whitespace-nowrap").on("click", lambda u=_url: ui.navigate.to(u, new_tab=True))
+                                ui.label(_name).classes("jitem").on(
+                                    "click", lambda u=_url: ui.navigate.to(u, new_tab=True))
 
             ui.space()
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位
