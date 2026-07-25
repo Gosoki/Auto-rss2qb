@@ -19,6 +19,7 @@ from db.models import AnimeTorrent, Movie, MovieTorrent
 from services import enrich
 from services.notify import notify
 from sources import mikan
+from sources.parse import format_quarter
 
 log = logging.getLogger("autorss")
 
@@ -598,7 +599,9 @@ async def download_movie_torrent(mt_id: int) -> bool:
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
-        ok = await engine.add_to_qb(data, save_path, f"autoRSS-movie {quarter}", quarter, info_hash=info_hash)
+        # 分类固定不带后缀；标签只放【年份】(不带季度)。format_quarter 解析不出时原样回退（如 unknown）
+        ok = await engine.add_to_qb(data, save_path, "AutoRSS-Movie",
+                                    format_quarter(quarter, "{yyyy}"), info_hash=info_hash)
     except asyncio.CancelledError:
         _set_status(mt_id, "pending")
         raise

@@ -353,7 +353,8 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
-        ok = await engine.add_to_qb(data, save_path, f"autoRSS {quarter}", quarter, info_hash=info_hash)
+        # 分类固定不带后缀，标签只放季度（qB 里按分类归大类、按标签筛季度）
+        ok = await engine.add_to_qb(data, save_path, "AutoRSS-Anime", quarter, info_hash=info_hash)
     except asyncio.CancelledError:
         _set_status(torrent_id, "pending")  # 被取消（关停等）→ 复位，别永久卡 downloading
         raise

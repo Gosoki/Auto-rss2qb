@@ -18,6 +18,9 @@ log = logging.getLogger("autorss")
 _BTIH_RE = re.compile(r"xt=urn:btih:([0-9A-Fa-f]{40}|[A-Za-z2-7]{32})")
 _BGM_ID_RE = re.compile(r"subject/(\d+)")
 
+MANUAL_CATEGORY = "AutoRSS-Manual"   # qB 分类：与番剧 AutoRSS-Anime / 剧场版 AutoRSS-Movie 并列，均不带后缀
+MANUAL_TAG = "Manual"                # qB 标签：只放后缀（番剧放季度、剧场版放年份，手动固定 Manual）
+
 
 def temp_path() -> str:
     """默认保存位置：工作目录下的 Temp（工作目录未设时退到动漫目录/空）。"""
@@ -88,14 +91,14 @@ async def add_manual(torrent_input: str, torrent_bytes, save_path: str) -> dict:
     try:
         if torrent_bytes:                                   # 上传的 .torrent 文件
             ih = info_hash_from_torrent(torrent_bytes)
-            ok = await engine.qb.add_torrent(torrent_bytes, save_path, "manual", "manual")
+            ok = await engine.qb.add_torrent(torrent_bytes, save_path, MANUAL_CATEGORY, MANUAL_TAG)
         elif inp.lower().startswith("magnet:"):             # magnet：交给 qB 抓
             ih = magnet_hash(inp)
-            ok = await engine.qb.add_url(inp, save_path, "manual", "manual")
+            ok = await engine.qb.add_url(inp, save_path, MANUAL_CATEGORY, MANUAL_TAG)
         elif inp.lower().startswith(("http://", "https://")):   # .torrent 链接：本地抓字节(带 SSRF 守卫)再交 qB
             data = await engine.fetch_torrent_bytes(inp)
             ih = info_hash_from_torrent(data)
-            ok = await engine.qb.add_torrent(data, save_path, "manual", "manual")
+            ok = await engine.qb.add_torrent(data, save_path, MANUAL_CATEGORY, MANUAL_TAG)
         else:
             return {"ok": False, "error": "请填 magnet: / http(s) .torrent 链接，或上传 .torrent 文件"}
     except Exception as e:
