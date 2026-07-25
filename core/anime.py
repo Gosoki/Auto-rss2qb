@@ -1545,5 +1545,5 @@ def seed_source_groups() -> None:
                           policy="auto", priority=100, enabled=True))
         s.add(SourceGroup(name="Mikan", site="mikan", feed=config.MIKAN_RSS_URL,
                           policy="review", priority=10, enabled=config.MIKAN_ENABLED,
-                          subgroups=",".join(config.MIKAN_SUBGROUPS)))
+                          subgroups="LoliHouse"))   # 默认给 Mikan 白名单 LoliHouse 字幕组
         s.commit()

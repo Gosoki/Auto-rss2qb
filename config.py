@@ -42,14 +42,14 @@ except ValueError:
 
 # ---- 可热改设置：{键: (类型, 默认值)}，类型 bool/int/str/list ----
 _SPEC = {
-    "SITE_NAME": (str, "autorss"),          # 站点名：顶栏站名 + 浏览器标签页标题（空=回落 autorss）
-    "QB_ENABLED": (bool, True),
+    "SITE_NAME": (str, ""),          # 站点名：顶栏站名 + 浏览器标签页标题（空=回落 autorss）
+    "QB_ENABLED": (bool, False),
     "QB_SYNC_STATUS": (bool, True),         # 开=读 qB 实时态(下载中/进度/做种…)；关=发送过去即『已下』、完全不轮询 qB
-    "QB_SYNC_INTERVAL": (int, 20),          # 有种子在下时的活跃轮询间隔（秒）——只在下载窗口内轮询
-    "QB_SYNC_BACKSTOP_MIN": (int, 180),     # 保底自查间隔（分钟）：全无在下时才睡这么久，默认 3 小时
+    "QB_SYNC_INTERVAL": (int, 30),          # 有种子在下时的活跃轮询间隔（秒）——只在下载窗口内轮询
+    "QB_SYNC_BACKSTOP_MIN": (int, 120),     # 保底自查间隔（分钟）：全无在下时才睡这么久，默认 2 小时
     "QB_IDLE_RECHECK_MIN": (int, 10),       # 中档自查间隔（分钟）：还有没下完的在下种子但都不活跃(慢/stalled/暂停)时，
                                             # 每隔这么久自查一次（介于高频轮询与保底长睡之间），别等一个保底周期才发现完成
-    "QB_ACTIVE_FLOOR_KBPS": (int, 20),      # 慢速地板（KB/s）：下载慢于此算『没在真下』；0=只要有速度就算
+    "QB_ACTIVE_FLOOR_KBPS": (int, 50),      # 慢速地板（KB/s）：下载慢于此算『没在真下』；0=只要有速度就算
     "QB_SLOW_ROUNDS": (int, 3),             # 连续几轮都没在真下才退出高频轮询、休眠（防单次抖动误判）
     "QB_STALL_TIMEOUT_MIN": (int, 1440),    # 停滞超时（分钟）：已交付的在下种子若进度连续这么久无推进，标『停滞(异常)』
                                             # 供人工处理——不自动换源、脱离轮询。默认 1 天；0=关闭该检测
@@ -59,19 +59,19 @@ _SPEC = {
     "QB_URL": (str, "http://127.0.0.1:8080"),
     "QB_USERNAME": (str, ""),
     "QB_PASSWORD": (str, ""),
-    "DOWN_PATH": (str, "/media/upan/Anime"),   # 工作目录=下载根；动漫/电影留空时都落它下面
+    "DOWN_PATH": (str, "/home"),            # 工作目录=下载根；动漫/电影留空时都落它下面
     "ANIME_DOWN_PATH": (str, ""),           # 动漫独立下载根（空=用工作目录 DOWN_PATH/番剧；填了=放这个独立目录，可另一块盘）
     "MOVIE_DOWN_PATH": (str, ""),            # 电影独立下载根（空=用工作目录 DOWN_PATH/剧场版；填了=放这个独立目录，可另一块盘）
-    "ANIME_SEASON_SUBFOLDER": (bool, True),
+    "ANIME_SEASON_SUBFOLDER": (bool, False),
     "QUARTER_FMT": (str, "{yy}{q} · {m}月 · {season}"),   # 番剧下载文件夹的季度目录名
     "MOVIE_QUARTER_FMT": (str, "{yyyy}"),   # 电影下载文件夹命名（默认年份 2026）；番剧走 QUARTER_FMT
     "QUARTER_FMT_UI": (str, ""),            # 空 = 跟随 QUARTER_FMT（见 __getattr__）
-    "ANIME_SHOW_PENDING": (bool, False),
-    "ANIME_SHOW_REJECTED": (bool, False),
+    "ANIME_SHOW_PENDING": (bool, True),
+    "ANIME_SHOW_REJECTED": (bool, True),
     "ANIME_PAGE_YEARS": (int, 3),           # 番剧表一页显示几年的番（1~5，×4 得季度数）
     "MOVIE_PAGE_YEARS": (int, 5),            # 剧场版列表一页显示几年（1~5）
-    "ANIME_DEFAULT_TAB": (str, "manage"),   # 番剧页默认停哪个标签（overview/manage/confirm/fail/reject/sources），URL 带 ?t= 时以 URL 为准
-    "MOVIE_DEFAULT_TAB": (str, "list"),     # 剧场版页默认停哪个标签（overview/list/fail/reject/sources）
+    "ANIME_DEFAULT_TAB": (str, "overview"), # 番剧页默认停哪个标签（overview/manage/confirm/fail/reject/sources），URL 带 ?t= 时以 URL 为准
+    "MOVIE_DEFAULT_TAB": (str, "overview"), # 剧场版页默认停哪个标签（overview/list/fail/reject/sources）
     "ANIME_MULTIBRACKET_PARSE": (bool, False),    # 全括号命名(沸羊羊/悠哈/GM-Team 等)番名回退捕获——默认关，开了才对空名种子尝试从括号块猜番名
     "ANIME_POLL_ENABLED": (bool, True),           # 后台采集总开关（全新库首启默认关，见 load_from_db）
     "ANIME_POLL_INTERVAL": (int, 1200),
@@ -90,7 +90,7 @@ _SPEC = {
     "ENRICH_RETRY_TIMES": (int, 3),          # bgm 请求瞬时失败(超时/连接)的即时重试次数
     "REENRICH_RETRY_BASE": (int, 30),        # 『待识别』番延迟重试基准等待（分钟），每失败一次翻倍（默认 30 分钟）
     "REENRICH_RETRY_MAX": (int, 1440),       # 延迟重试等待上限（分钟），翻倍到此封顶（默认 1440=24 小时）
-    "REENRICH_MAX_TRIES": (int, 12),         # 每部『待识别』番最多自动重试几次（满则停自动、留手动）
+    "REENRICH_MAX_TRIES": (int, 5),          # 每部『待识别』番最多自动重试几次（满则停自动、留手动）
     "ANI_RSS_URL": (str, "https://nyaa.si/?page=rss&u=ANiTorrent"),
     "MIKAN_ENABLED": (bool, False),
     "MIKAN_RSS_URL": (str, "https://mikanani.me/RSS/Classic"),
