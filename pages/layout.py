@@ -13,6 +13,17 @@ NAV = [("manage", "动漫番剧", "/"), ("movies", "OVA・剧场版", "/movies")
        ("parse", "解析测试", "/parse"), ("manual", "手动下载", "/manual"),
        ("logs", "运行日志", "/logs"), ("settings", "全局设置", "/settings")]
 
+
+def _jump_targets() -> list:
+    """『跳转到』下拉的外链目标（新标签打开）：qB 后台(设置里填的地址，空则不列) + 常用站点。每次渲染读，改地址即时生效。"""
+    qb = (config.QB_URL or "").strip()
+    mikan = (config.MIKAN_BASE or "https://mikanani.me").rstrip("/")
+    return ([("qB 后台", qb)] if qb else []) + [
+        ("Nyaa", "https://nyaa.si"),
+        ("Mikan", mikan),
+        ("Bangumi", "https://bgm.tv"),
+    ]
+
 # 应用侧种子状态 → 中文（番剧表/剧场版/详情/新入库共用）
 STATUS_CN = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
              "error": "失败", "skipped": "跳过", "deleted": "已删", "excluded": "已排除",
@@ -410,9 +421,8 @@ def frame(active: str = ""):
                         mi = ui.menu_item(label, on_click=lambda p=path: ui.navigate.to(p))
                         if key == active:
                             mi.classes("text-blue-400 font-semibold")
-                    qb = (config.QB_URL or "").strip()   # qB 网页版：外链新标签打开
-                    if qb:
-                        ui.menu_item("qB 后台 ↗", on_click=lambda u=qb: ui.navigate.to(u, new_tab=True))
+                    for _name, _url in _jump_targets():   # 跳转到：外链新标签打开（qB后台/Nyaa/Mikan/Bangumi）
+                        ui.menu_item(f"{_name} ↗", on_click=lambda u=_url: ui.navigate.to(u, new_tab=True))
             # 品牌：手机绝对居中(.brand-center)，≥640 静态靠左跟导航同排
             with ui.row().classes("items-center gap-2 mr-2 sm:mr-6 brand-center"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
@@ -429,18 +439,19 @@ def frame(active: str = ""):
                     cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
                             if key == active else "text-gray-400 hover:text-gray-300")
                     ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
-                # qB 后台：外链，新标签打开设置里填的 qB 地址（每次渲染读，改地址即时生效）。
-                # max-lg:hidden＝窄于 1024 时先让它消失（它可有可无），给核心导航腾出居中空间。
-                qb = (config.QB_URL or "").strip()
-                qcls = ("cursor-pointer text-gray-400 hover:text-gray-300" if qb else "text-gray-600")
+                # 跳转到：外链下拉（qB后台/Nyaa/Mikan/Bangumi），【鼠标悬浮即弹出】、各项新标签打开。保留 ↗ 符号。
+                # no-parent-event＝不靠点击触发，由下面 mouseenter 手动 open()；QMenu 会 portal 到 body、不被顶栏裁剪。
+                # max-lg:hidden＝窄于 1024 时先让它消失（可有可无），给核心导航腾出居中空间（窄屏走汉堡菜单）。
                 with ui.row().classes(
-                        f"items-center gap-0.5 text-sm px-2 transition-colors max-lg:hidden {qcls}") as _qbnav:
-                    ui.label("qB 后台")
+                        "items-center gap-0.5 text-sm px-2 transition-colors cursor-pointer "
+                        "text-gray-400 hover:text-gray-300 max-lg:hidden") as _jrow:
+                    ui.label("跳转到")
                     ui.icon("open_in_new").style("font-size:14px")
-                if qb:
-                    _qbnav.on("click", lambda u=qb: ui.navigate.to(u, new_tab=True))
-                else:
-                    _qbnav.tooltip("先在『全局设置』里填 qB 地址")
+                    _jmenu = ui.menu().props("no-parent-event anchor='bottom middle' self='top middle'")
+                    with _jmenu:
+                        for _name, _url in _jump_targets():
+                            ui.menu_item(_name, on_click=lambda u=_url: ui.navigate.to(u, new_tab=True))
+                _jrow.on("mouseenter", lambda: _jmenu.open())
 
             ui.space()
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位
