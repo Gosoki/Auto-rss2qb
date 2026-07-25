@@ -67,7 +67,7 @@ def anime_page(t: str = ""):
                     pol = "自动下载" if policy == "auto" else "人工审核"
                     tail = "" if enabled else " · 停用"
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
-                        f"color={'blue-grey' if enabled else 'grey'}").classes("text-sm")
+                        f"color={'blue' if enabled else 'grey'}").classes("text-sm")   # 启用=蓝，停用=灰
 
         # 环图图例选择的持久化：用户点图例排除某字幕组后存下选择态，重建时塞回 legend.selected，
         # 任何刷新路径（定时器/用户操作/重识别）重建环图都不会把排除的源刷回来。

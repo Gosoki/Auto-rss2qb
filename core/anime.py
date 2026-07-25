@@ -1095,10 +1095,11 @@ def download_plan_for_ids(anime_ids) -> set[int]:
 
 def pending_breakdown() -> dict:
     """把『待下』(pending)拆成 将下载/备用/待确认/未知，供仪表盘种子状态区看清那一大坨到底是什么。
+    · 未知   = 批量/未知集(-2)——flush 后台不自动下（即便被 _select_downloads 挑中），需人工在详情页下。
+              【最先判】不论番确不确认，与 unknown_episode_rows（点开的列表）同口径，卡片数=列表条数。
     · 将下载 = 已确认番·本集首选（download_plan 会挑中，会自动下；含特别篇 -1 的首选）
     · 备用   = 已确认番·同集已有更优版本（不会自动下）；含已拒绝番/孤儿的残留
-    · 待确认 = 番还没确认（要点确认才下）
-    · 未知   = 批量/未知集(-2)——flush 后台不自动下（即便被 _select_downloads 挑中），需人工在详情页下
+    · 待确认 = 番还没确认（要点确认才下）；集号 -2 的已归入『未知』，不重复计
     四者之和 = 待下总数。复用批量 download_plan_for_ids，仅几条查询、只在仪表盘打开时算。"""
     with get_session() as s:
         conf = {aid: c for aid, c in s.exec(
@@ -1109,12 +1110,12 @@ def pending_breakdown() -> dict:
     will = backup = unconfirmed = unknown = 0
     for tid, aid, ep in pend:
         c = conf.get(aid)
-        if c is None:            # 番已拒绝/孤儿 → 不会自动下
+        if ep == -2:             # 未知集最先判：不论番确不确认，后台都不自动下、都得人工处理。
+            unknown += 1         # 放最前才与点开的列表(unknown_episode_rows=所有待下 -2)同口径，卡片数=列表条数。
+        elif c is None:          # 番已拒绝/孤儿 → 不会自动下
             backup += 1
         elif not c:              # 番未确认
             unconfirmed += 1
-        elif ep == -2:           # 批量/未知集：flush 不自动下（即便 plan 挑中），单列，别混进将下载
-            unknown += 1
         elif tid in plan:        # 已确认·本集首选（含 -1 特别篇的首选）
             will += 1
         else:                    # 已确认·非首选（同集有更优）
