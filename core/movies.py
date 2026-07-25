@@ -359,13 +359,26 @@ def restore_movie(movie_id: int) -> None:
         m.rejected = False
         s.add(m)
         rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)))
-        # deleted 也算『有过一版』：唯一版本被用户删掉后，不该把 skipped 旧版翻出来重下（与承诺一致）
-        anydl = any(t.status in ("downloaded", "downloading", "deleted") for t in rows)
+        # deleted/stalled 也算『有过一版』：唯一版本被删/停滞后，不该把 skipped 旧版翻出来重下（与番剧 _HANDLED 一致）
+        anydl = any(t.status in ("downloaded", "downloading", "deleted", "stalled") for t in rows)
         for t in rows:  # 剧场版=一部作品：已有一版就别把 skipped 旧版翻出来（deleted 是用户主动删，也不重下）
             if t.status == "skipped" and not anydl:
                 t.status = "pending"
                 s.add(t)
         s.commit()
+
+
+def deleted_movie_torrent_rows() -> list[dict]:
+    """已删除(deleted)的剧场版种子——供『已忽略』页底部『已删除种子』折叠展示 + 重新下载找回。
+    与番剧 deleted_torrent_rows 对称：deleted 是用户主动删文件的终态、不会自动重下，这里给集中入口找回。"""
+    with get_session() as s:
+        ts = list(s.exec(select(MovieTorrent).where(MovieTorrent.status == "deleted")
+                         .order_by(MovieTorrent.created_at.desc())))
+        ids = {t.movie_id for t in ts if t.movie_id}
+        names = ({m.id: (m.display_name or m.title) for m in
+                  s.exec(select(Movie).where(Movie.id.in_(ids)))} if ids else {})
+    return [{"id": t.id, "movie_id": t.movie_id,
+             "name": names.get(t.movie_id) or "?", "raw": t.raw_title or ""} for t in ts]
 
 
 async def enrich_movie(movie_id: int) -> bool:

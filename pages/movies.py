@@ -303,6 +303,14 @@ def movies_page(t: str = ""):
                 ui.notify("已恢复")
             return h
 
+        def _redownload(mt_id):
+            async def h():   # 重下一条已删除的剧场版种子，找回文件（download_movie_torrent 对 deleted 会重新交 qB）
+                ok = await mov.download_movie_torrent(mt_id)
+                refresh_all()
+                ui.notify("已重新下载" if ok else "重新下载失败（qB 未连上 / 种子不可用）",
+                          type="positive" if ok else "warning")
+            return h
+
         def _bind(movie_id, inp):
             async def h():
                 bid = parse_bgm_id(inp.value or "")
@@ -574,7 +582,8 @@ def movies_page(t: str = ""):
         @ui.refreshable
         def reject_panel():
             rej = mov.list_rejected_movies()
-            if not rej:
+            dels = mov.deleted_movie_torrent_rows()   # 已删除种子（放本页最底的独立折叠）
+            if not rej and not dels:
                 ui.label("没有已忽略的剧场版。（列表里点『忽略』会进这里，可随时恢复）").classes(
                     "text-gray-400 p-4")
                 return
@@ -590,6 +599,26 @@ def movies_page(t: str = ""):
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         ui.button("恢复订阅", icon="undo", on_click=_restore(m.id)).props(
                             "color=primary unelevated")
+
+            # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（与番剧侧对称）
+            if dels:
+                with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline").classes(
+                        "w-full mt-2").props("dense"):
+                    ui.label("你手动删掉文件的剧场版版本（终态，不会自动重下）。需要就点『重新下载』找回。").classes(
+                        "text-xs text-gray-500 p-1")
+                    for d in dels:
+                        with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
+                                "border-bottom:1px solid rgba(255,255,255,.06)"):
+                            ui.label(d["name"]).classes(
+                                "shrink-0 cursor-pointer text-blue-400 hover:underline").on(
+                                "click", lambda mid=d["movie_id"]: open_detail(mid))
+                            ui.label(d["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
+                            _rb = ui.button("重新下载", icon="download",
+                                            on_click=_redownload(d["id"])).props(
+                                "flat dense size=sm color=primary").style("font-size:14px")
+                            _rb.set_enabled(config.QB_ENABLED)
+                            _rb.tooltip("强制重新下这一版本到原目录（找回删掉的文件）" if config.QB_ENABLED
+                                        else "qB 未启用，去设置页开启后可下载")
 
         @ui.refreshable
         def sources_panel():
