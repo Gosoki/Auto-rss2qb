@@ -182,8 +182,7 @@ def overview() -> dict:
         dl_ids = set(s.exec(select(MovieTorrent.movie_id)
                             .where(MovieTorrent.status == "downloaded").distinct()))
     active = [m for m in all_m if not m.rejected]
-    active_ids = {m.id for m in active}
-    q_of = {m.id: (m.quarter or "未知") for m in active}
+    q_of = {m.id: (m.quarter or "未知") for m in active}   # 键域即 active 的 id 集，成员判断复用它
     total_by_q = Counter(q_of[m.id] for m in active)
     dl_by_q = Counter(q_of[mid] for mid in dl_ids if mid in q_of)
     qs = sorted((q for q in total_by_q if q != "未知"), reverse=True)
@@ -194,7 +193,7 @@ def overview() -> dict:
             "total": len(active),
             "matched": sum(1 for m in active if m.bangumi_id),
             "unmatched": sum(1 for m in active if not m.bangumi_id),
-            "downloaded": len([mid for mid in dl_ids if mid in active_ids]),
+            "downloaded": len([mid for mid in dl_ids if mid in q_of]),
             "rejected": sum(1 for m in all_m if m.rejected),
             "versions": versions,
         },

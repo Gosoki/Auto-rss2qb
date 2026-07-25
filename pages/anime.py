@@ -113,9 +113,9 @@ def anime_page(t: str = ""):
                             ui.label("—").classes("text-gray-500 text-sm")
                         for q, sub, rev, ign in bqs:
                             total = sub + rev + ign
+                            _ql = engine.quarter_label(q)   # 同值算一次，label 与 tooltip 复用
                             with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
-                                ui.label(engine.quarter_label(q)).classes(
-                                    "w-36 shrink-0 truncate").tooltip(engine.quarter_label(q))
+                                ui.label(_ql).classes("w-36 shrink-0 truncate").tooltip(_ql)
                                 # 满宽 100% 的比例条，按订阅/审核/忽略切三段（0 段跳过）
                                 with ui.element("div").classes("grow rounded overflow-hidden flex min-w-0").style(
                                         "height:13px;background:rgba(255,255,255,.08)"):
@@ -228,10 +228,11 @@ def anime_page(t: str = ""):
             if not pend:
                 ui.label("没有待确认的番。（『待确认』策略的源组发现的番会出现在这里）").classes("text-gray-400 p-4")
                 return
+            smap = anime.source_map()   # 批量取来源，避免逐番 anime_sources 的 N+1 查询
             for i, (q, items) in enumerate(group_by_quarter(pend)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
-                        srcs = anime.anime_sources(a.id)
+                        srcs = smap.get(a.id, [])
                         with ui.card().classes("w-full"):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
                                 ui.badge("待确认").props("color=orange")
@@ -255,6 +256,7 @@ def anime_page(t: str = ""):
             if not rej:
                 ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
                 return
+            smap = anime.source_map()   # 批量取来源，避免逐番 N+1
             for i, (q, items) in enumerate(group_by_quarter(rej)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
@@ -267,7 +269,7 @@ def anime_page(t: str = ""):
                                 sl = season_label(a)
                                 if sl:
                                     ui.badge(sl).props("color=purple")
-                                ui.label("来源: " + (" · ".join(anime.anime_sources(a.id)) or "—")).classes(
+                                ui.label("来源: " + (" · ".join(smap.get(a.id, [])) or "—")).classes(
                                     "text-xs text-gray-400")
                             with ui.row().classes("items-stretch gap-3 flex-wrap"):
                                 ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
@@ -289,8 +291,9 @@ def anime_page(t: str = ""):
             ui.label("这些番没自动匹配到 bgm：缺规范名 / 日语文件夹名 / 季度。"
                      "可『重试识别』，或粘贴 bgm 链接/ID『绑定』，实在没有就『忽略』。").classes(
                 "text-xs text-gray-400 p-2")
+            smap = anime.source_map()   # 批量取来源，避免逐番 N+1
             for a in items:
-                srcs = anime.anime_sources(a.id)
+                srcs = smap.get(a.id, [])
                 with ui.card().classes("w-full"):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
                         ui.badge("未匹配").props("color=red")

@@ -31,6 +31,7 @@ _ROW_LABEL_RE = re.compile(r'id="data-row-\d+"[^>]*>\s*(.*?)\s*</div>', re.S)
 _BANGUMI_RE = re.compile(r'/Home/Bangumi/(\d+)"[^>]*?title="([^"]*)"')
 _BGM_RE = re.compile(r'bgm\.tv/subject/(\d+)')
 _HASH_FROM_LINK_RE = re.compile(r'/Home/Episode/([0-9a-f]{40})')
+_HEX40_RE = re.compile(r"[0-9a-f]{40}")   # info_hash 校验（每条种子热路径，预编译）
 
 
 def _hash_from_link(link: str) -> str:
@@ -84,7 +85,7 @@ class MikanSource(Source):
         try:
             raw_title = entry.title
             info_hash = _hash_from_link(entry.get("link", ""))
-            if not re.fullmatch(r"[0-9a-f]{40}", info_hash):
+            if not _HEX40_RE.fullmatch(info_hash):
                 return None  # 必须是 40 位 hex，才能与 nyaa 的 hash 精确对齐去重
 
             if is_batch(raw_title):
@@ -210,7 +211,7 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
         try:
             raw_title = entry.title
             info_hash = _hash_from_link(entry.get("link", ""))
-            if not re.fullmatch(r"[0-9a-f]{40}", info_hash):
+            if not _HEX40_RE.fullmatch(info_hash):
                 continue
             group, anime_title, season, episode = parse_title(raw_title)
             download_url = _enclosure(entry)

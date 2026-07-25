@@ -49,7 +49,12 @@ _EP_PATTERNS = [
 _EXT_RE = re.compile(r"\.(mp4|mkv|avi|ts|flv|rmvb|wmv|mov|m2ts|webm)\s*$", re.I)
 # 从番名里剥掉的集数段：锚定到『空格-空格数字(可带 v2)后接括号或行尾』，别吃副标题里的 -2nd
 _EP_TAIL = r"\s-\s*\d+(?:\.\d+)?(?:\s*[vV]\d+)?\s*(?:$|[\[【(（])"
-_STRIP_PATTERNS = [_EP_TAIL, r"[Ss]\d{1,2}[Ee]\d{1,3}", r"第\s*(?:[一二三四五六七八九十]+|\d+)\s*[话話集]"]
+_EP_TAIL_RE = re.compile(_EP_TAIL)              # 预编译（_clean_for_search 用）
+_STRIP_PATTERNS = [re.compile(p) for p in (     # 预编译（_clean_name 循环用）
+    _EP_TAIL, r"[Ss]\d{1,2}[Ee]\d{1,3}", r"第\s*(?:[一二三四五六七八九十]+|\d+)\s*[话話集]")]
+# 标签块 [..]/【..】（含空括号，整体替换）——_clean_name/_clean_for_search/parse_multibracket 共用。
+# 勿与 _INNER_BLK(带捕获组、+ 不匹配空括号) 混用：对空括号 [] 的 sub 结果不同。
+_TAG_BLK_RE = re.compile(r"[\[【][^\]】]*[\]】]")
 
 
 def is_batch(title: str) -> bool:
@@ -115,9 +120,9 @@ def extract_episode(text: str):
 
 def _clean_name(name_part: str) -> str:
     """去掉 [..]/【..】 标签块、扩展名与集数段，得到干净番名（无空格）。"""
-    s = _EXT_RE.sub("", re.sub(r"[\[【][^\]】]*[\]】]", "", name_part))
+    s = _EXT_RE.sub("", _TAG_BLK_RE.sub("", name_part))
     for pat in _STRIP_PATTERNS:
-        m = re.search(pat, s)
+        m = pat.search(s)
         if m:
             s = s[:m.start()]
             break
@@ -180,6 +185,12 @@ def _is_chinese(s: str) -> bool:
     return bool(_HAN_RE.search(s)) and not _KANA_RE.search(s)
 
 
+def _group_and_body(raw: str):
+    """组名 + 去掉开头 [组] 块后的正文。parse_title/candidate_names/剧场版抓取共用，省重复 _GROUP_RE.match。"""
+    m = _GROUP_RE.match(raw)
+    return (m.group(1).strip() if m else ""), (raw[m.end():] if m else raw)
+
+
 def parse_title(raw_title: str):
     """从各家字幕组标题提取 (组名, 番名, 季, 集)。
 
@@ -187,9 +198,7 @@ def parse_title(raw_title: str):
     没有中文才回退取末段（ANi 惯例 罗马音/中文，中文在末段）；集数从整体正文抽，不受挑哪段影响。
     繁转简 + 去季名。
     """
-    m = _GROUP_RE.match(raw_title)
-    group = m.group(1).strip() if m else ""
-    body = raw_title[m.end():] if m else raw_title   # 去开头 [组] 块，免得它混进第一段语言
+    group, body = _group_and_body(raw_title)   # 去开头 [组] 块，免得它混进第一段语言
 
     if _SLASH_RE.search(body):
         segs = _SLASH_RE.split(body)                 # 各语言段（罗马音/日文/中文，2~3 段）
@@ -206,8 +215,8 @@ def parse_title(raw_title: str):
 def _clean_for_search(s: str) -> str:
     """搜 bgm 用的关键词：去标签块与集数段，但**保留内部空格和季标记**
     （罗马音要空格才搜得准；"第二季"/S02 有助于命中正确的季条目）。"""
-    s = _EXT_RE.sub("", re.sub(r"[\[【][^\]】]*[\]】]", "", s))   # 去 [..]/【..】 标签块 + 扩展名
-    m = re.search(_EP_TAIL, s)                   # 去 " - 07" 及其后（锚定，不吃 -2nd 副标题）
+    s = _EXT_RE.sub("", _TAG_BLK_RE.sub("", s))   # 去 [..]/【..】 标签块 + 扩展名
+    m = _EP_TAIL_RE.search(s)                   # 去 " - 07" 及其后（锚定，不吃 -2nd 副标题）
     if m:
         s = s[:m.start()]
     return s.strip()
@@ -218,8 +227,7 @@ def candidate_names(raw_title: str) -> list[str]:
 
     有日文汉字/假名就一并带上（最准）；ANi 一般是 罗马音 + 繁体中文。
     """
-    m = _GROUP_RE.match(raw_title)
-    body = raw_title[m.end():] if m else raw_title
+    _, body = _group_and_body(raw_title)
     if _SLASH_RE.search(body):
         parts = _SLASH_RE.split(body, 1)   # 罗马音段 + 中文段
     else:
@@ -278,7 +286,7 @@ def parse_multibracket(raw_title: str):
 
     names: list[str] = []
     for p in re.split(r"\s*/\s*|_", nameblk):        # 中文/罗马音/日文 多用 / 或 _ 分隔
-        c = strip_season(_EXT_RE.sub("", re.sub(r"[\[【][^\]】]*[\]】]", "", p))).strip()
+        c = strip_season(_EXT_RE.sub("", _TAG_BLK_RE.sub("", p))).strip()
         if len(c.replace(" ", "")) < 2 or _is_skip_block(c):
             continue
         if c not in names:

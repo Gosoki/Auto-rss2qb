@@ -97,7 +97,7 @@ async def _search_one(client, name, est, release):
         if dt is None:
             continue
         if _date_ok(dt, est, release) and _name_plausible(name, d):
-            return d
+            return d, dt   # 连同已解析的放送日返回，供 resolve 复用、免二次解析
     return None
 
 
@@ -231,13 +231,13 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
             votes: Counter = Counter()
             gap: dict = {}
             for name in names:
-                d = await _search_one(client, name, est, release_time)
-                if d:
+                hit = await _search_one(client, name, est, release_time)
+                if hit:
+                    d, bdt = hit   # bdt 已由 _search_one 解析（且必非 None，命中前已校验）
                     bid = d.get("id")
                     if bid is None:
                         continue
                     votes[bid] += 1
-                    bdt = _parse_date(d.get("date"))
                     g = abs(((est or release_time) - bdt).days) if (bdt and (est or release_time)) else 999
                     gap[bid] = min(gap.get(bid, 10 ** 9), g)
             bgm_id = None
@@ -262,7 +262,7 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
                     meta = {}
                 cast = await _fetch_cast(client, bgm_id)   # 声优另调 /characters（只抓主角）
 
-        if _parse_date(meta.get("date")) is None and bgm_id is None:
+        if bgm_id is None and _parse_date(meta.get("date")) is None:   # bgm_id 命中即短路，跳过多余解析
             return None
         info = _subject_to_info(bgm_id, meta)
         info["cast"] = cast

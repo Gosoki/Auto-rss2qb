@@ -32,6 +32,7 @@ def init_db():
     SQLModel.metadata.create_all(engine)
     _migrate_add_columns()   # 给模型新增字段的表加列（开发期加字段免删整表）
     _migrate_inflight_indexes()   # 给 in-flight 高频查询建 partial index
+    _migrate_drop_redundant_indexes()   # 清掉 info_hash 上冗余的非唯一索引（唯一约束索引已覆盖）
 
 
 def _column_default(col):
@@ -92,6 +93,15 @@ def _migrate_inflight_indexes() -> None:
     with engine.begin() as conn:
         for stmt in ddl:
             conn.exec_driver_sql(stmt)
+
+
+def _migrate_drop_redundant_indexes() -> None:
+    """去掉 info_hash 上冗余的非唯一索引 ix_*_info_hash：该列有 UniqueConstraint(uq_*)，唯一索引已覆盖
+    全部等值查找（hash_owned_elsewhere/mark_done_by_hash/去重 upsert）。老库由此前 index=True 建过 ix_*，
+    create_all 不会自动 DROP，这里显式清掉；DROP IF EXISTS 幂等，新库/已清库均无副作用。"""
+    with engine.begin() as conn:
+        for name in ("ix_animetorrent_info_hash", "ix_movietorrent_info_hash"):
+            conn.exec_driver_sql(f"DROP INDEX IF EXISTS {name}")
 
 
 def get_session() -> Session:

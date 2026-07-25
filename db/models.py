@@ -89,7 +89,7 @@ class AnimeTorrent(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("info_hash", name="uq_animetorrent_info_hash"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    info_hash: str = Field(index=True)          # 40位hex，小写；跨源去重键
+    info_hash: str = Field()                    # 40位hex，小写；跨源去重键（唯一约束 uq_ 索引已覆盖等值查找，不再另建普通索引）
     anime_id: int = Field(default=0, index=True)  # → Anime.id（主键关联，取代按番名匹配）
     source: str = Field(default="")             # 字幕组/来源
     site: str = Field(default="nyaa")           # 下载站点
@@ -152,7 +152,7 @@ class MovieTorrent(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("info_hash", name="uq_movietorrent_info_hash"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    info_hash: str = Field(index=True)          # 40位hex，小写；跨源去重键
+    info_hash: str = Field()                    # 40位hex，小写；跨源去重键（唯一约束 uq_ 索引已覆盖等值查找，不再另建普通索引）
     movie_id: int = Field(default=0, index=True)  # → Movie.id
     source: str = Field(default="")             # 字幕组/来源
     site: str = Field(default="mikan")

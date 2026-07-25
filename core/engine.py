@@ -333,9 +333,10 @@ async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
     if await qb.add_torrent(data, save_path, category, tags):
         return True
     if info_hash:
-        info = await qb.torrents_info([info_hash])   # None=连不上(真失败)；dict 里有该 hash=已在 qB
-        if info and info_hash.lower() in info:
-            log.info("add 被 qB 拒但该 hash 已在 qB（重复提交/跨表同种）→ 视作已交付 - %s", info_hash[:12])
+        h = info_hash.lower()   # torrents_info 返回小写键；命中判定与日志统一归一（防上游传大写）
+        info = await qb.torrents_info([h])   # None=连不上(真失败)；dict 里有该 hash=已在 qB
+        if info and h in info:
+            log.info("add 被 qB 拒但该 hash 已在 qB（重复提交/跨表同种）→ 视作已交付 - %s", h[:12])
             return True
     return False
 
@@ -354,6 +355,9 @@ _QB_SETTLED = _QB_SEEDING | {"missingFiles"}
 # 短暂『工作中』态（在动但速度可能为 0：取元数据/校验/分配磁盘）——这些也算『在真下』，
 # 免得刚开始那几秒被速度地板误判成慢。真正的下载态(downloading/forcedDL)则改用速度地板判快慢。
 _QB_TRANSIENT = {"metaDL", "forcedMetaDL", "checkingDL", "allocating"}
+# 预算成 list 供 SQL in_/not_in 复用（集合恒定、只读；避免热路径每次调用重新 list()）
+_QB_SETTLED_LIST = list(_QB_SETTLED)
+_QB_TRANSIENT_LIST = list(_QB_TRANSIENT)
 
 
 def qb_is_downloading(state: str) -> bool:
@@ -371,7 +375,7 @@ def _inflight_where(model_cls):
     return (
         model_cls.status.in_(["downloaded", "downloading"]),
         model_cls.qb_progress < 1.0,
-        func.coalesce(model_cls.qb_state, "").not_in(list(_QB_SETTLED)),
+        func.coalesce(model_cls.qb_state, "").not_in(_QB_SETTLED_LIST),
     )
 
 
@@ -400,7 +404,7 @@ def has_active_downloading() -> bool:
                     *_inflight_where(model_cls),
                     model_cls.qb_synced_at >= cutoff,
                     or_(model_cls.qb_dlspeed >= thr,
-                        model_cls.qb_state.in_(list(_QB_TRANSIENT)))).limit(1)).first():
+                        model_cls.qb_state.in_(_QB_TRANSIENT_LIST))).limit(1)).first():
                 return True
     return False
 

@@ -333,6 +333,58 @@ async def confirm(title: str, note: str = "", ok_label: str = "确定",
         dlg.delete()
 
 
+# ---- 恒定 head html（内容与运行时状态无关，提到模块级，frame() 每次渲染直接注入、免重复拼接）----
+# 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
+_HEAD_REFERRER = '<meta name="referrer" content="no-referrer">'
+# 整页重载防白闪 + 顶栏/标签不做加载时的怪过渡：html 直接上暗底；关掉 q-header/q-tab 的加载过渡。
+_HEAD_PRELOAD = (
+    "<style>"
+    "html,body{background:#121212}"                                  # html+body 都上暗底，重载瞬间不白闪
+    ".q-header{transition:none!important}"                            # 顶栏底色不白→灰淡入
+    ".q-tab,.q-tab__indicator,.q-tabs__content{transition:none!important}"  # 标签/指示器不做加载动效
+    "html.preload *{transition:none!important}"                      # 加载期禁掉一切过渡
+    "</style>"
+    "<script>document.documentElement.classList.add('preload');"
+    "addEventListener('load',function(){setTimeout(function(){"
+    "document.documentElement.classList.remove('preload')},600)});</script>")
+# 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
+_HEAD_BASE_CSS = (
+    "<style>"
+    "body{font-size:14px}"   # 基础字号 14px：没显式定大小的继承文字统一 14；番名单独 text-lg(18px)
+    ".q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
+    ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}"
+    ".q-table tbody td,.q-table thead th,.q-table .q-badge{font-size:14px}"
+    # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
+    ".kpi-group{display:grid;gap:.75rem;grid-template-columns:repeat(2,minmax(0,1fr))}"
+    "@media(min-width:860px){.kpi-group{grid-template-columns:repeat(var(--kpi-n,4),minmax(0,1fr))}}"
+    # 数字输入：隐去浏览器原生上下箭头，统一成纯输入框
+    "input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button"
+    "{-webkit-appearance:none;margin:0}input[type=number]{-moz-appearance:textfield}"
+    # 设置页数字项栅格：桌面每格 1/4 宽（4 列），窄屏落到 2 列；顶端对齐
+    ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
+    "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
+    # 顶栏品牌：手机(<640)绝对居中；≥640 静态靠左跟导航同排
+    "@media(max-width:639px){.brand-center{position:absolute;left:50%;top:50%;"
+    "transform:translate(-50%,-50%);margin:0!important}}"
+    "</style>")
+# 全站徽标统一配色：Tailwind 色板映射到 .q-badge。放 @layer overrides 才能压过 Quasar 的 .bg-* !important。
+_HEAD_BADGE_CSS = (
+    "<style>@layer overrides{"
+    ".q-badge.bg-green{background:oklch(72.3% 0.219 149.579)!important}"               # green-500（绿单独调暗）
+    ".q-badge.bg-red{background:oklch(70.4% 0.191 22.216)!important}"                  # red-400（红单独调暗）
+    ".q-badge.bg-blue,.q-badge.bg-primary{background:oklch(70.7% 0.165 254.624)!important}"  # blue-400
+    ".q-badge.bg-blue-grey,.q-badge.bg-grey{background:oklch(70.7% 0.022 261.325)!important}"  # 中性灰统一：gray-400
+    ".q-badge.bg-orange{background:oklch(75% 0.183 55.934)!important}"                 # orange-400
+    ".q-badge.bg-purple{background:oklch(71.4% 0.203 305.504)!important}"              # purple-400
+    ".q-badge.bg-teal{background:oklch(77.7% 0.152 181.912)!important}"                # teal-400
+    ".q-badge.bg-indigo{background:oklch(67.3% 0.182 276.935)!important}"              # indigo-400
+    ".q-badge.bg-deep-purple{background:oklch(70.2% 0.183 293.541)!important}"         # violet-400
+    ".q-badge.bg-amber{background:oklch(82.8% 0.189 84.429)!important}"                # amber-400
+    ".q-badge.bg-pink{background:oklch(71.8% 0.202 349.761)!important}"                # pink-400
+    ".q-btn.text-grey{color:oklch(70.7% 0.022 261.325)!important}"                     # 次级灰按钮→gray-400(灰2)
+    "}</style>")
+
+
 @contextmanager
 def frame(active: str = ""):
     """页面骨架：暗色 + 顶栏（站名 + 导航 + 右侧动作位）。
@@ -343,61 +395,10 @@ def frame(active: str = ""):
     ui.page_title(config.SITE_NAME or "autorss")   # 浏览器标签页标题＝站点名（每次渲染读，改了刷新即变）
     # 全站主色＝blue-400、负色＝red-400，用 oklch（跟徽标/链接同源，P3 屏上也完全同色，不走 sRGB 夹紧）
     ui.colors(primary="oklch(70.7% 0.165 254.624)", negative="oklch(70.4% 0.191 22.216)")
-    # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
-    ui.add_head_html('<meta name="referrer" content="no-referrer">')
-    # 整页重载防白闪 + 顶栏/标签不做加载时的怪过渡：
-    #   html 直接上暗底（HTML 一解析就是暗的，不等 JS 的 dark_mode）；
-    #   q-header 默认 transition:all 会把底色从白淡入到 #15171c（就是那下"变白再变灰"）→ 关掉；
-    #   q-tab/指示器默认过渡会在加载时淡色/滑动（怪动效）→ 关掉（切 tab 时指示器改为瞬移，更跟手）。
-    ui.add_head_html(
-        "<style>"
-        "html,body{background:#121212}"                                  # html+body 都上暗底，重载瞬间不白闪
-        ".q-header{transition:none!important}"                            # 顶栏底色不白→灰淡入
-        ".q-tab,.q-tab__indicator,.q-tabs__content{transition:none!important}"  # 标签/指示器不做加载动效
-        "html.preload *{transition:none!important}"                      # 加载期禁掉一切过渡，防浅灰→白之类的淡入卡顿
-        "</style>"
-        "<script>document.documentElement.classList.add('preload');"
-        "addEventListener('load',function(){setTimeout(function(){"
-        "document.documentElement.classList.remove('preload')},600)});</script>")
-    # 全站去卡片阴影，改成扁平 + 一条细边（统一风格）
-    ui.add_head_html(
-        "<style>"
-        "body{font-size:14px}"   # 基础字号 14px：没显式定大小的继承文字统一 14；番名单独 text-lg(18px)；text-sm/xs/2xl 跟 html rem 走、不受影响
-        ".q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
-        ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}"
-        ".q-table tbody td,.q-table thead th,.q-table .q-badge{font-size:14px}"
-        # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
-        ".kpi-group{display:grid;gap:.75rem;grid-template-columns:repeat(2,minmax(0,1fr))}"
-        "@media(min-width:860px){.kpi-group{grid-template-columns:repeat(var(--kpi-n,4),minmax(0,1fr))}}"
-        # 数字输入：隐去浏览器原生上下箭头（各浏览器样式不一、与 dense 描边框高度错位），统一成纯输入框
-        "input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button"
-        "{-webkit-appearance:none;margin:0}input[type=number]{-moz-appearance:textfield}"
-        # 设置页数字项栅格：桌面每格 1/4 宽（4 列），窄屏落到 2 列；顶端对齐（标签在框上、行高不齐也整齐）
-        ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
-        "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
-        # 顶栏品牌：手机(<640)绝对居中（汉堡在左、刷新在右，品牌图标居中）；≥640 静态靠左跟导航同排
-        "@media(max-width:639px){.brand-center{position:absolute;left:50%;top:50%;"
-        "transform:translate(-50%,-50%);margin:0!important}}"
-        "</style>")
-    # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。绿用 -500（-400 太亮），其余（含红）用 -400。
-    # 必须放进 @layer overrides —— Quasar 的 .bg-* !important 在 quasar_importants 层里；分层后 !important 比的是
-    # 「层序（靠前的赢）」而非特异度，overrides 层排在 quasar_importants 之前，故能压过它。裸样式会输、失效。
-    # 只作用于 .q-badge（按钮是 .q-btn，不受影响）；白字沿用 Quasar 徽标默认。
-    ui.add_head_html(
-        "<style>@layer overrides{"
-        ".q-badge.bg-green{background:oklch(72.3% 0.219 149.579)!important}"               # green-500（绿单独调暗）
-        ".q-badge.bg-red{background:oklch(70.4% 0.191 22.216)!important}"                  # red-400（红单独调暗）
-        ".q-badge.bg-blue,.q-badge.bg-primary{background:oklch(70.7% 0.165 254.624)!important}"  # blue-400
-        ".q-badge.bg-blue-grey,.q-badge.bg-grey{background:oklch(70.7% 0.022 261.325)!important}"  # 中性灰统一：gray-400
-        ".q-badge.bg-orange{background:oklch(75% 0.183 55.934)!important}"                 # orange-400
-        ".q-badge.bg-purple{background:oklch(71.4% 0.203 305.504)!important}"              # purple-400
-        ".q-badge.bg-teal{background:oklch(77.7% 0.152 181.912)!important}"                # teal-400
-        ".q-badge.bg-indigo{background:oklch(67.3% 0.182 276.935)!important}"              # indigo-400
-        ".q-badge.bg-deep-purple{background:oklch(70.2% 0.183 293.541)!important}"         # violet-400
-        ".q-badge.bg-amber{background:oklch(82.8% 0.189 84.429)!important}"                # amber-400
-        ".q-badge.bg-pink{background:oklch(71.8% 0.202 349.761)!important}"                # pink-400
-        ".q-btn.text-grey{color:oklch(70.7% 0.022 261.325)!important}"                     # 次级灰按钮→gray-400(灰2)
-        "}</style>")
+    ui.add_head_html(_HEAD_REFERRER)
+    ui.add_head_html(_HEAD_PRELOAD)
+    ui.add_head_html(_HEAD_BASE_CSS)
+    ui.add_head_html(_HEAD_BADGE_CSS)
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.08);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）

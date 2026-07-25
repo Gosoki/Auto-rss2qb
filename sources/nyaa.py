@@ -18,6 +18,8 @@ from sources.parse import (candidate_names, estimate_premiere, extract_quarter, 
 
 log = logging.getLogger("autorss")
 
+_HEX40_RE = re.compile(r"[0-9a-f]{40}")   # info_hash 校验（每条种子热路径，预编译）
+
 
 def nyaa_feed_url(feed: str) -> str:
     """用户名 → 拼 RSS；已是 http(s) URL → 原样用。
@@ -70,7 +72,7 @@ class NyaaSource(Source):
         try:
             raw_title = entry.title
             info_hash = (entry.get("nyaa_infohash") or "").strip().lower()
-            if not re.fullmatch(r"[0-9a-f]{40}", info_hash):
+            if not _HEX40_RE.fullmatch(info_hash):
                 return None  # 必须是 40 位 hex：既能跨源去重，也防脏 hash 注入 qB 的 '|' 分隔符
             if is_batch(raw_title):
                 return None  # 合集/BDRip/连续集范围 整理帖

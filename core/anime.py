@@ -73,11 +73,15 @@ def _parse_date(s):
     return None
 
 
-def _aired_before_start(air_date) -> bool:
-    """该番开播日是否早于『开始使用日』(config.ANIME_START_DATE)。开始日空/开播日未知 → False(不判超期)。"""
-    start = _parse_date(config.ANIME_START_DATE)
+def _aired_before(air_date, start) -> bool:
+    """开播日是否早于【已解析的】开始日 start。start/开播日为 None → False。批量循环传入解析好的 start，免逐番重解析。"""
     aired = _parse_date(air_date)
     return bool(start and aired and aired < start)
+
+
+def _aired_before_start(air_date) -> bool:
+    """该番开播日是否早于『开始使用日』(config.ANIME_START_DATE)。开始日空/开播日未知 → False(不判超期)。"""
+    return _aired_before(air_date, _parse_date(config.ANIME_START_DATE))
 
 
 def apply_start_date_filter() -> int:
@@ -87,9 +91,10 @@ def apply_start_date_filter() -> int:
     · 已不超期(改早开始日/未知开播日/关闭) 且 当前是超期忽略 → 释放回待确认(清 rejected)。
     人工确认(confirmed=True)、人工拒绝(rejected 且 confirmed=True) 一律不碰——改日期不会掀翻用户的手动决定。返回变更数。"""
     changed = 0
+    start = _parse_date(config.ANIME_START_DATE)   # 循环外解析一次（本次调用内 config 值恒定）
     with get_session() as s:
         for a in s.exec(select(Anime)):
-            out = _aired_before_start(a.air_date)
+            out = _aired_before(a.air_date, start)
             if out and not a.rejected and not a.confirmed:      # 超期 + 待确认 → 判超期忽略
                 a.rejected = True
                 s.add(a); changed += 1
@@ -106,12 +111,13 @@ def ignore_confirmed_before_start() -> int:
     """一次性：把『开始使用日之前开播、当前已确认(追番中)』的番也转为超期忽略(rejected=True, confirmed=False)。
     供设置里手动触发——自动确认与人工确认都是 confirmed=True、无法区分，故这步须用户显式执行；执行后想留哪部再单独恢复。
     未设开始使用日则不动。返回处理数。"""
-    if not _parse_date(config.ANIME_START_DATE):
+    start = _parse_date(config.ANIME_START_DATE)   # 解析一次：判空 + 循环内复用
+    if not start:
         return 0
     changed = 0
     with get_session() as s:
         for a in s.exec(select(Anime).where(Anime.confirmed == True, Anime.rejected.is_not(True))):  # noqa: E712
-            if _aired_before_start(a.air_date):
+            if _aired_before(a.air_date, start):
                 a.confirmed, a.rejected = False, True
                 s.add(a); changed += 1
         if changed:
@@ -1210,15 +1216,14 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
             return {"found": 0, "kept": 0, "ingested": 0, "sites": [], "error": "番不存在"}
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
         pref, quarter = a.pref_source, a.quarter
-        names = [n for n in (a.jp_name, a.display_name) if n]     # 搜索名（有序：先 日/中，再罗马音）
-        ref_names = {_norm_name(x) for x in (a.jp_name, a.display_name, a.title) if x}  # strict 参考名集
+        jp, dn, title = a.jp_name, a.display_name, a.title
+        names = [n for n in (jp, dn) if n]     # 搜索名（有序：先 日/中，再罗马音）
 
     latest = max(rows, key=lambda t: t.created_at, default=None)
     if latest:
         for n in candidate_names(latest.raw_title):
             if n not in names:
                 names.append(n)
-    ref_names |= {_norm_name(t.anime_title) for t in rows if t.anime_title}
     # 季号过滤基准：用本番种子【实际解析出的季号】而非 bgm 纠正后的 a.season——否则锁定源的续季番若种子标题
     # 无季标记(解析成 season=1)，会与 a.season=2 全对不上而假阴、补齐永远搜不到。
     existing_seasons = {t.season for t in rows}
@@ -1261,6 +1266,9 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
             found.setdefault(it.info_hash, it)
 
     # 过滤：季号一致（挡 S1/S2 混淆）+ strict 番名近似（挡同名衍生作/恶搞）
+    # ref_names 仅 strict 分支用到 → 只在 strict 时构建（含逐条 _norm_name 正则），非 strict 不白算
+    ref_names = ({_norm_name(x) for x in (jp, dn, title) if x}
+                 | {_norm_name(t.anime_title) for t in rows if t.anime_title}) if strict else set()
     kept = []
     for it in found.values():
         if it.season not in existing_seasons:
