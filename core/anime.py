@@ -55,10 +55,16 @@ def quarter_brief() -> list[dict]:
         animes = list(s.exec(select(
             Anime.quarter, Anime.confirmed, Anime.rejected, Anime.bangumi_id)
             .where(Anime.quarter.in_([cur, prev]))))
+        # 种子按【所属番的季度】归拢，而不是种子行自己的 quarter：
+        # Anime.quarter 才是权威（它决定实际保存目录），AnimeTorrent.quarter 只是无番时的路径回退。
+        # 手动改季度/重绑 bgm 只改 Anime.quarter，历史种子行仍留旧季度——按种子行归拢会把同一部番
+        # 劈到两个季度卡上，旧卡出现『订阅中 0 部』却还挂着『种子 N / 已下 M』的鬼影。
+        # join 到 Anime 后与上面的番数同源，两个数字必然自洽（孤儿种子无番可归，本就不该进小结）。
         tcounts = list(s.exec(
-            select(AnimeTorrent.quarter, AnimeTorrent.status, func.count())
-            .where(AnimeTorrent.quarter.in_([cur, prev]))
-            .group_by(AnimeTorrent.quarter, AnimeTorrent.status)))
+            select(Anime.quarter, AnimeTorrent.status, func.count())
+            .join(Anime, Anime.id == AnimeTorrent.anime_id)
+            .where(Anime.quarter.in_([cur, prev]))
+            .group_by(Anime.quarter, AnimeTorrent.status)))
     out = []
     for tag, q in (("当季", cur), ("上季", prev)):
         aq = [(conf, rej, bid) for aqk, conf, rej, bid in animes if (aqk or "") == q]
@@ -260,8 +266,21 @@ async def process_item(item) -> bool:
         torrent_id = torrent.id
         # 自动升确认：auto 源为『已识别、未确认、未拒』的番贡献种子 → 转自动下。
         # 救回『review/泛 feed 先建番把 auto 主力番静默压进待确认』与『bgm 瞬时失败先建的番』。
+        #
+        # 【限定"从没下过任何一集的番"】——它要救的两种情形都还没交付过东西；
+        # 而『补齐(backfill)』和『手动绑定 bgm』也用 confirmed=False 表达"这批要你人工审"，
+        # 对这些番不能自作主张改回去，否则：
+        #   · 番未超期 → 被改回 confirmed=True，补齐进来的待审种子下一轮就被自动下走，
+        #     详情页那句"后台将暂停自动下新集，直到你去待确认页重新点确认"当场失效；
+        #   · 番超期(早于开始使用日，续季/老番补齐正是这种) → 走下面 rejected=True 分支被判
+        #     『超期忽略』，从主列表消失、永久停更，而它压根不在弹窗指引的『待确认』页，用户无从发现。
+        # 判据用"有没有 HANDLED 状态的种子"：补齐/重绑的番按定义已下过，待救的两种情形则没有。
         if (a is not None and not a.confirmed and not a.rejected
-                and a.bangumi_id is not None and _is_auto(item.source_kind)):
+                and a.bangumi_id is not None and _is_auto(item.source_kind)
+                and not s.exec(select(AnimeTorrent).where(
+                    AnimeTorrent.anime_id == anime_id,
+                    AnimeTorrent.status.in_(HANDLED_STATUSES),
+                    AnimeTorrent.id != torrent_id)).first()):
             if _aired_before_start(a.air_date):
                 a.rejected = True   # 超期(早于开始使用日) → 判超期忽略(rejected 且 confirmed 仍 False)，不自动下（种子照常入库）
             else:
@@ -518,25 +537,18 @@ def overview() -> dict:
         status = {st: c for st, c in s.exec(
             select(AnimeTorrent.status, func.count()).group_by(AnimeTorrent.status))}
         total_torrents = s.exec(select(func.count()).select_from(AnimeTorrent)).one()
-        dl_ids = set(s.exec(select(AnimeTorrent.anime_id)
-                            .where(AnimeTorrent.status == "sent").distinct()))
         src_total = {src: c for src, c in s.exec(
             select(AnimeTorrent.source, func.count()).group_by(AnimeTorrent.source))}
-        src_done = {src: c for src, c in s.exec(
-            select(AnimeTorrent.source, func.count())
-            .where(AnimeTorrent.status == "sent").group_by(AnimeTorrent.source))}
 
     confirmed = [a for a in animes if a.confirmed]
     pending_c = [a for a in animes if not a.confirmed and a.bangumi_id]  # 待确认=已匹配未确认；未匹配的算『富集失败』
 
-    # 各季度：总番数（含待确认/待识别/已忽略）+ 有已下集的番数（真·比例，分子分母同为"部"）
+    # 各季度总番数（含待确认/待识别/已忽略）——供下面的 3 桶分解用
     total_by_q = Counter((q or "未知") for _, q in all_aq)
     aid_q = {aid: (q or "未知") for aid, q in all_aq}
-    dl_by_q = Counter(aid_q[aid] for aid in dl_ids if aid in aid_q)
     qs = sorted((q for q in total_by_q if q != "未知"), reverse=True)
     if "未知" in total_by_q:
         qs.append("未知")
-    by_quarter = [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs]
 
     # 各季度番剧按流水线 3 桶：订阅(已确认)/审核(未确认待处理=待确认+待识别)/忽略(已拒绝)，互斥、和=该季总番数
     nonrej_ids = {a.id for a in animes}
@@ -546,7 +558,8 @@ def overview() -> dict:
     by_quarter_state = [(q, sub_by_q.get(q, 0), rev_by_q.get(q, 0), ign_by_q.get(q, 0)) for q in qs]
 
     # 各来源：种子数 + 已下
-    by_source = sorted((((src or "?"), cnt, src_done.get(src, 0)) for src, cnt in src_total.items()),
+    # 只回 (源, 种子数)：第三元『各源已下数』页面从没读过（环图只用前两元），白挂一条 GROUP BY
+    by_source = sorted((((src or "?"), cnt) for src, cnt in src_total.items()),
                        key=lambda x: -x[1])
 
     split = pending_breakdown()   # 待下拆 将下载/备用/待确认/未知，算一次给 KPI 与状态区共用
@@ -555,7 +568,6 @@ def overview() -> dict:
             "tracking": len(confirmed), "fail": sum(1 for a in animes if not a.bangumi_id),
             "confirm": len(pending_c), "rejected": rejected,
             "done": status.get("sent", 0),
-            "will": split["will"],   # 顶部只汇总『真会自动下的』，别再用糊在一起的 pending 总数误导
             "torrents": total_torrents,
         },
         # 八种应用侧 status 全列（含 deleted/excluded）：仪表盘『种子数』号称"各状态之和"，
@@ -564,7 +576,6 @@ def overview() -> dict:
         # 将来加第 9 个状态时漏改这里，页面数字就会静默对不上（且不报错）
         "status": {k: status.get(k, 0) for k in engine.ALL_STATUSES},
         "pending_split": split,
-        "by_quarter": by_quarter,
         "by_quarter_state": by_quarter_state,
         "by_source": by_source,
         "enriched": (sum(1 for a in animes if a.bangumi_id), len(animes)),
@@ -670,14 +681,19 @@ def inflight_anime_rows(limit: int = 50) -> list[dict]:
 
 
 def confirmed_anime_ids(ids) -> set:
-    """给定番 id 集合，返回其中『已确认下载』的。新入库里未确认（待确认）番的待下不显示
-    将下载/备用（那是假的、要点确认才会下），而是显示『待确认』——故先筛出已确认的。"""
+    """给定番 id 集合，返回其中【真的会自动下】的（已确认 且 未忽略）。
+
+    新入库里未确认（待确认）番的待下不显示将下载/备用（那是假的、要点确认才会下），
+    而显示『待确认』——故先筛出已确认的。已忽略(rejected)的同样排除：执行侧
+    (flush/补下)都要求 `confirmed and not rejected`，只看 confirmed 会把已忽略番的
+    待下标成『将下载』甚至『待确认』（可它根本没有确认入口），而它永远不会被下。"""
     ids = {i for i in ids if i}
     if not ids:
         return set()
     with get_session() as s:
         return set(s.exec(select(Anime.id).where(
-            Anime.id.in_(ids), Anime.confirmed == True)))  # noqa: E712
+            Anime.id.in_(ids), Anime.confirmed == True,   # noqa: E712
+            Anime.rejected.is_not(True))))
 
 
 def get_anime(anime_id: int) -> Anime | None:
@@ -694,11 +710,6 @@ def list_episodes(anime_id: int) -> list[AnimeTorrent]:
         ))
 
 
-def anime_sources(anime_id: int) -> list[str]:
-    """某番剧现有的所有来源（去重排序），供待确认/详情页展示与选源。"""
-    with get_session() as s:
-        rows = s.exec(select(AnimeTorrent.source).where(AnimeTorrent.anime_id == anime_id)).all()
-    return sorted({r for r in rows if r})
 
 
 def downloaded_count(anime_id: int) -> int:
@@ -1064,7 +1075,10 @@ def download_plan(anime_id: int, for_backfill: bool = False) -> set[int]:
     """
     with get_session() as s:
         a = s.get(Anime, anime_id)
-        if a is None:
+        # 已忽略(rejected)的番一条都不会被下——执行侧(flush:446 / 补下:1223)都要求
+        # `confirmed and not rejected`。这里若只看 confirmed，就会把它的待下标成
+        # 『将下载』而实际点下载返回 0 集（页面撒谎）。
+        if a is None or a.rejected:
             return set()
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
@@ -1087,9 +1101,13 @@ def download_plan_for_ids(anime_ids, for_backfill: bool = False) -> set[int]:
     if not ids:
         return set()
     with get_session() as s:
-        animes = list(s.exec(select(Anime).where(Anime.id.in_(ids))))
+        animes = list(s.exec(select(Anime).where(  # 排除已忽略：与执行侧同判据，见 download_plan
+            Anime.id.in_(ids), Anime.rejected.is_not(True))))
         pref_map = {a.id: a.pref_source for a in animes}
         kw_map = {a.id: a.pref_keyword for a in animes}
+        ids = set(pref_map)      # 只保留过滤后仍在的番——否则被排除的番，其种子仍会被下面计划进去
+        if not ids:
+            return set()
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id.in_(ids))))
     by_anime: dict = {}
     have_by_anime: dict = {}
@@ -1203,29 +1221,14 @@ def set_torrent_episode(torrent_id: int, episode: float) -> bool:
 
 
 def exclude_torrent(torrent_id: int) -> bool:
-    """直接排除一条不想要的待下种子：置专门的终态 excluded（不删文件、不碰 qB，只改状态）——
-    flush/补下永不再挑、restore 不复活、RSS 再遇到同 hash 也不重收，彻底脱离待下/未知集；可用
-    unexclude_torrent 撤销。只动未下载的(pending/error)。返回是否排除了。"""
-    with get_session() as s:
-        t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in DOWNLOADABLE_STATUSES:
-            return False
-        t.status = "excluded"
-        s.add(t)
-        s.commit()
-    return True
+    """排除一条不想要的待下种子（实现见 engine.exclude_torrent，两条线共用）。
+    flush/补下永不再挑、restore 不复活、RSS 再遇到同 hash 也不重收；可用 unexclude_torrent 撤销。"""
+    return engine.exclude_torrent(AnimeTorrent, torrent_id)
 
 
 def unexclude_torrent(torrent_id: int) -> bool:
-    """取消排除：把 excluded 的种子放回 pending，重新参与下载/去重。返回是否放回了。"""
-    with get_session() as s:
-        t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status != "excluded":
-            return False
-        t.status = "pending"
-        s.add(t)
-        s.commit()
-    return True
+    """取消排除：放回 pending，重新参与下载/去重。返回是否放回了。"""
+    return engine.unexclude_torrent(AnimeTorrent, torrent_id)
 
 
 async def download_all_pending() -> int:
@@ -1400,94 +1403,11 @@ def anime_save_path(anime_id: int) -> str | None:
 
 
 async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
-    """把该番已下/在下的种子移到当前归档目录（改季度/重绑后调用；调用方应已落新 a.quarter/名/季号）。
-
-    qB 跟踪该种子 → setLocation 原地搬 + 更新 save_path；qB 关/连不上/不跟踪(remove-on-complete)
-    → 清完成状态待重下到新目录；setLocation 报 403/409(新目录不可写) → 只报告、不动状态。
-    返回 {new_path, old_path, moved, redownload, untracked, failed, fail_code?, error?}。
-    """
-    new_path = anime_save_path(anime_id)
-    rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
-           "redownload": 0, "untracked": 0, "failed": 0,
-           "stalled_kept": 0}   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
-    if new_path is None:
-        rep["error"] = "算不出新路径（越界或无番）"
-        return rep
-    with get_session() as s:
-        pairs = [(t.id, t.info_hash) for t in s.exec(select(AnimeTorrent).where(
-            AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(HAVE_STATUSES),   # 含 stalled：半成品也在盘上，同样要搬
-            AnimeTorrent.archived_at.is_(None)))]   # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
-    if not pairs:
-        return rep
-
-    def _clear(ids) -> int:
-        """搬不动时把行清成 pending，等 flush 重下到新目录。返回【实际改了几行】。
-
-        只降级仍被 qB 跟踪的行(TRACKED)。stalled 有意保持原样——它是『等人工处理』的标记，
-        降成 pending 会：① 让停滞集重回自动队列，flush 还可能挑中同集别的源＝对停滞集自动换源
-        （engine 状态词表明令禁止）；② 抹掉『⚠️停滞』提示；③ 详情页删除按钮门槛是 HAVE，
-        变 pending 后按钮消失，旧目录的半成品成了 UI 删不掉的孤儿。
-        故停滞行原地不动，由调用方在报告里单列，提示用户其文件仍在旧目录。
-        返回真实改动数是为了让报告不说谎（说要重下 N 条，就得真有 N 条被清）。
-        """
-        changed = 0
-        with get_session() as s:
-            for tid in ids:
-                t = s.get(AnimeTorrent, tid)
-                if t is not None and t.status in TRACKED_STATUSES:
-                    # 连 qB 实时态一起清：否则这行虽已是『待重下』，UI 仍按残留的 qb_state/进度
-                    # 渲染成『已完成 100%』(qb_live_text 优先于 status)，用户看不出它需要重下。
-                    # 与 download_*_torrent 重下时的清理保持一致。
-                    t.status = "pending"
-                    t.qb_state, t.qb_progress = "", 0.0
-                    t.qb_synced_at, t.qb_progress_at = None, None
-                    s.add(t)
-                    changed += 1
-            s.commit()
-        return changed
-
-    def _stalled_of(ids) -> int:
-        with get_session() as s:
-            return sum(1 for tid in ids
-                       if (t := s.get(AnimeTorrent, tid)) is not None and t.status == "stalled")
-
-    def _mark_moved(ids):
-        with get_session() as s:
-            for tid in ids:
-                t = s.get(AnimeTorrent, tid)
-                if t is not None:
-                    t.save_path = new_path
-                    s.add(t)
-            s.commit()
-
-    all_ids = [tid for tid, _ in pairs]
-    if not config.QB_ENABLED:   # qB 关：只能清状态待重下 + 提醒
-        rep["stalled_kept"] = _stalled_of(all_ids)
-        rep["redownload"] = _clear(all_ids)
-        return rep
-    info = await engine.qb.torrents_info([h for _, h in pairs])
-    if info is None:            # qB 连不上：同上
-        rep["stalled_kept"] = _stalled_of(all_ids)
-        rep["redownload"] = _clear(all_ids)
-        return rep
-    tracked = [(tid, h) for tid, h in pairs if h in info]
-    untracked = [tid for tid, h in pairs if h not in info]
-    if untracked:               # remove-on-complete 等：qB 已不认识 → 清状态待重下
-        rep["stalled_kept"] += _stalled_of(untracked)
-        rep["untracked"] = rep["redownload"] = _clear(untracked)
-    if tracked:
-        code = await engine.qb.set_location([h for _, h in tracked], new_path)
-        if code == 200:
-            _mark_moved([tid for tid, _ in tracked])
-            rep["moved"] = len(tracked)
-        elif code is None:      # 中途连不上：退回清状态待重下
-            rep["stalled_kept"] += _stalled_of([tid for tid, _ in tracked])
-            rep["redownload"] += _clear([tid for tid, _ in tracked])
-        else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
-            rep["failed"] = len(tracked)
-            rep["fail_code"] = code
-    return rep
+    """把该番已下/在下/停滞的种子移到当前归档目录（改季度/重绑后调用；调用方应已落新 a.quarter/名/季号）。
+    实现见 engine.relocate（两条线共用）。返回 {new_path, old_path, moved, redownload, untracked,
+    failed, stalled_kept, fail_code?, error?}。"""
+    return await engine.relocate(AnimeTorrent, AnimeTorrent.anime_id, anime_id,
+                                 anime_save_path(anime_id), old_path, noun="集")
 
 
 async def delete_anime_torrent(torrent_id: int) -> bool:
@@ -1566,23 +1486,37 @@ def list_source_groups(enabled_only: bool = False) -> list[SourceGroup]:
         return list(s.exec(q.order_by(SourceGroup.priority.desc(), SourceGroup.id)))
 
 
-def add_source_group(name, site, feed, policy, priority, enabled=True, subgroups="", title_filter="") -> None:
+def add_source_group(name, site, feed, policy, priority, enabled=True,
+                     subgroups="", title_filter="") -> bool:
+    """新增源组。组名撞了唯一约束返回 False（调用方据此提示）——不捕获的话 IntegrityError
+    会逃到 NiceGUI 的事件处理器里只落日志，用户侧完全静默，看上去就是『点了没反应』。"""
     with get_session() as s:
         s.add(SourceGroup(name=name, site=site, feed=feed, policy=policy,
                           priority=int(priority), enabled=enabled, subgroups=subgroups,
                           title_filter=title_filter))
-        s.commit()
+        try:
+            s.commit()
+        except IntegrityError:
+            s.rollback()
+            return False
+    return True
 
 
-def update_source_group(gid: int, **fields) -> None:
+def update_source_group(gid: int, **fields) -> bool:
+    """改源组。组名改成已存在的名字同样撞唯一约束 → 返回 False，理由同上。"""
     with get_session() as s:
         g = s.get(SourceGroup, gid)
         if g is None:
-            return
+            return False
         for k, v in fields.items():
             setattr(g, k, v)
         s.add(g)
-        s.commit()
+        try:
+            s.commit()
+        except IntegrityError:
+            s.rollback()
+            return False
+    return True
 
 
 def delete_source_group(gid: int) -> None:

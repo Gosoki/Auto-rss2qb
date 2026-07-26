@@ -66,12 +66,15 @@ def render_sources() -> None:
             if not name.value or not feed.value:
                 ui.notify("名字和 feed 不能为空", type="warning")
                 return
-            anime.update_source_group(
+            if not anime.update_source_group(
                 gid, name=name.value.strip(), site=site.value, policy=policy.value,
                 priority=int(priority.value or 0), enabled=bool(enabled.value),
                 feed=feed.value.strip(), subgroups=(subgroups.value or "").strip(),
                 title_filter=(tfilter.value or "").strip(),
-            )
+            ):
+                ui.notify(f"保存失败：已有叫『{name.value.strip()}』的源组，换个名字",
+                          type="warning")
+                return
             group_list.refresh()
             ui.notify("已保存（下一轮生效）")
         return h
@@ -94,12 +97,15 @@ def render_sources() -> None:
             if not name.value or not feed.value:
                 ui.notify("名字和 feed 不能为空", type="warning")
                 return
-            anime.add_source_group(
+            if not anime.add_source_group(
                 name.value.strip(), site.value, feed.value.strip(),
                 policy.value, int(priority.value or 0),
                 subgroups=(subgroups.value or "").strip(),
                 title_filter=(tfilter.value or "").strip(),
-            )
+            ):
+                ui.notify(f"添加失败：已有叫『{name.value.strip()}』的源组，换个名字",
+                          type="warning")
+                return
             group_list.refresh()
             ui.notify("已添加（下一轮生效）")
         return h

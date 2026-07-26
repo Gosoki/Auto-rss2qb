@@ -8,6 +8,7 @@ from datetime import datetime
 from nicegui import ui
 
 import config
+from db.models import MovieTorrent
 from core import engine, movies as mov
 from sources.parse import SEASON_CN
 from .layout import (WEEKDAY_CN, barline, confirm, expand_collapse_bar, frame,
@@ -451,7 +452,9 @@ def movies_page(t: str = ""):
                        ("待识别", k["unmatched"], "red", lambda: tabs.set_value("fail")),
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
                        "|",
-                       ("已下", k["done"], "green", None),
+                       # 这一组是【种子/版本维度】：全用种子数，别混影片数（原来这张是"有已下版本的片数"，
+                       # 与同组其它三张不同量纲，同页还有另外两个口径不同的『已下』）
+                       ("已交付", ov["status"]["sent"], "green", None),
                        ("可下载", ov["status"]["pending"], "blue", None),
                        ("失败", ov["status"]["error"], "red", None),
                        ("版本", k["versions"], "", None)])
@@ -472,7 +475,8 @@ def movies_page(t: str = ""):
                 ui.label("种子状态").classes("text-sm font-bold")
                 ui.label("各状态种子计数").classes("text-xs text-gray-400")
             chips = [
-                ("已下载", ov["status"]["sent"], "green", None),
+                ("已交付", ov["status"]["sent"], "green",
+                 "已发送给 qB 的版本数（含仍在下的）。真正下完的看下方『已完成』"),
                 ("可下载", ov["status"]["pending"], "blue", "还没下的版本，进详情逐条下"),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
                  "已忽略剧场版留下的种子；恢复时若一版都没下过会放回可下载"),
@@ -534,7 +538,8 @@ def movies_page(t: str = ""):
         @ui.refreshable
         def inflight_panel():
             rows = mov.inflight_movie_rows()
-            ui.label(f"正在下载（{len(rows)}）").classes("text-sm font-bold mt-4 pl-1")
+            _inflight_total = engine.inflight_count(MovieTorrent)
+            ui.label(f"正在下载（{_inflight_total}{'，显示前 %d' % len(rows) if _inflight_total > len(rows) else ''}）").classes("text-sm font-bold mt-4 pl-1")
             with ui.card().classes("w-full"):
                 if not config.QB_SYNC_STATUS:
                     ui.label("已关闭 qB 状态跟踪：发送即视为『已下』，不跟踪下载进度（设置页可重新开启）。").classes(
@@ -649,6 +654,7 @@ def movies_page(t: str = ""):
                 return
             ui.label("这些剧场版没自动匹配到 bgm：缺规范名/日语文件夹名/季度。可『重试识别』或粘贴 bgm 链接『绑定』。").classes(
                 "text-xs text-gray-400 p-2")
+            _smap = mov.source_map()   # 批量取来源，避免逐片查的 N+1
             for m in items:
                 with ui.card().classes("w-full"):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
@@ -656,7 +662,7 @@ def movies_page(t: str = ""):
                         ui.label(name_of(m)).classes(
                             "text-lg cursor-pointer text-blue-400 hover:underline").on(
                             "click", lambda mid=m.id: open_detail(mid))
-                        ui.label("来源: " + (" · ".join(mov.movie_sources(m.id)) or "—")).classes(
+                        ui.label("来源: " + (" · ".join(_smap.get(m.id, [])) or "—")).classes(
                             "text-xs text-gray-400")
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         inp = ui.input(placeholder="bgm 链接或 ID").props("dense outlined").classes("min-w-96")
@@ -673,6 +679,7 @@ def movies_page(t: str = ""):
                 ui.label("没有已忽略的剧场版。（列表里点『忽略』会进这里，可随时恢复）").classes(
                     "text-gray-400 p-4")
                 return
+            _smap = mov.source_map()   # 批量取来源，避免逐片查的 N+1
             for m in rej:
                 with ui.card().classes("w-full"):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
@@ -680,7 +687,7 @@ def movies_page(t: str = ""):
                         ui.label(name_of(m)).classes(
                             "text-lg cursor-pointer text-blue-400 hover:underline").on(
                             "click", lambda mid=m.id: open_detail(mid))
-                        ui.label("来源: " + (" · ".join(mov.movie_sources(m.id)) or "—")).classes(
+                        ui.label("来源: " + (" · ".join(_smap.get(m.id, [])) or "—")).classes(
                             "text-xs text-gray-400")
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         ui.button("恢复订阅", icon="undo", on_click=_restore(m.id)).props(

@@ -26,19 +26,26 @@ def _jump_targets() -> list:
     ]
 
 # 应用侧种子状态 → 中文（番剧表/剧场版/详情/新入库共用）
-STATUS_CN = {"sent": "已下", "pending": "待下", "downloading": "下载中",
+STATUS_CN = {"sent": "已交付", "pending": "待下", "downloading": "下载中",
              "error": "失败", "skipped": "跳过", "deleted": "已删", "excluded": "已排除",
              "stalled": "⚠️停滞"}
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def torrent_status_cn(status: str, qb_progress=0, qb_synced_at=None) -> str:
-    """无 qB 实时态时的回落显示：已交给 qB 但还没首次同步回来（刚发送）→『下载中』；其余按 STATUS_CN
-    （含已下完/跳过/已删）。有实时态时调用方用 qb_live_text 显示『下载中 X% / 做种 100%』，不走这里。
-    关了状态跟踪（QB_SYNC_STATUS=false）时不读 qB，发送即『已下』，故 sent 一律显示已下、不显『下载中』。"""
-    if (config.QB_SYNC_STATUS and status == "sent"
-            and (qb_progress or 0) < 1.0 and qb_synced_at is None):
-        return "下载中"
+    """无 qB 实时态时的回落显示。有实时态时调用方用 qb_live_text，不走这里。
+
+    sent 的含义随『是否读 qB 实时态』而变，故文案也跟着变：
+    · 开跟踪：sent = 已发给 qB，可能还在下 → 还没首次同步回来时显示『下载中』，
+      同步过之后显示『已交付』（真正下完与否看 qb_live_text/『已完成』那个数）。
+    · 关跟踪：不读 qB，发送即视为下完（settle_sent 会把 qb_progress 落成 1）→ 直接显示『已下』，
+      此时说『已交付』反而让人以为还没下完。
+    """
+    if status == "sent":
+        if not config.QB_SYNC_STATUS:
+            return "已下"                     # 关跟踪：发送即完成
+        if (qb_progress or 0) < 1.0 and qb_synced_at is None:
+            return "下载中"                   # 刚发出去，还没同步回来
     return STATUS_CN.get(status, status)
 
 
@@ -260,10 +267,13 @@ def human_size(n) -> str:
 
 def qb_live_text(t) -> str:
     """种子的 qB 实时态一行文案，如『下载中 45% ↓2.1MB/s』/『已完成 100%』；无实时态返回 ''。"""
-    # 人工终态优先于任何 qB 残留态：deleted/excluded 的行仍留着 archived_at 或旧 qb_state
-    # （删除/排除只改 status，不清实时态），若不先拦住，已删的会被显示成『已归档』或『已完成 100%』。
-    # 返回 '' 让调用方回落到 torrent_status_cn(status)，拿到『已删/已排除』与中性配色。
-    if getattr(t, "status", "") in engine.MANUAL_TERMINAL_STATUSES:
+    # 这些 status 优先于任何 qB 残留态，返回 '' 让调用方回落到 torrent_status_cn(status)：
+    #   · deleted/excluded：删除/排除只改 status、不清实时态，不拦住会显示成『已归档』或『已完成 100%』；
+    #   · stalled：判停滞时同样只改 status，qb_state 仍是判定前那一刻的值（downloading/stalledDL…），
+    #     而 stalled 已脱离轮询、这个值永远不会再更新——不拦住就恒显示『下载中 12%』，
+    #     『⚠️停滞』这个标记在详情页/新入库根本到不了，而停滞集恰恰是设计上要人工处理的那些。
+    if getattr(t, "status", "") in engine.MANUAL_TERMINAL_STATUSES or \
+            getattr(t, "status", "") == "stalled":
         return ""
     if getattr(t, "archived_at", None):
         return "已归档"          # 完成后已从 qB 移除(留文件)、不再跟踪
@@ -285,6 +295,10 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
     区分待下『将下载/备用』、失败『可补下/失败』；再否则按 torrent_status_cn（刚交付未同步→下载中）。
     in_plan=None 表示不区分首选/备用（剧场版没有集去重，用这个）。
     confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。"""
+    # 同 qb_live_text：人工终态与停滞的 qB 残留态是陈旧的，别拿它盖住真实 status
+    if status in engine.MANUAL_TERMINAL_STATUSES or status == "stalled":
+        return torrent_status_cn(status, qb_progress, qb_synced_at), (
+            "deep-orange" if status == "stalled" else "blue-grey")
     if qb_state:
         pr = qb_progress or 0
         parts = [qb_state_cn(qb_state), f"{pr * 100:.0f}%"]

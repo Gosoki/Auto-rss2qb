@@ -75,9 +75,25 @@ _BGM_FIELDS = ("bangumi_id", "display_name", "jp_name", "air_date", "air_weekday
 
 # ---------------- 文件名 / 季度 ----------------
 
+# 单段文件/目录名的字节上限：ext4/NTFS/APFS 都是 255 字节，留点余量给 qB 可能追加的后缀。
+# 番名来自 RSS，长标题（尤其中文/日文，1 字 3 字节）很容易越界——越界会让该番【所有集】
+# 在 qB 侧 ENAMETOOLONG 永久失败，且报错在 qB 那边、本工具只看到"加种子失败"，极难排查。
+_NAME_MAX_BYTES = 200
+
+
 def safe_name(name: str) -> str:
-    """清洗成安全的单段文件夹名：去非法字符/控制符，并挡掉 '.'/'..' 路径穿越。"""
+    """清洗成安全的单段文件夹名：去非法字符/控制符，挡掉 '.'/'..' 路径穿越，并按字节截断。"""
     cleaned = _ILLEGAL.sub("_", name or "").strip().strip(".").strip()
+    if len(cleaned.encode("utf-8")) > _NAME_MAX_BYTES:
+        # 按【字节】截断但不切碎多字节字符：逐字符累加，超了就停
+        out, used = [], 0
+        for ch in cleaned:
+            w = len(ch.encode("utf-8"))
+            if used + w > _NAME_MAX_BYTES:
+                break
+            out.append(ch)
+            used += w
+        cleaned = "".join(out).strip().strip(".").strip()
     return cleaned or "unknown"
 
 
@@ -337,6 +353,126 @@ def hash_owned_elsewhere(info_hash: str, other_model) -> bool:
             other_model.status.in_(HAVE_STATUSES))).first() is not None
 
 
+def exclude_torrent(model_cls, tid: int) -> bool:
+    """把一条【还没落盘】的种子置终态 excluded：不删文件、不碰 qB，只改状态。
+
+    效果：不再出现在待下队列、自动放行/补下永不再挑、RSS 再遇到同 hash 也不重收；
+    可用 unexclude_torrent 撤销。只动 DOWNLOADABLE 的行（已下/在下的请走删除，不是排除）。
+    两条线逻辑完全一致，故实现放这里，anime/movies 各留一层同名薄包装供 pages 调用。
+    """
+    with get_session() as s:
+        t = s.get(model_cls, tid)
+        if t is None or t.status not in DOWNLOADABLE_STATUSES:
+            return False
+        t.status = "excluded"
+        s.add(t)
+        s.commit()
+    return True
+
+
+def unexclude_torrent(model_cls, tid: int) -> bool:
+    """取消排除：把 excluded 的种子放回 pending，重新参与挑选。返回是否放回了。"""
+    with get_session() as s:
+        t = s.get(model_cls, tid)
+        if t is None or t.status != "excluded":
+            return False
+        t.status = "pending"
+        s.add(t)
+        s.commit()
+    return True
+
+
+async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
+                   old_path: str | None = None, noun: str = "集") -> dict:
+    """把某番/某片『盘上有文件』的种子移到新的归档目录（改季度/重绑后调用，调用方须已落新季度/名）。
+
+    两条线逻辑完全一致（此前是同一段 67 行抄两份），故实现放这里；差异只有名词与错误文案，走参数。
+    · qB 跟踪该种子 → setLocation 原地搬 + 更新 save_path
+    · qB 关 / 连不上 / 不认识该 hash(remove-on-complete) → 清状态待重下到新目录
+    · setLocation 报 403/409(新目录不可写) → 只报告、不动状态
+    返回 {new_path, old_path, moved, redownload, untracked, failed, stalled_kept, fail_code?, error?}。
+    """
+    rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
+           "redownload": 0, "untracked": 0, "failed": 0,
+           "stalled_kept": 0}   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
+    if new_path is None:
+        rep["error"] = f"算不出新路径（越界或无{'番' if noun == '集' else '片'}）"
+        return rep
+    with get_session() as s:
+        pairs = [(t.id, t.info_hash) for t in s.exec(select(model_cls).where(
+            owner_col == owner_id,
+            model_cls.status.in_(HAVE_STATUSES),   # 含 stalled：半成品也在盘上，同样要搬
+            model_cls.archived_at.is_(None)))]     # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
+    if not pairs:
+        return rep
+
+    def _clear(ids) -> int:
+        """搬不动时把行清成 pending，等重下到新目录。返回【实际改了几行】。
+
+        只降级仍被 qB 跟踪的行(TRACKED)。stalled 有意保持原样——它是『等人工处理』的标记，
+        降成 pending 会：① 让停滞集重回自动队列，flush 还可能挑中同集别的源＝对停滞集自动换源
+        （状态词表明令禁止）；② 抹掉『⚠️停滞』提示；③ 详情页删除按钮门槛是 HAVE，
+        变 pending 后按钮消失，旧目录的半成品成了 UI 删不掉的孤儿。
+        返回真实改动数是为了让报告不说谎（说要重下 N 条，就得真有 N 条被清）。
+        """
+        changed = 0
+        with get_session() as s:
+            for tid in ids:
+                t = s.get(model_cls, tid)
+                if t is not None and t.status in TRACKED_STATUSES:
+                    # 连 qB 实时态一起清：否则这行虽已是『待重下』，UI 仍按残留的 qb_state/进度
+                    # 渲染成『已完成 100%』(qb_live_text 优先于 status)，用户看不出它需要重下。
+                    t.status = "pending"
+                    t.qb_state, t.qb_progress = "", 0.0
+                    t.qb_synced_at, t.qb_progress_at = None, None
+                    s.add(t)
+                    changed += 1
+            s.commit()
+        return changed
+
+    def _stalled_of(ids) -> int:
+        with get_session() as s:
+            return sum(1 for tid in ids
+                       if (t := s.get(model_cls, tid)) is not None and t.status == "stalled")
+
+    def _mark_moved(ids):
+        with get_session() as s:
+            for tid in ids:
+                t = s.get(model_cls, tid)
+                if t is not None:
+                    t.save_path = new_path
+                    s.add(t)
+            s.commit()
+
+    all_ids = [tid for tid, _ in pairs]
+    if not config.QB_ENABLED:   # qB 关：只能清状态待重下 + 提醒
+        rep["stalled_kept"] = _stalled_of(all_ids)
+        rep["redownload"] = _clear(all_ids)
+        return rep
+    info = await qb.torrents_info([h for _, h in pairs])
+    if info is None:            # qB 连不上：同上
+        rep["stalled_kept"] = _stalled_of(all_ids)
+        rep["redownload"] = _clear(all_ids)
+        return rep
+    tracked = [(tid, h) for tid, h in pairs if h in info]
+    untracked = [tid for tid, h in pairs if h not in info]
+    if untracked:               # remove-on-complete 等：qB 已不认识 → 清状态待重下
+        rep["stalled_kept"] += _stalled_of(untracked)
+        rep["untracked"] = rep["redownload"] = _clear(untracked)
+    if tracked:
+        code = await qb.set_location([h for _, h in tracked], new_path)
+        if code == 200:
+            _mark_moved([tid for tid, _ in tracked])
+            rep["moved"] = len(tracked)
+        elif code is None:      # 中途连不上：退回清状态待重下
+            rep["stalled_kept"] += _stalled_of([tid for tid, _ in tracked])
+            rep["redownload"] += _clear([tid for tid, _ in tracked])
+        else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
+            rep["failed"] = len(tracked)
+            rep["fail_code"] = code
+    return rep
+
+
 def qb_is_local() -> bool:
     """qB 是否与本工具同机（QB_URL 指向 loopback）——决定要不要在本地预建保存目录。
     远程 qB（LAN IP / 域名）在本地建目录既无意义（是另一台机器的文件系统）又会落一堆空目录，故只对 loopback 建。"""
@@ -394,13 +530,18 @@ async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
 #   T = 短暂工作态（在动但速度可能为 0：取元数据/校验/分配/搬运）——按『在真下』算，
 #       免得刚开始那几秒或校验/搬运期间被速度地板误判成慢而提前退出快轮询
 #   X = 落定态（不再需要轮询跟踪）——做种(已完成) + 文件缺失(终态、不会再变)
-# 不带任何标记 = 既非在下也非已完成（暂停未完成 pausedDL/stoppedDL、error、unknown）
+#   W = qB【没在推进】它：排队等额度(queuedDL) / 被要求停下(pausedDL/stoppedDL)。
+#       停滞计时对这些态不该走——它们不是"卡住"，是"还没轮到 / 你让它停的"。
+#       漏了这条会出事：qB 的 max_active_downloads 一小（本项目部署是 3），批量补番时几十条
+#       全在 queuedDL 排队，超过 QB_STALL_TIMEOUT_MIN(默认 24h) 就会被整批误标『停滞异常』，
+#       从而脱离轮询、不自动换源、在 UI 上报一堆假告警。
+# 不带任何标记 = 既非在下也非已完成（error、unknown）
 _QB_STATES: dict[str, tuple[str, str]] = {
     # ---- 下载中 ----
     "downloading":        ("D",  "下载中"),
     "forcedDL":           ("D",  "下载中"),
     "stalledDL":          ("D",  "等待下载"),      # 无源、0 速：算下载态但不算『在真下』
-    "queuedDL":           ("D",  "排队中"),
+    "queuedDL":           ("DW", "排队下载"),    # qB 排队等额度，不是卡住
     "metaDL":             ("DT", "取元数据"),
     "forcedMetaDL":       ("DT", "取元数据"),
     "checkingDL":         ("DT", "校验中"),
@@ -419,8 +560,8 @@ _QB_STATES: dict[str, tuple[str, str]] = {
     # ---- 落定但不是完成 ----
     "missingFiles":       ("X",  "文件缺失"),      # 文件没了：终态，不再轮询，也不算已完成
     # ---- 既非在下也非已完成 ----
-    "pausedDL":           ("",   "已暂停"),
-    "stoppedDL":          ("",   "已暂停"),
+    "pausedDL":           ("W",  "已暂停"),
+    "stoppedDL":          ("W",  "已暂停"),
     "error":              ("",   "错误"),
     "unknown":            ("",   "未知"),
 }
@@ -434,6 +575,7 @@ _QB_DOWNLOADING = _states_with("D")
 _QB_SEEDING = _states_with("S")
 _QB_SETTLED = _states_with("X")
 _QB_TRANSIENT = _states_with("T")
+_QB_NOT_ADVANCING = _states_with("W")   # qB 没在推进它（排队/暂停）——停滞计时跳过这些
 # qB 原始态 → 中文（UI 只从这里取，不再自己维护一份）
 QB_STATE_CN = {s: cn for s, (_, cn) in _QB_STATES.items()}
 # 预算成 list 供 SQL in_/not_in 复用（集合恒定、只读；避免热路径每次调用重新 list()）
@@ -454,6 +596,15 @@ def _inflight_where(model_cls):
         model_cls.qb_progress < 1.0,
         func.coalesce(model_cls.qb_state, "").not_in(_QB_SETTLED_LIST),
     )
+
+
+def inflight_count(model_cls) -> int:
+    """『在下的』种子总数（口径同 _inflight_where）。列表页只取前 N 条展示，
+    标题要显示真实总数——否则被 limit 截断时标题少报，还会和上方按 qb_summary 算的
+    『下载中』对不上（实测过：标题写 50、同屏 chip 写 64）。"""
+    with get_session() as s:
+        return s.exec(select(func.count()).select_from(model_cls)
+                      .where(*_inflight_where(model_cls))).one()
 
 
 def has_inflight() -> bool:
@@ -546,7 +697,13 @@ async def sync_qb_status(model_cls) -> int:
     with get_session() as s:
         rows = [(t.id, t.info_hash, t.qb_synced_at is not None)
                 for t in s.exec(select(model_cls).where(*_inflight_where(model_cls)))
-                if t.info_hash]
+                # 跳过【交付中】的占位行：download_*_torrent 在锁内先置 downloading 提交，
+                # 出锁后才 fetch(最长 180s)+add，此刻 qB 里根本还没有它。若把它当"在下的"去问 qB，
+                # 第一轮 d is None 走宽限【并自己写上 qb_synced_at】，第二轮就凭这个自造的证据判成
+                # error——而交付其实还在进行。行一落 error 就掉出 HAVE_STATUSES，集去重闸失效，
+                # flush 会自动为同一集再下一份到同一目录（实测无需任何用户操作即可复现）。
+                # 交付协程独占这条行，它成功/失败都会自己写回状态，这里不该插手。
+                if t.info_hash and t.status != "downloading"]
     if not rows:
         return 0
     info = await qb.torrents_info([h for _, h, _ in rows])
@@ -600,6 +757,11 @@ async def sync_qb_status(model_cls) -> int:
                 t.status = "error"          # qB 侧真错误 → 回传；missingFiles 有意不回传（只镜像显示）
             elif t.status == "downloading" and t.qb_progress >= 1.0:
                 t.status = "sent"     # 兼容旧的 downloading 占位（正常已在交付时置 sent）
+            elif state in _QB_NOT_ADVANCING:
+                # qB 排队等额度 / 被要求停下：这段时间不算"卡住"，重置停滞计时基准。
+                # 否则 max_active_downloads 一小、批量补番时整批会被误标停滞异常
+                # （脱离轮询 + 不自动换源 + UI 一堆假告警）。
+                t.qb_progress_at = now
             elif (config.QB_STALL_TIMEOUT_MIN > 0 and t.qb_progress < 1.0
                   and t.qb_progress_at is not None
                   and now - t.qb_progress_at > timedelta(minutes=config.QB_STALL_TIMEOUT_MIN)):

@@ -201,7 +201,6 @@ def overview() -> dict:
             "total": len(active),
             "matched": sum(1 for m in active if m.bangumi_id),
             "unmatched": sum(1 for m in active if not m.bangumi_id),
-            "done": len([mid for mid in dl_ids if mid in q_of]),   # 有已下版本的影片数（KPI，非状态值）
             "rejected": sum(1 for m in all_m if m.rejected),
             "versions": versions,
         },
@@ -280,6 +279,22 @@ def movie_torrents(movie_id: int) -> list[MovieTorrent]:
     with get_session() as s:
         return list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)
                            .order_by(MovieTorrent.created_at.desc())))
+
+
+def source_map() -> dict:
+    """{片 id: [来源...]}，一次 DISTINCT 查齐（对齐番剧 source_map）。
+
+    列表页/待识别页逐片调 movie_sources 是 N+1：每片一个 session、一条 SQL；
+    片数一多（剧场版按年攒）渲染就线性变慢。这里一次查完，行数只与『片×来源』有关。
+    """
+    from collections import defaultdict
+    with get_session() as s:
+        pairs = list(s.exec(select(MovieTorrent.movie_id, MovieTorrent.source).distinct()))
+    src: dict = defaultdict(set)
+    for mid, source in pairs:
+        if mid:
+            src[mid].add(source or "?")
+    return {mid: sorted(v) for mid, v in src.items()}
 
 
 def movie_sources(movie_id: int) -> list[str]:
@@ -402,28 +417,14 @@ def excluded_torrent_rows() -> list[dict]:
 
 
 def exclude_torrent(mt_id: int) -> bool:
-    """排除一条不想要的待下剧场版版本：置终态 excluded（不删文件、不碰 qB，只改状态）——
-    不再显示在可下队列、RSS 再遇到同 hash 也不重收；可用 unexclude_torrent 撤销。只动 pending/error。"""
-    with get_session() as s:
-        t = s.get(MovieTorrent, mt_id)
-        if t is None or t.status not in engine.DOWNLOADABLE_STATUSES:
-            return False
-        t.status = "excluded"
-        s.add(t)
-        s.commit()
-    return True
+    """排除一条不想要的待下版本（实现见 engine.exclude_torrent，两条线共用）。
+    不再显示在可下队列、RSS 再遇到同 hash 也不重收；可用 unexclude_torrent 撤销。"""
+    return engine.exclude_torrent(MovieTorrent, mt_id)
 
 
 def unexclude_torrent(mt_id: int) -> bool:
-    """取消排除：把 excluded 的剧场版种子放回 pending。返回是否放回了。"""
-    with get_session() as s:
-        t = s.get(MovieTorrent, mt_id)
-        if t is None or t.status != "excluded":
-            return False
-        t.status = "pending"
-        s.add(t)
-        s.commit()
-    return True
+    """取消排除：把 excluded 的版本放回 pending（可下）。返回是否放回了。"""
+    return engine.unexclude_torrent(MovieTorrent, mt_id)
 
 
 async def enrich_movie(movie_id: int) -> bool:
@@ -498,91 +499,10 @@ def movie_save_path(movie_id: int) -> str | None:
 
 
 async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
-    """把该剧场版已下/在下的种子移到当前归档目录（改季度/重绑后调用；调用方应已落新 m.quarter/名）。
-
-    对齐番剧 relocate_anime：qB 跟踪该种子 → setLocation 原地搬 + 更新 save_path；qB 关/连不上/不跟踪
-    (remove-on-complete) → 清完成状态待人工重下到新目录；setLocation 报 403/409(新目录不可写) → 只报告、不动状态。
-    返回 {new_path, old_path, moved, redownload, untracked, failed, fail_code?, error?}。
-    """
-    new_path = movie_save_path(movie_id)
-    rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
-           "redownload": 0, "untracked": 0, "failed": 0,
-           "stalled_kept": 0}   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
-    if new_path is None:
-        rep["error"] = "算不出新路径（越界或无片）"
-        return rep
-    with get_session() as s:
-        pairs = [(t.id, t.info_hash) for t in s.exec(select(MovieTorrent).where(
-            MovieTorrent.movie_id == movie_id,
-            MovieTorrent.status.in_(engine.HAVE_STATUSES),   # 含 stalled：半成品也在盘上，同样要搬
-            MovieTorrent.archived_at.is_(None)))]   # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
-    if not pairs:
-        return rep
-
-    def _clear(ids) -> int:
-        """搬不动时把行清成 pending 等人工重下到新目录。返回【实际改了几行】。
-
-        与番剧同口径：只降级仍被 qB 跟踪的行(TRACKED)，stalled 保持原样——降成 pending 会抹掉
-        『⚠️停滞』提示、让卡片『已下 N』凭空少一，并使详情页删除按钮消失（门槛是 HAVE），
-        旧目录的半成品成为 UI 删不掉的孤儿。停滞行原地不动，由报告单列提示用户。
-        """
-        changed = 0
-        with get_session() as s:
-            for tid in ids:
-                t = s.get(MovieTorrent, tid)
-                if t is not None and t.status in engine.TRACKED_STATUSES:
-                    # 连 qB 实时态一起清：否则这行虽已是『待重下』，UI 仍按残留的 qb_state/进度
-                    # 渲染成『已完成 100%』(qb_live_text 优先于 status)，用户看不出它需要重下。
-                    # 与 download_*_torrent 重下时的清理保持一致。
-                    t.status = "pending"
-                    t.qb_state, t.qb_progress = "", 0.0
-                    t.qb_synced_at, t.qb_progress_at = None, None
-                    s.add(t)
-                    changed += 1
-            s.commit()
-        return changed
-
-    def _stalled_of(ids) -> int:
-        with get_session() as s:
-            return sum(1 for tid in ids
-                       if (t := s.get(MovieTorrent, tid)) is not None and t.status == "stalled")
-
-    def _mark_moved(ids):
-        with get_session() as s:
-            for tid in ids:
-                t = s.get(MovieTorrent, tid)
-                if t is not None:
-                    t.save_path = new_path
-                    s.add(t)
-            s.commit()
-
-    all_ids = [tid for tid, _ in pairs]
-    if not config.QB_ENABLED:   # qB 关：只能清状态待重下 + 提醒
-        rep["stalled_kept"] = _stalled_of(all_ids)
-        rep["redownload"] = _clear(all_ids)
-        return rep
-    info = await engine.qb.torrents_info([h for _, h in pairs])
-    if info is None:            # qB 连不上：同上
-        rep["stalled_kept"] = _stalled_of(all_ids)
-        rep["redownload"] = _clear(all_ids)
-        return rep
-    tracked = [(tid, h) for tid, h in pairs if h in info]
-    untracked = [tid for tid, h in pairs if h not in info]
-    if untracked:               # remove-on-complete 等：qB 已不认识 → 清状态待重下
-        rep["stalled_kept"] += _stalled_of(untracked)
-        rep["untracked"] = rep["redownload"] = _clear(untracked)
-    if tracked:
-        code = await engine.qb.set_location([h for _, h in tracked], new_path)
-        if code == 200:
-            _mark_moved([tid for tid, _ in tracked])
-            rep["moved"] = len(tracked)
-        elif code is None:      # 中途连不上：退回清状态待重下
-            rep["stalled_kept"] += _stalled_of([tid for tid, _ in tracked])
-            rep["redownload"] += _clear([tid for tid, _ in tracked])
-        else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
-            rep["failed"] = len(tracked)
-            rep["fail_code"] = code
-    return rep
+    """把该剧场版已下/在下/停滞的版本移到当前归档目录（改季度/重绑后调用；调用方应已落新 m.quarter/名）。
+    实现见 engine.relocate（与番剧共用同一份）。"""
+    return await engine.relocate(MovieTorrent, MovieTorrent.movie_id, movie_id,
+                                 movie_save_path(movie_id), old_path, noun="个版本")
 
 
 # ---------------- 下载 ----------------

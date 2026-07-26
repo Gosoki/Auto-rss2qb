@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 from nicegui import ui
 
+from db.models import AnimeTorrent
 from core import anime, engine
 import config
 from .layout import (confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
@@ -38,9 +39,20 @@ def anime_page(t: str = ""):
             manage_panel.refresh()
 
         # ---- 刷新（页面局部，闭包内共享）----
+        # 仪表盘的 head/charts/tail 是三个独立 refreshable，但用的是同一份 overview() 数据。
+        # 各自调一次等于把它算三遍——overview() 要跑 15 条查询 + pending_breakdown，
+        # 后者在大库时是整个仪表盘的开销大头（实测 19k 种子：overview 182ms，其中 157ms 是它）。
+        # 这里让三者共用【本轮】的一份快照；每轮刷新开头清空，出了本轮不复用（不会读到陈旧值）。
+        _ov_snap: dict = {}
+
+        def _overview():
+            if "v" not in _ov_snap:
+                _ov_snap["v"] = anime.overview()
+            return _ov_snap["v"]
+
         @ui.refreshable
         def overview_head():   # KPI + 订阅源组（计数，随定时器刷新，无交互态可丢）
-            ov = anime.overview()
+            ov = _overview()
             k = ov["kpi"]
             ps = ov["pending_split"]
 
@@ -51,10 +63,12 @@ def anime_page(t: str = ""):
                        ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm")),
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
                        "|",
-                       ("已下载", k["done"], "green", None),
+                       ("已交付", k["done"], "green", None),
                        ("未知集", ps["unknown"], "purple", _open_unknown),
-                       ("失败数", ov["status"]["error"] + ov["status"]["stalled"], "red",
-                        _open_failed),   # 与点开的 failed_rows() 同口径(error+stalled)
+                       # 名字与下方 chip『失败数』(仅 error) 区分开：这张卡是"需要处理的总数"，
+                       # 含长期停滞，和点开后的 failed_rows()/弹窗标题『失败 / 异常』一致
+                       ("失败/异常", ov["status"]["error"] + ov["status"]["stalled"], "red",
+                        _open_failed),
                        ("种子数", k["torrents"], "", None)])
 
             # ── qB 未启用提醒 ──
@@ -94,7 +108,7 @@ def anime_page(t: str = ""):
 
         @ui.refreshable
         def charts_panel():   # 图表单独一个 refreshable：不被 30s 定时器刷，避免环图重建丢交互态（悬停/图例翻页）
-            ov = anime.overview()
+            ov = _overview()
             # ── 下载番剧 / 种子来源（左右分开，窄屏自动堆叠）──
             with ui.row().classes("w-full gap-6 flex-wrap mt-3 pl-1"):   # pl-1 跟其他区块(订阅源组/种子状态)左对齐，别突出去
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
@@ -134,7 +148,7 @@ def anime_page(t: str = ""):
                     if not ov["by_source"]:
                         ui.label("—").classes("text-gray-500 text-sm")
                     else:
-                        # 环图：各源的种子占比（悬停切片→环心显示源名+数量）。ov['by_source']=[(源,种子数,已下)…]
+                        # 环图：各源的种子占比（悬停切片→环心显示源名+数量）。ov['by_source']=[(源,种子数)…]
                         ui.echart({
                             # Tailwind -400 十色（sRGB hex；ECharts canvas 不吃 oklch）
                             "color": ["#50a2ff", "#a684ff", "#00d492", "#ff8904", "#ff6467",
@@ -152,14 +166,14 @@ def anime_page(t: str = ""):
                                 "emphasis": {"label": {"show": True, "color": "#d1d5dc",
                                                        "fontSize": 14, "fontWeight": "bold",
                                                        "formatter": "{b}\n{c}"}},
-                                "data": [{"name": src, "value": tot} for src, tot, _ in ov["by_source"]],
+                                "data": [{"name": src, "value": tot} for src, tot in ov["by_source"]],
                             }],
                         }).classes("w-full").style("height:220px").on(
                             "chart:legendselectchanged", _remember_legend, args=["selected"])
 
         @ui.refreshable
         def overview_tail():   # 种子状态(含 qB 实时徽标) + 采集状态：随定时器刷新，qB 进度要 30s 更新
-            ov = anime.overview()
+            ov = _overview()
             k = ov["kpi"]
             ps = ov["pending_split"]
             # ── 种子状态 ──
@@ -173,7 +187,9 @@ def anime_page(t: str = ""):
                              else "qB 未启用，去设置页开启后可下载")
             # 待下拆 将下载/备用/待确认/未知（库态『下载中』恒≈0、与 qB 实时态重复不单列）；失败、种子总数一并列出，与 KPI 卡呼应
             chips = [
-                ("已下载", ov["status"]["sent"], "green", None),
+                # sent = 已发给 qB（含仍在下的）；真正下完的数在下方 qB 实时区的『已完成』
+                ("已交付", ov["status"]["sent"], "green",
+                 "已发送给 qB 的种子数（含仍在下载的）。真正下完的看下方『已完成』"),
                 ("将下载", ps["will"], "blue", "已确认番·本集首选（含特别篇），会自动下"),
                 ("备用项", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
@@ -249,7 +265,7 @@ def anime_page(t: str = ""):
             if not pend:
                 ui.label("没有待确认的番。（『待确认』策略的源组发现的番会出现在这里）").classes("text-gray-400 p-4")
                 return
-            smap = anime.source_map()   # 批量取来源，避免逐番 anime_sources 的 N+1 查询
+            smap = anime.source_map()   # 批量取来源，避免逐番查的 N+1
             for i, (q, items) in enumerate(group_by_quarter(pend)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
@@ -381,7 +397,8 @@ def anime_page(t: str = ""):
         @ui.refreshable
         def inflight_panel():
             rows = anime.inflight_anime_rows()
-            ui.label(f"正在下载（{len(rows)}）").classes("text-sm font-bold mt-4 pl-1")
+            _inflight_total = engine.inflight_count(AnimeTorrent)
+            ui.label(f"正在下载（{_inflight_total}{'，显示前 %d' % len(rows) if _inflight_total > len(rows) else ''}）").classes("text-sm font-bold mt-4 pl-1")
             with ui.card().classes("w-full"):
                 if not config.QB_SYNC_STATUS:
                     ui.label("已关闭 qB 状态跟踪：发送即视为『已下』，不跟踪下载进度（设置页可重新开启）。").classes(
@@ -508,10 +525,14 @@ def anime_page(t: str = ""):
         def _refresh_overview(charts):
             # 刷新仪表盘：head(计数)+tail(种子状态/qB实时)恒刷；charts(图表)仅 charts=True 时刷。
             # 定时器传 charts=False → 不重建环图，保住悬停/图例翻页等交互态。
-            overview_head.refresh()
-            if charts:
-                charts_panel.refresh()
-            overview_tail.refresh()
+            _ov_snap.clear()          # 本轮取最新数据，下面三个面板共用这一份
+            try:
+                overview_head.refresh()
+                if charts:
+                    charts_panel.refresh()
+                overview_tail.refresh()
+            finally:
+                _ov_snap.clear()      # 出了本轮就作废，避免下次读到陈旧快照
 
         def refresh_dynamic():
             # 用户操作后的全动态刷新：含『待确认/待识别』，好让确认/绑定/忽略后的番立即从对应列表流转。
@@ -720,8 +741,9 @@ def anime_page(t: str = ""):
         # 懒加载：首屏只构建当前 tab 的内容；切到别的 tab 首次才建（6 个面板 → 1 个，砍首屏构建/推送）。
         # 面板都是 @ui.refreshable，未构建过的 .refresh() 是安全 no-op，所以刷新逻辑无需改动。
         _builders = {
-            "overview": lambda: (overview_head(), charts_panel(), overview_tail(),
-                                 inflight_panel(), recent_panel()),
+            "overview": lambda: (_ov_snap.clear(), overview_head(), charts_panel(),
+                                 overview_tail(), inflight_panel(), recent_panel(),
+                                 _ov_snap.clear()),
             "manage": manage_panel, "confirm": confirm_panel,
             "fail": fail_panel, "reject": reject_panel, "sources": render_sources,
         }

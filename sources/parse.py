@@ -192,9 +192,14 @@ def format_quarter(quarter: str, fmt: str) -> str:
     ctx = {"yy": yy, "yyyy": f"20{yy}", "q": q,
            "season": SEASON_CN[q], "m": str(_Q_MONTH[q])}
     try:
-        return (fmt or "{yy}{q}").format(**ctx)
-    except (KeyError, IndexError, ValueError):
+        out = (fmt or "{yy}{q}").format(**ctx)
+    except Exception:
+        # 模板由用户在设置页手填，str.format 的出错方式远不止 KeyError/IndexError/ValueError：
+        # 例如 '{yy.foo}' 抛 AttributeError——漏捕会让【任何渲染季度名的页面】整页打挂。
+        # 这里一律回退成原始季度键，宁可显示得朴素也不能崩。
         return quarter
+    # 同理 '{yy:>{yyyy}}' 这种嵌套宽度能生成几千字符：它会变成目录名的一段，必须封顶。
+    return out[:60] if len(out) > 60 else out
 
 
 def _is_chinese(s: str) -> bool:
