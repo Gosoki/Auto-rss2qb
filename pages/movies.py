@@ -163,9 +163,9 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     ui.label(t.raw_title or t.source).classes("grow break-all")
                 with ui.row().classes("items-center gap-2 flex-wrap"):   # 状态标签 + 下载：统一左下
                     live = qb_live_text(t)
-                    if live:  # 完成(做种/100%)才绿，下载中用 teal
+                    if live:  # 完成(做种/100%)才绿，下载中用蓝
                         _done = (t.qb_progress or 0) >= 1
-                        ui.badge(live).props(f"color={'green' if _done else 'teal'}").tooltip(
+                        ui.badge(live).props(f"color={'green' if _done else 'blue'}").tooltip(
                             "qB 实时状态")
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余按状态
                         ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
@@ -459,7 +459,7 @@ def movies_page(t: str = ""):
             # ── 种子状态 ──（剧场版逐版本人工下，无待确认/首选/备用概念，只列库态计数）
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("种子状态").classes("text-sm font-bold")
-                ui.label("各状态种子计数（含 qB 实时态）").classes("text-xs text-gray-400")
+                ui.label("各状态种子计数").classes("text-xs text-gray-400")
             chips = [
                 ("已下载", ov["status"]["sent"], "green", None),
                 ("可下载", ov["status"]["pending"], "blue", "还没下的版本，进详情逐条下"),
@@ -469,7 +469,7 @@ def movies_page(t: str = ""):
             ]
             # 少见状态只在非零时露出（与番剧侧同口径）：保证各 chip 之和 == 种子数，又不让全新库挂一排 0
             for _lb, _key, _cl, _tip in (
-                ("下载中", "downloading", "teal", "正在交付给 qB 的瞬时态（通常一闪而过）"),
+                ("下载中", "downloading", "blue", "正在交付给 qB 的瞬时态（通常一闪而过）"),
                 ("停滞", "stalled", "deep-orange", "已交付但长期零推进，脱离轮询、等人工处理"),
                 ("已删除", "deleted", "grey", "人工删过的版本"),
                 ("已排除", "excluded", "grey", "人工排除的版本（不再参与下载）"),
@@ -482,20 +482,33 @@ def movies_page(t: str = ""):
                     b = ui.badge(f"{label} {val}").props(f"color={color}").classes("text-sm")
                     if tip:
                         b.tooltip(tip)
-            if ov["config"]["qb"]:   # qB 实时态（接上 qB 后每 QB_SYNC_INTERVAL 秒刷新）
-                q = ov["qb"]
-                with ui.row().classes("gap-2 flex-wrap pl-1 items-center mt-1"):
-                    ui.badge(f"qB 跟踪 {q['tracked']}").props("color=teal").classes("text-sm").tooltip(
-                        "qB 里正在跟踪的种子数（已交付给 qB 的）")
-                    ui.badge(f"下载中 {q['downloading']}").props("color=teal").classes("text-sm")
-                    ui.badge(f"已完成 {q['completed']}").props("color=green").classes("text-sm")
-                    if q["dlspeed"]:
-                        ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=teal").classes("text-sm")
+            # ── 下载状态 ──（qB 实时态，独立成区；与番剧页同款：后台轮询之外可点『立刻刷新』手动拉一次）
+            # qB 未启用也照常显示：qb_summary 只查库、不打 qB 接口，此时列的是最后已知进度，只把手动同步按钮禁掉。
+            q = ov["qb"]
+            _qb_on = ov["config"]["qb"]
+            with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
+                ui.label("下载状态").classes("text-sm font-bold")
+                ui.label("qB 实时下载进度" if _qb_on else "qB 未启用·最后进度").classes(
+                    "text-xs text-gray-400")
+                _sync = ui.button("立刻刷新", icon="sync", on_click=_qb_sync_now).props(
+                    "outline color=primary size=sm").style("font-size:12px")
+                _sync.set_enabled(_qb_on)
+                _sync.tooltip("立即向 qB 拉一次最新进度（不必等后台轮询）" if _qb_on
+                              else "qB 未启用，去设置页开启后可同步")
+            with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
+                ui.badge(f"已完成 {q['completed']}").props("color=green").classes("text-sm")
+                ui.badge(f"下载中 {q['downloading']}").props("color=blue").classes("text-sm")
+                ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").classes("text-sm").tooltip(
+                    "qB 里正在跟踪的种子数（已交付给 qB 的）")
+                if q["dlspeed"]:
+                    ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=blue").classes("text-sm")
+                ui.badge(f"完成率 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").classes(
+                    "text-sm").tooltip("已交付种子的平均完成度")
 
             # ── 采集状态 ──（剧场版=Mikan 季度扫描；开关/间隔在『订阅源』tab 调）
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("采集状态").classes("text-sm font-bold")
-                ui.label("后台采集与 bgm 识别的运行情况").classes("text-xs text-gray-400")
+                ui.label("后台采集与识别").classes("text-xs text-gray-400")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 ui.badge("扫描开启" if config.MOVIE_SCAN_ENABLED else "扫描暂停").props(
                     f"color={'green' if config.MOVIE_SCAN_ENABLED else 'red'}").classes("text-sm").tooltip(
@@ -744,6 +757,20 @@ def movies_page(t: str = ""):
             fail_panel.refresh()
             reject_panel.refresh()
             sources_panel.refresh()
+
+        async def _qb_sync_now():
+            """『下载状态』的立刻刷新：主动向 qB 拉一次在下版本的进度，不必等后台轮询（对齐番剧页）。"""
+            if not config.QB_ENABLED:
+                ui.notify("qB 未启用（去设置页开启『发送种子到 qB』）", type="warning")
+                return
+            try:
+                n = await mov.sync_qb_status()
+            except Exception as e:                       # qB 连不上/超时：给可读提示，别掀翻页面
+                ui.notify(f"同步失败：{e}", type="negative")
+                return
+            overview_panel.refresh()
+            inflight_panel.refresh()
+            ui.notify(f"已同步 {n} 个版本的进度" if n else "没有正在下载的版本", type="positive")
 
         # ---- 标签 ----
         with ui.tabs().classes("w-full") as tabs:
