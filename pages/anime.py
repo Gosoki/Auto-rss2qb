@@ -165,7 +165,7 @@ def anime_page(t: str = ""):
             # ── 种子状态 ──
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("种子状态").classes("text-sm font-bold")
-                ui.label("各状态种子计数（含 qB 实时态）").classes("text-xs text-gray-400")
+                ui.label("各状态种子计数").classes("text-xs text-gray-400")
                 _dla = ui.button("补下全部", icon="download", on_click=_download_all).props(
                     "outline color=primary size=sm").style("font-size:12px")
                 _dla.set_enabled(config.QB_ENABLED)
@@ -185,7 +185,7 @@ def anime_page(t: str = ""):
             # 少见状态只在非零时露出：保证各 chip 之和 == 种子数（否则『各状态之和』就是句假话），
             # 又不让全新库挂一排 0。库态『下载中』恒≈0（交付即置 sent），同理只在非零时显示。
             for _lb, _key, _cl, _tip in (
-                ("下载中", "downloading", "teal", "已挑中正在交付给 qB 的瞬时态（通常一闪而过）"),
+                ("下载中", "downloading", "blue", "已挑中正在交付给 qB 的瞬时态（通常一闪而过）"),
                 ("停滞", "stalled", "deep-orange", "已交付但长期零推进，脱离轮询、等人工处理"),
                 ("已删除", "deleted", "grey", "人工删过的种子（同集来新 hash 仍会照常下）"),
                 ("已排除", "excluded", "grey", "人工排除的种子（不再参与自动下载）"),
@@ -198,24 +198,34 @@ def anime_page(t: str = ""):
                     b = ui.badge(f"{label} {val}").props(f"color={color}").classes("text-sm")
                     if tip:
                         b.tooltip(tip)
-            # qB 实时态（接上 qB 后每 QB_SYNC_INTERVAL 秒刷新）
-            if ov["config"]["qb"]:
-                q = ov["qb"]
-                with ui.row().classes("gap-2 flex-wrap pl-1 items-center mt-1"):
-                    ui.badge(f"qB 跟踪 {q['tracked']}").props("color=teal").classes("text-sm").tooltip(
-                        "qB 里正在跟踪的种子数（已交付给 qB 的）")
-                    ui.badge(f"下载中 {q['downloading']}").props("color=teal").classes("text-sm")
-                    ui.badge(f"已完成 {q['completed']}").props("color=green").classes("text-sm")
-                    if q["dlspeed"]:
-                        ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=teal").classes("text-sm")
-                    ui.badge(f"平均 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").classes(
-                        "text-sm").tooltip("已交付种子的平均完成度")
+            # ── 下载状态 ──（qB 实时态，独立成区；后台每 QB_SYNC_INTERVAL 秒刷，也可点『立刻刷新』手动拉一次）
+            # qB 未启用也照常显示：qb_summary 只查库、不打 qB 接口，此时列的是最后已知进度，只把手动同步按钮禁掉。
+            q = ov["qb"]
+            _qb_on = ov["config"]["qb"]
+            with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
+                ui.label("下载状态").classes("text-sm font-bold")
+                ui.label("qB 实时下载进度" if _qb_on else "qB 未启用·最后进度").classes(
+                    "text-xs text-gray-400")
+                _sync = ui.button("立刻刷新", icon="sync", on_click=_qb_sync_now).props(
+                    "outline color=primary size=sm").style("font-size:12px")
+                _sync.set_enabled(_qb_on)
+                _sync.tooltip("立即向 qB 拉一次最新进度（不必等后台轮询）" if _qb_on
+                              else "qB 未启用，去设置页开启后可同步")
+            with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
+                ui.badge(f"已完成 {q['completed']}").props("color=green").classes("text-sm")
+                ui.badge(f"下载中 {q['downloading']}").props("color=blue").classes("text-sm")
+                ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").classes("text-sm").tooltip(
+                    "qB 里正在跟踪的种子数（已交付给 qB 的）")
+                if q["dlspeed"]:
+                    ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=blue").classes("text-sm")
+                ui.badge(f"完成率 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").classes(
+                    "text-sm").tooltip("已交付种子的平均完成度")
 
             # ── 采集状态 / 源组 ──
             enr, tot = ov["enriched"]
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("采集状态").classes("text-sm font-bold")
-                ui.label("后台采集与 bgm 识别的运行情况").classes("text-xs text-gray-400")
+                ui.label("后台采集与识别").classes("text-xs text-gray-400")
                 with ui.button("重新识别", icon="sync").props("outline color=primary size=sm").style("font-size:12px"):
                     with ui.menu():
                         ui.menu_item("识别当季", on_click=_reident(1))
@@ -650,6 +660,20 @@ def anime_page(t: str = ""):
             n = await anime.download_all_pending()
             refresh_all()   # 含 manage_panel，好让季度小结的已下/待下计数也即时更新（展开/页码已持久化，不打乱视图）
             ui.notify(f"已触发补下 {n} 集")
+
+        async def _qb_sync_now():
+            """『下载状态』的立刻刷新：主动向 qB 拉一次在下种子的进度，不必等后台轮询（默认间隔可能上千秒）。"""
+            if not config.QB_ENABLED:
+                ui.notify("qB 未启用（去设置页开启『发送种子到 qB』）", type="warning")
+                return
+            try:
+                n = await anime.sync_qb_status()
+            except Exception as e:                       # qB 连不上/超时：别让异常掀翻页面，给个可读提示
+                ui.notify(f"同步失败：{e}", type="negative")
+                return
+            _refresh_overview(charts=False)              # 刷计数区，不重建环图（保住图例排除态）
+            inflight_panel.refresh()                     # 『正在下载』列表的进度条也跟着更新
+            ui.notify(f"已同步 {n} 条种子的进度" if n else "没有正在下载的种子", type="positive")
 
         def _reident(seasons):
             async def h():

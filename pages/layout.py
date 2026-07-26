@@ -281,7 +281,7 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
                 qb_dlspeed=0, in_plan=None, confirmed=True) -> tuple[str, str]:
     """新入库/正在下载：把一条种子压成 (文案, 徽标色)，复刻详情页那套阶梯。
 
-    有 qB 实时态 → 『下载中 X% ↓速度』/『做种 100%』(完成绿、在下 teal)；否则 in_plan 非空(番剧)时
+    有 qB 实时态 → 『下载中 X% ↓速度』/『做种 100%』(完成绿、在下蓝)；否则 in_plan 非空(番剧)时
     区分待下『将下载/备用』、失败『可补下/失败』；再否则按 torrent_status_cn（刚交付未同步→下载中）。
     in_plan=None 表示不区分首选/备用（剧场版没有集去重，用这个）。
     confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。"""
@@ -290,7 +290,7 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
         parts = [qb_state_cn(qb_state), f"{pr * 100:.0f}%"]
         if (qb_dlspeed or 0) > 0:
             parts.append(f"↓{human_size(qb_dlspeed)}/s")
-        return " ".join(parts), ("green" if pr >= 1 else "teal")
+        return " ".join(parts), ("green" if pr >= 1 else "blue")
     if in_plan is not None:
         # 下面这两支是 engine.DOWNLOADABLE_STATUSES 的【渲染侧对偶】：调用方(pages/anime.py)按同一集合
         # 决定要不要算 in_plan，这里再逐个状态分支出文案。它不是集合判断故无法直接引用常量——

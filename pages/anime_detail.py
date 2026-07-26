@@ -149,9 +149,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         "shrink-0 text-gray-500 text-xs")                 # 次要：时间(12px)
                     ui.space()
                     live = qb_live_text(t)
-                    if live:  # qB 实时态：完成(做种/100%)才绿，下载中用 teal
+                    if live:  # qB 实时态：完成(做种/100%)才绿，下载中用蓝
                         _done = (t.qb_progress or 0) >= 1
-                        ui.badge(live).props(f"color={'green' if _done else 'teal'}").tooltip(
+                        ui.badge(live).props(f"color={'green' if _done else 'blue'}").tooltip(
                             "qB 实时状态")
                     elif t.status == "pending":  # 待下：未知集 / 将下载 / 备用
                         if t.episode == -2:  # -2 后台不自动下，别标『将下载』

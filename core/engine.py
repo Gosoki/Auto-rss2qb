@@ -400,7 +400,7 @@ _QB_STATES: dict[str, tuple[str, str]] = {
     "downloading":        ("D",  "下载中"),
     "forcedDL":           ("D",  "下载中"),
     "stalledDL":          ("D",  "等待下载"),      # 无源、0 速：算下载态但不算『在真下』
-    "queuedDL":           ("D",  "排队下载"),
+    "queuedDL":           ("D",  "排队中"),
     "metaDL":             ("DT", "取元数据"),
     "forcedMetaDL":       ("DT", "取元数据"),
     "checkingDL":         ("DT", "校验中"),
