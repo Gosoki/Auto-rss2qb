@@ -6,7 +6,9 @@ anime.py(TV) 与 movies.py(剧场版) 都依赖这里；本模块不含任何 TV
 import asyncio
 import ipaddress
 import logging
+import ntpath
 import os
+import posixpath
 import re
 import socket
 from datetime import datetime, timedelta, timezone
@@ -116,18 +118,43 @@ def prev_quarter(q: str) -> str:
     return f"{yy}{chr(ord(letter) - 1)}"
 
 
+_WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _path_module(base: str):
+    """按 base 的样子选路径规则：Windows 盘符(E:\\ / E:/)或 UNC(\\\\NAS\\share) → ntpath，其余 → posixpath。
+
+    路径是【给 qB 主机用的】，而本程序可能跑在另一个系统上，所以不能用 os.path——
+    在 macOS/Linux 上 os.sep 是 '/'，拼出来的 Windows 路径会是
+    'E:\\Anime\\AutoRSS/26C/番名' 这种混合分隔符。
+
+    混合分隔符本身不影响下载（已在真机 qB v5.2.3 上验过：它照收，并规范化成全反斜杠），
+    但 qB 回报的 save_path 就与我们库里存的【逐字不同】了，而 relocate（改季度搬文件）
+    正是拿这两个字符串比对的——不一致会让它误判该不该搬、以及把"旧文件在 X"提示指到
+    一个字面上不存在的路径。所以要从源头生成与 qB 一致的分隔符。
+
+    判据无歧义（盘符/UNC 前缀），不需要用户去设开关——开关多一个就多一处能设错的地方，
+    而且填了 Windows 路径却忘了拨开关时，症状与现在完全一样、更难查。
+    """
+    b = (base or "").strip()
+    return ntpath if (_WIN_DRIVE_RE.match(b) or b.startswith("\\\\")) else posixpath
+
+
 def build_save_path(quarter: str, folder_name: str, season: int | None = None,
                     sub_dir: str = "", quarter_fmt: str | None = None) -> str | None:
-    """下载保存路径：根/[季度目录]/名字[/Season N]。做 realpath 包含校验，越界返回 None。
+    """下载保存路径：根/[季度目录]/名字[/Season N]。做包含校验，越界返回 None。
 
     据工作目录(config.DOWN_PATH)与该侧目录 sub_dir(ANIME_DOWN_PATH/MOVIE_DOWN_PATH) 定根：
       有工作目录：sub_dir 作『相对』路径拼其下（sub_dir 空=直接落工作目录，不额外分类）；
       无工作目录：sub_dir 即『绝对』路径（须非空；两者皆空=无处下载，返回 None）。
     quarter_fmt=季度/年份目录模板（None=用 config.QUARTER_FMT；留空 ''=不建季度/年份目录，直接放名字）。
+
+    分隔符按 base 的样子走（见 _path_module）：Windows 路径用反斜杠、POSIX 用正斜杠。
     """
     work = config.DOWN_PATH
+    pm = _path_module(work or sub_dir)
     if work:
-        base = os.path.join(work, sub_dir.lstrip("/\\")) if sub_dir else work
+        base = pm.join(work, sub_dir.lstrip("/\\")) if sub_dir else work
     else:
         base = sub_dir
     if not base:            # 工作目录与该侧都空——无处下载
@@ -139,7 +166,21 @@ def build_save_path(quarter: str, folder_name: str, season: int | None = None,
     parts.append(safe_name(folder_name))
     if season is not None and config.ANIME_SEASON_SUBFOLDER:
         parts.append(f"Season {int(season)}")
-    save_path = os.path.join(*parts)
+    save_path = pm.join(*parts)
+    if pm is ntpath:
+        # Windows 路径用【词法】规范化比对，而不是 realpath——后者会拿本机（macOS/Linux）
+        # 文件系统去解析一个 Windows 路径，纯属空转。大小写按 Windows 语义忽略。
+        #
+        # 注意这道闸的实际覆盖面与 POSIX 分支【一样窄】：sub_dir 在上面已经被折进 base，
+        # 两边一起 normpath 后自然相等，所以 sub_dir 里写 '..' 是拦不住的（POSIX 分支同理，
+        # 这是审计记录的待裁项，与本次 Windows 支持无关）。真正被它守住的只有季度/番名两段，
+        # 而那两段已先过 safe_name（剥掉 . 与路径分隔符）。留着是纵深防御，不是主要防线。
+        base_n = ntpath.normpath(base).rstrip("\\").lower()
+        real_n = ntpath.normpath(save_path).lower()
+        if real_n != base_n and not real_n.startswith(base_n + "\\"):
+            return None
+        return save_path
+    # POSIX 分支保持原样（含 realpath 解析软链）：本机就是 qB 主机时它是真在校验，别动。
     base_real = os.path.realpath(base)
     real = os.path.realpath(save_path)
     if real != base_real and not real.startswith(base_real + os.sep):
