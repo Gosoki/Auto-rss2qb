@@ -101,7 +101,8 @@ _SPEC = {
     "BGM_API": (str, "https://api.bgm.tv"),
     # ---- 剧场版/OVA 自动扫描（来源固定为 Mikan 季度桶）----
     "MOVIE_SCAN_ENABLED": (bool, False),    # 自动扫描开关（关=只在 /movies 手动点扫描）
-    "MOVIE_SCAN_INTERVAL": (int, 43200),    # 每隔多少秒自动扫一次剧场版（默认 12 小时）
+    "MOVIE_SCAN_INTERVAL": (int, 604800),   # 每隔多少秒自动扫一次剧场版（默认 7 天）——
+                                            # 剧场版桶更新很慢，扫太勤没意义、只是白打 Mikan
     "MOVIE_SCAN_LAST": (str, ""),           # 上次扫描时间（ISO，运行时更新；非用户填）
     # ---- 业务数据库（这几项本身恒存在【本地 SQLite】的 setting 表里，见 db.__init__ 的双引擎说明）----
     "DB_BACKEND": (str, "sqlite"),          # 业务表落在哪：'sqlite'(本地文件) | 'mysql'
