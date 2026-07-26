@@ -8,7 +8,7 @@
 
 技术栈：**Python + NiceGUI（界面）+ FastAPI（内核，NiceGUI 自带）+ SQLite/SQLModel + asyncio 轮询器**。
 
-## 运行
+## 运行（本地开发）
 
 ```bash
 pip install -r requirements.txt
@@ -16,8 +16,32 @@ cp .env.example .env      # 可选：只放 Web 端口等结构项
 python main.py            # 浏览器打开 http://<host>:8080
 ```
 
+需要 **Python ≥ 3.10**（代码用了 PEP 604 的 `str | None`）。
+
 qB 账号、下载目录、代理、面板显示等设置都在启动后的 Web「设置」/「源管理」页里填（存数据库、即时生效）。
 一条命令同时跑：后台轮询下载 + Web 面板。数据库在 `data/autorss.db`（首次自动建，加字段会自动迁移，并写入默认设置）。
+
+## 部署（Debian/Ubuntu 服务器、PVE LXC）
+
+```bash
+apt update && apt install -y git curl ca-certificates
+git clone <本仓库> && cd <仓库目录>
+bash deploy.sh            # root 运行
+```
+
+`deploy.sh` 自动完成：装 [uv](https://docs.astral.sh/uv/)（自带独立 Python，**不依赖系统 python**，
+Debian 11 的 3.9 也无所谓）→ 建 `.venv` 装依赖 → 写 `.env`（`WEB_HOST=0.0.0.0`）+ 关掉开发用热重载
+→ 生成 systemd 服务并启动。路径由脚本自身位置推导，仓库克隆到哪都行；每步失败即停并报错，
+**幂等可重复跑**，升级也是 `git pull && bash deploy.sh`。
+
+```bash
+journalctl -u autorss -f          # 看日志
+systemctl restart autorss         # 重启
+```
+
+> ⚠️ **本工具没有鉴权**，设置页还存着 qB 密码。绑 `0.0.0.0` 后请进设置页把 `WEB_ALLOW_CIDRS`
+> 填成你的网段（如 `192.168.1.0/24`）收窄访问——该项走数据库、改完即时生效，回环地址恒放行不会把自己锁在外面。
+> 要暴露到公网请在前面套反向代理做鉴权（此时白名单应留空，因为对端 IP 会变成代理）。
 
 ## 结构
 
