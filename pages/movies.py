@@ -326,6 +326,28 @@ def movies_page(t: str = ""):
                 render_movie_detail(movie_id, refresh_outer=refresh_all, on_close=detail_dlg.close)
             detail_dlg.open()
 
+        list_dlg = ui.dialog()   # KPI『失败』点开的种子清单（对齐番剧页）
+
+        def _open_failed():
+            """失败 KPI 点开：列出失败/停滞的版本，点片名进详情页补下重试 / 忽略。"""
+            list_dlg.clear()
+            rows = mov.failed_rows()
+            with list_dlg, ui.card().classes("w-full").style("max-width:720px"):
+                ui.label(f"失败 · {len(rows)}").classes("text-base font-bold")
+                ui.label("下载失败过的版本（取种/发送失败）。点片名进详情页补下重试 / 忽略。").classes(
+                    "text-xs text-gray-400")
+                if not rows:
+                    ui.label("（空）").classes("text-gray-500 p-2")
+                for r in rows:
+                    with ui.column().classes("gap-0 w-full py-1").style(
+                            "border-bottom:1px solid rgba(255,255,255,.08)"):
+                        ui.label(r["name"]).classes(
+                            "text-sm text-blue-400 cursor-pointer hover:underline").on(
+                            "click", lambda mid=r["movie_id"]: open_detail(mid))  # 不关本弹窗，详情叠上面
+                        ui.label(r["raw"] or "—").classes("text-xs text-gray-500 break-all")
+                ui.button("关闭", on_click=list_dlg.close).props("flat")
+            list_dlg.open()
+
         # ---- 事件 ----
         async def _scan(year_in, sel):
             yr = int(year_in.value or datetime.now().year)
@@ -456,7 +478,7 @@ def movies_page(t: str = ""):
                        # 与同组其它三张不同量纲，同页还有另外两个口径不同的『已下』）
                        ("已交付", ov["status"]["sent"], "green", None),
                        ("可下载", ov["status"]["pending"], "blue", None),
-                       ("失败", ov["status"]["error"], "red", None),
+                       ("失败", ov["status"]["error"], "red", _open_failed),
                        ("版本", k["versions"], "", None)])
             if not ov["config"]["qb"]:
                 warn_banner("qB 未启用：剧场版也只采集不下载（设置页开 QB_ENABLED 后生效）")
