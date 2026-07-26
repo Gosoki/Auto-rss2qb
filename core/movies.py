@@ -668,3 +668,18 @@ async def delete_movie_torrent(mt_id: int) -> bool:
 async def sync_qb_status() -> int:
     """从 qB 同步剧场版种子实时态。"""
     return await engine.sync_qb_status(MovieTorrent)
+
+
+def failed_rows() -> list[dict]:
+    """status∈{error, stalled}（下载失败过 / 长期停滞）的版本，供 KPI『失败』点开查看、进详情页处理。
+    对齐番剧的 anime.failed_rows：一次取种子 + 批量取片名，避免逐条查库。"""
+    with get_session() as s:
+        ts = list(s.exec(select(MovieTorrent)
+                         .where(MovieTorrent.status.in_(["error", "stalled"]))
+                         .order_by(MovieTorrent.created_at.desc())))
+        ids = {t.movie_id for t in ts if t.movie_id}
+        names = ({m.id: (m.display_name or m.title) for m in
+                  s.exec(select(Movie).where(Movie.id.in_(ids)))} if ids else {})
+    return [{"id": t.id, "movie_id": t.movie_id,
+             "name": names.get(t.movie_id) or (t.raw_title or "?"),
+             "raw": t.raw_title or ""} for t in ts]
