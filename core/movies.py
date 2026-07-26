@@ -506,7 +506,8 @@ async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
     """
     new_path = movie_save_path(movie_id)
     rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
-           "redownload": 0, "untracked": 0, "failed": 0}
+           "redownload": 0, "untracked": 0, "failed": 0,
+           "stalled_kept": 0}   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
     if new_path is None:
         rep["error"] = "算不出新路径（越界或无片）"
         return rep
@@ -518,14 +519,33 @@ async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
     if not pairs:
         return rep
 
-    def _clear(ids):   # 清完成状态→pending，等人工重下到新目录
+    def _clear(ids) -> int:
+        """搬不动时把行清成 pending 等人工重下到新目录。返回【实际改了几行】。
+
+        与番剧同口径：只降级仍被 qB 跟踪的行(TRACKED)，stalled 保持原样——降成 pending 会抹掉
+        『⚠️停滞』提示、让卡片『已下 N』凭空少一，并使详情页删除按钮消失（门槛是 HAVE），
+        旧目录的半成品成为 UI 删不掉的孤儿。停滞行原地不动，由报告单列提示用户。
+        """
+        changed = 0
         with get_session() as s:
             for tid in ids:
                 t = s.get(MovieTorrent, tid)
-                if t is not None and t.status in engine.HAVE_STATUSES:   # 必须与上面选行同集合
+                if t is not None and t.status in engine.TRACKED_STATUSES:
+                    # 连 qB 实时态一起清：否则这行虽已是『待重下』，UI 仍按残留的 qb_state/进度
+                    # 渲染成『已完成 100%』(qb_live_text 优先于 status)，用户看不出它需要重下。
+                    # 与 download_*_torrent 重下时的清理保持一致。
                     t.status = "pending"
+                    t.qb_state, t.qb_progress = "", 0.0
+                    t.qb_synced_at, t.qb_progress_at = None, None
                     s.add(t)
+                    changed += 1
             s.commit()
+        return changed
+
+    def _stalled_of(ids) -> int:
+        with get_session() as s:
+            return sum(1 for tid in ids
+                       if (t := s.get(MovieTorrent, tid)) is not None and t.status == "stalled")
 
     def _mark_moved(ids):
         with get_session() as s:
@@ -538,27 +558,27 @@ async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
 
     all_ids = [tid for tid, _ in pairs]
     if not config.QB_ENABLED:   # qB 关：只能清状态待重下 + 提醒
-        _clear(all_ids)
-        rep["redownload"] = len(all_ids)
+        rep["stalled_kept"] = _stalled_of(all_ids)
+        rep["redownload"] = _clear(all_ids)
         return rep
     info = await engine.qb.torrents_info([h for _, h in pairs])
     if info is None:            # qB 连不上：同上
-        _clear(all_ids)
-        rep["redownload"] = len(all_ids)
+        rep["stalled_kept"] = _stalled_of(all_ids)
+        rep["redownload"] = _clear(all_ids)
         return rep
     tracked = [(tid, h) for tid, h in pairs if h in info]
     untracked = [tid for tid, h in pairs if h not in info]
     if untracked:               # remove-on-complete 等：qB 已不认识 → 清状态待重下
-        _clear(untracked)
-        rep["untracked"] = rep["redownload"] = len(untracked)
+        rep["stalled_kept"] += _stalled_of(untracked)
+        rep["untracked"] = rep["redownload"] = _clear(untracked)
     if tracked:
         code = await engine.qb.set_location([h for _, h in tracked], new_path)
         if code == 200:
             _mark_moved([tid for tid, _ in tracked])
             rep["moved"] = len(tracked)
         elif code is None:      # 中途连不上：退回清状态待重下
-            _clear([tid for tid, _ in tracked])
-            rep["redownload"] += len(tracked)
+            rep["stalled_kept"] += _stalled_of([tid for tid, _ in tracked])
+            rep["redownload"] += _clear([tid for tid, _ in tracked])
         else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
             rep["failed"] = len(tracked)
             rep["fail_code"] = code

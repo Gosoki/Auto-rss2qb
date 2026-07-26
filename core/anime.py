@@ -26,9 +26,12 @@ log = logging.getLogger("autorss")
 # 串行化『选集→占位下载』，防止 worker flush 与 UI 补下并发对同一集重复放行
 _download_lock = asyncio.Lock()
 
-# 状态词表统一在 engine（两条线共用，见那里的定义与口径说明）；此处转出，供 pages 沿用 anime.HAVE_STATUSES
+# 状态词表统一在 engine（两条线共用，见那里的定义与口径说明）。此处把本模块用到的都转出：
+# 一是供 pages 沿用 anime.HAVE_STATUSES，二是让本文件内引用风格一致（全用不带前缀的名字）。
+TRACKED_STATUSES = engine.TRACKED_STATUSES
 HAVE_STATUSES = engine.HAVE_STATUSES
 HANDLED_STATUSES = engine.HANDLED_STATUSES
+DOWNLOADABLE_STATUSES = engine.DOWNLOADABLE_STATUSES
 
 
 def _anime_path_parts(a, t=None):
@@ -68,7 +71,7 @@ def quarter_brief() -> list[dict]:
             "ignored": sum(1 for conf, rej, bid in aq if rej),                 # 已忽略
             "torrents": sum(qc.values()),
             "done": qc.get("sent", 0),
-            "pending": sum(qc.get(k, 0) for k in engine.DOWNLOADABLE_STATUSES),
+            "pending": sum(qc.get(k, 0) for k in DOWNLOADABLE_STATUSES),
         })
     return out
 
@@ -297,7 +300,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
                 return False
             if t.status in engine.TRACKED_STATUSES and not (force and t.archived_at is not None):
                 return False  # 已在下/已下：幂等短路（force 也不例外）。例外：已归档的可 force 重新下（重新交回 qB）
-            if not force and t.status not in engine.DOWNLOADABLE_STATUSES:
+            if not force and t.status not in DOWNLOADABLE_STATUSES:
                 return False  # 非 force：只放行 pending/error；skipped/deleted 需 force 才强制下
             anime_id = t.anime_id
             episode = t.episode
@@ -765,7 +768,7 @@ def reject_anime(anime_id: int) -> None:
         s.add(a)
         for t in s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(engine.DOWNLOADABLE_STATUSES),
+            AnimeTorrent.status.in_(DOWNLOADABLE_STATUSES),
         )):
             t.status = "skipped"
             s.add(t)
@@ -1029,7 +1032,7 @@ async def download_pending_for_anime(anime_id: int) -> int:
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
-    pending = [t for t in all_rows if t.status in engine.DOWNLOADABLE_STATUSES]
+    pending = [t for t in all_rows if t.status in DOWNLOADABLE_STATUSES]
     if pref:  # 锁定源：只补锁定组的待下集（硬锁、不兜底）
         pending = [t for t in pending if pref == (t.source or "")]
     if kw:     # 版本关键词：再过滤到命中该版本的（繁日/简日/画质…；硬锁、不兜底）
@@ -1055,7 +1058,7 @@ def download_plan(anime_id: int) -> set[int]:
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
-    pending = [t for t in all_rows if t.status in engine.DOWNLOADABLE_STATUSES]
+    pending = [t for t in all_rows if t.status in DOWNLOADABLE_STATUSES]
     if pref:
         pending = [t for t in pending if pref == (t.source or "")]
     if kw:
@@ -1078,7 +1081,7 @@ def download_plan_for_ids(anime_ids) -> set[int]:
     by_anime: dict = {}
     have_by_anime: dict = {}
     for t in rows:
-        if t.status in engine.DOWNLOADABLE_STATUSES:
+        if t.status in DOWNLOADABLE_STATUSES:
             by_anime.setdefault(t.anime_id, []).append(t)
         elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
@@ -1178,7 +1181,7 @@ def set_torrent_episode(torrent_id: int, episode: float) -> bool:
     只动未下载的(pending/error)；改完仍是待下，由 flush / 补下本番按新集号处理。返回是否改了。"""
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in engine.DOWNLOADABLE_STATUSES:
+        if t is None or t.status not in DOWNLOADABLE_STATUSES:
             return False
         t.episode = episode
         s.add(t)
@@ -1192,7 +1195,7 @@ def exclude_torrent(torrent_id: int) -> bool:
     unexclude_torrent 撤销。只动未下载的(pending/error)。返回是否排除了。"""
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in engine.DOWNLOADABLE_STATUSES:
+        if t is None or t.status not in DOWNLOADABLE_STATUSES:
             return False
         t.status = "excluded"
         s.add(t)
@@ -1227,7 +1230,7 @@ async def download_all_pending() -> int:
     by_anime: dict = {}
     have_by_anime: dict = {}
     for t in rows:
-        if t.status in engine.DOWNLOADABLE_STATUSES:
+        if t.status in DOWNLOADABLE_STATUSES:
             by_anime.setdefault(t.anime_id, []).append(t)
         elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
@@ -1392,7 +1395,8 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
     """
     new_path = anime_save_path(anime_id)
     rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
-           "redownload": 0, "untracked": 0, "failed": 0}
+           "redownload": 0, "untracked": 0, "failed": 0,
+           "stalled_kept": 0}   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
     if new_path is None:
         rep["error"] = "算不出新路径（越界或无番）"
         return rep
@@ -1404,14 +1408,36 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
     if not pairs:
         return rep
 
-    def _clear(ids):   # 清完成状态→pending，等 flush 重下到新目录
+    def _clear(ids) -> int:
+        """搬不动时把行清成 pending，等 flush 重下到新目录。返回【实际改了几行】。
+
+        只降级仍被 qB 跟踪的行(TRACKED)。stalled 有意保持原样——它是『等人工处理』的标记，
+        降成 pending 会：① 让停滞集重回自动队列，flush 还可能挑中同集别的源＝对停滞集自动换源
+        （engine 状态词表明令禁止）；② 抹掉『⚠️停滞』提示；③ 详情页删除按钮门槛是 HAVE，
+        变 pending 后按钮消失，旧目录的半成品成了 UI 删不掉的孤儿。
+        故停滞行原地不动，由调用方在报告里单列，提示用户其文件仍在旧目录。
+        返回真实改动数是为了让报告不说谎（说要重下 N 条，就得真有 N 条被清）。
+        """
+        changed = 0
         with get_session() as s:
             for tid in ids:
                 t = s.get(AnimeTorrent, tid)
-                if t is not None and t.status in HAVE_STATUSES:   # 必须与上面选行同集合，否则停滞行被计数却没动
+                if t is not None and t.status in TRACKED_STATUSES:
+                    # 连 qB 实时态一起清：否则这行虽已是『待重下』，UI 仍按残留的 qb_state/进度
+                    # 渲染成『已完成 100%』(qb_live_text 优先于 status)，用户看不出它需要重下。
+                    # 与 download_*_torrent 重下时的清理保持一致。
                     t.status = "pending"
+                    t.qb_state, t.qb_progress = "", 0.0
+                    t.qb_synced_at, t.qb_progress_at = None, None
                     s.add(t)
+                    changed += 1
             s.commit()
+        return changed
+
+    def _stalled_of(ids) -> int:
+        with get_session() as s:
+            return sum(1 for tid in ids
+                       if (t := s.get(AnimeTorrent, tid)) is not None and t.status == "stalled")
 
     def _mark_moved(ids):
         with get_session() as s:
@@ -1424,27 +1450,27 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
 
     all_ids = [tid for tid, _ in pairs]
     if not config.QB_ENABLED:   # qB 关：只能清状态待重下 + 提醒
-        _clear(all_ids)
-        rep["redownload"] = len(all_ids)
+        rep["stalled_kept"] = _stalled_of(all_ids)
+        rep["redownload"] = _clear(all_ids)
         return rep
     info = await engine.qb.torrents_info([h for _, h in pairs])
     if info is None:            # qB 连不上：同上
-        _clear(all_ids)
-        rep["redownload"] = len(all_ids)
+        rep["stalled_kept"] = _stalled_of(all_ids)
+        rep["redownload"] = _clear(all_ids)
         return rep
     tracked = [(tid, h) for tid, h in pairs if h in info]
     untracked = [tid for tid, h in pairs if h not in info]
     if untracked:               # remove-on-complete 等：qB 已不认识 → 清状态待重下
-        _clear(untracked)
-        rep["untracked"] = rep["redownload"] = len(untracked)
+        rep["stalled_kept"] += _stalled_of(untracked)
+        rep["untracked"] = rep["redownload"] = _clear(untracked)
     if tracked:
         code = await engine.qb.set_location([h for _, h in tracked], new_path)
         if code == 200:
             _mark_moved([tid for tid, _ in tracked])
             rep["moved"] = len(tracked)
         elif code is None:      # 中途连不上：退回清状态待重下
-            _clear([tid for tid, _ in tracked])
-            rep["redownload"] += len(tracked)
+            rep["stalled_kept"] += _stalled_of([tid for tid, _ in tracked])
+            rep["redownload"] += _clear([tid for tid, _ in tracked])
         else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
             rep["failed"] = len(tracked)
             rep["fail_code"] = code
