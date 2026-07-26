@@ -84,7 +84,7 @@ async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
     new_path = mov.movie_save_path(movie_id)
     if not new_path or new_path == old_path:
         return   # 路径没变，无需移动
-    dl = [t for t in mov.movie_torrents(movie_id) if t.status in ("sent", "downloading")]
+    dl = [t for t in mov.movie_torrents(movie_id) if t.status in engine.HAVE_STATUSES]
     if not dl:
         ui.notify("归档目录已更新（无已下文件，新版本将下到新目录）", type="positive")
         return
@@ -181,7 +181,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                             "size=sm flat dense color=negative").tooltip(
                             "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
                             else "删除这一版本的文件（qB+硬盘，不可撤销）")
-                    if t.status in ("pending", "error"):   # 未下载的可直接排除
+                    if t.status in engine.DOWNLOADABLE_STATUSES:   # 未下载的可直接排除
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "size=sm flat dense color=grey").style("font-size:12px").tooltip(
                             "不想要这版本：从可下排除（不删文件，只改状态；可恢复）")
@@ -399,7 +399,11 @@ def movies_page(t: str = ""):
             ui.notify(f"已保存：自动扫描{on}，每 {secs // 3600} 小时一次", type="positive")
 
         def _movie_card(m, ts):
-            ndone = sum(1 for t in ts if t.status in ("sent", "downloading"))
+            # "已下 N" = 这部片有几个版本已经落到盘上（含停滞的半成品）——与同页搬迁框的
+            # "{n} 个版本已下"(87 行)、详情页"删除文件"按钮的门槛(178 行) 同集合，三者可互相校验。
+            # 不用 TRACKED：sent→stalled 只是引擎停止轮询的内部决定，盘上文件一点没变，
+            # 若跟着 TRACKED 走，这个数字会无缘无故从 1 掉到 0，还把占空间的半成品藏起来。
+            ndone = sum(1 for t in ts if t.status in engine.HAVE_STATUSES)
             srcs = sorted({t.source for t in ts if t.source})
             with ui.card().classes("w-full"):
                 with ui.row().classes("gap-3 items-start no-wrap w-full"):

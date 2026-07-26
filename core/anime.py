@@ -68,7 +68,7 @@ def quarter_brief() -> list[dict]:
             "ignored": sum(1 for conf, rej, bid in aq if rej),                 # 已忽略
             "torrents": sum(qc.values()),
             "done": qc.get("sent", 0),
-            "pending": qc.get("pending", 0) + qc.get("error", 0),
+            "pending": sum(qc.get(k, 0) for k in engine.DOWNLOADABLE_STATUSES),
         })
     return out
 
@@ -295,9 +295,9 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             t = s.get(AnimeTorrent, torrent_id)
             if t is None:
                 return False
-            if t.status in ("downloading", "sent") and not (force and t.archived_at is not None):
+            if t.status in engine.TRACKED_STATUSES and not (force and t.archived_at is not None):
                 return False  # 已在下/已下：幂等短路（force 也不例外）。例外：已归档的可 force 重新下（重新交回 qB）
-            if not force and t.status not in ("pending", "error"):
+            if not force and t.status not in engine.DOWNLOADABLE_STATUSES:
                 return False  # 非 force：只放行 pending/error；skipped/deleted 需 force 才强制下
             anime_id = t.anime_id
             episode = t.episode
@@ -314,8 +314,8 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
                 dup = s.exec(select(AnimeTorrent).where(
                     AnimeTorrent.anime_id == anime_id,
                     AnimeTorrent.episode == episode,
-                    AnimeTorrent.status.in_(["downloading", "sent"]),
-                    AnimeTorrent.id != torrent_id,
+                    AnimeTorrent.status.in_(HAVE_STATUSES),   # 含 stalled：instant 路径不经 flush 的 have_eps，
+                    AnimeTorrent.id != torrent_id,           # 这里是它唯一的集去重闸，口径必须与 flush 一致
                 )).first()
                 if dup is not None:
                     t.status = "skipped"
@@ -552,9 +552,9 @@ def overview() -> dict:
         },
         # 八种应用侧 status 全列（含 deleted/excluded）：仪表盘『种子数』号称"各状态之和"，
         # 漏列任何一种都会让页面数字对不上——用户用了『已删除/已排除』后尤其明显。
-        "status": {k: status.get(k, 0) for k in
-                   ("sent", "downloading", "pending", "error",
-                    "skipped", "stalled", "deleted", "excluded")},
+        # 八状态【全集】取自 engine，别再手抄：仪表盘对用户承诺"种子数 = 各状态之和"，
+        # 将来加第 9 个状态时漏改这里，页面数字就会静默对不上（且不报错）
+        "status": {k: status.get(k, 0) for k in engine.ALL_STATUSES},
         "pending_split": split,
         "by_quarter": by_quarter,
         "by_quarter_state": by_quarter_state,
@@ -765,7 +765,7 @@ def reject_anime(anime_id: int) -> None:
         s.add(a)
         for t in s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(["pending", "error"]),
+            AnimeTorrent.status.in_(engine.DOWNLOADABLE_STATUSES),
         )):
             t.status = "skipped"
             s.add(t)
@@ -1029,7 +1029,7 @@ async def download_pending_for_anime(anime_id: int) -> int:
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
-    pending = [t for t in all_rows if t.status in ("pending", "error")]
+    pending = [t for t in all_rows if t.status in engine.DOWNLOADABLE_STATUSES]
     if pref:  # 锁定源：只补锁定组的待下集（硬锁、不兜底）
         pending = [t for t in pending if pref == (t.source or "")]
     if kw:     # 版本关键词：再过滤到命中该版本的（繁日/简日/画质…；硬锁、不兜底）
@@ -1055,7 +1055,7 @@ def download_plan(anime_id: int) -> set[int]:
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
-    pending = [t for t in all_rows if t.status in ("pending", "error")]
+    pending = [t for t in all_rows if t.status in engine.DOWNLOADABLE_STATUSES]
     if pref:
         pending = [t for t in pending if pref == (t.source or "")]
     if kw:
@@ -1078,7 +1078,7 @@ def download_plan_for_ids(anime_ids) -> set[int]:
     by_anime: dict = {}
     have_by_anime: dict = {}
     for t in rows:
-        if t.status in ("pending", "error"):
+        if t.status in engine.DOWNLOADABLE_STATUSES:
             by_anime.setdefault(t.anime_id, []).append(t)
         elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
@@ -1177,7 +1177,7 @@ def set_torrent_episode(torrent_id: int, episode: float) -> bool:
     只动未下载的(pending/error)；改完仍是待下，由 flush / 补下本番按新集号处理。返回是否改了。"""
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in ("pending", "error"):
+        if t is None or t.status not in engine.DOWNLOADABLE_STATUSES:
             return False
         t.episode = episode
         s.add(t)
@@ -1191,7 +1191,7 @@ def exclude_torrent(torrent_id: int) -> bool:
     unexclude_torrent 撤销。只动未下载的(pending/error)。返回是否排除了。"""
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in ("pending", "error"):
+        if t is None or t.status not in engine.DOWNLOADABLE_STATUSES:
             return False
         t.status = "excluded"
         s.add(t)
@@ -1226,7 +1226,7 @@ async def download_all_pending() -> int:
     by_anime: dict = {}
     have_by_anime: dict = {}
     for t in rows:
-        if t.status in ("pending", "error"):
+        if t.status in engine.DOWNLOADABLE_STATUSES:
             by_anime.setdefault(t.anime_id, []).append(t)
         elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
@@ -1398,7 +1398,7 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
     with get_session() as s:
         pairs = [(t.id, t.info_hash) for t in s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(["sent", "downloading"]),
+            AnimeTorrent.status.in_(HAVE_STATUSES),   # 含 stalled：半成品也在盘上，同样要搬
             AnimeTorrent.archived_at.is_(None)))]   # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
     if not pairs:
         return rep
@@ -1407,7 +1407,7 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
         with get_session() as s:
             for tid in ids:
                 t = s.get(AnimeTorrent, tid)
-                if t is not None and t.status in ("sent", "downloading"):
+                if t is not None and t.status in HAVE_STATUSES:   # 必须与上面选行同集合，否则停滞行被计数却没动
                     t.status = "pending"
                     s.add(t)
             s.commit()

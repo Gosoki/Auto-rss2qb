@@ -292,6 +292,9 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
             parts.append(f"↓{human_size(qb_dlspeed)}/s")
         return " ".join(parts), ("green" if pr >= 1 else "teal")
     if in_plan is not None:
+        # 下面这两支是 engine.DOWNLOADABLE_STATUSES 的【渲染侧对偶】：调用方(pages/anime.py)按同一集合
+        # 决定要不要算 in_plan，这里再逐个状态分支出文案。它不是集合判断故无法直接引用常量——
+        # 将来往 DOWNLOADABLE_STATUSES 加成员时，这里必须同步加分支，否则新状态会静默掉进下面的兜底。
         if status == "pending":
             if not confirmed:
                 return "待确认", "orange"

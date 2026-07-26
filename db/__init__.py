@@ -105,14 +105,17 @@ def _migrate_inflight_indexes() -> None:
     注意：partial index 的谓词里写死了状态名，而 `CREATE INDEX IF NOT EXISTS` 对【已存在】的同名索引
     什么都不做——状态改名后老库会留着谓词过时的旧索引（永不命中，白占空间且悄悄失去加速）。
     故先比对 sqlite_master 里的实际 SQL，谓词对不上就 DROP 重建；一致则原样跳过，不做无谓重建。
+
+    谓词里的状态集【由 engine.TRACKED_STATUSES 拼出】，不再手抄——它必须与 _inflight_where 的第一个
+    条件逐字对齐，两边各写一份的话改了 engine 这里不会报错，只会静默失去索引加速。
     """
+    from core.engine import TRACKED_STATUSES   # 延迟导入：db 是底层，engine 依赖 db
+    states = ",".join(f"'{s}'" for s in TRACKED_STATUSES)
     want = {
-        "ix_animetorrent_inflight":
-            "CREATE INDEX ix_animetorrent_inflight ON animetorrent(status, qb_progress) "
-            "WHERE status IN ('sent','downloading') AND qb_progress < 1.0",
-        "ix_movietorrent_inflight":
-            "CREATE INDEX ix_movietorrent_inflight ON movietorrent(status, qb_progress) "
-            "WHERE status IN ('sent','downloading') AND qb_progress < 1.0",
+        f"ix_{table}_inflight":
+            f"CREATE INDEX ix_{table}_inflight ON {table}(status, qb_progress) "
+            f"WHERE status IN ({states}) AND qb_progress < 1.0"
+        for table in ("animetorrent", "movietorrent")
     }
     with engine.begin() as conn:
         for name, stmt in want.items():

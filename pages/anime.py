@@ -396,12 +396,12 @@ def anime_page(t: str = ""):
             # 待下/失败行标『将下载/备用』：只给『已确认』的番批量算 download_plan（每番一查）；
             # 未确认（待确认）的番不算、显示『待确认』——它要点确认才会下，标将下载是假的。
             pend_aids = {r["anime_id"] for r in raw
-                         if r["status"] in ("pending", "error") and r["anime_id"]}
+                         if r["status"] in engine.DOWNLOADABLE_STATUSES and r["anime_id"]}
             confirmed = anime.confirmed_anime_ids(pend_aids)
             plan_ids = anime.download_plan_for_ids(confirmed)   # 批量一次算完，避免每番一查(N+1)
             rows = []
             for r in raw:
-                if r["status"] in ("pending", "error"):
+                if r["status"] in engine.DOWNLOADABLE_STATUSES:
                     conf = r["anime_id"] in confirmed
                     in_plan = r["id"] in plan_ids
                 else:

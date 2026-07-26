@@ -131,7 +131,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
                 # 第一行：集号 · 字幕组 · 时间 同一行居中（天然竖直齐平），状态/按钮 space() 推到最右
                 with ui.row().classes("items-center gap-3 w-full text-sm flex-wrap"):
-                    if t.status in ("pending", "error"):  # 待下/失败的集号都可点改：不止 -2，
+                    if t.status in engine.DOWNLOADABLE_STATUSES:  # 待下/失败的集号都可点改：不止 -2，
                         _neg = t.episode == -2                            # 解析也可能写错正整数(把分辨率/季号当集号)
                         ui.label(ep_txt).classes(
                             "shrink-0 cursor-pointer hover:underline"
@@ -174,7 +174,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
                             "size=sm flat dense color=primary").style("font-size:12px").tooltip(
                             "放回待下，重新参与下载/去重")
-                    if t.status in ("pending", "error"):  # 未下载的才可直接排除
+                    if t.status in engine.DOWNLOADABLE_STATUSES:  # 未下载的才可直接排除
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "size=sm flat dense color=grey").style("font-size:12px").tooltip(
                             "不想要这条：从待下直接排除（不删文件，只改状态；可撤销）")
@@ -288,7 +288,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if not new_path or new_path == old_path:
             return   # 路径没变，无需移动
         dl = [t for t in anime.list_episodes(anime_id)
-              if t.status in ("sent", "downloading")]
+              if t.status in engine.HAVE_STATUSES]
         if not dl:
             ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
             return

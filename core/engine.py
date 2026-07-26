@@ -31,17 +31,33 @@ _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _QUARTER_KEY_RE = re.compile(r"(\d{2})([A-D])")
 _TORRENT_CAP = 32 * 1024 * 1024  # .torrent 通常 < 1MB，32MB 已是极宽松上限
 
-# ---- 种子状态词表（TV 与剧场版共用的唯一来源；两条线 + 本模块都从这里取，别再各处手抄）----
-# 应用侧 status 全集：pending / downloading / sent / error / skipped / deleted / excluded / stalled
+# ==== 种子状态词表：全项目唯一真相（两条线 + 本模块 + pages 都从这里取，别再各处手抄）====
 #
-# 『该集已有一份、不再自动下』的权威判据（flush/plan/详情 covered/补下/跨表持有 统一用它）：
-#   sent/downloading=已交付或在下；stalled=停滞异常(留人工处理、不自动换源)。
-#   【不含 deleted】——用户删的那条不回来（靠其自身 deleted 终态：flush/plan 只挑 pending/error，永不选它），
-#   但同集来了新 hash 照常自动下（该集此时无 sent/downloading/stalled → 不被挡）。
-HAVE_STATUSES = ("sent", "downloading", "stalled")
-# 『该集已处理过、不复活去重落选的 skipped 兄弟』的判据（restore/换源兜底用）：在上者基础上【+deleted】——
-#   用户特意删过的集，其 skipped 兄弟不该被复活重下（与"deleted 不重下"一致）。
+# 应用侧 status 全集。加第 9 个状态时，下面每个子集都要重新想一遍该不该含它——
+# 这正是过去出事的地方：同一个集合被手抄十几份，加状态时漏改一处就静默失效（不报错、只是永远不匹配）。
+ALL_STATUSES = ("pending", "downloading", "sent", "error",
+                "skipped", "deleted", "excluded", "stalled")
+
+# 三个判据是【逐层包含】的，写成累加形式让关系一目了然，也防止某一层被单独改歪：
+#
+# ① TRACKED：『已交付给 qB，且仍归轮询跟踪』——只有这两个态会被 sync 拉取/计入 qB 实时统计。
+#    stalled 有意【不在】此列：它已被判停滞、脱离轮询、交人工处理。
+#    ⚠️ download_*_torrent 的幂等短路用它：stalled 若混进来，详情页对停滞种子点『下载』会静默无反应
+#      （那是人工抢救停滞种子的唯一入口）。
+TRACKED_STATUSES = ("sent", "downloading")
+# ② HAVE：『这一集盘上已经有一份』——在 ① 基础上 +stalled（停滞种子的半成品文件确实在盘上）。
+#    用于：集去重(flush/plan/instant 去重闸/补下)、跨表持有判断、删除、搬迁、详情页 covered。
+#    【不含 deleted】——用户删的那条不会自己回来（它自身是终态，flush/plan 只挑 pending/error 永不选它），
+#    但同集来了新 hash 照常自动下（该集此时不含本集合任一状态 → 不被挡）。
+HAVE_STATUSES = TRACKED_STATUSES + ("stalled",)
+# ③ HANDLED：『这一集处理过』——在 ② 基础上 +deleted。用于 restore / 换源兜底：
+#    用户特意删过的集，其被去重压成 skipped 的兄弟不该被复活重下。
 HANDLED_STATUSES = HAVE_STATUSES + ("deleted",)
+
+# 与上面三者互斥的另一维：『还没落盘、仍在待下队列』——可被下载选中，也可改集号/排除。
+# 不叫 RETRYABLE：failed_rows 用的 ("error","stalled") 才是直觉上的"可重试"，重名会诱使后人往这里加 stalled，
+# 而 stalled 一旦进来就会被自动重下/换源（正是 ② 要挡住的）。
+DOWNLOADABLE_STATUSES = ("pending", "error")
 
 # 写回 Anime/Movie 的 bgm 字段；多数两者同名，个别（duration=片长）仅剧场版有，靠下方 hasattr 跳过番剧
 _BGM_FIELDS = ("bangumi_id", "display_name", "jp_name", "air_date", "air_weekday",
@@ -426,7 +442,7 @@ def _inflight_where(model_cls):
     已交付(sent/downloading) 且 进度<100% 且 qB 态未落定(非做种/非文件缺失)。
     进度满/做种(已完成)/文件缺失 都算落定 → 不再轮询，qB 压力只随『当前在下数』走。"""
     return (
-        model_cls.status.in_(["sent", "downloading"]),
+        model_cls.status.in_(TRACKED_STATUSES),
         model_cls.qb_progress < 1.0,
         func.coalesce(model_cls.qb_state, "").not_in(_QB_SETTLED_LIST),
     )
@@ -536,7 +552,7 @@ async def sync_qb_status(model_cls) -> int:
     with get_session() as s:
         for tid, h, was_synced in rows:
             t = s.get(model_cls, tid)
-            if t is None or t.status not in ("sent", "downloading"):
+            if t is None or t.status not in TRACKED_STATUSES:
                 continue
             d = info.get(h)
             if d is None:
@@ -601,14 +617,14 @@ def qb_summary(model_cls) -> dict:
         grp = s.exec(
             select(model_cls.qb_state, func.count(), func.sum(model_cls.qb_dlspeed),
                    func.sum(model_cls.qb_progress))
-            .where(model_cls.status.in_(["sent", "downloading"]), model_cls.qb_state != "")
+            .where(model_cls.status.in_(TRACKED_STATUSES), model_cls.qb_state != "")
             .group_by(model_cls.qb_state)).all()
         # 『已完成』按【进度满】判，不按 qB 态判：种子一到 100% 就脱离 in-flight、此后不再同步，
         # 其 qb_state 会永久冻结在最后一次同步到的值。开了 temp_path 时完成瞬间是 moving(搬运中)，
         # 若按做种态判就会把这些行永久算作『跟踪中但未完成』，仪表盘已完成数长期少记。进度是唯一可靠依据。
         # 唯一例外 missingFiles：进度虽记着 1.0，但文件已从盘上消失，不该报成『已完成』（只在跟踪数里体现）。
         completed = s.exec(select(func.count()).select_from(model_cls).where(
-            model_cls.status.in_(["sent", "downloading"]),
+            model_cls.status.in_(TRACKED_STATUSES),
             model_cls.qb_state != "", model_cls.qb_state != "missingFiles",
             model_cls.qb_progress >= 1.0)).one()
     tracked = downloading = dlspeed = 0

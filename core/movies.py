@@ -207,9 +207,9 @@ def overview() -> dict:
         },
         "by_quarter": [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs],
         # 八种应用侧 status 全列（含 deleted/excluded），与番剧侧同口径：仪表盘『种子数』号称"各状态之和"
-        "status": {k: status.get(k, 0) for k in
-                   ("sent", "downloading", "pending", "error",
-                    "skipped", "stalled", "deleted", "excluded")},
+        # 八状态【全集】取自 engine，别再手抄：仪表盘对用户承诺"种子数 = 各状态之和"，
+        # 将来加第 9 个状态时漏改这里，页面数字就会静默对不上（且不报错）
+        "status": {k: status.get(k, 0) for k in engine.ALL_STATUSES},
         "qb": engine.qb_summary(MovieTorrent),
         "config": {"qb": config.QB_ENABLED},
     }
@@ -244,7 +244,7 @@ def year_brief() -> list[dict]:
             "ignored": sum(1 for rej, bid in mv if rej),               # 已忽略
             "versions": sum(qc.values()),
             "done": qc.get("sent", 0),
-            "pending": qc.get("pending", 0) + qc.get("error", 0),
+            "pending": sum(qc.get(k, 0) for k in engine.DOWNLOADABLE_STATUSES),
         })
     return out
 
@@ -355,7 +355,8 @@ def reject_movie(movie_id: int) -> None:
         m.rejected = True
         s.add(m)
         for t in s.exec(select(MovieTorrent).where(
-                MovieTorrent.movie_id == movie_id, MovieTorrent.status.in_(["pending", "error"]))):
+                MovieTorrent.movie_id == movie_id,
+                MovieTorrent.status.in_(engine.DOWNLOADABLE_STATUSES))):
             t.status = "skipped"
             s.add(t)
         s.commit()
@@ -405,7 +406,7 @@ def exclude_torrent(mt_id: int) -> bool:
     不再显示在可下队列、RSS 再遇到同 hash 也不重收；可用 unexclude_torrent 撤销。只动 pending/error。"""
     with get_session() as s:
         t = s.get(MovieTorrent, mt_id)
-        if t is None or t.status not in ("pending", "error"):
+        if t is None or t.status not in engine.DOWNLOADABLE_STATUSES:
             return False
         t.status = "excluded"
         s.add(t)
@@ -512,7 +513,7 @@ async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
     with get_session() as s:
         pairs = [(t.id, t.info_hash) for t in s.exec(select(MovieTorrent).where(
             MovieTorrent.movie_id == movie_id,
-            MovieTorrent.status.in_(["sent", "downloading"]),
+            MovieTorrent.status.in_(engine.HAVE_STATUSES),   # 含 stalled：半成品也在盘上，同样要搬
             MovieTorrent.archived_at.is_(None)))]   # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
     if not pairs:
         return rep
@@ -521,7 +522,7 @@ async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
         with get_session() as s:
             for tid in ids:
                 t = s.get(MovieTorrent, tid)
-                if t is not None and t.status in ("sent", "downloading"):
+                if t is not None and t.status in engine.HAVE_STATUSES:   # 必须与上面选行同集合
                     t.status = "pending"
                     s.add(t)
             s.commit()
@@ -582,7 +583,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
     async with _dl_lock:
         with get_session() as s:
             t = s.get(MovieTorrent, mt_id)
-            if t is None or (t.status in ("downloading", "sent") and t.archived_at is None):
+            if t is None or (t.status in engine.TRACKED_STATUSES and t.archived_at is None):
                 return False  # 已在下/已下 → 幂等短路，防并发重复交 qB；例外：已归档的可重新下（重新交回 qB）
             # 跨表【不】去重：剧场版/番剧各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer。
