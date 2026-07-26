@@ -227,6 +227,19 @@ async def _resolve_anime(item) -> int:
         return anime.id
 
 
+def _warn_unknown_episode(it) -> None:
+    """集号没解析出来（-2）时报一次。
+
+    只在【真正新入库】的种子上调用，所以一个种子一辈子只有一条。曾放在
+    sources/nyaa.py 的 _parse 里——那是解析层，每轮抓取对 feed 里每条都跑一遍、
+    且在 hash 去重之前，于是同一个种子每 20 分钟复报一次，直到它滑出 RSS 窗口
+    （实测一条剧场版刷了 160+ 条）。-2 本身是设计内的一等状态（models 里就是默认值、
+    有『未知集』KPI 可点开处理），日志只需留痕、不该当持续告警。
+    """
+    if it.episode == -2:
+        log.warning("集数解析失败 - %s", it.raw_title)
+
+
 async def process_item(item) -> bool:
     """处理一条标准条目。返回 True 表示是新种子（之前没见过）。"""
     # 1) 种子级去重：同一 hash 见过就跳过（跨源相等）
@@ -292,6 +305,7 @@ async def process_item(item) -> bool:
         kw = a.pref_keyword if a else None     # 版本关键词：即时下载也只放行命中该版本的
 
     log.info("新增 - %s - %s 第%s季 第%s集", item.source, item.anime_title, item.season, item.episode)
+    _warn_unknown_episode(item)
     # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 + (未锁源或正是锁定源) → 入库就下，不等缓冲窗口。
     # 排除 -2(未知/批量)：与 flush 一致留人工处理，别让它是否被下取决于来源组优先级（instant 下、flush 不下）。
     if (config.ANIME_TOP_PRIORITY_INSTANT and should_download
@@ -1367,6 +1381,7 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
             try:
                 s.commit()
                 ingested += 1
+                _warn_unknown_episode(it)   # 补齐是第二个入库口，不走 process_item
             except IntegrityError:
                 s.rollback()
         if ingested and not a_now.rejected:   # 有新货且未忽略(实时态) → 转待确认，复用审核流、别自动下

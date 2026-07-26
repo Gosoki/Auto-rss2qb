@@ -89,9 +89,6 @@ class NyaaSource(Source):
                 return None  # 番名解析为空（如纯多括号格式）→ 无法定位/去重，跳过免撞库
             if self.subgroups and not any(g in group for g in self.subgroups):
                 return None  # 不在白名单的字幕组
-            if episode == -2:
-                log.warning("集数解析失败 - %s", raw_title)
-
             release_time = None
             # 用 feedparser 已解析的 published_parsed（C 层解析、与进程 LC_TIME 无关），与 mikan 一致。
             # 曾用 datetime.strptime(含 %a/%b 英文缩写)：非英文 locale(如 ja_JP.UTF-8)下会 ValueError→丢 release_time，
