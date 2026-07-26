@@ -26,12 +26,13 @@ DATA_DIR.mkdir(exist_ok=True)
 
 # ---- 结构性/绑定项：走 .env，改了需重启（DB_PATH 是启动 DB 的前提，WEB_HOST/WEB_PORT 绑监听）----
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "autorss.db"))
+_WEB_PORT_DEFAULT = 2333
 try:
-    WEB_PORT = int(os.getenv("WEB_PORT", "8080") or "8080")
+    WEB_PORT = int(os.getenv("WEB_PORT", str(_WEB_PORT_DEFAULT)) or _WEB_PORT_DEFAULT)
     if not (1 <= WEB_PORT <= 65535):     # 超范围端口 ui.run 会绑定失败起不来 → 回落默认
-        WEB_PORT = 8080
+        WEB_PORT = _WEB_PORT_DEFAULT
 except ValueError:
-    WEB_PORT = 8080
+    WEB_PORT = _WEB_PORT_DEFAULT
 # 监听地址：空/未设=只本机(127.0.0.1)。0.0.0.0=整个局域网可访问——本工具无鉴权、含 qB 密码，慎改（见设置页提示）
 WEB_HOST = os.getenv("WEB_HOST") or "127.0.0.1"
 try:

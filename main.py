@@ -1,6 +1,6 @@
 """入口：初始化数据库、启动后台轮询器、跑 NiceGUI 界面。
 
-运行： python main.py    然后浏览器打开 http://<host>:8080
+运行： python main.py    然后浏览器打开 http://<host>:2333
 """
 import asyncio
 import logging

@@ -13,7 +13,7 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env      # 可选：只放 Web 端口等结构项
-python main.py            # 浏览器打开 http://<host>:8080
+python main.py            # 浏览器打开 http://<host>:2333
 ```
 
 需要 **Python ≥ 3.10**（代码用了 PEP 604 的 `str | None`）。
