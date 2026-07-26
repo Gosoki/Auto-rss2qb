@@ -10,6 +10,12 @@ from nicegui import ui
 import config
 from core import engine
 
+# 下拉恒为『锚在输入框下方的菜单』。Quasar 的 behavior 默认值是 default，判定是
+# `platform.is.mobile !== true && behavior !== "dialog" ? false : behavior !== "menu" && …`——
+# 即手机/平板上默认翻成顶部弹出的全宽 dialog（带一个没用的只读输入框），跟桌面端两副样子。
+# 定死 menu，所有 ui.select（含以后新加的）在任何设备上都是同一个下拉。
+ui.select.default_props("behavior=menu")
+
 NAV = [("manage", "动漫番剧", "/"), ("movies", "OVA・剧场版", "/movies"),
        ("parse", "解析测试", "/parse"), ("manual", "手动下载", "/manual"),
        ("logs", "运行日志", "/logs"), ("settings", "全局设置", "/settings")]
@@ -126,12 +132,19 @@ def kpi_cards(cards) -> None:
                         _card(card, grow=True)
 
 
-def qb_disabled_banner(text: str) -> None:
-    """qB 未启用时的 amber 提醒横幅；text 为各页自定文案。"""
-    with ui.row().classes("items-center gap-2 p-2 rounded w-full").style(
+def warn_banner(text: str) -> None:
+    """全站唯一的警告块：amber-400 文字 + 同色 12% 底 + Material warning 图标。
+
+    提示文本分两级，别再各写各的：中性说明＝text-xs text-gray-500 的裸 label；
+    需要用户注意的＝这个块。图标由本函数出，文案里不要再带 ⚠️。
+    多行长文（如设置页那两条）图标顶部对齐、只有文字缩进换行。
+    """
+    with ui.row().classes("items-start gap-2 p-2 rounded w-full no-wrap").style(
             "background:oklch(82.8% 0.189 84.429 / .12)"):   # amber-400 @ 12%
-        ui.icon("warning").classes("text-amber-400")
-        ui.label(text).classes("text-sm text-amber-400")
+        # 图标压到与 text-sm 同高(20px)并锁行高，才能跟首行文字齐平、也不被长文挤掉
+        ui.icon("warning").classes("text-amber-400 shrink-0").style(
+            "font-size:20px;line-height:20px")
+        ui.label(text).classes("text-sm text-amber-400 min-w-0")
 
 
 def recent_table(rows, name_label: str, on_row_click=None) -> None:

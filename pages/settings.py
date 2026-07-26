@@ -10,7 +10,7 @@ from nicegui import context, ui
 from core import anime, engine, netguard
 import config
 from sources.parse import format_quarter
-from .layout import confirm, frame
+from .layout import confirm, frame, warn_banner
 
 _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
@@ -218,9 +218,8 @@ def settings():
             _text("ANIME_DOWN_PATH", "动漫下载目录", config.ANIME_DOWN_PATH, _sub_ph)
             _text("MOVIE_DOWN_PATH", "电影下载目录", config.MOVIE_DOWN_PATH, _sub_ph)
             if config.QB_ENABLED and not engine.qb_is_local():
-                ui.label("⚠️ qB 在远程主机（非 127.0.0.1）：以上路径是【qB 主机上】的绝对路径，不是本机路径。"
-                         "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。").classes(
-                    "text-xs text-orange-500")
+                warn_banner("qB 在远程主机（非 127.0.0.1）：以上路径是【qB 主机上】的绝对路径，不是本机路径。"
+                            "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的下载文件夹命名。",
                              config.QUARTER_FMT_UI, empty_hint="留空＝跟随番剧下载文件夹命名", tpl_label="季度模板")
@@ -245,10 +244,9 @@ def settings():
                 _text("WEB_HOST", "绑定地址", config.WEB_HOST)
                 _num("WEB_PORT", "Web 端口", config.WEB_PORT)
                 _text("WEB_ALLOW_CIDRS", "允许网段(CIDR)", config.WEB_ALLOW_CIDRS)
-            ui.label("⚠ 本工具无鉴权、本页含 qB 密码。绑 0.0.0.0 时用『允许网段』把访问限定在可信内网（如 "
-                     "192.168.1.0/24，多个用逗号），即时生效、留空=不限制。本机恒放行；若新网段会把你当前访问挡在门外，"
-                     "保存时会被拦下。经反向代理时对端是代理 IP，此项应留空、鉴权交给代理。").classes(
-                "text-xs text-amber-400")
+            warn_banner("本工具无鉴权、本页含 qB 密码。绑 0.0.0.0 时用『允许网段』把访问限定在可信内网（如 "
+                        "192.168.1.0/24，多个用逗号），即时生效、留空=不限制。本机恒放行；若新网段会把你当前访问挡在门外，"
+                        "保存时会被拦下。经反向代理时对端是代理 IP，此项应留空、鉴权交给代理。")
 
             ui.separator()
             _section("高级（超时 / 站点地址 · 一般不用动）",

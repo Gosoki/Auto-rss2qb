@@ -109,7 +109,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             if not _sp:
                 ui.label("↓ 未配置下载目录").classes("text-gray-500 text-xs break-all min-w-0 text-right")
             elif _unident:
-                ui.label(f"⚠ 未识别，暂用解析名：{_sp}").classes(
+                ui.label(f"⚠️ 未识别，暂用解析名：{_sp}").classes(
                     "text-amber-400 text-xs break-all min-w-0 text-right").tooltip(
                     "该番还没匹配到 bgm，保存目录暂用种子解析名（可能不准）。建议先『绑定 bgm』或『重新识别』再下，"
                     "免得目录名不对、日后改季度/重绑还要搬文件")

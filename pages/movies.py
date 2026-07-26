@@ -13,8 +13,8 @@ from core import engine, movies as mov
 from sources.parse import SEASON_CN
 from .layout import (WEEKDAY_CN, barline, confirm, expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
-                     name_of, paginate, parse_bgm_id, qb_disabled_banner, qb_live_text,
-                     recent_table, torrent_status_cn)
+                     name_of, paginate, parse_bgm_id, qb_live_text,
+                     recent_table, torrent_status_cn, warn_banner)
 
 _TABS = ("overview", "list", "fail", "reject", "sources")
 
@@ -459,7 +459,7 @@ def movies_page(t: str = ""):
                        ("失败", ov["status"]["error"], "red", None),
                        ("版本", k["versions"], "", None)])
             if not ov["config"]["qb"]:
-                qb_disabled_banner("qB 未启用：剧场版也只采集不下载（设置页开 QB_ENABLED 后生效）")
+                warn_banner("qB 未启用：剧场版也只采集不下载（设置页开 QB_ENABLED 后生效）")
 
             # ── 各季度（电影数）──
             ui.label(f"各季度（电影数）· {len(ov['by_quarter'])}").classes("text-sm font-bold mt-3 pl-1")

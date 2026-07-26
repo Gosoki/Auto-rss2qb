@@ -12,8 +12,8 @@ from core import anime, engine
 import config
 from .layout import (confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
-                     platform_badge, qb_disabled_banner, recent_table, season_label,
-                     source_options)
+                     platform_badge, recent_table, season_label, source_options,
+                     warn_banner)
 from .sources import render_sources
 
 
@@ -73,7 +73,7 @@ def anime_page(t: str = ""):
 
             # ── qB 未启用提醒 ──
             if not ov["config"]["qb"]:
-                qb_disabled_banner("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）")
+                warn_banner("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）")
 
             # ── 订阅源组 ──
             ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
