@@ -30,7 +30,7 @@ def manual_page():
         up = {"bytes": None, "name": ""}
         st = {"path": None}
 
-        with ui.card().classes("w-full gap-4 max-w-3xl"):
+        with ui.card().classes("w-full gap-4"):   # 宽度交给 frame() 的 max-w-5xl 容器，跟其他页卡片一致
             # ========== 种子来源 ==========
             ui.label("种子来源（链接 或 上传文件，二选一）").classes("font-bold text-sm")
             tin = ui.input("magnet: / http(s) .torrent 链接",
