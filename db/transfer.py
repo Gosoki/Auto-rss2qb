@@ -106,6 +106,13 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
     if same_database(src_engine, dst_engine):
         raise ValueError("源库与目标库指向同一个数据库，无需迁移（也不能迁，会把它清空）")
 
+    # 【顺便升级】目标库先升到最新版本再往里灌数据：
+    #   · 全新空库 → 一路建表到 head，用户不必先切过去建一遍再回来迁；
+    #   · 老版本的库 → 补齐缺的 revision，免得拿新模型的列往旧表结构里插而报 Unknown column。
+    # 源库【不动】：迁移不该顺手改用户还在用的那一头，它自己启动时会升。
+    from . import migrate
+    migrate.upgrade(dst_engine, "data")
+
     src_counts = count_rows(src_engine)
     dst_counts = count_rows(dst_engine)
     if not overwrite and any(dst_counts.values()):

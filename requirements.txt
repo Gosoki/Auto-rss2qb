@@ -7,3 +7,5 @@ opencc-python-reimplemented   # 繁转简；没装也能跑（自动降级为不
 # 可选：业务数据要落 MySQL 时才需要（设置页→数据库）。没装也能跑，只是切不了 MySQL、
 # 面板上会提示装它；配置与默认的本地 SQLite 完全不依赖它。
 pymysql>=1.1
+# 数据库版本管理：建表/升级一律走 Alembic（db/migrate.py + alembic/），两种后端共用一条版本链
+alembic>=1.13

@@ -13,18 +13,14 @@ SQLite 侧开 WAL 让读写并发（后台轮询写、UI 读）；MySQL 侧用�
 服务端按 wait_timeout 掐断，不 ping 就会在下次查询时抛 'MySQL server has gone away'）。
 """
 import logging
-from datetime import datetime
 
-import sqlalchemy as sa
 from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine
 
 from config import DB_PATH
-from .dialect import adapt_metadata, is_mysql, is_sqlite, quote
+from .dialect import adapt_metadata, is_mysql
 
 log = logging.getLogger("autorss")
-
-_NO_DEFAULT = object()  # _column_default 解析不出默认值时的哨兵
 
 # 恒留在本地 SQLite 的表（配置）。其余表跟随 data 引擎。
 META_TABLES = ("setting",)
@@ -90,21 +86,21 @@ def data_target_desc() -> str:
 
 
 def init_db():
-    """建表 + 跑迁移。meta 与 data 指向同一个 SQLite 时，两边各建各的表、互不重复。"""
-    from . import models  # noqa: F401  确保表被注册
-    SQLModel.metadata.create_all(meta_engine, tables=_tables(True))
+    """把两个引擎都升到最新版本。meta 与 data 指向同一个 SQLite 时，两边各管各的表、互不重复。"""
+    from . import migrate
+    migrate.upgrade(meta_engine, "meta")     # setting 表
     init_data_engine()
 
 
 def init_data_engine() -> None:
-    """在当前 data 引擎上建业务表并跑迁移。切库后也要调它（新库可能是空的）。"""
-    from . import models  # noqa: F401
-    SQLModel.metadata.create_all(engine, tables=_tables(False))
-    _migrate_add_columns()   # 给模型新增字段的表加列（开发期加字段免删整表）
-    _migrate_rename_downloaded_to_sent()   # 老库状态值改名：downloaded → sent
-    _migrate_inflight_indexes()   # 给 in-flight 高频查询建 partial index（仅 SQLite）
-    _migrate_drop_redundant_indexes()   # 清掉 info_hash 上冗余的非唯一索引（唯一约束索引已覆盖）
-    _migrate_widen_mysql_ints()   # 老 MySQL 库的 INT 列拓成 BIGINT（qb_size 会溢出 2GiB）
+    """把当前 data 引擎升到最新版本。切库/迁移到新库后也要调它（新库可能完全是空的）。
+
+    以前这里是 create_all + 五个"每次启动都比对补一遍"的临时迁移函数。改成 Alembic 之后
+    库里有 alembic_version_data 记着版本号：全新库一路建到 head，已有库只跑缺的那几步，
+    已是最新则一条 DDL 都不发。表结构与索引（含仅 SQLite 有的 partial index）都在版本脚本里。
+    """
+    from . import migrate
+    migrate.upgrade(engine, "data")
 
 
 def configured_mysql_url() -> str | None:
@@ -225,156 +221,6 @@ def switch_data_engine(url: str | None) -> None:
     if old is not meta_engine:   # 默认态下 old 就是 meta_engine，不能 dispose（配置还要用它）
         old.dispose()
     log.info("业务数据库已切换到：%s", data_target_desc())
-
-
-def _column_default(col):
-    """取列的模型默认值（用于给非空新列回填老行 NULL）。解析不出返回 _NO_DEFAULT。"""
-    d = col.default
-    if d is None:
-        return _NO_DEFAULT
-    if getattr(d, "is_scalar", False):
-        return d.arg
-    if getattr(d, "is_callable", False):
-        try:
-            return d.arg(None)          # SQLAlchemy 把 default_factory 包成接收 context 的可调用
-        except Exception:
-            return _NO_DEFAULT
-    return _NO_DEFAULT
-
-
-def _migrate_add_columns():
-    """给已存在的表补上模型里新增的列（create_all 不会 ALTER 老表）。
-
-    覆盖后续给模型加字段的场景（bgm 元数据、qB 实时态等）。新列以可空加入；但对模型标注 NOT NULL
-    且带默认值的列，加列后立即把老行的 NULL 回填成模型默认值——否则老行该列为 NULL，会被
-    status=='pending' / episode>=0 之类过滤静默漏掉，从下载管线/统计里凭空消失。
-
-    标识符引用与参数占位符都走方言（SQLite 是 "x"/?，MySQL 是 `x`/%s），别手拼。
-    """
-    inspector = sa.inspect(engine)
-    for table in _tables(meta=False):
-        if not inspector.has_table(table.name):
-            continue
-        existing = {c["name"] for c in inspector.get_columns(table.name)}
-        for col in table.columns:
-            if col.name in existing:
-                continue
-            ddl_type = col.type.compile(dialect=engine.dialect)
-            val = _column_default(col) if not col.nullable else _NO_DEFAULT
-            if isinstance(val, datetime):
-                val = val.isoformat(sep=" ")   # 冻结成常量字符串（回填老行，非每行现算）
-            tq, cq = quote(engine, table.name), quote(engine, col.name)
-            with engine.begin() as conn:
-                conn.exec_driver_sql(f"ALTER TABLE {tq} ADD COLUMN {cq} {ddl_type}")
-                if val is not _NO_DEFAULT:      # 非空列：把刚加进来的老行 NULL 回填成模型默认值
-                    conn.execute(sa.text(f"UPDATE {tq} SET {cq}=:v WHERE {cq} IS NULL"), {"v": val})
-            log.info("数据库迁移：%s 加列 %s%s", table.name, col.name,
-                     "" if val is _NO_DEFAULT else f"（回填 {val!r}）")
-
-
-def _migrate_rename_downloaded_to_sent() -> None:
-    """老库状态值迁移：status='downloaded' → 'sent'（该状态语义一直是"已交付给 qB"，故改名以正名）。
-
-    必须做：全项目已无一处再读 'downloaded'，老行若不迁移就会对所有查询静默失联——
-    删不掉、统计不到、去重判据认不出（进而把已下过的集重下一遍、重识别把季度冲掉）。
-    幂等：迁完就没有匹配行，之后每次启动都是 0 行 UPDATE，代价可忽略。
-    """
-    with engine.begin() as conn:
-        n = 0
-        for table in ("animetorrent", "movietorrent"):
-            tq = quote(engine, table)
-            n += conn.execute(sa.text(
-                f"UPDATE {tq} SET status='sent' WHERE status='downloaded'")).rowcount or 0
-    if n:
-        log.info("数据库迁移：%d 条种子状态 downloaded → sent", n)
-
-
-def _migrate_inflight_indexes() -> None:
-    """给 _inflight_where 的高频查询(has_inflight/has_active_downloading/inflight_*_rows，每唤醒轮 +
-    每仪表盘刷新都跑)建 partial index。in-flight 集合天然极小 → 索引也小；常态『无在下』时不必再全表扫
-    两表才能确认为空。谓词与 _inflight_where 前两条件对齐(qb_state 作残余过滤)，对查询结果透明、行为等价。
-
-    注意：partial index 的谓词里写死了状态名，而 `CREATE INDEX IF NOT EXISTS` 对【已存在】的同名索引
-    什么都不做——状态改名后老库会留着谓词过时的旧索引（永不命中，白占空间且悄悄失去加速）。
-    故先比对 sqlite_master 里的实际 SQL，谓词对不上就 DROP 重建；一致则原样跳过，不做无谓重建。
-
-    谓词里的状态集【由 engine.TRACKED_STATUSES 拼出】，不再手抄——它必须与 _inflight_where 的第一个
-    条件逐字对齐，两边各写一份的话改了 engine 这里不会报错，只会静默失去索引加速。
-
-    【MySQL 不支持 partial index】（没有 CREATE INDEX ... WHERE），故只在 SQLite 上做；
-    MySQL 侧由 create_all 建的普通索引也能把范围缩下来。
-    """
-    if not is_sqlite(engine):
-        return
-    from core.engine import TRACKED_STATUSES   # 延迟导入：db 是底层，engine 依赖 db
-    states = ",".join(f"'{s}'" for s in TRACKED_STATUSES)
-    want = {
-        f"ix_{table}_inflight":
-            f"CREATE INDEX ix_{table}_inflight ON {table}(status, qb_progress) "
-            f"WHERE status IN ({states}) AND qb_progress < 1.0"
-        for table in ("animetorrent", "movietorrent")
-    }
-    with engine.begin() as conn:
-        for name, stmt in want.items():
-            cur = conn.exec_driver_sql(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
-            if cur is not None:
-                if (cur[0] or "").strip() == stmt:
-                    continue                       # 谓词一致，无需动
-                conn.exec_driver_sql(f"DROP INDEX {name}")   # 谓词过时（如状态改名）→ 重建
-                log.info("数据库迁移：重建过时的 partial index %s", name)
-            conn.exec_driver_sql(stmt)
-
-
-def _migrate_drop_redundant_indexes() -> None:
-    """去掉 info_hash 上冗余的非唯一索引 ix_*_info_hash：该列有 UniqueConstraint(uq_*)，唯一索引已覆盖
-    全部等值查找（hash_owned_elsewhere/mark_done_by_hash/去重 upsert）。老库由此前 index=True 建过 ix_*，
-    create_all 不会自动 DROP，这里显式清掉。
-
-    先用 inspector 查存在性再 DROP，而不是 `DROP INDEX IF EXISTS`——后者 MySQL 8 不支持；
-    且 MySQL 的 DROP INDEX 必须带 ON 表名。
-    """
-    inspector = sa.inspect(engine)
-    for table, name in (("animetorrent", "ix_animetorrent_info_hash"),
-                        ("movietorrent", "ix_movietorrent_info_hash")):
-        if not inspector.has_table(table):
-            continue
-        if name not in {i["name"] for i in inspector.get_indexes(table)}:
-            continue
-        with engine.begin() as conn:
-            if is_mysql(engine):
-                conn.exec_driver_sql(f"DROP INDEX {quote(engine, name)} ON {quote(engine, table)}")
-            else:
-                conn.exec_driver_sql(f"DROP INDEX {quote(engine, name)}")
-
-
-def _migrate_widen_mysql_ints() -> None:
-    """把老 MySQL 库里 4 字节的 INT 列拓成 BIGINT（仅 MySQL；SQLite 的 INTEGER 本来就是 64 位）。
-
-    必做：qb_size 存字节数，MySQL 的 INT 上限 2147483647 ≈ 2 GiB。第一个超过 2 GiB 的种子
-    （BDRip 单集、剧场版常规 3~10GB）会在 STRICT 模式下抛 1264，把 sync_qb_status 整轮的
-    进度更新一起回滚，且该行永远留在 in-flight、每轮复发、界面零报错。
-    新库由 dialect.adapt_metadata 直接建成 BIGINT，这里只管在此之前建过表的库。
-    幂等：已经是 bigint 的跳过，之后每次启动都是 0 条 ALTER。
-    """
-    if not is_mysql(engine):
-        return
-    with engine.begin() as conn:
-        for table in _tables(meta=False):
-            for col in table.columns:
-                if col.primary_key or not isinstance(col.type, sa.BigInteger):
-                    continue
-                cur = conn.exec_driver_sql(
-                    "SELECT DATA_TYPE FROM information_schema.COLUMNS "
-                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s",
-                    (table.name, col.name)).fetchone()
-                if cur is None or (cur[0] or "").lower() == "bigint":
-                    continue
-                null_sql = "NULL" if col.nullable else "NOT NULL"
-                conn.exec_driver_sql(
-                    f"ALTER TABLE {quote(engine, table.name)} "
-                    f"MODIFY {quote(engine, col.name)} BIGINT {null_sql}")
-                log.info("数据库迁移：%s.%s 由 %s 拓宽为 BIGINT", table.name, col.name, cur[0])
 
 
 def get_session() -> Session:
