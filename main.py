@@ -42,4 +42,4 @@ async def _startup():
 if __name__ in {"__main__", "__mp_main__"}:
     # 监听地址默认回环 127.0.0.1：本工具无鉴权、设置页含 qB 密码等敏感信息，默认不对局域网开放。
     # 可在设置页改绑定地址（写 .env、需重启）；改成 0.0.0.0 会对内网开放，务必自行加鉴权/反代（页内已警示）。
-    ui.run(title="autorss", host=WEB_HOST, port=WEB_PORT, show=False, reload=True)
+    ui.run(title="autorss", host=WEB_HOST, port=WEB_PORT, show=False, reload=False)
