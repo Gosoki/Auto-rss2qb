@@ -357,21 +357,61 @@ async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
 
 # ---------------- qB 实时态（对 AnimeTorrent / MovieTorrent 通用） ----------------
 
-# 下载态含 qB 5.x 新增的 forcedMetaDL；做种态含 5.x 改名后的 stoppedUP（=已完成暂停做种）。
-# 暂停未完成的 pausedDL/stoppedDL 有意不计入下载、也不计入做种（既非在下也非已完成）。
-_QB_DOWNLOADING = {"downloading", "forcedDL", "metaDL", "forcedMetaDL", "stalledDL",
-                   "queuedDL", "checkingDL", "allocating"}
-_QB_SEEDING = {"uploading", "forcedUP", "stalledUP", "queuedUP", "checkingUP",
-               "pausedUP", "stoppedUP"}  # 含已完成（暂停做种）
-# 『落定』态：不再需要轮询跟踪的种子 qB 态——做种(=下载已完成) + 文件缺失(终态、不会再变)。
-# in-flight 判定与 sync 查询都据此把它们排除，使『停止监听』对做种/缺文件都生效。
-_QB_SETTLED = _QB_SEEDING | {"missingFiles"}
-# 短暂『工作中』态（在动但速度可能为 0：取元数据/校验/分配磁盘/搬运）——这些也算『在真下』，
-# 免得刚开始那几秒被速度地板误判成慢。真正的下载态(downloading/forcedDL)则改用速度地板判快慢。
-# checkingResumeData=qB 重启后校验续传数据、moving=搬运文件(开 temp_path 时完成后必经)：
-# 都是速度 0 但确实在动，漏收会让快轮询在校验/搬运期间误判『没在真下』而提前退回休眠。
-_QB_TRANSIENT = {"metaDL", "forcedMetaDL", "checkingDL", "allocating",
-                 "checkingResumeData", "moving"}
+# ==== qB 原始态词表：全项目唯一真相（分类 + 中文名都在这一张表里）====
+#
+# 以前分类集合在这里、中文名在 pages/layout.py 各记一份 → 两边漂移无人察觉：
+# qB 5.x 的 moving / checkingResumeData 早就写进了 UI 中文表，engine 的集合却没收，
+# 结果『已完成』长期少记、校验期快轮询提前退出（详见 AUDIT.md B2/B3）。
+# 现在新增一个 qB 状态只需在这里加一行，分类与中文名同时到位，漏不掉。
+#
+# 分类标记（可组合，一个状态可同时属多类）：
+#   D = 下载态（计入『下载中』统计）
+#   S = 做种/已完成态（下载已完成；含 5.x 改名后的 stoppedUP=完成后暂停）
+#   T = 短暂工作态（在动但速度可能为 0：取元数据/校验/分配/搬运）——按『在真下』算，
+#       免得刚开始那几秒或校验/搬运期间被速度地板误判成慢而提前退出快轮询
+#   X = 落定态（不再需要轮询跟踪）——做种(已完成) + 文件缺失(终态、不会再变)
+# 不带任何标记 = 既非在下也非已完成（暂停未完成 pausedDL/stoppedDL、error、unknown）
+_QB_STATES: dict[str, tuple[str, str]] = {
+    # ---- 下载中 ----
+    "downloading":        ("D",  "下载中"),
+    "forcedDL":           ("D",  "下载中"),
+    "stalledDL":          ("D",  "等待下载"),      # 无源、0 速：算下载态但不算『在真下』
+    "queuedDL":           ("D",  "排队下载"),
+    "metaDL":             ("DT", "取元数据"),
+    "forcedMetaDL":       ("DT", "取元数据"),
+    "checkingDL":         ("DT", "校验中"),
+    "allocating":         ("DT", "分配空间"),
+    # ---- 在动，但不属下载态 ----
+    "checkingResumeData": ("T",  "校验中"),        # qB 重启后校验续传数据
+    "moving":             ("T",  "移动中"),        # 开 temp_path 时完成后搬运必经
+    # ---- 下载已完成（做种 / 完成后暂停）----
+    "uploading":          ("SX", "已完成"),
+    "forcedUP":           ("SX", "已完成"),
+    "stalledUP":          ("SX", "已完成"),
+    "queuedUP":           ("SX", "已完成"),
+    "checkingUP":         ("SX", "校验中"),
+    "pausedUP":           ("SX", "已完成"),
+    "stoppedUP":          ("SX", "已完成"),
+    # ---- 落定但不是完成 ----
+    "missingFiles":       ("X",  "文件缺失"),      # 文件没了：终态，不再轮询，也不算已完成
+    # ---- 既非在下也非已完成 ----
+    "pausedDL":           ("",   "已暂停"),
+    "stoppedDL":          ("",   "已暂停"),
+    "error":              ("",   "错误"),
+    "unknown":            ("",   "未知"),
+}
+
+
+def _states_with(flag: str) -> set:
+    return {s for s, (flags, _) in _QB_STATES.items() if flag in flags}
+
+
+_QB_DOWNLOADING = _states_with("D")
+_QB_SEEDING = _states_with("S")
+_QB_SETTLED = _states_with("X")
+_QB_TRANSIENT = _states_with("T")
+# qB 原始态 → 中文（UI 只从这里取，不再自己维护一份）
+QB_STATE_CN = {s: cn for s, (_, cn) in _QB_STATES.items()}
 # 预算成 list 供 SQL in_/not_in 复用（集合恒定、只读；避免热路径每次调用重新 list()）
 _QB_SETTLED_LIST = list(_QB_SETTLED)
 _QB_TRANSIENT_LIST = list(_QB_TRANSIENT)

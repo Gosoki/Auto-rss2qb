@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from nicegui import ui
 
 import config
+from core import engine
 
 NAV = [("manage", "动漫番剧", "/"), ("movies", "OVA・剧场版", "/movies"),
        ("parse", "解析测试", "/parse"), ("manual", "手动下载", "/manual"),
@@ -237,20 +238,15 @@ def ep_str(e) -> str:
     return str(int(e)) if float(e).is_integer() else str(e)
 
 
-# qB 原始态 → 中文（下载完成后的各种做种/暂停态一律显示『已完成』，不再对用户区分做种，见 B6）
-_QB_STATE_CN = {
-    "downloading": "下载中", "forcedDL": "下载中", "metaDL": "取元数据",
-    "forcedMetaDL": "取元数据", "stalledDL": "等待下载", "queuedDL": "排队下载",
-    "checkingDL": "校验中", "allocating": "分配空间", "uploading": "已完成",
-    "forcedUP": "已完成", "stalledUP": "已完成", "queuedUP": "已完成", "checkingUP": "校验中",
-    "pausedDL": "已暂停", "stoppedDL": "已暂停", "pausedUP": "已完成", "stoppedUP": "已完成",
-    "checkingResumeData": "校验中", "moving": "移动中", "error": "错误",
-    "missingFiles": "文件缺失", "unknown": "未知",
-}
+# qB 原始态 → 中文：词表（分类 + 中文名）统一在 core.engine._QB_STATES，本层只负责翻译，
+# 不再自建一份——历史上两边各记一份导致 moving/checkingResumeData 只有 UI 认识、
+# engine 集合漏收，进而『已完成』长期少记（见 AUDIT.md B2/B3）。
+# 下载完成后的各种做种/暂停态一律显示『已完成』，不再对用户区分做种（B6）。
 
 
 def qb_state_cn(state: str) -> str:
-    return _QB_STATE_CN.get(state or "", state or "")
+    """qB 原始态 → 中文；词表里没有的原样返回（新 qB 版本冒出的未知态不至于显示成空白）。"""
+    return engine.QB_STATE_CN.get(state or "", state or "")
 
 
 def human_size(n) -> str:

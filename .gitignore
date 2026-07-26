@@ -3,3 +3,8 @@ data/
 __pycache__/
 *.pyc
 .venv/
+
+# 本地测试套件（按要求不上传 git）
+tests/
+pytest.ini
+.pytest_cache/
