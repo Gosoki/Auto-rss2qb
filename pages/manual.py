@@ -14,16 +14,23 @@ def manual_page():
         ui.label("把 magnet / .torrent（链接或上传文件）交给 qB。默认下到『工作目录/Temp』；"
                  "填 bgm 可识别成正常番剧目录（季度/日文名/Season），点『设为保存位置』就下到那里。"
                  "一次性下载，不进番剧列表、不做去重追踪。").classes("text-xs text-gray-400 mb-3")
-        # 放大上传控件的选择按钮 + 收紧留白，避免 ➕ 太小难点到
+        # 上传控件改成低调的虚线拖拽框：去掉 Quasar 默认那条亮蓝 header、0.0B/0.00% 统计、常空的文件列表区，
+        # 跟全站扁平暗色风统一（选好文件后本就切成下面的绿色确认框，故列表区永远空、直接隐藏）。
         ui.add_head_html(
-            "<style>.tmanual-up .q-uploader__header{min-height:46px;padding:4px 10px}"
-            ".tmanual-up .q-uploader__header .q-btn{font-size:1.5em}"
-            ".tmanual-up .q-uploader__list{max-height:120px}</style>")
+            "<style>"
+            ".tmanual-up{border:1px dashed rgba(255,255,255,.22)!important;border-radius:8px;"
+            "background:rgba(255,255,255,.02);box-shadow:none!important}"
+            ".tmanual-up .q-uploader__header{background:transparent!important;color:#9ca3af;min-height:56px}"
+            ".tmanual-up .q-uploader__title{font-size:14px;line-height:1.35;white-space:normal}"
+            ".tmanual-up .q-uploader__subtitle{display:none}"          # 隐藏 0.0B / 0.00%
+            ".tmanual-up .q-uploader__list{display:none}"              # 隐藏常空的文件列表区
+            ".tmanual-up .q-uploader__header .q-btn{color:#60a5fa}"    # + 按钮蓝色好认
+            "</style>")
 
         up = {"bytes": None, "name": ""}
         st = {"path": None}
 
-        with ui.card().classes("w-full gap-4 max-w-3xl"):
+        with ui.card().classes("w-full gap-4"):   # 宽度交给 frame() 的 max-w-5xl 容器，跟其他页卡片一致
             # ========== 种子来源 ==========
             ui.label("种子来源（链接 或 上传文件，二选一）").classes("font-bold text-sm")
             tin = ui.input("magnet: / http(s) .torrent 链接",
@@ -101,7 +108,7 @@ def manual_page():
                     ui.notify(f"下载失败：{r['error']}", type="negative")
 
             _dl = ui.button("下载", icon="download", on_click=_download).props(
-                "color=primary unelevated size=lg").classes("self-start")
+                "color=primary unelevated").classes("self-start")
             _dl.set_enabled(config.QB_ENABLED)
             if not config.QB_ENABLED:
                 _dl.tooltip("qB 未启用，去设置页开启后可下载")

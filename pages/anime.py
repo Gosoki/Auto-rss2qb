@@ -46,15 +46,15 @@ def anime_page(t: str = ""):
 
             # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
             # 番维度四卡（粉字）与种子维度四卡（绿字）各自打包，"|" 分组，窄了整组换行成上下布局；数字保持各自语义色
-            kpi_cards([("订阅中", k["tracking"], "", None, "pink-400"),
-                       ("待识别", k["fail"], "red", lambda: tabs.set_value("fail"), "pink-400"),
-                       ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm"), "pink-400"),
-                       ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-400"),
+            kpi_cards([("订阅中", k["tracking"], "", None),
+                       ("待识别", k["fail"], "red", lambda: tabs.set_value("fail")),
+                       ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm")),
+                       ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
                        "|",
-                       ("已下载", k["done"], "green", None, "green-500"),
-                       ("未知集", ps["unknown"], "purple", _open_unknown, "green-500"),
-                       ("失败数", ov["status"]["error"], "red", _open_failed, "green-500"),
-                       ("种子数", k["torrents"], "", None, "green-500")])
+                       ("已下载", k["done"], "green", None),
+                       ("未知集", ps["unknown"], "purple", _open_unknown),
+                       ("失败数", ov["status"]["error"], "red", _open_failed),
+                       ("种子数", k["torrents"], "", None)])
 
             # ── qB 未启用提醒 ──
             if not ov["config"]["qb"]:
@@ -67,7 +67,7 @@ def anime_page(t: str = ""):
                     pol = "自动下载" if policy == "auto" else "人工审核"
                     tail = "" if enabled else " · 停用"
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
-                        f"color={'blue-grey' if enabled else 'grey'}").classes("text-sm")
+                        f"color={'blue' if enabled else 'grey'}").classes("text-sm")   # 启用=蓝，停用=灰
 
         # 环图图例选择的持久化：用户点图例排除某字幕组后存下选择态，重建时塞回 legend.selected，
         # 任何刷新路径（定时器/用户操作/重识别）重建环图都不会把排除的源刷回来。
@@ -95,7 +95,7 @@ def anime_page(t: str = ""):
         def charts_panel():   # 图表单独一个 refreshable：不被 30s 定时器刷，避免环图重建丢交互态（悬停/图例翻页）
             ov = anime.overview()
             # ── 下载番剧 / 种子来源（左右分开，窄屏自动堆叠）──
-            with ui.row().classes("w-full gap-6 flex-wrap mt-3"):
+            with ui.row().classes("w-full gap-6 flex-wrap mt-3 pl-1"):   # pl-1 跟其他区块(订阅源组/种子状态)左对齐，别突出去
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
                     bqs = ov["by_quarter_state"]
                     with ui.row().classes("items-center gap-3 flex-wrap w-full"):

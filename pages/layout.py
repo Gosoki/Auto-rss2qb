@@ -381,8 +381,10 @@ _HEAD_BASE_CSS = (
     # 设置页数字项栅格：桌面每格 1/4 宽（4 列），窄屏落到 2 列；顶端对齐
     ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
     "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
-    # 顶栏品牌：手机(<640)绝对居中；≥640 静态靠左跟导航同排
-    "@media(max-width:639px){.brand-center{position:absolute;left:50%;top:50%;"
+    # 顶栏品牌：只要汉堡在（<1024，与 lg:hidden 同断点）就绝对居中——汉堡在左、品牌居中、动作在右；
+    # ≥1024 汉堡消失、内联导航接管居中位，品牌回到静态靠左跟导航同排。两个断点必须一致，否则会出现
+    # 『汉堡在、品牌却还靠左』的错位。
+    "@media(max-width:1023px){.brand-center{position:absolute;left:50%;top:50%;"
     "transform:translate(-50%,-50%);margin:0!important}}"
     # 顶栏『跳转到』悬浮下拉：自写 :hover 规则（不依赖 Tailwind 的 group-hover——它在本环境的 Tailwind 构建里不生成）。
     # 菜单本体/条目也全用自写 CSS：block 条目撑满菜单宽，hover 高亮整行铺满（不再是浮在中间的圆角小块）。
@@ -429,8 +431,9 @@ def frame(active: str = ""):
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.08);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）
         with ui.row().classes("items-center gap-2 w-full px-4 relative flex-nowrap").style("height:56px"):
-            # 移动端(<640px)：导航收进汉堡菜单（sm:hidden＝≥640 隐藏），避免链接横向溢出
-            with ui.button(icon="menu").props("flat round dense color=white").classes("md:hidden"):
+            # 窄屏(<1024px)：导航+跳转到 全收进汉堡（lg:hidden＝≥1024 隐藏）。断点跟下面的内联导航严格互补，
+            # 保证任何宽度下『跳转到』都有着落——要么在内联导航里，要么在汉堡里，不留够不着的空档。
+            with ui.button(icon="menu").props("flat round dense color=white").classes("lg:hidden"):
                 with ui.menu().props("dark"):
                     for key, label, path in NAV:
                         mi = ui.menu_item(label, on_click=lambda p=path: ui.navigate.to(p))
@@ -443,11 +446,11 @@ def frame(active: str = ""):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
                 ui.label(config.SITE_NAME or "AutoRSS").classes("text-lg font-bold max-sm:hidden").style(
                     "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去，只留居中图标
-            # 桌面端(≥768px)：内联导航，绝对定位在顶栏水平居中（不受左侧品牌/右侧按钮宽度影响）。
+            # 桌面端(≥1024px)：内联导航，绝对定位在顶栏水平居中（不受左侧品牌/右侧按钮宽度影响）。
             # w-max 必须有：绝对元素 left-1/2 的收缩宽度只有父宽 50%，不锁 max-content 会被压缩、把每个项文字挤成两行。
             # flex-nowrap + whitespace-nowrap 双保险，行不换、字不折。
-            # max-md:hidden＝<768 隐藏改走汉堡菜单（此向可靠，hidden+md:flex 在本环境无法复原）。
-            with ui.row().classes("items-center gap-2 flex-nowrap whitespace-nowrap w-max max-md:hidden "
+            # max-lg:hidden＝<1024 隐藏改走汉堡菜单（此向可靠，hidden+lg:flex 在本环境无法复原）。
+            with ui.row().classes("items-center gap-2 flex-nowrap whitespace-nowrap w-max max-lg:hidden "
                                   "absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"):
                 for key, label, path in NAV:
                     cls = "cursor-pointer text-sm px-2 transition-colors "
@@ -455,8 +458,9 @@ def frame(active: str = ""):
                             if key == active else "text-gray-400 hover:text-gray-300")
                     ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
                 # 跳转到：外链下拉（qB后台/Nyaa/Mikan/Bangumi）。自写 CSS『.jumpdd:hover .jumpmenu』控制显隐——
-                # 【鼠标悬浮即显示、移开即收起】，不用点击。max-lg:hidden＝窄于 1024 隐藏（走汉堡菜单）。保留 ↗ 符号。
-                with ui.element("div").classes("relative jumpdd max-lg:hidden"):
+                # 【鼠标悬浮即显示、移开即收起】，不用点击。不再单独设断点——整条内联导航已是 ≥1024 才出现，
+                # 窄屏时它和导航一起收进汉堡（汉堡菜单里已列了同样的外链），不会出现两边都够不着的空档。
+                with ui.element("div").classes("relative jumpdd"):
                     with ui.row().classes("items-center gap-0.5 text-sm px-2 cursor-pointer "
                                           "text-gray-400 hover:text-gray-300 transition-colors"):
                         ui.label("跳转到")

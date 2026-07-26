@@ -435,15 +435,15 @@ def movies_page(t: str = ""):
             ov = mov.overview()
             k = ov["kpi"]
             # 影片维度四卡（粉字）与种子维度三卡（绿字）分组；数字保持语义色；待识别/已忽略点击跳 tab
-            kpi_cards([("电影", k["total"], "", None, "pink-400"),
-                       ("已识别", k["matched"], "", None, "pink-400"),
-                       ("待识别", k["unmatched"], "red", lambda: tabs.set_value("fail"), "pink-400"),
-                       ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-400"),
+            kpi_cards([("电影", k["total"], "", None),
+                       ("已识别", k["matched"], "", None),
+                       ("待识别", k["unmatched"], "red", lambda: tabs.set_value("fail")),
+                       ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
                        "|",
-                       ("已下", k["done"], "green", None, "green-500"),
-                       ("可下载", ov["status"]["pending"], "blue", None, "green-500"),
-                       ("失败", ov["status"]["error"], "red", None, "green-500"),
-                       ("版本", k["versions"], "", None, "green-500")])
+                       ("已下", k["done"], "green", None),
+                       ("可下载", ov["status"]["pending"], "blue", None),
+                       ("失败", ov["status"]["error"], "red", None),
+                       ("版本", k["versions"], "", None)])
             if not ov["config"]["qb"]:
                 qb_disabled_banner("qB 未启用：剧场版也只采集不下载（设置页开 QB_ENABLED 后生效）")
 
