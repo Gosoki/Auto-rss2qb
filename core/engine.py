@@ -54,6 +54,14 @@ HAVE_STATUSES = TRACKED_STATUSES + ("stalled",)
 #    用户特意删过的集，其被去重压成 skipped 的兄弟不该被复活重下。
 HANDLED_STATUSES = HAVE_STATUSES + ("deleted",)
 
+# 『用户手工置的终态』：不是流程跑出来的，是人明确表达过"不要这条"。两处判据共用：
+#   · force 重下失败时恢复原态（core.anime 的 fail_status）——落成 error 会让该集不再含任何
+#     HANDLED 状态，进而被换源兜底复活 + flush 自动重下，等于把用户的删除决定悄悄撤销；
+#   · UI 显示时优先于 qB 残留态（pages.layout.qb_live_text）——删除/排除只改 status 不清 qb_state，
+#     不先拦住就会把已删的显示成『已归档』或『已完成 100%』。
+# 加第 9 个人工终态时，这两处会同时跟着走，不必再各改一遍。
+MANUAL_TERMINAL_STATUSES = ("deleted", "excluded")
+
 # 与上面三者互斥的另一维：『还没落盘、仍在待下队列』——可被下载选中，也可改集号/排除。
 # 不叫 RETRYABLE：failed_rows 用的 ("error","stalled") 才是直觉上的"可重试"，重名会诱使后人往这里加 stalled，
 # 而 stalled 一旦进来就会被自动重下/换源（正是 ② 要挡住的）。

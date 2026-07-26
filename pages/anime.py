@@ -53,7 +53,8 @@ def anime_page(t: str = ""):
                        "|",
                        ("已下载", k["done"], "green", None),
                        ("未知集", ps["unknown"], "purple", _open_unknown),
-                       ("失败数", ov["status"]["error"], "red", _open_failed),
+                       ("失败数", ov["status"]["error"] + ov["status"]["stalled"], "red",
+                        _open_failed),   # 与点开的 failed_rows() 同口径(error+stalled)
                        ("种子数", k["torrents"], "", None)])
 
             # ── qB 未启用提醒 ──
@@ -398,12 +399,15 @@ def anime_page(t: str = ""):
             pend_aids = {r["anime_id"] for r in raw
                          if r["status"] in engine.DOWNLOADABLE_STATUSES and r["anime_id"]}
             confirmed = anime.confirmed_anime_ids(pend_aids)
-            plan_ids = anime.download_plan_for_ids(confirmed)   # 批量一次算完，避免每番一查(N+1)
+            # 两种口径各算一次（都是批量，避免 N+1）：pending 行看『自动会下吗』，
+            # error 行看『补下会挑吗』——后台自动下从不重试 error，用同一个集合会标反。
+            plan_ids = anime.download_plan_for_ids(confirmed)
+            backfill_ids = anime.download_plan_for_ids(confirmed, for_backfill=True)
             rows = []
             for r in raw:
                 if r["status"] in engine.DOWNLOADABLE_STATUSES:
                     conf = r["anime_id"] in confirmed
-                    in_plan = r["id"] in plan_ids
+                    in_plan = r["id"] in (backfill_ids if r["status"] == "error" else plan_ids)
                 else:
                     conf, in_plan = True, None
                 text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
@@ -566,7 +570,8 @@ def anime_page(t: str = ""):
 
         def _open_failed():
             _open_torrent_list(
-                "失败", "下载失败过的种子（取种/发送失败）。点番名进详情页补下重试 / 忽略。",
+                "失败 / 异常",
+                "下载失败过（取种/发送失败）或长期停滞无进展的种子。点番名进详情页补下重试 / 忽略。",
                 anime.failed_rows)
 
         # ---- 事件处理（闭包，直接引用上面的刷新函数）----

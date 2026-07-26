@@ -32,6 +32,7 @@ TRACKED_STATUSES = engine.TRACKED_STATUSES
 HAVE_STATUSES = engine.HAVE_STATUSES
 HANDLED_STATUSES = engine.HANDLED_STATUSES
 DOWNLOADABLE_STATUSES = engine.DOWNLOADABLE_STATUSES
+MANUAL_TERMINAL_STATUSES = engine.MANUAL_TERMINAL_STATUSES
 
 
 def _anime_path_parts(a, t=None):
@@ -343,7 +344,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     # 失败落定态：从用户终态(deleted/excluded) force 重下若失败，恢复原终态而非 error——
     # 否则 deleted→error 会让该集不再含任何 _HANDLED 状态，被 _revive_orphaned_skipped 复活 skipped 兄弟、
     # flush 自动把用户删过的集重新下回来（违反 deleted『不重下』）。pending/error/skipped/stalled 仍落 error。
-    fail_status = orig_status if orig_status in ("deleted", "excluded") else "error"
+    fail_status = orig_status if orig_status in MANUAL_TERMINAL_STATUSES else "error"
     # 组装保存路径（含越界校验），TV 按设置可加 Season N 子目录
     save_path = engine.build_save_path(quarter, folder_name, season=season,
                                        sub_dir=config.ANIME_DOWN_PATH)
@@ -356,7 +357,11 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
         # 分类固定不带后缀，标签只放季度（qB 里按分类归大类、按标签筛季度）
         ok = await engine.add_to_qb(data, save_path, "AutoRSS-Anime", quarter, info_hash=info_hash)
     except asyncio.CancelledError:
-        _set_status(torrent_id, "pending")  # 被取消（关停等）→ 复位，别永久卡 downloading
+        # 被取消（关停等）→ 复位，别永久卡 downloading。用 fail_status 而非写死 pending：
+        # 从 deleted/excluded 强制重下时若正好被取消，写 pending 会让该集不再含任何"已处理"状态，
+        # 于是被 _revive_orphaned_skipped 复活 + flush 自动重下——用户删掉的集又被下回来。
+        # 取种最长 180s，这期间关程序就会中招，窗口并不小。
+        _set_status(torrent_id, fail_status)
         raise
     except Exception as e:  # 失败回写：终态重下失败恢复原态，其余落 error，避免卡在 downloading
         log.error("下载失败 - %s - %s", title, e)
@@ -1045,11 +1050,17 @@ async def download_pending_for_anime(anime_id: int) -> int:
     return n
 
 
-def download_plan(anime_id: int) -> set[int]:
-    """这部番『现在补下/自动下会挑中』的种子 id 集合——供详情页标『将下载 / 备用』。
+def download_plan(anime_id: int, for_backfill: bool = False) -> set[int]:
+    """这部番会被挑中下载的种子 id 集合，只算不下。供详情页/仪表盘标注。
 
-    与 download_pending_for_anime 同一套挑选（锁定源过滤 + 跳过已下集 + 每集一份、负集整组一份），
-    只算不下。不在这个集合里的待下种子=备用（同集已被首选/已下覆盖，或非锁定源）。
+    【两种口径，别混用】——混用正是过去把『将下载』标到不会下的那条上的原因：
+    · for_backfill=False（默认）＝『后台自动会下哪条』：候选只含 pending，与
+      flush_ready_downloads 一致（它有意不自动重试 error，见那里注释）。若把 error 也算候选，
+      高优先级的 error 会顶掉同集真正会被自动下的 pending，页面标注就与实际相反。
+    · for_backfill=True ＝『点补下会挑哪条』：候选含 pending+error（补下确实重试失败的），
+      只用于给 error 行判『失败·可补下』还是『失败』。
+
+    两者走同一套挑选（锁定源/版本关键词过滤 + 跳过已有一份的集 + 每集一份、负集各一份）。
     """
     with get_session() as s:
         a = s.get(Anime, anime_id)
@@ -1058,7 +1069,8 @@ def download_plan(anime_id: int) -> set[int]:
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
-    pending = [t for t in all_rows if t.status in DOWNLOADABLE_STATUSES]
+    pending = [t for t in all_rows
+               if t.status in (DOWNLOADABLE_STATUSES if for_backfill else ("pending",))]
     if pref:
         pending = [t for t in pending if pref == (t.source or "")]
     if kw:
@@ -1066,8 +1078,9 @@ def download_plan(anime_id: int) -> set[int]:
     return {t.id for t in _select_downloads(pending, pref, have_eps)}
 
 
-def download_plan_for_ids(anime_ids) -> set[int]:
-    """批量版 download_plan：给定一组番 id，返回它们『会真下』的种子 id 并集（供新入库一次性标将下载/备用）。
+def download_plan_for_ids(anime_ids, for_backfill: bool = False) -> set[int]:
+    """批量版 download_plan（口径同上：默认只算 pending＝后台自动会下的，for_backfill 才含 error）。
+    给定一组番 id，返回它们会被挑中的种子 id 并集（供新入库一次性标将下载/备用）。
     与 download_all_pending 同一挑选口径（锁定源过滤 + 跳过已下/在下集 + 每集一份、负集整组一份），只算不下。
     把逐番 N 次查询压成 2 次：一次拿这些番的锁定源、一次拿它们的全部种子；等价于对每个 id 调 download_plan 求并。"""
     ids = {i for i in anime_ids if i}
@@ -1081,7 +1094,7 @@ def download_plan_for_ids(anime_ids) -> set[int]:
     by_anime: dict = {}
     have_by_anime: dict = {}
     for t in rows:
-        if t.status in DOWNLOADABLE_STATUSES:
+        if t.status in (DOWNLOADABLE_STATUSES if for_backfill else ("pending",)):
             by_anime.setdefault(t.anime_id, []).append(t)
         elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
             have_by_anime.setdefault(t.anime_id, set()).add(t.episode)

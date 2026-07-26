@@ -86,12 +86,21 @@ async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
     new_path = mov.movie_save_path(movie_id)
     if not new_path or new_path == old_path:
         return   # 路径没变，无需移动
-    dl = [t for t in mov.movie_torrents(movie_id) if t.status in engine.HAVE_STATUSES]
+    # 与 relocate_movie 选行同谓词：HAVE 且【未归档】（已归档的不在 qB、移不动，
+    # 算进来会导致『说要搬 N 个 → 点确认 → 报"无需移动"』）
+    _ts = mov.movie_torrents(movie_id)
+    dl = [t for t in _ts if t.status in engine.HAVE_STATUSES and not t.archived_at]
+    arch = [t for t in _ts if t.status in engine.HAVE_STATUSES and t.archived_at]
     if not dl:
-        ui.notify("归档目录已更新（无已下文件，新版本将下到新目录）", type="positive")
+        if arch:
+            ui.notify(f"归档目录已更新。但有 {len(arch)} 个版本已归档（不在 qB，无法代为移动），"
+                      f"其文件仍在旧目录 {old_path or '原位置'}，需你手动处理", type="warning")
+        else:
+            ui.notify("归档目录已更新（无已下文件，新版本将下到新目录）", type="positive")
         return
+    _extra = f"；另有 {len(arch)} 个版本已归档、无法代为移动（文件留在旧目录）" if arch else ""
     if not await confirm("归档目录变了，移动已下文件？",
-                         f"{len(dl)} 个版本已下，移到新目录：{new_path}",
+                         f"{len(dl)} 个版本已下，移到新目录：{new_path}{_extra}",
                          ok_label="移动文件", ok_icon="drive_file_move"):
         ui.notify("已更新记录，未移动文件（新版本将下到新目录，旧文件留在原处）", type="warning")
         return

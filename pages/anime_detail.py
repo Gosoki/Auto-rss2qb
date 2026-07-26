@@ -120,11 +120,15 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if not eps:
             ui.label("（还没有种子）").classes("text-gray-400")
             return
-        plan = anime.download_plan(anime_id)  # 待下里『会真下』的那些（首选/锁定组），其余待下=备用
+        # 两个问题各查各的：pending 行问『后台自动会下吗』(只算 pending，与 flush 同口径)，
+        # error 行问『点补下会挑中吗』(含 error)。混用一个集合会让高优先级的 error 顶掉
+        # 同集真正会被自动下的 pending，把『将下载』标到不会下的那条上。
+        plan = anime.download_plan(anime_id)
+        backfill_plan = anime.download_plan(anime_id, for_backfill=True)
         # 这一集是否『有着落』：将下(plan) 或 已有一份(HAVE_STATUSES：已下/在下/停滞)。与 flush 同口径——
         # stalled 也算有着落(不再误报缺集，B4)；deleted 不算(删了同集新 hash 会当将下载来下)。
         covered = {t.episode for t in eps
-                   if t.id in plan or t.status in anime.HAVE_STATUSES}
+                   if t.id in plan or t.id in backfill_plan or t.status in anime.HAVE_STATUSES}
         for t in eps:
             ep_txt = f"第{ep_str(t.episode)}集"
             with ui.column().classes("w-full gap-0 py-1").style(
@@ -163,10 +167,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             ui.badge("缺集·仅非锁源").props("color=orange").tooltip(
                                 "这一集在当前锁定源/版本下没有可下的，只剩被过滤掉的版本；要它就点右边下载")
                     elif t.status == "error":
-                        ui.badge("失败·可补下" if t.id in plan else "失败").props(
-                            f"color={'orange' if t.id in plan else 'red'}").tooltip(
+                        # error 行问的是『点补下会不会挑它』——后台自动下从不重试 error，
+                        # 故这里必须用 backfill_plan，不能用只含 pending 的 plan
+                        _bf = t.id in backfill_plan
+                        ui.badge("失败·可补下" if _bf else "失败").props(
+                            f"color={'orange' if _bf else 'red'}").tooltip(
                             "下载失败过；点右边『下载』或『补下本番』手动重试（后台不自动重试 error）"
-                            if t.id in plan else "下载失败过")
+                            if _bf else "下载失败过")
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删/已排除)按状态
                         ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
                             "color=blue-grey")
@@ -287,13 +294,22 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         new_path = anime.anime_save_path(anime_id)
         if not new_path or new_path == old_path:
             return   # 路径没变，无需移动
-        dl = [t for t in anime.list_episodes(anime_id)
-              if t.status in engine.HAVE_STATUSES]
+        # 计数必须与 relocate_anime 的选行【同谓词】：HAVE 且【未归档】。
+        # 已归档的早已不在 qB、setLocation 移不动，若算进来就会出现
+        #『弹窗说要搬 N 集 → 点确认 → 报"无需移动" → 文件静默留在旧目录』。
+        _eps = anime.list_episodes(anime_id)
+        dl = [t for t in _eps if t.status in engine.HAVE_STATUSES and not t.archived_at]
+        arch = [t for t in _eps if t.status in engine.HAVE_STATUSES and t.archived_at]
         if not dl:
-            ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
+            if arch:   # 只有归档文件：搬不了，但必须告诉用户它们留在哪儿
+                ui.notify(f"归档目录已更新。但有 {len(arch)} 集已归档（不在 qB，无法代为移动），"
+                          f"其文件仍在旧目录 {old_path or '原位置'}，需你手动处理", type="warning")
+            else:
+                ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
             return
+        _extra = f"；另有 {len(arch)} 集已归档、无法代为移动（文件留在旧目录）" if arch else ""
         if not await confirm("归档目录变了，移动已下文件？",
-                             f"{len(dl)} 集已下，移到新目录：{new_path}",
+                             f"{len(dl)} 集已下，移到新目录：{new_path}{_extra}",
                              ok_label="移动文件", ok_icon="drive_file_move"):
             ui.notify("已更新记录，未移动文件（新集将下到新目录，旧文件留在原处）", type="warning")
             return

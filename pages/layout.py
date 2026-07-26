@@ -263,7 +263,7 @@ def qb_live_text(t) -> str:
     # 人工终态优先于任何 qB 残留态：deleted/excluded 的行仍留着 archived_at 或旧 qb_state
     # （删除/排除只改 status，不清实时态），若不先拦住，已删的会被显示成『已归档』或『已完成 100%』。
     # 返回 '' 让调用方回落到 torrent_status_cn(status)，拿到『已删/已排除』与中性配色。
-    if getattr(t, "status", "") in ("deleted", "excluded"):
+    if getattr(t, "status", "") in engine.MANUAL_TERMINAL_STATUSES:
         return ""
     if getattr(t, "archived_at", None):
         return "已归档"          # 完成后已从 qB 移除(留文件)、不再跟踪
