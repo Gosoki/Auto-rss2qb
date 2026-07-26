@@ -98,7 +98,9 @@ class AnimeTorrent(SQLModel, table=True):
     season: int = Field(default=1)
     episode: float = Field(default=-2)          # 支持 .5；-1特别篇 -2未知
     quarter: str = Field(default="")
-    status: str = Field(default="pending")      # 应用侧生命周期：pending/downloading/downloaded/error/skipped
+    # 应用侧生命周期（全集见 core.engine 状态词表）：pending 待下 / downloading 交付中 / sent 已交付qB
+    # / error 失败 / skipped 同集去重落选 / deleted 人工删过 / excluded 人工排除 / stalled 停滞异常
+    status: str = Field(default="pending")
     download_url: str = Field(default="")
     save_path: str = Field(default="")          # 交 qB 时的实际保存路径；改季度/重绑后据此移动或提醒旧位置
     release_time: datetime | None = Field(default=None)
@@ -157,7 +159,9 @@ class MovieTorrent(SQLModel, table=True):
     source: str = Field(default="")             # 字幕组/来源
     site: str = Field(default="mikan")
     raw_title: str = Field(default="")          # 原始种子完整标题（区分版本）
-    status: str = Field(default="pending")      # 应用侧生命周期：pending/downloading/downloaded/error/skipped
+    # 应用侧生命周期（全集见 core.engine 状态词表）：pending 待下 / downloading 交付中 / sent 已交付qB
+    # / error 失败 / skipped 同集去重落选 / deleted 人工删过 / excluded 人工排除 / stalled 停滞异常
+    status: str = Field(default="pending")
     download_url: str = Field(default="")
     save_path: str = Field(default="")          # 交 qB 时的实际保存路径；改季度/重绑后据此移动或提醒旧位置
     release_time: datetime | None = Field(default=None)

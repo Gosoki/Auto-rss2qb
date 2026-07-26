@@ -21,6 +21,9 @@ _SEASON_CN_RE = re.compile(r"第\s*([一二三四五六七八九十]+|\d+)\s*[�
 _SEASON_WORD_RE = re.compile(                            # 3rd Season / Season 3（ANi 罗马音常见）
     r"(\d+)(?:st|nd|rd|th)\s+season|season\s*(\d+)", re.I)
 _SEASON_EN_RE = re.compile(r"[Ss](\d{1,2})[Ee]\d")       # S02E07 → 第2季
+# 裸季标记 S4 / S2（LoliHouse、喵萌等常写 『番名 S4 / Romaji S4 - 17』）——前后都不许挨字母数字，
+# 免得吃到 PS4 / DTS5 / S02E07(由上面那条管) 之类。仅作最后兜底，显式的『第X季/Season N』优先。
+_SEASON_BARE_RE = re.compile(r"(?<![A-Za-z0-9])[Ss](\d{1,2})(?![0-9A-Za-z])")
 _GROUP_RE = re.compile(r"^[\[【]([^\]】]+)[\]】]")          # [组] 或 【组】
 _SLASH_RE = re.compile(r"\s+/\s+")                        # 语言分隔『罗马音 / 中文』，不吃番名内部的裸 /
 _HAN_RE = re.compile(r"[一-鿿]")                           # CJK 汉字
@@ -57,6 +60,9 @@ _STRIP_PATTERNS = [re.compile(p) for p in (     # 预编译（_clean_name 循环
 # 标签块 [..]/【..】（含空括号，整体替换）——_clean_name/_clean_for_search/parse_multibracket 共用。
 # 勿与 _INNER_BLK(带捕获组、+ 不匹配空括号) 混用：对空括号 [] 的 sub 结果不同。
 _TAG_BLK_RE = re.compile(r"[\[【][^\]】]*[\]】]")
+# 宣传标记『★07月新番★』（喵萌等）：它后面紧跟的 [ 会因语言分段被切走而失去右括号，
+# _TAG_BLK_RE 要求成对故删不掉，残留在番名里污染 别名键 与 bgm 搜索词。
+_PROMO_RE = re.compile(r"★[^★]*★")
 
 
 def is_batch(title: str) -> bool:
@@ -102,6 +108,9 @@ def extract_season(text: str) -> int:
     if s is not None:
         return s
     m = _SEASON_EN_RE.search(text)      # 兜底 S02E07
+    if m:
+        return int(m.group(1))
+    m = _SEASON_BARE_RE.search(text)    # 再兜底裸 S4（『番名 S4 - 17』）
     return int(m.group(1)) if m else 1
 
 
@@ -128,13 +137,14 @@ def extract_episode(text: str):
 
 def _clean_name(name_part: str) -> str:
     """去掉 [..]/【..】 标签块、扩展名与集数段，得到干净番名（无空格）。"""
-    s = _EXT_RE.sub("", _TAG_BLK_RE.sub("", name_part))
+    s = _PROMO_RE.sub("", _EXT_RE.sub("", _TAG_BLK_RE.sub("", name_part)))
     for pat in _STRIP_PATTERNS:
         m = pat.search(s)
         if m:
             s = s[:m.start()]
             break
-    return s.replace(" ", "").strip()
+    # 去掉分段切剩的孤立括号（『★07月新番★[番名』剥掉标记后会留个左括号）
+    return s.replace(" ", "").strip().strip("[]【】").strip()
 
 
 def estimate_premiere(release_time: datetime, episode, season: int) -> datetime:

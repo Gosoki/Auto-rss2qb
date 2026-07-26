@@ -84,7 +84,7 @@ async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
     new_path = mov.movie_save_path(movie_id)
     if not new_path or new_path == old_path:
         return   # 路径没变，无需移动
-    dl = [t for t in mov.movie_torrents(movie_id) if t.status in ("downloaded", "downloading")]
+    dl = [t for t in mov.movie_torrents(movie_id) if t.status in ("sent", "downloading")]
     if not dl:
         ui.notify("归档目录已更新（无已下文件，新版本将下到新目录）", type="positive")
         return
@@ -175,9 +175,12 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     _vdl.set_enabled(config.QB_ENABLED)
                     _vdl.tooltip("强制下这一版本到文件夹" if config.QB_ENABLED
                                  else "qB 未启用，去设置页开启后可下载")
-                    if t.status in ("downloaded", "downloading", "stalled") and not t.archived_at:  # 下过/在下/停滞(盘上有文件)且未归档才可删（delete 函数亦接受 stalled）
-                        ui.button(icon="delete_forever", on_click=_del(t.id)).props(
-                            "size=sm flat dense color=negative").tooltip("删除这一版本的文件（qB+硬盘，不可撤销）")
+                    if t.status in engine.HAVE_STATUSES:  # 下过/在下/停滞(盘上有文件)都可删（delete 函数亦接受 stalled）
+                        ui.button(icon="delete_forever",
+                                  on_click=_del(t.id, t.archived_at, t.save_path)).props(
+                            "size=sm flat dense color=negative").tooltip(
+                            "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
+                            else "删除这一版本的文件（qB+硬盘，不可撤销）")
                     if t.status in ("pending", "error"):   # 未下载的可直接排除
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "size=sm flat dense color=grey").style("font-size:12px").tooltip(
@@ -221,16 +224,27 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.notify("下载失败，看日志", type="negative")
         return h
 
-    def _del(mt_id):
+    def _del(mt_id, archived=None, save_path=""):
         async def h():
-            if not await confirm("删除这一版本的文件？",
-                                 "通过 qB 连同硬盘文件一起删除，不可撤销。",
-                                 ok_label="删除文件", ok_icon="delete_forever"):
+            if archived:   # 已归档：种子早已移出 qB，删不到文件 → 明确告知路径，让用户自己清理
+                if not await confirm(
+                        "这一版本已归档，只能标记已删",
+                        f"它已从 qB 移除，本工具删不到文件。确认后仅标记为『已删』。\n\n"
+                        f"⚠️ 文件仍在（需你手动删）：{save_path or '（未记录路径，请到下载目录自行查找）'}\n\n"
+                        f"想连文件一起删：先点『下载』把它重新挂回 qB，再删。",
+                        ok_label="标记已删", ok_icon="delete_forever"):
+                    return
+            elif not await confirm("删除这一版本的文件？",
+                                   "通过 qB 连同硬盘文件一起删除，不可撤销。",
+                                   ok_label="删除文件", ok_icon="delete_forever"):
                 return
             ok = await mov.delete_movie_torrent(mt_id)
             _after()
-            ui.notify("已删除该版本文件" if ok else "没删成（qB 未连上或无文件）",
-                      type="positive" if ok else "warning")
+            if ok and archived:
+                ui.notify(f"已标记为已删；文件仍在 {save_path or '下载目录'}，需手动清理", type="warning")
+            else:
+                ui.notify("已删除该版本文件" if ok else "没删成（qB 未连上或无文件）",
+                          type="positive" if ok else "warning")
         return h
 
     def _exclude(mt_id):
@@ -239,7 +253,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                                  "从可下里排除：不再显示为可下、RSS 再遇到同种子也不重收；可随时点『恢复』放回。",
                                  ok_label="排除", ok_icon="block"):
                 return
-            ok = mov.exclude_movie_torrent(mt_id)
+            ok = mov.exclude_torrent(mt_id)
             _after()
             ui.notify("已排除" if ok else "排除失败（已下载的用『删除文件』）",
                       type="positive" if ok else "warning")
@@ -247,7 +261,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
 
     def _unexclude(mt_id):
         def h():
-            mov.unexclude_movie_torrent(mt_id)
+            mov.unexclude_torrent(mt_id)
             _after()
             ui.notify("已恢复到可下")
         return h
@@ -339,7 +353,7 @@ def movies_page(t: str = ""):
 
         def _unexclude_mv(mt_id):
             def h():   # 取消排除：把 excluded 放回可下
-                mov.unexclude_movie_torrent(mt_id)
+                mov.unexclude_torrent(mt_id)
                 refresh_all()
                 ui.notify("已恢复到可下")
             return h
@@ -385,7 +399,7 @@ def movies_page(t: str = ""):
             ui.notify(f"已保存：自动扫描{on}，每 {secs // 3600} 小时一次", type="positive")
 
         def _movie_card(m, ts):
-            ndone = sum(1 for t in ts if t.status in ("downloaded", "downloading"))
+            ndone = sum(1 for t in ts if t.status in ("sent", "downloading"))
             srcs = sorted({t.source for t in ts if t.source})
             with ui.card().classes("w-full"):
                 with ui.row().classes("gap-3 items-start no-wrap w-full"):
@@ -422,7 +436,7 @@ def movies_page(t: str = ""):
                        ("待识别", k["unmatched"], "red", lambda: tabs.set_value("fail"), "pink-400"),
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject"), "pink-400"),
                        "|",
-                       ("已下", k["downloaded"], "green", None, "green-500"),
+                       ("已下", k["done"], "green", None, "green-500"),
                        ("可下载", ov["status"]["pending"], "blue", None, "green-500"),
                        ("失败", ov["status"]["error"], "red", None, "green-500"),
                        ("版本", k["versions"], "", None, "green-500")])
@@ -443,13 +457,22 @@ def movies_page(t: str = ""):
                 ui.label("种子状态").classes("text-sm font-bold")
                 ui.label("各状态种子计数（含 qB 实时态）").classes("text-xs text-gray-400")
             chips = [
-                ("已下载", ov["status"]["downloaded"], "green", None),
+                ("已下载", ov["status"]["sent"], "green", None),
                 ("可下载", ov["status"]["pending"], "blue", "还没下的版本，进详情逐条下"),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
                  "已忽略剧场版留下的种子；恢复时若一版都没下过会放回可下载"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的版本"),
-                ("种子数", k["versions"], "blue-grey", "全部种子/版本数（各状态之和）"),
             ]
+            # 少见状态只在非零时露出（与番剧侧同口径）：保证各 chip 之和 == 种子数，又不让全新库挂一排 0
+            for _lb, _key, _cl, _tip in (
+                ("下载中", "downloading", "teal", "正在交付给 qB 的瞬时态（通常一闪而过）"),
+                ("停滞", "stalled", "deep-orange", "已交付但长期零推进，脱离轮询、等人工处理"),
+                ("已删除", "deleted", "grey", "人工删过的版本"),
+                ("已排除", "excluded", "grey", "人工排除的版本（不再参与下载）"),
+            ):
+                if ov["status"].get(_key):
+                    chips.append((_lb, ov["status"][_key], _cl, _tip))
+            chips.append(("种子数", k["versions"], "blue-grey", "全部种子/版本数（各状态之和）"))
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
                     b = ui.badge(f"{label} {val}").props(f"color={color}").classes("text-sm")
@@ -616,8 +639,8 @@ def movies_page(t: str = ""):
         @ui.refreshable
         def reject_panel():
             rej = mov.list_rejected_movies()
-            dels = mov.deleted_movie_torrent_rows()      # 已删除种子（本页最底折叠①）
-            excls = mov.excluded_movie_torrent_rows()    # 已排除种子（本页最底折叠②）
+            dels = mov.deleted_torrent_rows()      # 已删除种子（本页最底折叠①）
+            excls = mov.excluded_torrent_rows()    # 已排除种子（本页最底折叠②）
             if not rej and not dels and not excls:
                 ui.label("没有已忽略的剧场版。（列表里点『忽略』会进这里，可随时恢复）").classes(
                     "text-gray-400 p-4")

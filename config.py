@@ -63,7 +63,7 @@ _SPEC = {
     "ANIME_DOWN_PATH": (str, ""),           # 动漫独立下载根（空=用工作目录 DOWN_PATH/番剧；填了=放这个独立目录，可另一块盘）
     "MOVIE_DOWN_PATH": (str, ""),            # 电影独立下载根（空=用工作目录 DOWN_PATH/剧场版；填了=放这个独立目录，可另一块盘）
     "ANIME_SEASON_SUBFOLDER": (bool, False),
-    "QUARTER_FMT": (str, "{yy}{q} · {m}月 · {season}"),   # 番剧下载文件夹的季度目录名
+    "QUARTER_FMT": (str, "{yy}{q}"),   # 番剧下载文件夹的季度目录名
     "MOVIE_QUARTER_FMT": (str, "{yyyy}"),   # 电影下载文件夹命名（默认年份 2026）；番剧走 QUARTER_FMT
     "QUARTER_FMT_UI": (str, ""),            # 空 = 跟随 QUARTER_FMT（见 __getattr__）
     "ANIME_SHOW_PENDING": (bool, True),
@@ -78,7 +78,9 @@ _SPEC = {
     "ANIME_DOWNLOAD_GRACE_MIN": (int, 120),
     "ANIME_TOP_PRIORITY_INSTANT": (bool, True),
     "ANIME_START_DATE": (str, ""),          # 开始使用日 YYYY-MM-DD：早于这天开播的番自动判『超期忽略』、不自动下载
-                                            # （种子照常入库）；空=不限。改日期可逆，只动待确认/超期番，不碰人工确认/拒绝
+                                            # （种子照常入库）；空=不限。改日期可逆，只动待确认/超期番，不碰人工确认/拒绝。
+                                            # 【只作用于 TV 番剧】：剧场版逐版本人工点下、本就不会自动下载，
+                                            # 故有意不受此限（已确认的产品决定，勿"对齐"加上去）
     "OPEN_PROXY": (bool, False),
     "PROXY_URL": (str, ""),                  # 代理地址：支持 http:// / https://；socks5:// 需另装 socksio 包
     "PROXY_USER": (str, ""),                 # 代理账号（需认证的代理才填；空=不认证）

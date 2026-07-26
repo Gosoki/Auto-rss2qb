@@ -31,6 +31,18 @@ _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _QUARTER_KEY_RE = re.compile(r"(\d{2})([A-D])")
 _TORRENT_CAP = 32 * 1024 * 1024  # .torrent 通常 < 1MB，32MB 已是极宽松上限
 
+# ---- 种子状态词表（TV 与剧场版共用的唯一来源；两条线 + 本模块都从这里取，别再各处手抄）----
+# 应用侧 status 全集：pending / downloading / sent / error / skipped / deleted / excluded / stalled
+#
+# 『该集已有一份、不再自动下』的权威判据（flush/plan/详情 covered/补下/跨表持有 统一用它）：
+#   sent/downloading=已交付或在下；stalled=停滞异常(留人工处理、不自动换源)。
+#   【不含 deleted】——用户删的那条不回来（靠其自身 deleted 终态：flush/plan 只挑 pending/error，永不选它），
+#   但同集来了新 hash 照常自动下（该集此时无 sent/downloading/stalled → 不被挡）。
+HAVE_STATUSES = ("sent", "downloading", "stalled")
+# 『该集已处理过、不复活去重落选的 skipped 兄弟』的判据（restore/换源兜底用）：在上者基础上【+deleted】——
+#   用户特意删过的集，其 skipped 兄弟不该被复活重下（与"deleted 不重下"一致）。
+HANDLED_STATUSES = HAVE_STATUSES + ("deleted",)
+
 # 写回 Anime/Movie 的 bgm 字段；多数两者同名，个别（duration=片长）仅剧场版有，靠下方 hasattr 跳过番剧
 _BGM_FIELDS = ("bangumi_id", "display_name", "jp_name", "air_date", "air_weekday",
                "total_episodes", "platform", "cover_url", "rating", "summary",
@@ -197,31 +209,31 @@ def set_torrent_status(model_cls, tid: int, status: str) -> None:
             s.commit()
 
 
-def settle_downloaded(model_cls, tid: int) -> None:
-    """把交付成功的种子直接落定为『已下完』(status=downloaded, qb_progress=1，脱离 in-flight)。
+def settle_sent(model_cls, tid: int) -> None:
+    """把交付成功的种子直接落定为『已下完』(status=sent, qb_progress=1，脱离 in-flight)。
     关状态跟踪(QB_SYNC_STATUS=off)时用：发送即已下、不轮询 qB——若不落定 qb_progress，它会永久满足
     _inflight_where(progress<1 且 state 空未落定)，永远挂在『正在下载』区、且 has_inflight 恒真。"""
     with get_session() as s:
         t = s.get(model_cls, tid)
         if t is not None:
-            t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "downloaded", 1.0, "", datetime.now()
+            t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "sent", 1.0, "", datetime.now()
             s.add(t)
             s.commit()
 
 
 def settle_inflight_off() -> int:
     """关闭 qB 状态跟踪(QB_SYNC_STATUS→off)或发送(QB_ENABLED→off)时，一次性把当前所有『在下的』种子
-    落定为已下完(status=downloaded、qb_progress=1、脱离 in-flight)。返回落定数。
+    落定为已下完(status=sent、qb_progress=1、脱离 in-flight)。返回落定数。
 
     off 之后 sync 内层循环不再运行(见 worker.run_qb_sync 的 while 条件)，这批『on 模式交付、进度未满』的行
     再无路径推进 → 会永久满足 _inflight_where、恒挂『正在下载』区、has_inflight 恒真。此处一次性落定，语义与
-    settle_downloaded/『off=发送即已下』一致。settle_downloaded 只对【新交付】单条生效，故切换时刻的旧行须靠这里兜。"""
+    settle_sent/『off=发送即已下』一致。settle_sent 只对【新交付】单条生效，故切换时刻的旧行须靠这里兜。"""
     n = 0
     now = datetime.now()
     with get_session() as s:
         for model_cls in (AnimeTorrent, MovieTorrent):
             for t in s.exec(select(model_cls).where(*_inflight_where(model_cls))):
-                t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "downloaded", 1.0, "", now
+                t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "sent", 1.0, "", now
                 s.add(t)
                 n += 1
         s.commit()
@@ -241,8 +253,8 @@ def reset_downloading(model_cls) -> None:
 
 async def archive_old_completed() -> int:
     """完成归档：把『下载完成已超过 QB_ARCHIVE_AFTER_DAYS 天』的种子从 qB 移除【只删种子、留文件】，
-    盖 archived_at、清 qb_state（不再跟踪）。status 保持 downloaded 不变——归档的仍是已下的一集，去重/统计
-    /不重下等一切沿用 downloaded 语义，只是从 qB 列表清出、UI 显示『已归档』。
+    盖 archived_at、清 qb_state（不再跟踪）。status 保持 sent 不变——归档的仍是已下的一集，去重/统计
+    /不重下等一切沿用 sent 语义，只是从 qB 列表清出、UI 显示『已归档』。
 
     完成时间以 qb_synced_at 为准：种子完成即脱离轮询、该时间冻结在完成点。跨表同 hash 安全：只删种子不删文件，
     另一侧下轮各自归档（qb.delete 对已不在的 hash 幂等）。qB 连不上/删失败则本轮跳过、下轮再来。返回归档数。"""
@@ -254,7 +266,7 @@ async def archive_old_completed() -> int:
     for model_cls in (AnimeTorrent, MovieTorrent):
         with get_session() as s:
             rows = [(t.id, t.info_hash) for t in s.exec(select(model_cls).where(
-                model_cls.status == "downloaded",
+                model_cls.status == "sent",
                 model_cls.qb_progress >= 1.0,
                 model_cls.archived_at.is_(None),
                 model_cls.qb_synced_at.is_not(None),
@@ -266,7 +278,7 @@ async def archive_old_completed() -> int:
             now = datetime.now()
             with get_session() as s:
                 t = s.get(model_cls, tid)
-                if t is not None and t.status == "downloaded" and t.archived_at is None:
+                if t is not None and t.status == "sent" and t.archived_at is None:
                     t.archived_at, t.qb_state = now, ""    # 标已归档 + 清实时态（脱离 qB 跟踪与做种统计）
                     s.add(t)
                     s.commit()
@@ -288,17 +300,17 @@ def pick_best(torrents, pref=None):
 
 
 def hash_owned_elsewhere(info_hash: str, other_model) -> bool:
-    """该 info_hash 在另一张表里是否仍被持有(downloading/downloaded)。
+    """该 info_hash 在另一张表里是否仍被持有(downloading/sent)。
 
     TV 与剧场版两条独立管线偶有同一物理种子（同 hash，如某剧场版也被 ANi 按集发）。删文件前查一下：
     对面还在用就别 qB-delete(deleteFiles) 把共享的种子/硬盘文件一起端了，只在本表脱手即可。
-    持有判据须与『可删状态』(downloaded/downloading/stalled) 对齐：stalled 的行文件仍在盘、仍指向该 hash，
+    持有判据须与『可删状态』(sent/downloading/stalled) 对齐：stalled 的行文件仍在盘、仍指向该 hash，
     若不算持有会被本侧 deleteFiles 误删共享文件、留下永久悬空指针（deleted 是文件已删的终态，不计入）。
     """
     with get_session() as s:
         return s.exec(select(other_model).where(
             other_model.info_hash == info_hash,
-            other_model.status.in_(["downloaded", "downloading", "stalled"]))).first() is not None
+            other_model.status.in_(HAVE_STATUSES))).first() is not None
 
 
 def qb_is_local() -> bool:
@@ -354,9 +366,12 @@ _QB_SEEDING = {"uploading", "forcedUP", "stalledUP", "queuedUP", "checkingUP",
 # 『落定』态：不再需要轮询跟踪的种子 qB 态——做种(=下载已完成) + 文件缺失(终态、不会再变)。
 # in-flight 判定与 sync 查询都据此把它们排除，使『停止监听』对做种/缺文件都生效。
 _QB_SETTLED = _QB_SEEDING | {"missingFiles"}
-# 短暂『工作中』态（在动但速度可能为 0：取元数据/校验/分配磁盘）——这些也算『在真下』，
+# 短暂『工作中』态（在动但速度可能为 0：取元数据/校验/分配磁盘/搬运）——这些也算『在真下』，
 # 免得刚开始那几秒被速度地板误判成慢。真正的下载态(downloading/forcedDL)则改用速度地板判快慢。
-_QB_TRANSIENT = {"metaDL", "forcedMetaDL", "checkingDL", "allocating"}
+# checkingResumeData=qB 重启后校验续传数据、moving=搬运文件(开 temp_path 时完成后必经)：
+# 都是速度 0 但确实在动，漏收会让快轮询在校验/搬运期间误判『没在真下』而提前退回休眠。
+_QB_TRANSIENT = {"metaDL", "forcedMetaDL", "checkingDL", "allocating",
+                 "checkingResumeData", "moving"}
 # 预算成 list 供 SQL in_/not_in 复用（集合恒定、只读；避免热路径每次调用重新 list()）
 _QB_SETTLED_LIST = list(_QB_SETTLED)
 _QB_TRANSIENT_LIST = list(_QB_TRANSIENT)
@@ -366,16 +381,12 @@ def qb_is_downloading(state: str) -> bool:
     return state in _QB_DOWNLOADING
 
 
-def qb_is_seeding(state: str) -> bool:
-    return state in _QB_SEEDING
-
-
 def _inflight_where(model_cls):
     """『在下的种子』筛选条件（sync 查询与 has_inflight 共用，口径一致）：
-    已交付(downloaded/downloading) 且 进度<100% 且 qB 态未落定(非做种/非文件缺失)。
+    已交付(sent/downloading) 且 进度<100% 且 qB 态未落定(非做种/非文件缺失)。
     进度满/做种(已完成)/文件缺失 都算落定 → 不再轮询，qB 压力只随『当前在下数』走。"""
     return (
-        model_cls.status.in_(["downloaded", "downloading"]),
+        model_cls.status.in_(["sent", "downloading"]),
         model_cls.qb_progress < 1.0,
         func.coalesce(model_cls.qb_state, "").not_in(_QB_SETTLED_LIST),
     )
@@ -413,7 +424,7 @@ def has_active_downloading() -> bool:
 
 def mark_done_by_hash(info_hash: str) -> bool:
     """把某 info_hash 的种子标记为『已下完』(qb_progress=1、脱离 in-flight)——供 qB『完成时回调』精确兜底。
-    认我们表里 downloaded/downloading/stalled 的种子；非法 hash / 非我们的 / 已终态(deleted/skipped/excluded) 返回 False。
+    认我们表里 sent/downloading/stalled 的种子；非法 hash / 非我们的 / 已终态(deleted/skipped/excluded) 返回 False。
     含 stalled：停滞种子被 sync 脱离轮询后再不复查，若它其实爬完了，只能靠此回调恢复为已下完。"""
     h = (info_hash or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", h):
@@ -423,9 +434,9 @@ def mark_done_by_hash(info_hash: str) -> bool:
             t = s.exec(select(model_cls).where(model_cls.info_hash == h)).first()
             if t is None:
                 continue
-            if t.status not in ("downloaded", "downloading", "stalled"):
+            if t.status not in HAVE_STATUSES:
                 continue   # 这张表里是终态 → 跨表同 hash 可能另一表还在下/停滞，继续查下一张，别提前 return
-            t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "downloaded", 1.0, "", datetime.now()
+            t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "sent", 1.0, "", datetime.now()
             s.add(t)
             s.commit()
             log.info("qB 完成回调：标记已下完 - %s", h[:12])
@@ -433,9 +444,9 @@ def mark_done_by_hash(info_hash: str) -> bool:
     return False   # 不是我们的种子 → 忽略
 
 
-def backfill_legacy_downloaded_once() -> None:
-    """一次性迁移：本功能上线前 status='downloaded' 语义=已交付（历史行都早已下完），但 qb_progress 可能为 0/未满。
-    新模型以 qb_progress>=1 判『已完成、停止监听』，故上线时把现存 downloaded 行的 qb_progress 补成 1.0，免得它们
+def backfill_legacy_progress_once() -> None:
+    """一次性迁移：本功能上线前 status='sent' 语义=已交付（历史行都早已下完），但 qb_progress 可能为 0/未满。
+    新模型以 qb_progress>=1 判『已完成、停止监听』，故上线时把现存 sent 行的 qb_progress 补成 1.0，免得它们
     被误判成『在下』而永久滞留 in-flight、每活跃间隔空打一次 qB。用 Setting 标记，只跑一次（后续新交付照常跟踪）。"""
     flag = "_QB_PROGRESS_BACKFILLED"
     n = 0
@@ -444,14 +455,14 @@ def backfill_legacy_downloaded_once() -> None:
             return
         for model_cls in (AnimeTorrent, MovieTorrent):
             for t in s.exec(select(model_cls).where(
-                    model_cls.status == "downloaded", model_cls.qb_progress < 1.0)):
+                    model_cls.status == "sent", model_cls.qb_progress < 1.0)):
                 t.qb_progress = 1.0
                 s.add(t)
                 n += 1
         s.add(Setting(key=flag, value="1"))
         s.commit()
     if n:
-        log.info("一次性迁移：%d 条历史 downloaded 种子标记为已完成（qb_progress=1，脱离 in-flight）", n)
+        log.info("一次性迁移：%d 条历史 sent 种子标记为已完成（qb_progress=1，脱离 in-flight）", n)
 
 
 async def sync_qb_status(model_cls) -> int:
@@ -485,7 +496,7 @@ async def sync_qb_status(model_cls) -> int:
     with get_session() as s:
         for tid, h, was_synced in rows:
             t = s.get(model_cls, tid)
-            if t is None or t.status not in ("downloaded", "downloading"):
+            if t is None or t.status not in ("sent", "downloading"):
                 continue
             d = info.get(h)
             if d is None:
@@ -524,7 +535,7 @@ async def sync_qb_status(model_cls) -> int:
             if state == "error":
                 t.status = "error"          # qB 侧真错误 → 回传；missingFiles 有意不回传（只镜像显示）
             elif t.status == "downloading" and t.qb_progress >= 1.0:
-                t.status = "downloaded"     # 兼容旧的 downloading 占位（正常已在交付时置 downloaded）
+                t.status = "sent"     # 兼容旧的 downloading 占位（正常已在交付时置 sent）
             elif (config.QB_STALL_TIMEOUT_MIN > 0 and t.qb_progress < 1.0
                   and t.qb_progress_at is not None
                   and now - t.qb_progress_at > timedelta(minutes=config.QB_STALL_TIMEOUT_MIN)):
@@ -541,8 +552,8 @@ async def sync_qb_status(model_cls) -> int:
 
 def qb_summary(model_cls) -> dict:
     """某表已交付种子的 qB 实时态聚合：跟踪数 / 下载中 / 已完成 / 下速 / 平均进度。
-    completed = 处于做种/已完成暂停等『下载已完成』态的数（max_ratio 极小时下完即 stoppedUP）——
-    统一叫『已完成』而非『做种』，避免把下完停着的种子说成在上传做种（B6）。
+    completed = 进度已满(qb_progress>=1)的数——统一叫『已完成』而非『做种』，
+    避免把下完停着的种子说成在上传做种（B6）；为何按进度而非 qB 态判，见下方实现处注释。
 
     SQL 侧按 qb_state 分组聚合，只回十几种 state 的汇总行，不把整表已下种子整行拉进内存
     （已下是常态终态、只增不减，随挂机可累积到几千上万条）。qb_state='' 即未被 qB 跟踪，排除。"""
@@ -550,9 +561,17 @@ def qb_summary(model_cls) -> dict:
         grp = s.exec(
             select(model_cls.qb_state, func.count(), func.sum(model_cls.qb_dlspeed),
                    func.sum(model_cls.qb_progress))
-            .where(model_cls.status.in_(["downloaded", "downloading"]), model_cls.qb_state != "")
+            .where(model_cls.status.in_(["sent", "downloading"]), model_cls.qb_state != "")
             .group_by(model_cls.qb_state)).all()
-    tracked = downloading = completed = dlspeed = 0
+        # 『已完成』按【进度满】判，不按 qB 态判：种子一到 100% 就脱离 in-flight、此后不再同步，
+        # 其 qb_state 会永久冻结在最后一次同步到的值。开了 temp_path 时完成瞬间是 moving(搬运中)，
+        # 若按做种态判就会把这些行永久算作『跟踪中但未完成』，仪表盘已完成数长期少记。进度是唯一可靠依据。
+        # 唯一例外 missingFiles：进度虽记着 1.0，但文件已从盘上消失，不该报成『已完成』（只在跟踪数里体现）。
+        completed = s.exec(select(func.count()).select_from(model_cls).where(
+            model_cls.status.in_(["sent", "downloading"]),
+            model_cls.qb_state != "", model_cls.qb_state != "missingFiles",
+            model_cls.qb_progress >= 1.0)).one()
+    tracked = downloading = dlspeed = 0
     prog_sum = 0.0
     for state, cnt, speed, psum in grp:
         cnt = cnt or 0
@@ -561,8 +580,6 @@ def qb_summary(model_cls) -> dict:
         if qb_is_downloading(state):
             downloading += cnt
             dlspeed += int(speed or 0)
-        if qb_is_seeding(state):        # 做种态=下载已完成 → 计入『已完成』
-            completed += cnt
     return {
         "tracked": tracked,
         "downloading": downloading,

@@ -26,7 +26,7 @@ async def _startup():
     anime.seed_source_groups()       # 首启种入 ANi/Mikan 两个源组
     anime.reset_downloading()        # 复位上次遗留的 downloading（TV）
     movies.reset_downloading()      # 复位上次遗留的 downloading（剧场版）
-    engine.backfill_legacy_downloaded_once()  # 一次性：历史 downloaded 标记为已完成，免得被新模型误判『在下』
+    engine.backfill_legacy_progress_once()  # 一次性：历史 sent 标记为已完成，免得被新模型误判『在下』
     asyncio.create_task(run_worker())
     asyncio.create_task(run_qb_sync())    # qB 种子实时态同步（独立频率）
     asyncio.create_task(run_movie_scan())  # 剧场版/OVA 自动扫描（独立频率）

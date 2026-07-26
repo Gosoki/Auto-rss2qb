@@ -3,6 +3,11 @@
 来源仅 Mikan 季度浏览页的『剧场版/OVA 桶』——不碰 TV 那边的订阅源。识别用 bgm。
 『是不是电影以 Mikan 桶为准』：桶里的一律当剧场版/OVA 收进 Movie（哪怕 bgm 把类型识别成 TV，
 也只是详情页的 bgm 元数据，不改变它在剧场版列表里，也不转去番剧表）。剧场版一部作品逐版本人工点下。
+
+【有意与 TV 侧不同的两点，均为产品决定，勿"对齐"补上】：
+· 不受『开始使用日』(ANIME_START_DATE) 约束——那是给自动下载兜底的，剧场版本就不自动下。
+· 无 flush 自动放行、也无 _revive_orphaned_skipped 式的自动换源兜底——
+  哪一版下失败就停在那里，由用户在详情页自己挑另一版下，不替用户决定。
 """
 import asyncio
 import logging
@@ -31,7 +36,7 @@ def _has_downloads(s, movie_id: int) -> bool:
     含 deleted（删过也算季度已定）+ stalled（半成品仍在盘、save_path 按旧季度写过），否则重识别把季度冲掉、文件散目录。"""
     return s.exec(select(MovieTorrent).where(
         MovieTorrent.movie_id == movie_id,
-        MovieTorrent.status.in_(["downloading", "downloaded", "deleted", "stalled"]))).first() is not None
+        MovieTorrent.status.in_(engine.HANDLED_STATUSES))).first() is not None
 
 
 def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
@@ -183,7 +188,7 @@ def overview() -> dict:
             select(MovieTorrent.status, func.count()).group_by(MovieTorrent.status))}
         versions = s.exec(select(func.count()).select_from(MovieTorrent)).one()
         dl_ids = set(s.exec(select(MovieTorrent.movie_id)
-                            .where(MovieTorrent.status == "downloaded").distinct()))
+                            .where(MovieTorrent.status == "sent").distinct()))
     active = [m for m in all_m if not m.rejected]
     q_of = {m.id: (m.quarter or "未知") for m in active}   # 键域即 active 的 id 集，成员判断复用它
     total_by_q = Counter(q_of[m.id] for m in active)
@@ -196,13 +201,15 @@ def overview() -> dict:
             "total": len(active),
             "matched": sum(1 for m in active if m.bangumi_id),
             "unmatched": sum(1 for m in active if not m.bangumi_id),
-            "downloaded": len([mid for mid in dl_ids if mid in q_of]),
+            "done": len([mid for mid in dl_ids if mid in q_of]),   # 有已下版本的影片数（KPI，非状态值）
             "rejected": sum(1 for m in all_m if m.rejected),
             "versions": versions,
         },
         "by_quarter": [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs],
+        # 八种应用侧 status 全列（含 deleted/excluded），与番剧侧同口径：仪表盘『种子数』号称"各状态之和"
         "status": {k: status.get(k, 0) for k in
-                   ("downloaded", "downloading", "pending", "error", "skipped", "stalled")},
+                   ("sent", "downloading", "pending", "error",
+                    "skipped", "stalled", "deleted", "excluded")},
         "qb": engine.qb_summary(MovieTorrent),
         "config": {"qb": config.QB_ENABLED},
     }
@@ -236,7 +243,7 @@ def year_brief() -> list[dict]:
             "fail": sum(1 for rej, bid in mv if not rej and not bid),  # 待识别（未匹配 bgm）
             "ignored": sum(1 for rej, bid in mv if rej),               # 已忽略
             "versions": sum(qc.values()),
-            "done": qc.get("downloaded", 0),
+            "done": qc.get("sent", 0),
             "pending": qc.get("pending", 0) + qc.get("error", 0),
         })
     return out
@@ -363,7 +370,7 @@ def restore_movie(movie_id: int) -> None:
         s.add(m)
         rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)))
         # deleted/stalled 也算『有过一版』：唯一版本被删/停滞后，不该把 skipped 旧版翻出来重下（与番剧 _HANDLED 一致）
-        anydl = any(t.status in ("downloaded", "downloading", "deleted", "stalled") for t in rows)
+        anydl = any(t.status in engine.HANDLED_STATUSES for t in rows)
         for t in rows:  # 剧场版=一部作品：已有一版就别把 skipped 旧版翻出来（deleted 是用户主动删，也不重下）
             if t.status == "skipped" and not anydl:
                 t.status = "pending"
@@ -371,7 +378,7 @@ def restore_movie(movie_id: int) -> None:
         s.commit()
 
 
-def _terminal_movie_torrent_rows(status: str) -> list[dict]:
+def _terminal_torrent_rows(status: str) -> list[dict]:
     """某终态(deleted/excluded)的剧场版种子行（片名/原名），供『已忽略』页底部折叠展示。"""
     with get_session() as s:
         ts = list(s.exec(select(MovieTorrent).where(MovieTorrent.status == status)
@@ -383,19 +390,19 @@ def _terminal_movie_torrent_rows(status: str) -> list[dict]:
              "name": names.get(t.movie_id) or "?", "raw": t.raw_title or ""} for t in ts]
 
 
-def deleted_movie_torrent_rows() -> list[dict]:
+def deleted_torrent_rows() -> list[dict]:
     """已删除(deleted)的剧场版种子——『已删除种子』折叠 + 重新下载找回（与番剧对称）。"""
-    return _terminal_movie_torrent_rows("deleted")
+    return _terminal_torrent_rows("deleted")
 
 
-def excluded_movie_torrent_rows() -> list[dict]:
+def excluded_torrent_rows() -> list[dict]:
     """已排除(excluded)的剧场版种子——『已排除种子』折叠 + 恢复放回可下（与番剧对称）。"""
-    return _terminal_movie_torrent_rows("excluded")
+    return _terminal_torrent_rows("excluded")
 
 
-def exclude_movie_torrent(mt_id: int) -> bool:
+def exclude_torrent(mt_id: int) -> bool:
     """排除一条不想要的待下剧场版版本：置终态 excluded（不删文件、不碰 qB，只改状态）——
-    不再显示在可下队列、RSS 再遇到同 hash 也不重收；可用 unexclude_movie_torrent 撤销。只动 pending/error。"""
+    不再显示在可下队列、RSS 再遇到同 hash 也不重收；可用 unexclude_torrent 撤销。只动 pending/error。"""
     with get_session() as s:
         t = s.get(MovieTorrent, mt_id)
         if t is None or t.status not in ("pending", "error"):
@@ -406,7 +413,7 @@ def exclude_movie_torrent(mt_id: int) -> bool:
     return True
 
 
-def unexclude_movie_torrent(mt_id: int) -> bool:
+def unexclude_torrent(mt_id: int) -> bool:
     """取消排除：把 excluded 的剧场版种子放回 pending。返回是否放回了。"""
     with get_session() as s:
         t = s.get(MovieTorrent, mt_id)
@@ -505,7 +512,7 @@ async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
     with get_session() as s:
         pairs = [(t.id, t.info_hash) for t in s.exec(select(MovieTorrent).where(
             MovieTorrent.movie_id == movie_id,
-            MovieTorrent.status.in_(["downloaded", "downloading"]),
+            MovieTorrent.status.in_(["sent", "downloading"]),
             MovieTorrent.archived_at.is_(None)))]   # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
     if not pairs:
         return rep
@@ -514,7 +521,7 @@ async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
         with get_session() as s:
             for tid in ids:
                 t = s.get(MovieTorrent, tid)
-                if t is not None and t.status in ("downloaded", "downloading"):
+                if t is not None and t.status in ("sent", "downloading"):
                     t.status = "pending"
                     s.add(t)
             s.commit()
@@ -575,7 +582,7 @@ async def download_movie_torrent(mt_id: int) -> bool:
     async with _dl_lock:
         with get_session() as s:
             t = s.get(MovieTorrent, mt_id)
-            if t is None or (t.status in ("downloading", "downloaded") and t.archived_at is None):
+            if t is None or (t.status in ("downloading", "sent") and t.archived_at is None):
                 return False  # 已在下/已下 → 幂等短路，防并发重复交 qB；例外：已归档的可重新下（重新交回 qB）
             # 跨表【不】去重：剧场版/番剧各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer。
@@ -619,10 +626,10 @@ async def download_movie_torrent(mt_id: int) -> bool:
             s.add(t)
             s.commit()
     if config.QB_SYNC_STATUS:
-        _set_status(mt_id, "downloaded")
+        _set_status(mt_id, "sent")
         engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
     else:
-        engine.settle_downloaded(MovieTorrent, mt_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
+        engine.settle_sent(MovieTorrent, mt_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
     log.info("已加入qB（剧场版）- torrent=%s", mt_id)
     await notify(f"{folder} 🎬📥")
     return True
@@ -632,12 +639,21 @@ async def delete_movie_torrent(mt_id: int) -> bool:
     """删除单条剧场版种子在 qB 里的文件（走 qB 接口），标记为 deleted（终态，恢复时不重下）。
 
     若同一 hash TV 管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。
+
+    已归档(archived_at)的：种子早已从 qB 移除，qB 代删不到文件 → 只落 deleted 终态，
+    硬盘文件留在 save_path 由用户自行清理（UI 在确认框里把该路径显示出来）。
     """
     with get_session() as s:
         t = s.get(MovieTorrent, mt_id)
-        if t is None or t.status not in ("downloaded", "downloading", "stalled") or t.archived_at is not None:
-            return False  # stalled 也允许删；已归档(archived_at)不删——已不在 qB、代删不到文件，须先『重新下载』再删
+        if t is None or t.status not in engine.HAVE_STATUSES:
+            return False  # stalled 也允许删
         h = t.info_hash
+        if t.archived_at is not None:      # 已归档：不在 qB，删不到文件，只改状态
+            t.status = "deleted"
+            s.add(t)
+            s.commit()
+            log.info("删除已归档条目（仅标记，文件留在 %s）- torrent=%s", t.save_path or "?", mt_id)
+            return True
     if engine.hash_owned_elsewhere(h, AnimeTorrent):
         _set_status(mt_id, "deleted")  # TV 侧还持有同一种子 → 只脱手，不删文件
         return True

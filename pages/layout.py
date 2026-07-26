@@ -25,7 +25,7 @@ def _jump_targets() -> list:
     ]
 
 # 应用侧种子状态 → 中文（番剧表/剧场版/详情/新入库共用）
-STATUS_CN = {"downloaded": "已下", "pending": "待下", "downloading": "下载中",
+STATUS_CN = {"sent": "已下", "pending": "待下", "downloading": "下载中",
              "error": "失败", "skipped": "跳过", "deleted": "已删", "excluded": "已排除",
              "stalled": "⚠️停滞"}
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -34,8 +34,8 @@ WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周�
 def torrent_status_cn(status: str, qb_progress=0, qb_synced_at=None) -> str:
     """无 qB 实时态时的回落显示：已交给 qB 但还没首次同步回来（刚发送）→『下载中』；其余按 STATUS_CN
     （含已下完/跳过/已删）。有实时态时调用方用 qb_live_text 显示『下载中 X% / 做种 100%』，不走这里。
-    关了状态跟踪（QB_SYNC_STATUS=false）时不读 qB，发送即『已下』，故 downloaded 一律显示已下、不显『下载中』。"""
-    if (config.QB_SYNC_STATUS and status == "downloaded"
+    关了状态跟踪（QB_SYNC_STATUS=false）时不读 qB，发送即『已下』，故 sent 一律显示已下、不显『下载中』。"""
+    if (config.QB_SYNC_STATUS and status == "sent"
             and (qb_progress or 0) < 1.0 and qb_synced_at is None):
         return "下载中"
     return STATUS_CN.get(status, status)
@@ -264,6 +264,11 @@ def human_size(n) -> str:
 
 def qb_live_text(t) -> str:
     """种子的 qB 实时态一行文案，如『下载中 45% ↓2.1MB/s』/『已完成 100%』；无实时态返回 ''。"""
+    # 人工终态优先于任何 qB 残留态：deleted/excluded 的行仍留着 archived_at 或旧 qb_state
+    # （删除/排除只改 status，不清实时态），若不先拦住，已删的会被显示成『已归档』或『已完成 100%』。
+    # 返回 '' 让调用方回落到 torrent_status_cn(status)，拿到『已删/已排除』与中性配色。
+    if getattr(t, "status", "") in ("deleted", "excluded"):
+        return ""
     if getattr(t, "archived_at", None):
         return "已归档"          # 完成后已从 qB 移除(留文件)、不再跟踪
     if not getattr(t, "qb_state", ""):
@@ -332,7 +337,10 @@ async def confirm(title: str, note: str = "", ok_label: str = "确定",
     with ui.dialog() as dlg, ui.card().style("max-width:92vw"):
         ui.label(title).classes("font-bold")
         if note:
-            ui.label(note).classes("text-xs text-gray-400")
+            # pre-line：保留 note 里的换行（如"文件仍在 <路径>"这类要单独成行的提示），
+            # 同时仍按宽度自动折行；单行 note 的显示不受影响。
+            ui.label(note).classes("text-xs text-gray-400").style(
+                "white-space:pre-line;word-break:break-all")
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("取消", on_click=lambda: dlg.submit(False)).props("flat")
             ok = ui.button(ok_label, on_click=lambda: dlg.submit(True)).props(f"color={ok_color} unelevated")

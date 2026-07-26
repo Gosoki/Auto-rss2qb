@@ -178,10 +178,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "size=sm flat dense color=grey").style("font-size:12px").tooltip(
                             "不想要这条：从待下直接排除（不删文件，只改状态；可撤销）")
-                    if t.status in ("downloaded", "downloading", "stalled") and not t.archived_at:  # 下过/在下/停滞(盘上有文件)且未归档才给按集删（归档的不在 qB、代删不到文件；delete 函数亦接受 stalled）
-                        ui.button(icon="delete_forever", on_click=_del_one(t.id)).props(
+                    if t.status in engine.HAVE_STATUSES:  # 下过/在下/停滞(盘上有文件)都可删（delete 函数亦接受 stalled）
+                        ui.button(icon="delete_forever",
+                                  on_click=_del_one(t.id, t.archived_at, t.save_path)).props(
                             "size=sm flat dense color=negative").tooltip(
-                            "删除这一集的文件（qB+硬盘，不可撤销）")
+                            "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
+                            else "删除这一集的文件（qB+硬盘，不可撤销）")
                     _dlb = ui.button("下载", icon="download", on_click=_force(t.id)).props(  # 下载放最后
                         "size=sm flat dense").style("font-size:12px")
                     _dlb.set_enabled(config.QB_ENABLED)
@@ -286,7 +288,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if not new_path or new_path == old_path:
             return   # 路径没变，无需移动
         dl = [t for t in anime.list_episodes(anime_id)
-              if t.status in ("downloaded", "downloading")]
+              if t.status in ("sent", "downloading")]
         if not dl:
             ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
             return
@@ -393,16 +395,30 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.notify("下载失败，看日志", type="negative")
         return h
 
-    def _del_one(torrent_id):
+    def _del_one(torrent_id, archived=None, save_path=""):
         async def h():
-            if not await confirm("删除这一集的文件？",
-                                 "通过 qB 连同硬盘文件一起删除，不可撤销。",
-                                 ok_label="删除文件", ok_icon="delete_forever"):
+            if archived:   # 已归档：种子早已移出 qB，删不到文件 → 明确告知路径与后果，让用户自己清理
+                if not await confirm(
+                        "这一集已归档，只能标记已删",
+                        f"它已从 qB 移除，本工具删不到文件。确认后仅标记为『已删』。\n\n"
+                        f"⚠️ 文件仍在（需你手动删）：{save_path or '（未记录路径，请到下载目录自行查找）'}\n\n"
+                        f"注意：标记后这一集就算『没有了』，若该集还有别的源的待下版本，"
+                        f"后台可能自动补下一份——旧文件不会被覆盖，会变成同一集两份。"
+                        f"请尽快自行删除上面的文件；只是不想要这个版本的话，用『排除』更合适。\n"
+                        f"想连文件一起删：先点『下载』把它重新挂回 qB，再删。",
+                        ok_label="标记已删", ok_icon="delete_forever"):
+                    return
+            elif not await confirm("删除这一集的文件？",
+                                   "通过 qB 连同硬盘文件一起删除，不可撤销。",
+                                   ok_label="删除文件", ok_icon="delete_forever"):
                 return
             ok = await anime.delete_anime_torrent(torrent_id)
             _after()
-            ui.notify("已删除该集文件" if ok else "没删成（qB 未连上或该集无文件）",
-                      type="positive" if ok else "warning")
+            if ok and archived:
+                ui.notify(f"已标记为已删；文件仍在 {save_path or '下载目录'}，需手动清理", type="warning")
+            else:
+                ui.notify("已删除该集文件" if ok else "没删成（qB 未连上或该集无文件）",
+                          type="positive" if ok else "warning")
         return h
 
     def _set_ep(torrent_id):

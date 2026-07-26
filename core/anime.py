@@ -26,14 +26,9 @@ log = logging.getLogger("autorss")
 # 串行化『选集→占位下载』，防止 worker flush 与 UI 补下并发对同一集重复放行
 _download_lock = asyncio.Lock()
 
-# 『该集已有一份、不再自动下』的权威判据（flush/plan/详情 covered/补下 统一用它）：
-#   downloaded/downloading=已交付或在下；stalled=停滞异常(留人工处理、不自动换源)。
-#   【不含 deleted】——用户删的那条不回来（靠其自身 deleted 终态：flush/plan 只挑 pending/error，永不选它），
-#   但同集来了新 hash 照常自动下（该集此时无 downloaded/downloading/stalled → 不被挡）。
-HAVE_STATUSES = ("downloaded", "downloading", "stalled")
-# 『该集已处理过、不复活去重落选的 skipped 兄弟』的判据（restore/换源兜底用）：在上者基础上【+deleted】——
-#   用户特意删过的集，其 skipped 兄弟不该被复活重下（与"deleted 不重下"一致）。
-_HANDLED_STATUSES = HAVE_STATUSES + ("deleted",)
+# 状态词表统一在 engine（两条线共用，见那里的定义与口径说明）；此处转出，供 pages 沿用 anime.HAVE_STATUSES
+HAVE_STATUSES = engine.HAVE_STATUSES
+HANDLED_STATUSES = engine.HANDLED_STATUSES
 
 
 def _anime_path_parts(a, t=None):
@@ -72,7 +67,7 @@ def quarter_brief() -> list[dict]:
             "fail": sum(1 for conf, rej, bid in aq if not rej and not bid),    # 待识别(未匹配)
             "ignored": sum(1 for conf, rej, bid in aq if rej),                 # 已忽略
             "torrents": sum(qc.values()),
-            "done": qc.get("downloaded", 0),
+            "done": qc.get("sent", 0),
             "pending": qc.get("pending", 0) + qc.get("error", 0),
         })
     return out
@@ -204,8 +199,10 @@ async def _resolve_anime(item) -> int:
                 confirmed=auto,
             )
             _apply_bgm(anime, info)   # 落 air_date 等 bgm 字段（下面判超期要用）
-            if anime.confirmed and _aired_before_start(anime.air_date):
-                anime.confirmed, anime.rejected = False, True   # 自动确认但早于开始使用日 → 超期忽略，不自动下
+            # 新入库即判超期：与 apply_start_date_filter 同口径（超期+非人工决定 → 超期忽略），
+            # 不分自动源/review 源——否则 review 源的老番会滞留『待确认』，跟批量重算结果不一致。
+            if _aired_before_start(anime.air_date):
+                anime.confirmed, anime.rejected = False, True   # 早于开始使用日 → 超期忽略，不自动下（种子照常入库）
             s.add(anime)
             s.commit()          # Anime 无唯一约束，(title,季) 的去重由 AnimeAlias 负责，此处不会撞约束
             s.refresh(anime)
@@ -286,7 +283,7 @@ async def process_item(item) -> bool:
 async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     """取种子文件并加入 qBittorrent。成功返回 True。
 
-    『选集去重 + 占位』整段放在 _download_lock 里做，且集去重同时看 downloading/downloaded，
+    『选集去重 + 占位』整段放在 _download_lock 里做，且集去重同时看 downloading/sent，
     这样 worker flush 与 UI 补下并发时也不会对同一集重复放行两份。
     force=True：强制下这一条（无视当前状态、跳过集去重），用于详情页手动指定下载。
     """
@@ -298,7 +295,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             t = s.get(AnimeTorrent, torrent_id)
             if t is None:
                 return False
-            if t.status in ("downloading", "downloaded") and not (force and t.archived_at is not None):
+            if t.status in ("downloading", "sent") and not (force and t.archived_at is not None):
                 return False  # 已在下/已下：幂等短路（force 也不例外）。例外：已归档的可 force 重新下（重新交回 qB）
             if not force and t.status not in ("pending", "error"):
                 return False  # 非 force：只放行 pending/error；skipped/deleted 需 force 才强制下
@@ -317,7 +314,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
                 dup = s.exec(select(AnimeTorrent).where(
                     AnimeTorrent.anime_id == anime_id,
                     AnimeTorrent.episode == episode,
-                    AnimeTorrent.status.in_(["downloading", "downloaded"]),
+                    AnimeTorrent.status.in_(["downloading", "sent"]),
                     AnimeTorrent.id != torrent_id,
                 )).first()
                 if dup is not None:
@@ -373,10 +370,10 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             s.add(t)
             s.commit()
     if config.QB_SYNC_STATUS:
-        _set_status(torrent_id, "downloaded")
+        _set_status(torrent_id, "sent")
         engine.qb_kick.set()   # 唤醒 qB 同步循环，立即开始跟这个新交付的种子
     else:
-        engine.settle_downloaded(AnimeTorrent, torrent_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
+        engine.settle_sent(AnimeTorrent, torrent_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
     log.info("已加入qB - %s 第%s季 第%s集", title, season, episode)
     await notify(f"{title}[{episode}] 📥")
     return True
@@ -403,14 +400,14 @@ def _revive_orphaned_skipped() -> None:
             return
         rows = list(s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id.in_(auto_ids),
-            AnimeTorrent.status.in_(["error", "skipped", "downloaded", "downloading", "deleted", "stalled"]))))
+            AnimeTorrent.status.in_(("error", "skipped") + HANDLED_STATUSES))))
         by_ep: dict = {}
         for t in rows:
             by_ep.setdefault((t.anime_id, t.episode), set()).add(t.status)
-        # 目标集：有 error，且无 downloaded/downloading/deleted/stalled（首选已败、该集尚无可用/已删/停滞的下载）。
+        # 目标集：有 error，且无 sent/downloading/deleted/stalled（首选已败、该集尚无可用/已删/停滞的下载）。
         # stalled 也算『已处理』→ 不复活兄弟源：停滞的那条留人工处理，不自动换源（与 flush 阻断口径一致）。
         revive = {k for k, sts in by_ep.items()
-                  if "error" in sts and not (set(_HANDLED_STATUSES) & sts)}
+                  if "error" in sts and not (set(HANDLED_STATUSES) & sts)}
         if not revive:
             return
         changed = 0
@@ -445,10 +442,10 @@ async def flush_ready_downloads() -> int:
         kw_map = {a.id: a.pref_keyword for a in auto if a.pref_keyword}
         if not auto_ids:
             return 0
-        # 『该集已有一份』阻断自动换源的集，统一用 HAVE_STATUSES（downloaded/downloading/stalled）：
+        # 『该集已有一份』阻断自动换源的集，统一用 HAVE_STATUSES（sent/downloading/stalled）：
         # 含 downloading（在下的交付，不必再挑同集别的）+ stalled（停滞异常，留人工、不自动换源）。
         # 不含 deleted——删的那条不自动回来，但同集来新 hash 仍允许自动下（非整集拉黑）。
-        downloaded = {
+        have_eps = {
             (t.anime_id, t.episode)
             for t in s.exec(select(AnimeTorrent).where(
                 AnimeTorrent.status.in_(HAVE_STATUSES)))
@@ -476,14 +473,14 @@ async def flush_ready_downloads() -> int:
         return engine.pick_best(ts, pref_map.get(aid))
 
     for key, ts in groups.items():
-        if key in downloaded:
+        if key in have_eps:
             continue  # 这一集已有一份
         first_seen = min(t.created_at for t in ts)
         if now - first_seen < grace:
             continue  # 缓冲窗口未到，等偏好组
         chosen.append(_pick(ts, key[0]).id)  # key = (anime_id, episode)
     # 特别篇：每番只放一份（多字幕组版本别全下），走同样的缓冲窗口，且该番未下过特别篇才放
-    have_special = {aid for (aid, ep) in downloaded if ep == -1}
+    have_special = {aid for (aid, ep) in have_eps if ep == -1}
     for aid, ts in special_groups.items():
         if aid in have_special:
             continue
@@ -514,12 +511,12 @@ def overview() -> dict:
             select(AnimeTorrent.status, func.count()).group_by(AnimeTorrent.status))}
         total_torrents = s.exec(select(func.count()).select_from(AnimeTorrent)).one()
         dl_ids = set(s.exec(select(AnimeTorrent.anime_id)
-                            .where(AnimeTorrent.status == "downloaded").distinct()))
+                            .where(AnimeTorrent.status == "sent").distinct()))
         src_total = {src: c for src, c in s.exec(
             select(AnimeTorrent.source, func.count()).group_by(AnimeTorrent.source))}
         src_done = {src: c for src, c in s.exec(
             select(AnimeTorrent.source, func.count())
-            .where(AnimeTorrent.status == "downloaded").group_by(AnimeTorrent.source))}
+            .where(AnimeTorrent.status == "sent").group_by(AnimeTorrent.source))}
 
     confirmed = [a for a in animes if a.confirmed]
     pending_c = [a for a in animes if not a.confirmed and a.bangumi_id]  # 待确认=已匹配未确认；未匹配的算『富集失败』
@@ -549,12 +546,15 @@ def overview() -> dict:
         "kpi": {
             "tracking": len(confirmed), "fail": sum(1 for a in animes if not a.bangumi_id),
             "confirm": len(pending_c), "rejected": rejected,
-            "done": status.get("downloaded", 0),
+            "done": status.get("sent", 0),
             "will": split["will"],   # 顶部只汇总『真会自动下的』，别再用糊在一起的 pending 总数误导
             "torrents": total_torrents,
         },
+        # 八种应用侧 status 全列（含 deleted/excluded）：仪表盘『种子数』号称"各状态之和"，
+        # 漏列任何一种都会让页面数字对不上——用户用了『已删除/已排除』后尤其明显。
         "status": {k: status.get(k, 0) for k in
-                   ("downloaded", "downloading", "pending", "error", "skipped", "stalled")},
+                   ("sent", "downloading", "pending", "error",
+                    "skipped", "stalled", "deleted", "excluded")},
         "pending_split": split,
         "by_quarter": by_quarter,
         "by_quarter_state": by_quarter_state,
@@ -785,8 +785,8 @@ def restore_anime(anime_id: int) -> None:
         a.confirmed = True   # 恢复=确认，confirmed=True → 改开始日不会再把它判超期忽略（超期忽略需 confirmed=False）
         s.add(a)
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-        # 复活 skipped 兄弟用 _HANDLED_STATUSES（含 deleted）：用户特意删过的集，其去重落选的兄弟不该被复活重下。
-        have_eps = {t.episode for t in all_rows if t.status in _HANDLED_STATUSES}
+        # 复活 skipped 兄弟用 HANDLED_STATUSES（含 deleted）：用户特意删过的集，其去重落选的兄弟不该被复活重下。
+        have_eps = {t.episode for t in all_rows if t.status in HANDLED_STATUSES}
         for t in all_rows:
             # 只放回『该集尚无下载/未被删过』的 skipped（集去重留下的旧版本）；用户主动删过的记为 deleted，
             # 其集已进 have_eps 而被排除——免得恢复订阅时把用户特意删掉的文件又重新下回来。
@@ -836,12 +836,12 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
 def _has_downloads(s, anime_id: int) -> bool:
     """该番是否已下过（在下/已下/停滞/曾删）——有则季度已落盘/曾落盘，不该被重识别改（避免散目录）。
 
-    用 _HANDLED_STATUSES（downloaded/downloading/stalled/deleted）：deleted=删过也算季度已定；
+    用 HANDLED_STATUSES（sent/downloading/stalled/deleted）：deleted=删过也算季度已定；
     stalled=半成品仍在盘（save_path 按旧季度写过），更该锁季度——否则重识别把季度冲掉、停滞文件遗留旧目录、新集散两处。
     """
     return s.exec(select(AnimeTorrent).where(
         AnimeTorrent.anime_id == anime_id,
-        AnimeTorrent.status.in_(_HANDLED_STATUSES),
+        AnimeTorrent.status.in_(HANDLED_STATUSES),
     )).first() is not None
 
 
@@ -1398,7 +1398,7 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
     with get_session() as s:
         pairs = [(t.id, t.info_hash) for t in s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(["downloaded", "downloading"]),
+            AnimeTorrent.status.in_(["sent", "downloading"]),
             AnimeTorrent.archived_at.is_(None)))]   # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
     if not pairs:
         return rep
@@ -1407,7 +1407,7 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
         with get_session() as s:
             for tid in ids:
                 t = s.get(AnimeTorrent, tid)
-                if t is not None and t.status in ("downloaded", "downloading"):
+                if t is not None and t.status in ("sent", "downloading"):
                     t.status = "pending"
                     s.add(t)
             s.commit()
@@ -1455,12 +1455,21 @@ async def delete_anime_torrent(torrent_id: int) -> bool:
 
     deleted 是用户主动删除的终态：恢复订阅时不会被重新下（区别于集去重落选、可复活的 skipped）。
     若同一 hash 剧场版管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。
+
+    已归档(archived_at)的：种子早已从 qB 移除，qB 代删不到文件 → 只落 deleted 终态，
+    硬盘文件留在 save_path 由用户自行清理（UI 在确认框里把该路径显示出来）。
     """
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in ("downloaded", "downloading", "stalled") or t.archived_at is not None:
-            return False  # stalled 也允许删；已归档(archived_at)不删——已不在 qB、代删不到文件，须先『重新下载』再删
+        if t is None or t.status not in HAVE_STATUSES:
+            return False  # stalled 也允许删
         h = t.info_hash
+        if t.archived_at is not None:      # 已归档：不在 qB，删不到文件，只改状态
+            t.status = "deleted"
+            s.add(t)
+            s.commit()
+            log.info("删除已归档条目（仅标记，文件留在 %s）- torrent=%s", t.save_path or "?", torrent_id)
+            return True
     if engine.hash_owned_elsewhere(h, MovieTorrent):
         _set_status(torrent_id, "deleted")  # 剧场版侧还持有同一种子 → 只脱手，不删文件
         return True
@@ -1476,17 +1485,22 @@ async def delete_anime_files(anime_id: int) -> int:
 
     显式、独立于『拒绝』的动作，需 UI 二次确认。成功后把这些种子标记为 deleted（终态，恢复订阅不重下）。
     与剧场版共享 hash 的只脱手不删文件。返回处理的种子数；qB 未连上/无已下则返回 0。
+
+    已归档的一并计入并标 deleted（与逐条删同口径），但它们早已不在 qB、代删不到文件——
+    只改状态，文件留在各自 save_path 由用户自行清理（UI 负责提示）。
     """
     with get_session() as s:
         rows = list(s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
-            AnimeTorrent.status.in_(["downloaded", "downloading", "stalled"]),  # 含停滞异常，一并清
-            AnimeTorrent.archived_at.is_(None),  # 已归档的跳过：不在 qB、代删不到文件
+            AnimeTorrent.status.in_(HAVE_STATUSES),   # 含停滞异常，一并清
         )))
         pairs = [(t.id, t.info_hash) for t in rows]
+        archived_paths = [t.save_path for t in rows if t.archived_at is not None]
+        live = [(t.id, t.info_hash) for t in rows if t.archived_at is None]
     if not pairs:
         return 0
-    exclusive = [h for _, h in pairs if not engine.hash_owned_elsewhere(h, MovieTorrent)]
+    # 只对【还在 qB 里】且未被剧场版共享的 hash 真删文件；已归档的不进这批（qB 里已无，删了也白删）
+    exclusive = [h for _, h in live if not engine.hash_owned_elsewhere(h, MovieTorrent)]
     if exclusive and not await engine.qb.delete(exclusive, delete_files=True):
         return 0
     with get_session() as s:
@@ -1496,7 +1510,9 @@ async def delete_anime_files(anime_id: int) -> int:
                 t.status = "deleted"  # 用户主动删除，终态；恢复订阅时不重下（区别集去重的 skipped）
                 s.add(t)
         s.commit()
-    log.info("删除文件 - anime=%s 共 %d 个种子（独占 %d 个删文件）", anime_id, len(pairs), len(exclusive))
+    log.info("删除文件 - anime=%s 共 %d 个种子（独占 %d 个删文件；已归档 %d 个只标状态，文件留 %s）",
+             anime_id, len(pairs), len(exclusive), len(archived_paths),
+             "/".join(sorted({p for p in archived_paths if p})) or "下载目录")
     return len(pairs)
 
 

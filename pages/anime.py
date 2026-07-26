@@ -172,7 +172,7 @@ def anime_page(t: str = ""):
                              else "qB 未启用，去设置页开启后可下载")
             # 待下拆 将下载/备用/待确认/未知（库态『下载中』恒≈0、与 qB 实时态重复不单列）；失败、种子总数一并列出，与 KPI 卡呼应
             chips = [
-                ("已下载", ov["status"]["downloaded"], "green", None),
+                ("已下载", ov["status"]["sent"], "green", None),
                 ("将下载", ps["will"], "blue", "已确认番·本集首选（含特别篇），会自动下"),
                 ("备用项", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
@@ -180,8 +180,18 @@ def anime_page(t: str = ""):
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
                  "同集已有别版在下/已下被去重，或忽略番的积压；换源兜底时可能被复活"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的种子"),
-                ("种子数", k["torrents"], "grey", "全部种子数（各状态之和）"),
             ]
+            # 少见状态只在非零时露出：保证各 chip 之和 == 种子数（否则『各状态之和』就是句假话），
+            # 又不让全新库挂一排 0。库态『下载中』恒≈0（交付即置 sent），同理只在非零时显示。
+            for _lb, _key, _cl, _tip in (
+                ("下载中", "downloading", "teal", "已挑中正在交付给 qB 的瞬时态（通常一闪而过）"),
+                ("停滞", "stalled", "deep-orange", "已交付但长期零推进，脱离轮询、等人工处理"),
+                ("已删除", "deleted", "grey", "人工删过的种子（同集来新 hash 仍会照常下）"),
+                ("已排除", "excluded", "grey", "人工排除的种子（不再参与自动下载）"),
+            ):
+                if ov["status"].get(_key):
+                    chips.append((_lb, ov["status"][_key], _cl, _tip))
+            chips.append(("种子数", k["torrents"], "grey", "全部种子数（各状态之和）"))
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
                     b = ui.badge(f"{label} {val}").props(f"color={color}").classes("text-sm")
