@@ -5,7 +5,7 @@
 """
 import ipaddress
 
-from nicegui import context, ui
+from nicegui import context, run, ui
 
 from core import anime, engine, netguard
 import config
@@ -17,8 +17,8 @@ _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_S
             "QB_IDLE_RECHECK_MIN", "QB_STALL_TIMEOUT_MIN", "QB_ARCHIVE_AFTER_DAYS",
             "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
             "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES",
-            "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT"}
-_PASSWORD = {"QB_PASSWORD", "PROXY_PASS"}
+            "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT", "DB_MYSQL_PORT"}
+_PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}  # 绑监听地址/端口，仍走 .env、改了要重启；其余都进 DB 即时生效
 
 
@@ -105,6 +105,230 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str,
     ui.select(_QUARTER_PRESETS, label="预设（选中填入上面模板，可再手改）",
               on_change=_pick).props("dense outlined").classes("w-full")
     _prev()
+
+
+# 模块级表单助手：settings() 里那几个同名闭包只在页面函数内可见，_db_panel 在模块级，
+# 需要自己的一份。语义与闭包版一致（写进同一个 f 字典，由统一的 _save 收集）。
+def _text_into(f: dict, key: str, label: str, val, ph: str = "") -> None:
+    f[key] = ui.input(label, value=str(val), placeholder=ph).props("dense outlined").classes("w-full")
+
+
+def _num_into(f: dict, key: str, label: str, val) -> None:
+    f[key] = ui.number(label, value=val, format="%d").props("dense outlined").classes("w-full")
+
+
+def _pw_into(f: dict, key: str, label: str) -> None:
+    f[key] = ui.input(label, value="", password=True).props("dense outlined").classes("w-full")
+
+
+def _db_panel(f: dict) -> None:
+    """『数据库』分栏：MySQL 连接参数 + 两个互不相同的动作（切换 / 迁移）。
+
+    这两件事最容易被搞混，UI 上必须写死区别：
+      · 切换 = 只改连接，一行数据都不动（用于"目标库里已经有数据了"）
+      · 迁移 = 复制数据过去，连接不变（搬完想用新库还得再点切换）
+    配置本身恒存本地 SQLite，所以 MySQL 连不上时这个面板照样打得开、改得了。
+    """
+    import db
+    from db import transfer
+    from db.dialect import driver_missing
+
+    _section("业务数据库",
+             "配置（本页所有设置）恒存在本地 SQLite，不随业务数据走——否则 MySQL 连不上时就再也"
+             "读不到『该怎么连 MySQL』。可迁到 MySQL 的是业务表：番剧 / 剧场版 / 种子 / 源组 / 番名对照。")
+
+    @ui.refreshable
+    def _status():
+        with ui.row().classes("items-center gap-2 flex-wrap"):
+            ui.label("当前业务数据库：").classes("text-sm")
+            ui.badge(db.data_target_desc()).props(
+                f"color={'purple' if db.data_backend() == 'mysql' else 'blue-grey'}").classes("text-sm")
+            # 【必须兜住】这是页面【构建期】对业务库发的查询。业务库若是运行中掉线的 MySQL，
+            # 异常会从构建函数冒出去让 /settings 整页 500——而『切回本地 SQLite』按钮和底部
+            # 『保存』都排在本面板之后，用户就再也没有页面入口能自救了，
+            # 正好违背本面板 docstring 承诺的"MySQL 连不上时照样打得开、改得了"。
+            try:
+                cnt = transfer.count_rows(db.engine)
+                ui.label(f"（{sum(cnt.values())} 行业务数据）").classes("text-xs text-gray-400")
+            except Exception as e:
+                ui.label(f"（连不上：{type(e).__name__}）").classes("text-xs text-red-400")
+        ui.label(f"配置库（不参与迁移）：本地 SQLite {config.DB_PATH}").classes("text-xs text-gray-500")
+
+    _status()
+    if miss := driver_missing():
+        warn_banner(miss)
+
+    with ui.element("div").classes("field-grid w-full"):
+        _text_into(f, "DB_MYSQL_HOST", "MySQL 地址", config.DB_MYSQL_HOST, "如 10.0.0.230")
+        _num_into(f, "DB_MYSQL_PORT", "端口", config.DB_MYSQL_PORT)
+        _text_into(f, "DB_MYSQL_USER", "用户名", config.DB_MYSQL_USER)
+        _pw_into(f, "DB_MYSQL_PASSWORD", "密码（留空=不修改）")
+        _text_into(f, "DB_MYSQL_NAME", "库名", config.DB_MYSQL_NAME, "不存在可用下面的『创建数据库』建")
+        _text_into(f, "DB_MYSQL_CHARSET", "字符集", config.DB_MYSQL_CHARSET or "utf8mb4")
+    ui.label("连接参数改完要先点页面底部的『保存』才会生效。库可以用下面的按钮直接建"
+             "（需要该账号有 CREATE 权限），表由本工具自动建。"
+             "字符集保持 utf8mb4，否则日文番名和 emoji 存不进去。").classes("text-xs text-gray-500")
+
+    async def _test():
+        url = db.configured_mysql_url()
+        if url is None:
+            ui.notify("MySQL 地址与库名都要填", type="warning")
+            return
+        try:
+            eng = db.make_mysql_engine(url)
+            with eng.connect() as c:
+                ver = c.exec_driver_sql("SELECT VERSION()").scalar()
+                cnt = transfer.count_rows(eng)
+            eng.dispose()
+            ui.notify(f"连接成功：MySQL {ver}；该库现有业务数据 {sum(cnt.values())} 行", type="positive")
+        except Exception as e:
+            # 库不存在是最常见的一种失败，单独认出来给出下一步动作，别让用户对着
+            # "Unknown database 'xxx'" 的英文原文猜。用错误码判，不匹配报错文本（会随版本/语言变）。
+            if db.mysql_errno(e) == db.MYSQL_ERR_NO_DB:
+                ui.notify(f"服务器连上了，但库 `{config.DB_MYSQL_NAME}` 不存在 —— "
+                          "点右边的『创建数据库』即可", type="warning")
+            else:
+                ui.notify(f"连不上：{type(e).__name__}: {str(e)[:160]}", type="negative")
+
+    async def _create_db():
+        name = (config.DB_MYSQL_NAME or "").strip()
+        host = (config.DB_MYSQL_HOST or "").strip()
+        if not host or not name:
+            ui.notify("MySQL 地址与库名都要填，并先点『保存设置』", type="warning")
+            return
+        if not await confirm(
+                f"在 {host} 上创建数据库 `{name}`？",
+                f"会执行：CREATE DATABASE `{name}` CHARACTER SET "
+                f"{config.DB_MYSQL_CHARSET or 'utf8mb4'} COLLATE utf8mb4_unicode_ci\n"
+                "只建空库、不建表也不写数据（表会在你『切换』过去时自动建）。\n"
+                "库已存在则什么都不做。需要该账号有 CREATE 权限。",
+                ok_label="创建", ok_icon="add", ok_color="primary"):
+            return
+        try:
+            msg = await run.io_bound(
+                db.create_mysql_database, host, config.DB_MYSQL_PORT, config.DB_MYSQL_USER,
+                config.DB_MYSQL_PASSWORD, name, config.DB_MYSQL_CHARSET or "utf8mb4")
+        except ValueError as e:            # 库名/字符集非法
+            ui.notify(str(e), type="negative")
+            return
+        except Exception as e:
+            ui.notify(f"创建失败：{type(e).__name__}: {str(e)[:160]}"
+                      "（该账号可能没有 CREATE 权限）", type="negative")
+            return
+        ui.notify(msg + "。接下来可以点『切到 MySQL』建表，或先『迁移数据』把现有数据搬过去。",
+                  type="positive")
+
+    async def _switch(to_mysql: bool):
+        """只切连接、不动数据。"""
+        url = db.configured_mysql_url() if to_mysql else None
+        if to_mysql and url is None:
+            ui.notify("MySQL 地址与库名都要填，并先点『保存设置』", type="warning")
+            return
+        target = "MySQL" if to_mysql else "本地 SQLite"
+        if not await confirm(
+                f"把业务数据库切到 {target}？",
+                "【只改连接，不搬任何数据】。切过去之后你看到的就是那个库里已有的内容——\n"
+                "如果目标库是空的，页面上会变成一部番都没有（数据仍在原库、切回来就还在）。\n"
+                "想把数据带过去，请先用下面的『迁移数据』。",
+                ok_label=f"切到 {target}", ok_icon="swap_horiz", ok_color="primary"):
+            return
+        try:
+            db.switch_data_engine(url)
+        except Exception as e:
+            if db.mysql_errno(e) == db.MYSQL_ERR_NO_DB:
+                ui.notify(f"库 `{config.DB_MYSQL_NAME}` 不存在，已留在原库 —— 先点『创建数据库』",
+                          type="warning")
+            else:
+                ui.notify(f"切换失败，已留在原库：{type(e).__name__}: {str(e)[:160]}", type="negative")
+            return
+        config.set_many({"DB_BACKEND": "mysql" if to_mysql else "sqlite"})
+        _status.refresh()
+        ui.notify(f"已切到 {db.data_target_desc()}（数据未改动）。刷新页面看新库内容。", type="positive")
+
+    async def _migrate(to_mysql: bool):
+        """复制数据；连接不变。"""
+        url = db.configured_mysql_url()
+        if url is None:
+            ui.notify("MySQL 地址与库名都要填，并先点『保存设置』", type="warning")
+            return
+        try:
+            other = db.make_mysql_engine(url)
+            with other.connect():
+                pass
+        except Exception as e:
+            ui.notify(f"连不上 MySQL：{type(e).__name__}: {str(e)[:160]}", type="negative")
+            return
+        # 【本地那一端恒取 meta_engine，绝不能用 db.engine】。db.engine 是"当前在用的业务库"——
+        # 已经切到 MySQL 之后它就是那个 MySQL，拿它当"本地"会让源和目标指向同一个物理库：
+        # 两个不同的 Engine 对象、`is` 判等不出来，于是 overwrite 先把它清空、再从空库读出 0 行，
+        # 最后 verify 拿"删完之后"的两边行数比 0==0，弹一句绿色的『迁移完成并校验一致』——
+        # 用户的数据就这么没了。meta_engine 恒指向 DB_PATH 那个本地文件，两种后端下都对。
+        src, dst = (db.meta_engine, other) if to_mysql else (other, db.meta_engine)
+        s_cnt, d_cnt = transfer.count_rows(src), transfer.count_rows(dst)
+        arrow = "本地 SQLite → MySQL" if to_mysql else "MySQL → 本地 SQLite"
+        # 把两端【具体是哪个库】写进确认框：只写"本地/MySQL"时，用户无从发现方向算错了
+        note = (f"{arrow}\n"
+                f"源：{db.engine_desc(src)}（{sum(s_cnt.values())} 行）\n"
+                f"目标：{db.engine_desc(dst)}（现有 {sum(d_cnt.values())} 行）\n"
+                "【只复制业务数据，配置不动】。主键(id)原样保留，跨表关联不会断。\n")
+        over = any(d_cnt.values())
+        if over:
+            note += "⚠️ 目标库【非空】，继续会先清空它的业务表再写入——那些数据将不可恢复。\n"
+        note += "迁移完成后连接【仍在原库】，想改用新库请再点『切换』。"
+        if not await confirm("开始迁移数据？", note,
+                             ok_label="清空目标库并迁移" if over else "开始迁移",
+                             ok_icon="content_copy", ok_color="negative" if over else "primary"):
+            return
+        try:
+            res = await run.io_bound(transfer.migrate_data, src, dst, overwrite=over)
+            moved = res["moved"]
+            # 用【迁前】的源快照校验：现查源库有个自证陷阱——万一两端其实是同一个库，
+            # 清空之后现查两边都是 0，反而"校验通过"。
+            bad = transfer.verify(src, dst, res["src_before"])
+        except Exception as e:
+            ui.notify(f"迁移失败：{type(e).__name__}: {str(e)[:200]}", type="negative")
+            return
+        finally:
+            other.dispose()
+        detail = "、".join(f"{k} {v}" for k, v in moved.items() if v)
+        if bad:
+            ui.notify(f"迁移完成但行数对不上：{'；'.join(bad)}", type="warning")
+        else:
+            ui.notify(f"迁移完成并校验一致：{detail or '（源库为空）'}。"
+                      "连接仍在原库，要用新库请点『切换』。", type="positive")
+        _status.refresh()
+
+    # 这两个按钮属于【上面那组连接参数】——它们只验证/准备连接，不改变当前用哪个库，
+    # 所以放在字段正下方，别混进下面的『切换』分区惹人误会。
+    # 代码位置必须在 _test/_create_db 定义之后；这中间没有别的 UI 元素，渲染出来仍紧贴字段。
+    with ui.row().classes("gap-2 flex-wrap"):
+        ui.button("测试连接", icon="network_check", on_click=_test).props(
+            "flat color=primary no-caps").tooltip("只连一下看通不通，不改变当前在用的库")
+        ui.button("创建数据库", icon="add", on_click=_create_db).props(
+            "flat color=primary no-caps").tooltip(
+            "在 MySQL 服务器上建一个空库（CREATE DATABASE，utf8mb4）。只建库不建表，"
+            "表在你『切到 MySQL』时自动建。库已存在则什么都不做。")
+
+    ui.separator().classes("my-2")
+    ui.label("① 切换数据库（只改连接，不动数据）").classes("text-sm font-bold")
+    ui.label("用于目标库里已经有数据、或想先切到空库再迁。切错了再切回来即可，数据不会丢。").classes(
+        "text-xs text-gray-500 mb-1")
+    with ui.row().classes("gap-2 flex-wrap"):
+        ui.button("切到 MySQL", icon="storage", on_click=lambda: _switch(True)).props(
+            "color=primary unelevated no-caps")
+        ui.button("切回本地 SQLite", icon="undo", on_click=lambda: _switch(False)).props(
+            "flat color=grey no-caps")
+
+    ui.separator().classes("my-2")
+    ui.label("② 迁移数据（复制数据，连接不变）").classes("text-sm font-bold")
+    ui.label("把业务数据整体复制到另一个库，两个方向都支持。保留主键、迁完自动校验行数；"
+             "目标库非空时会要你确认清空。迁移期间建议先在上面『番剧』里关掉后台采集，避免边搬边写。").classes(
+        "text-xs text-gray-500 mb-1")
+    with ui.row().classes("gap-2 flex-wrap"):
+        ui.button("本地 SQLite → MySQL", icon="upload", on_click=lambda: _migrate(True)).props(
+            "color=primary unelevated no-caps")
+        ui.button("MySQL → 本地 SQLite", icon="download", on_click=lambda: _migrate(False)).props(
+            "flat color=primary no-caps")
 
 
 @ui.page("/settings")
@@ -347,6 +571,11 @@ def settings():
             _quarter_setting(f, "MOVIE_QUARTER_FMT", "下载文件夹命名（默认按年份）",
                              "电影按此建下载文件夹（默认年份，如 2026；同年归一个文件夹）；留空＝不分类、直接放片名。",
                              config.MOVIE_QUARTER_FMT, empty_hint="留空＝不建年份目录，直接 …/片名/")
+
+        # ========== 折叠 ④ 数据库 ==========
+        with ui.card().classes("w-full"), ui.expansion(
+                "数据库", icon="storage", value=False).classes("w-full").props("dense"):
+            _db_panel(f)
 
         async def _save():
             updates = {}

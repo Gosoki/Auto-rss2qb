@@ -3,6 +3,7 @@
 运行： python main.py    然后浏览器打开 http://<host>:8080
 """
 import asyncio
+import logging
 
 from nicegui import app, ui
 
@@ -13,16 +14,21 @@ from core import anime, engine, movies
 from core.logsetup import setup_logging
 from core.netguard import install as install_netguard
 from core.worker import run_movie_scan, run_qb_sync, run_reenrich_retry, run_worker
-from db import init_db
+from db import apply_configured_backend, init_db
 
 setup_logging()   # 控制台 + 滚动文件(data/autorss.log) + 内存环形缓冲(供 /logs 页实时看)
 install_netguard(app)   # 网段白名单中间件（WEB_ALLOW_CIDRS 为空则放行一切；须在起服务器前挂）
+
+log = logging.getLogger("autorss")
 
 
 @app.on_startup
 async def _startup():
     init_db()
     config.load_from_db()           # 把数据库里的配置覆盖加载进内存（必须在建表之后）
+    # 配置读出来了才知道业务数据该连哪：DB_BACKEND=mysql 就把业务表切过去。
+    # 配置本身恒在本地 SQLite，所以即使 MySQL 连不上也读得到设置、进得去设置页改（见 db 的双引擎说明）。
+    log.info("业务数据库：%s", apply_configured_backend())
     anime.seed_source_groups()       # 首启种入 ANi/Mikan 两个源组
     anime.reset_downloading()        # 复位上次遗留的 downloading（TV）
     movies.reset_downloading()      # 复位上次遗留的 downloading（剧场版）

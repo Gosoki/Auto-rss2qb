@@ -103,6 +103,14 @@ _SPEC = {
     "MOVIE_SCAN_ENABLED": (bool, False),    # 自动扫描开关（关=只在 /movies 手动点扫描）
     "MOVIE_SCAN_INTERVAL": (int, 43200),    # 每隔多少秒自动扫一次剧场版（默认 12 小时）
     "MOVIE_SCAN_LAST": (str, ""),           # 上次扫描时间（ISO，运行时更新；非用户填）
+    # ---- 业务数据库（这几项本身恒存在【本地 SQLite】的 setting 表里，见 db.__init__ 的双引擎说明）----
+    "DB_BACKEND": (str, "sqlite"),          # 业务表落在哪：'sqlite'(本地文件) | 'mysql'
+    "DB_MYSQL_HOST": (str, ""),
+    "DB_MYSQL_PORT": (int, 3306),
+    "DB_MYSQL_USER": (str, ""),
+    "DB_MYSQL_PASSWORD": (str, ""),
+    "DB_MYSQL_NAME": (str, ""),             # 库名（database），需已存在
+    "DB_MYSQL_CHARSET": (str, "utf8mb4"),   # 必须是 utf8mb4，否则日文/emoji 番名存不进去
 }
 
 # 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集
@@ -169,9 +177,11 @@ def load_from_db() -> None:
     """
     from sqlmodel import select
 
-    from db import get_session
+    from db import get_meta_session
     from db.models import Setting
-    with get_session() as s:
+    # 【走 meta 会话】配置恒存本地 SQLite，与业务库是否切到 MySQL 无关——
+    # 否则连不上 MySQL 时就读不到"该怎么连 MySQL"，先有鸡还是先有蛋。
+    with get_meta_session() as s:
         have = {r.key: r.value for r in s.exec(select(Setting))}
         fresh = not have  # settings 表原本为空 = 全新库首启
         for k, (kind, default) in _SPEC.items():
@@ -188,10 +198,10 @@ def load_from_db() -> None:
 
 def set_many(updates: dict) -> None:
     """把设置写进数据库并即时更新内存（热生效）。updates: {键: 字符串值}，非 _SPEC 键忽略。"""
-    from db import get_session
+    from db import get_meta_session
     from db.models import Setting
     applied = {}
-    with get_session() as s:
+    with get_meta_session() as s:   # 同 load_from_db：配置恒走本地 SQLite
         for k, raw in updates.items():
             if k not in _SPEC:
                 continue

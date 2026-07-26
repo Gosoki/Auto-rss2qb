@@ -15,7 +15,7 @@ import httpx
 from sqlmodel import func, or_, select
 
 import config
-from db import get_session
+from db import get_meta_session, get_session
 from db.models import AnimeTorrent, MovieTorrent, Setting
 from services.qbittorrent import QBittorrent
 from sources.parse import format_quarter
@@ -725,20 +725,30 @@ def mark_done_by_hash(info_hash: str) -> bool:
 def backfill_legacy_progress_once() -> None:
     """一次性迁移：本功能上线前 status='sent' 语义=已交付（历史行都早已下完），但 qb_progress 可能为 0/未满。
     新模型以 qb_progress>=1 判『已完成、停止监听』，故上线时把现存 sent 行的 qb_progress 补成 1.0，免得它们
-    被误判成『在下』而永久滞留 in-flight、每活跃间隔空打一次 qB。用 Setting 标记，只跑一次（后续新交付照常跟踪）。"""
+    被误判成『在下』而永久滞留 in-flight、每活跃间隔空打一次 qB。用 Setting 标记，只跑一次（后续新交付照常跟踪）。
+
+    【标记位必须走 meta 会话】Setting 属 META_TABLES，只存在于本地 SQLite；业务库切到 MySQL 后
+    那边【永远】不会有 setting 表（create_all 不建它、transfer 也不搬它）。以前这里用 get_session()
+    读 Setting，切 MySQL 后每次启动必抛 1146，而它在 main.py 里排在四个 create_task 之前——
+    异常一抛，采集/qB同步/剧场版扫描/待识别重试【一个都起不来】，页面却照常 200，
+    用户只会觉得"好几天没更新了"。标记位读写走 meta，业务行更新走 data，两段分开。
+    """
     flag = "_QB_PROGRESS_BACKFILLED"
     n = 0
-    with get_session() as s:
-        if s.get(Setting, flag) is not None:
+    with get_meta_session() as ms:            # 标记位：本地 SQLite
+        if ms.get(Setting, flag) is not None:
             return
+    with get_session() as s:                  # 业务行：当前业务库（可能是 MySQL）
         for model_cls in (AnimeTorrent, MovieTorrent):
             for t in s.exec(select(model_cls).where(
                     model_cls.status == "sent", model_cls.qb_progress < 1.0)):
                 t.qb_progress = 1.0
                 s.add(t)
                 n += 1
-        s.add(Setting(key=flag, value="1"))
         s.commit()
+    with get_meta_session() as ms:
+        ms.add(Setting(key=flag, value="1"))
+        ms.commit()
     if n:
         log.info("一次性迁移：%d 条历史 sent 种子标记为已完成（qb_progress=1，脱离 in-flight）", n)
 

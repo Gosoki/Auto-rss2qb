@@ -4,3 +4,6 @@ httpx>=0.27
 feedparser>=6.0
 python-dotenv>=1.0
 opencc-python-reimplemented   # 繁转简；没装也能跑（自动降级为不转换）
+# 可选：业务数据要落 MySQL 时才需要（设置页→数据库）。没装也能跑，只是切不了 MySQL、
+# 面板上会提示装它；配置与默认的本地 SQLite 完全不依赖它。
+pymysql>=1.1
