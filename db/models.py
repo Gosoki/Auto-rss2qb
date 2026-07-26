@@ -69,6 +69,11 @@ class Anime(SQLModel, table=True):
     pref_source: str | None = Field(default=None)     # 锁定下载源（精确匹配 torrent.source：锁哪个组只下哪个；联合发布如"喵萌&LoliHouse"视作独立源、要单独锁，入库照收）；空=按优先级多源兜底
     pref_keyword: str | None = Field(default=None)    # 版本关键词（大小写不敏感子串命中 raw_title，如 繁日/简日/1080p）：与锁定源叠加、只下命中的版本；空=不限
     enrich_tries: int = Field(default=0)              # bgm 未识别番的后台重试次数（满 REENRICH_MAX_TRIES 停自动重试，留手动；手动重识别清零）
+    # 跨源集号偏移：某些源用【全系列绝对集号】（第二季第 4 集写成 16），另一些用【季内集号】（写 04）。
+    # 集去重键是 (anime_id, episode)，两种写法会被当成两集、各下一份到同一目录。
+    # 值＝绝对号 - 季内号，从标题里的双编号写法 '16(88)' 自动推出（见 sources.parse.extract_episode_abs）；
+    # 推不出就留 None，此时详情页会标出『疑似同集不同编号』交给人工，绝不瞎猜。
+    ep_offset: int | None = Field(default=None)
     last_enrich_at: datetime | None = Field(default=None)  # 上次后台重试 bgm 的时刻（指数退避调度：下次到点=此刻+BASE*2^tries，封顶 MAX）
     created_at: datetime = Field(default_factory=datetime.now)
 

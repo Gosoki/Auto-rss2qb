@@ -82,7 +82,7 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         movie.mikan_type = mikan_type   # Mikan 桶判定（剧场版/OVA），列表徽标用
         if not movie.display_name:
             movie.display_name = title  # 无 bgm 时先用 Mikan 展示名兜底
-        engine.apply_bgm_meta(movie, info, keep_quarter=(not is_new and _has_downloads(s, movie.id)))
+        engine.apply_bgm_meta(movie, info, keep_path=(not is_new and _has_downloads(s, movie.id)))
         s.add(movie)
         s.commit()
         s.refresh(movie)
@@ -444,7 +444,7 @@ async def enrich_movie(movie_id: int) -> bool:
         if m is None:
             return False
         # 手动重识别：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
-        engine.apply_bgm_meta(m, info, keep_quarter=False)
+        engine.apply_bgm_meta(m, info, keep_path=False)
         s.add(m)
         s.commit()
         if m.bangumi_id is not None:
@@ -464,7 +464,7 @@ async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
         if m is None:
             return False
         # 手动纠正绑定：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
-        engine.apply_bgm_meta(m, info, keep_quarter=False)
+        engine.apply_bgm_meta(m, info, keep_path=False)
         s.add(m)
         s.commit()
         for other in list(s.exec(select(Movie).where(
@@ -528,6 +528,8 @@ async def download_movie_torrent(mt_id: int) -> bool:
             # 跨表【不】去重：剧场版/番剧各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer。
             m = s.get(Movie, t.movie_id)
+            orig_status = t.status        # 供失败恢复：从终态(deleted/excluded)重下失败别降级成 error
+            orig_archived = t.archived_at  # 同上：重下【已归档】的版本失败要把归档标记原样放回
             t.status = "downloading"
             # 重新下：清归档标记 + 重置 qB 实时态，作『全新在下』重新跟踪、从新完成点重算归档倒计时（否则会被立刻再归档）
             t.archived_at = None
@@ -539,11 +541,27 @@ async def download_movie_torrent(mt_id: int) -> bool:
             quarter = (m.quarter if m else "") or "unknown"
             folder = _movie_folder(m, t)   # 与 movie_save_path 同口径（B3）
 
+    # 与番剧侧对齐：失败不无条件写 error。终态(deleted/excluded)重下失败降级成 error 会丢掉
+    # 『用户已处理』的语义；已归档重下失败降级则让那份仍在盘上的旧文件脱离 HAVE_STATUSES，
+    # UI 上再没有入口能删它。CancelledError 以前写死 pending，同样会抹掉终态。
+    fail_status = (orig_status if (orig_status in engine.MANUAL_TERMINAL_STATUSES
+                                   or orig_archived is not None) else "error")
+
+    def _fail() -> None:
+        _set_status(mt_id, fail_status)
+        if orig_archived is not None:
+            with get_session() as s2:
+                t2 = s2.get(MovieTorrent, mt_id)
+                if t2 is not None and t2.status == fail_status:
+                    t2.archived_at = orig_archived
+                    s2.add(t2)
+                    s2.commit()
+
     save_path = engine.build_save_path(quarter, folder, sub_dir=config.MOVIE_DOWN_PATH,
                                        quarter_fmt=config.MOVIE_QUARTER_FMT)
     if save_path is None:
         log.error("拒绝越界保存路径 - movie torrent %s", mt_id)
-        _set_status(mt_id, "error")
+        _fail()
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
@@ -551,14 +569,14 @@ async def download_movie_torrent(mt_id: int) -> bool:
         ok = await engine.add_to_qb(data, save_path, "AutoRSS-Movie",
                                     format_quarter(quarter, "{yyyy}"), info_hash=info_hash)
     except asyncio.CancelledError:
-        _set_status(mt_id, "pending")
+        _fail()
         raise
     except Exception as e:
         log.error("剧场版下载失败 - %s", e)
-        _set_status(mt_id, "error")
+        _fail()
         return False
     if not ok:
-        _set_status(mt_id, "error")
+        _fail()
         return False
     with get_session() as s:   # 记实际保存路径：改季度/重绑后据此移动或提醒旧位置
         t = s.get(MovieTorrent, mt_id)

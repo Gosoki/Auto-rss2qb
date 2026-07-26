@@ -13,6 +13,11 @@ import config
 
 log = logging.getLogger("autorss")
 
+# torrents_info 每批最多带多少个 hash（拼进 query string，见该函数注释）。
+# 100×41≈4.1KB URL，稳在常见 8K 请求行上限的一半以内（200 就顶到 8.2KB、正好压线）。
+# 代价只是多几个 GET：2000 个在下种子＝20 次请求，对 30s 一轮的同步毫无压力。
+_INFO_BATCH = 100
+
 _SESSION_TTL = 1800   # 复用已登录 client 的秒数；取小于 qB 默认 cookie 寿命(约 1h)，到点主动重登
 
 
@@ -88,7 +93,25 @@ class QBittorrent:
                 return None
             try:
                 resp = await client.request(method, path, **kw)
-            except httpx.HTTPError as e:
+            except httpx.TransportError as e:
+                # 传输层错误再给一次机会：client 是【全进程共享】的，另一个协程走到会话轮换
+                # （TTL 到点 / 认证被改 / 403 重登）时会直接 aclose 掉它，把【本协程此刻在途的】
+                # 请求扯断成 ReadError/ClosedResourceError。实测能让一次 add_torrent 返回 False，
+                # 而 qB 其实已经收下了种子。重试会走 _ensure 拿到新登录的 client。
+                # 只对第一次尝试重试，避免 qB 真离线时每个请求都翻倍。
+                if attempt == 1:
+                    log.warning("qB 请求传输层失败 %s %s: %s —— 重试一次", method, path, e)
+                    await self._invalidate()
+                    continue
+                log.error("qB 请求失败 %s %s: %s", method, path, e)
+                return None
+            except Exception as e:
+                # 兜宽到 Exception 而不是只 httpx.HTTPError：httpx 有一批异常【不】继承 HTTPError，
+                # 典型是 InvalidURL（query 过长等构造期错误）。它一旦漏出去就穿透 _request →
+                # torrents_info → sync_qb_status，只在 worker 那层留一行"qB 状态同步异常"，
+                # 本轮 0 行更新、in-flight 一条不减，下轮重复同样失败＝状态同步永久停摆。
+                # 与同文件 _login 的兜法一致（那里早就用的 except Exception）。
+                # 本函数对调用方的契约是"失败返回 None"，这里必须真的兑现。
                 log.error("qB 请求失败 %s %s: %s", method, path, e)
                 return None
             if resp.status_code == 403 and attempt == 1:
@@ -139,21 +162,29 @@ class QBittorrent:
         hashes = [h for h in hashes if h]
         if not hashes:
             return {}
-        resp = await self._request("GET", "/api/v2/torrents/info",
-                                   params={"hashes": "|".join(hashes)})
-        if resp is None:
-            return None
-        try:
-            resp.raise_for_status()
-            data = resp.json()
-        except (httpx.HTTPError, ValueError) as e:
-            log.error("查询种子状态失败: %s", e)
-            return None
-        if not isinstance(data, list):
-            # 正常 qB 该端点恒返回数组。非列表(反代/网关在 200 下塞的错误 JSON/维护页等)按『连不上』处理、
-            # 本轮不动——绝不能当成空 {}，否则上游会把在下种子逐个误判为 error（真在下却被标失败）。
-            return None
-        return {str(t.get("hash", "")).lower(): t for t in data if t.get("hash")}
+        # 【必须分批】hashes 是拼进 query string 的，条数没有上限：一个 40 位 hash + 分隔符 = 41 字节，
+        # 1525 条就把 URL 顶过 httpx 的 MAX_URL_LENGTH(65536) 抛 InvalidURL，socket 都发不出去；
+        # 而 qB 自己和中间反代对请求行的限制（常见 8K）比这低得多，才是真实环境里的第一个失效点。
+        # 任一批失败就整体返回 None，保住上游"连不上则本轮不动"的语义——不能只把成功的那几批合起来
+        # 返回，否则缺席的行会被 sync 当成"qB 里没有它"而走落定分支。
+        out: dict = {}
+        for i in range(0, len(hashes), _INFO_BATCH):
+            resp = await self._request("GET", "/api/v2/torrents/info",
+                                       params={"hashes": "|".join(hashes[i:i + _INFO_BATCH])})
+            if resp is None:
+                return None
+            try:
+                resp.raise_for_status()
+                data = resp.json()
+            except (httpx.HTTPError, ValueError) as e:
+                log.error("查询种子状态失败: %s", e)
+                return None
+            if not isinstance(data, list):
+                # 正常 qB 该端点恒返回数组。非列表(反代/网关在 200 下塞的错误 JSON/维护页等)按『连不上』处理、
+                # 本轮不动——绝不能当成空 {}，否则上游会把在下种子逐个误判为 error（真在下却被标失败）。
+                return None
+            out.update({str(t.get("hash", "")).lower(): t for t in data if t.get("hash")})
+        return out
 
     async def delete(self, hashes: list[str], delete_files: bool = True) -> bool:
         """按 info_hash 从 qB 删除种子；delete_files=True 连硬盘文件一起删。全空/成功返回 True。"""

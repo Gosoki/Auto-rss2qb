@@ -21,6 +21,7 @@ class ParsedItem:
     site: str               # 下载站点，如 'nyaa'
     source_kind: str = "auto"  # 组策略：'auto' 全下 / 'review' 需人工确认
     priority: int = 0          # 组优先级（越大越优先）
+    episode_abs: int | None = None  # 标题写成 '16(88)' 时的绝对集号；用来推该番的跨源集号偏移
     search_names: list[str] = field(default_factory=list)  # 候选名（搜 bgm 用）
 
 

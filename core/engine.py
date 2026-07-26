@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import socket
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from sqlmodel import func, or_, select
@@ -71,6 +71,9 @@ DOWNLOADABLE_STATUSES = ("pending", "error")
 _BGM_FIELDS = ("bangumi_id", "display_name", "jp_name", "air_date", "air_weekday",
                "total_episodes", "platform", "cover_url", "rating", "summary",
                "author", "director", "music", "cast", "duration")
+# _BGM_FIELDS 里【决定归档目录名】的那几个：有已下文件时不许被重识别改写（见 apply_bgm_meta）。
+# 加新的路径来源字段时记得同步这里。
+_PATH_FIELDS = ("display_name", "jp_name")
 
 
 # ---------------- 文件名 / 季度 ----------------
@@ -146,19 +149,27 @@ def build_save_path(quarter: str, folder_name: str, season: int | None = None,
 
 # ---------------- bgm 元数据落库 ----------------
 
-def apply_bgm_meta(obj, info: dict | None, keep_quarter: bool = False) -> None:
+def apply_bgm_meta(obj, info: dict | None, keep_path: bool = False) -> None:
     """把 enrich 结果写进 obj（Anime 或 Movie，bgm 字段同名）——只覆盖非空值。
 
-    keep_quarter=True（手动重识别、且已有季度）时不动季度——季度是归档路径的一部分，
-    确定后应保持稳定，否则已下分集会散落到另一个季度目录。season/kind 等专属字段由各线自理。
+    keep_path=True（已有已下文件时）冻结【所有决定归档路径的字段】：季度 + jp_name/display_name。
+    路径由 (quarter, jp_name or display_name, season) 拼成（见 anime._anime_path_parts），
+    这几个字段一变，新集就落到另一个目录、已下的分集留在旧目录，同一部番裂成两个文件夹，
+    而 qB 那边没人去搬。此前只冻结了 quarter，名字是漏的——重识别走的是【全新 bgm 搜索】而非
+    按 bangumi_id 取，命中同系列另一 cour/衍生作时 jp_name 会被整体改写（实测：猫と竜 → 猫と竜 ふたたび）。
+    改名只留给显式『绑定 bgm』流程——那条路径本来就带 relocate，会把文件一起搬过去。
+    注：季号 season 不在这里冻结，但 anime._apply_bgm 是从 display_name/jp_name 反推它的，
+    名字冻住了季号自然也稳；kind 等专属字段由各线自理。
     """
     if not info:
         return
     for k in _BGM_FIELDS:
+        if keep_path and k in _PATH_FIELDS and getattr(obj, k, None):
+            continue                            # 已有值且要保路径 → 不覆盖
         v = info.get(k)
         if v is not None and hasattr(obj, k):   # hasattr 跳过一方没有的列（番剧无 duration）
             setattr(obj, k, v)
-    if info.get("quarter") and not (keep_quarter and obj.quarter):
+    if info.get("quarter") and not (keep_path and obj.quarter):
         obj.quarter = info["quarter"]
 
 
@@ -234,9 +245,30 @@ async def fetch_torrent_bytes(url: str) -> bytes:
                 return bytes(buf)
 
 
+# release_time 存的是 naive datetime，但【基准随来源站不同】，入库时没归一：
+#   · nyaa  ：pubDate 带 -0000，feedparser 归一后是【真 UTC】
+#   · mikan ：pubDate 不带时区（实为北京时间 UTC+8），feedparser 按 GMT 解释 → 存的是北京墙钟
+# 存量数据用的都是旧基准，所以【只在显示期换算、不改库】——改入库那头会让新旧数据混在同一列、更难看。
+# 用真实时区做 astimezone() 而不是写死小时差：本机换个时区（或夏令时地区）也照样对。
+_SITE_TZ = {"nyaa": timezone.utc, "mikan": timezone(timedelta(hours=8))}
+
+
 def torrent_time(t) -> str:
-    """种子入库/发布时间的统一短显示：优先放送时间，退回创建时间，截到分钟。"""
-    return str(t.release_time or t.created_at)[:16]
+    """种子入库/发布时间的统一短显示：优先放送时间，退回创建时间，截到分钟。
+
+    release_time 按来源站的时区换算到本地再显示。不换算的话 nyaa 那批【日期会整天错】——
+    本机 JST 时，次日凌晨 00:30 上传的深夜番会显示成前一天 15:30，用户据此判断"这集什么时候
+    放出来的"直接错一天；同一集跨源并列时两条时间差出近两天；『新入库』表按 created_at 排序
+    却显示 release_time，时间列出现小时级倒挂、看起来像表坏了。
+    回退用的 created_at 本来就是 datetime.now() 的本地时间，不换算。
+    注意 release_time 不进任何下载/门禁判定（开始使用日比的是 bgm air_date），这纯粹是显示层。
+    """
+    if t.release_time is not None:
+        tz = _SITE_TZ.get(getattr(t, "site", "") or "")
+        if tz is not None:
+            return str(t.release_time.replace(tzinfo=tz).astimezone().replace(tzinfo=None))[:16]
+        return str(t.release_time)[:16]
+    return str(t.created_at)[:16]
 
 
 def set_torrent_status(model_cls, tid: int, status: str) -> None:
@@ -291,6 +323,11 @@ def reset_downloading(model_cls) -> None:
         s.commit()
 
 
+# 归档每轮处理上限 + 连续删除失败熔断阈值。归档幂等，分轮做不丢东西。
+_ARCHIVE_BATCH = 200
+_ARCHIVE_MAX_FAILS = 5
+
+
 async def archive_old_completed() -> int:
     """完成归档：把『下载完成已超过 QB_ARCHIVE_AFTER_DAYS 天』的种子从 qB 移除【只删种子、留文件】，
     盖 archived_at、清 qb_state（不再跟踪）。status 保持 sent 不变——归档的仍是已下的一集，去重/统计
@@ -303,6 +340,7 @@ async def archive_old_completed() -> int:
         return 0
     cutoff = datetime.now() - timedelta(days=days)
     n = 0
+    fails = 0            # 连续删除失败数：连挂 _ARCHIVE_MAX_FAILS 次就整轮收手（见下）
     for model_cls in (AnimeTorrent, MovieTorrent):
         with get_session() as s:
             rows = [(t.id, t.info_hash) for t in s.exec(select(model_cls).where(
@@ -311,10 +349,20 @@ async def archive_old_completed() -> int:
                 model_cls.archived_at.is_(None),
                 model_cls.qb_synced_at.is_not(None),
                 model_cls.qb_synced_at < cutoff,
-            )) if t.info_hash]
+            ).limit(_ARCHIVE_BATCH)) if t.info_hash]   # 每轮封顶：归档幂等，剩下的下轮接着来
         for tid, h in rows:
             if not await qb.delete([h], delete_files=False):  # 只删种子、保留硬盘文件
+                # 【连续失败熔断】qB 挂了的时候，_ensure 登录失败不缓存 client，于是每一条都会
+                # 重新登录、重新建 AsyncClient、各刷一行错误日志。上千条待归档时一次唤醒就能刷出
+                # 上万行，把 /logs 的 200 条环形缓冲和 2MB×5 的日志文件全冲掉——用户排查
+                # 『qB 为何连不上』时反而什么线索都看不到。连挂几次就认定 qB 不可用、本轮收手，
+                # 这也才对得上本函数 docstring 承诺的『qB 连不上则本轮跳过、下轮再来』。
+                fails += 1
+                if fails >= _ARCHIVE_MAX_FAILS:
+                    log.warning("完成归档：连续 %d 次删除失败（qB 不可用？），本轮跳过，下轮再试", fails)
+                    return n
                 continue
+            fails = 0    # 成功一次就清零，只熔断【连续】失败
             now = datetime.now()
             with get_session() as s:
                 t = s.get(model_cls, tid)
@@ -390,19 +438,27 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
     · qB 跟踪该种子 → setLocation 原地搬 + 更新 save_path
     · qB 关 / 连不上 / 不认识该 hash(remove-on-complete) → 清状态待重下到新目录
     · setLocation 报 403/409(新目录不可写) → 只报告、不动状态
-    返回 {new_path, old_path, moved, redownload, untracked, failed, stalled_kept, fail_code?, error?}。
+    返回 {new_path, old_path, moved, redownload, untracked, failed, stalled_kept, delivering, fail_code?, error?}。
     """
     rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
            "redownload": 0, "untracked": 0, "failed": 0,
-           "stalled_kept": 0}   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
+           "stalled_kept": 0,   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
+           "delivering": 0}     # 交付中的占位行：本次不动它，交付完仍会落旧目录，需提示用户再点一次
     if new_path is None:
         rep["error"] = f"算不出新路径（越界或无{'番' if noun == '集' else '片'}）"
         return rep
     with get_session() as s:
-        pairs = [(t.id, t.info_hash) for t in s.exec(select(model_cls).where(
+        rows = s.exec(select(model_cls).where(
             owner_col == owner_id,
             model_cls.status.in_(HAVE_STATUSES),   # 含 stalled：半成品也在盘上，同样要搬
-            model_cls.archived_at.is_(None)))]     # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
+            model_cls.archived_at.is_(None))).all()  # 已归档的不在 qB，setLocation 移不动、别误清成 pending 触发重下
+        # 排除【交付中】的占位行——与 sync_qb_status 同口径。downloading 是"已置位、还没 add 进 qB"的占位：
+        # 交付协程在锁外 fetch(最长 180s)+add，此刻 qB 里没有它，问 qB 必然查不到 → 会被下面当成
+        # untracked 清成 pending，而交付协程返回时又无条件写回 sent + 旧路径，净效果是：
+        # 文件落旧目录、库里记 sent 不会重下、报告却谎称"已清状态待重下"并让用户去删
+        # ——那正是 qB 此刻在写的文件。这里不碰它，只在报告里单独计数提示用户稍后再点一次。
+        pairs = [(t.id, t.info_hash) for t in rows if t.status != "downloading"]
+        rep["delivering"] = sum(1 for t in rows if t.status == "downloading")
     if not pairs:
         return rep
 
@@ -536,6 +592,9 @@ async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
 #       全在 queuedDL 排队，超过 QB_STALL_TIMEOUT_MIN(默认 24h) 就会被整批误标『停滞异常』，
 #       从而脱离轮询、不自动换源、在 UI 上报一堆假告警。
 # 不带任何标记 = 既非在下也非已完成（error、unknown）
+# 『qB 本轮查不到它』的记号态。不是 qB 的词，故用下划线开头，永不会与真实态撞。
+_QB_ABSENT = "_absent"
+
 _QB_STATES: dict[str, tuple[str, str]] = {
     # ---- 下载中 ----
     "downloading":        ("D",  "下载中"),
@@ -564,6 +623,10 @@ _QB_STATES: dict[str, tuple[str, str]] = {
     "stoppedDL":          ("W",  "已暂停"),
     "error":              ("",   "错误"),
     "unknown":            ("",   "未知"),
+    # ---- 我们自造的过渡态（不是 qB 会返回的值）----
+    # sync 本轮在 qB 里没查到这个在下的种子时先打这个记号、宽限一轮，下轮仍查不到才落 error。
+    # 带 W：qB 都看不到它，停滞计时自然不该继续走。只活一轮——下轮 qB 认回来就被真实态覆写。
+    _QB_ABSENT:           ("W",  "确认中"),
 }
 
 
@@ -726,12 +789,24 @@ async def sync_qb_status(model_cls) -> int:
                 # 若仍用 await 前的陈旧快照，会把刚被 /api/qb/done 回调标『已下完』的行覆写回 error、使回调形同虚设。
                 if (t.qb_progress or 0.0) >= 0.999:  # 已满(含完成回调刚落定) → 下完被 qB 移除，落定已下
                     t.qb_progress, t.qb_state, t.qb_synced_at = 1.0, "", now
-                elif was_synced:            # 曾在下、还没下完就从 qB 消失 → 落定 error（可补/重下）。
+                elif not was_synced:        # 从未被 qB 确认(刚交付未登记?) → 给一轮宽限，下轮仍无则→error
+                    t.qb_synced_at = now
+                elif t.qb_state != _QB_ABSENT:
+                    # 曾在下、这一轮从 qB 消失 —— 【先记号、宽限一轮，不立刻判死】。
+                    # qB 重启时 WebUI 先绑好端口、resume-data 还在异步装载，此期间 torrents/info 会
+                    # 合法返回 200 + 【不完整】列表（不是空 dict，挡不住上面那个 info is None 闸）。
+                    # 单轮 miss 即写 error 会把一批在下种子误杀成永久假失败：error 掉出 TRACKED_STATUSES
+                    # → sync 不再复查、flush 按设计不重试 error、mark_done_by_hash 只认 HAVE 也救不回；
+                    # 同时该集失去 HAVE 状态，flush 的 have_eps 闸当场放行同集另一个 pending 源，
+                    # 而原种子在 qB 里其实装载完毕照常下完 → 同一集两份落进同一目录。
+                    # 用 qb_state 记号而不是比时间：轮询间隔在 30s~保底 120 分之间浮动，
+                    # 任何基于 now-qb_synced_at 的阈值要么误判、要么（若每轮都刷新）永远进不了 error 分支，
+                    # 那会让查不到的种子永久滞留 in-flight、循环永不休眠——正是本段原注释要防的事。
+                    t.qb_state, t.qb_synced_at = _QB_ABSENT, now
+                else:                       # 连续第二轮仍查不到 → 落定 error（可补/重下）。
                     # 注：慢速种子被降级停跟后、在休眠里下完又被 qB 删（remove-on-complete）也会走这里被标 error——
                     # 我们看不到它爬到 100%。要精确标『已下』就在 qB 配『完成回调』(/api/qb/done，可选，见设置页)。
                     t.status, t.qb_state, t.qb_synced_at = "error", "", now
-                else:                       # 从未被 qB 确认(刚交付未登记?) → 给一轮宽限，下轮仍无则上面→error
-                    t.qb_synced_at = now
                 s.add(t)
                 updated += 1
                 continue

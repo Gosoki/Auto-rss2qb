@@ -19,7 +19,8 @@ import httpx
 
 import config
 from sources.base import ParsedItem, Source
-from sources.parse import (SEASON_CN, candidate_names, estimate_premiere, extract_quarter,
+from sources.parse import (SEASON_CN, candidate_names, estimate_premiere, extract_episode_abs,
+                           extract_quarter,
                            is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
@@ -130,6 +131,7 @@ class MikanSource(Source):
                 source_kind=self.policy,
                 priority=self.priority,
                 search_names=search_names,
+                episode_abs=extract_episode_abs(raw_title),
             )
         except Exception as e:
             log.error("Mikan 解析失败: %s - %s", e, entry.get("title", "?"))

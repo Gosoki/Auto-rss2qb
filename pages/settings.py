@@ -413,9 +413,11 @@ def settings():
                 config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
                 # 注：改开始使用日【不】自动重算已有番——由用户在设置里点『应用』按钮显式触发（更可控）
                 # qB 发送开着 → 保存后测一次连接：连不上就自动关掉开关（免得停在『开着却下不了』的迷惑态）
+                probe_failed = False
                 if config.QB_ENABLED:
                     client = await engine.qb._login()
                     if client is None:
+                        probe_failed = True
                         config.set_many({"QB_ENABLED": "false"})
                         if "QB_ENABLED" in f:
                             f["QB_ENABLED"].value = False   # 表单开关同步关掉
@@ -424,9 +426,19 @@ def settings():
                     else:
                         await client.aclose()
                         engine.qb_kick.set()      # 连上了：立即唤醒同步循环自查，别等一个保底周期
-                # 关跟踪/关发送（含上面连不上自动关）→ 落定切换时刻仍在下的旧种子，
-                # 否则它们再无路径推进、永久卡『正在下载』、has_inflight 恒真
-                if (sync_was_on and not config.QB_SYNC_STATUS) or (qb_was_on and not config.QB_ENABLED):
+                # 关跟踪/关发送 → 落定切换时刻仍在下的旧种子，
+                # 否则它们再无路径推进、永久卡『正在下载』、has_inflight 恒真。
+                #
+                # 【只对用户显式关闭落定，探测失败自动关的不落定】(probe_failed)：
+                # 收表单收的是【全量】而不是差量，所以改个站点名/轮询间隔都会走上面那次 qB 探测；
+                # 而那是一次性单发 _login()，不复用会话、不重试、任何失败（网络抖动/qB 正在重启）
+                # 都塌缩成 None。据此把在下种子写成 status=sent + qb_progress=1.0 后，它们永久掉出
+                # _inflight_where，把开关重新打开 sync 也不会再拉它们，UI 从此谎报 100% 已完成。
+                # 对照 sync_qb_status 对同样的失败信号是"本轮不动、不改任何状态"——两条路径不该互相打架。
+                # 探测失败只是把开关关掉+弹警告，等用户看到提示自己处理；真要落定就由他显式关一次。
+                explicit_off = ((sync_was_on and not config.QB_SYNC_STATUS)
+                                or (qb_was_on and not config.QB_ENABLED and not probe_failed))
+                if explicit_off:
                     engine.settle_inflight_off()
             if env_updates:
                 config.update_env(env_updates)  # WEB_PORT 等结构项仍走 .env

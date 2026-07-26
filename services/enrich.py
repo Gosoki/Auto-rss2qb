@@ -223,10 +223,22 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
     if not names and not info_hash:
         return None
 
-    # 集数倒推首播日（周更番第 N 集≈首播后 N-1 周），作为日期校验基准
+    # 集数倒推首播日（周更番第 N 集≈首播后 N-1 周），作为日期校验基准。
+    #
+    # 集号落在 1..30 之外时【连同 release 一起放弃日期校验】，不能像以前那样退回拿 release_time
+    # 当首播日：那样 _date_ok 的两条判据会塌缩成同一个 [bgm_air-35, bgm_air+45] 窗口，而长番
+    # 第 40 集的发布时间距首播已 280 天，窗口必然落空 → _search_one 把【包括正确答案在内的】
+    # 全部候选 continue 掉，名字投票整条路径失效，识别退化成只剩 Mikan-hash 桥一个单点。
+    # 也不能无脑把倒推外推到更大集号：跨季绝对编号（S2 第 4 集被写成 16）倒推会指到【上一季】的
+    # 首播日，反而把正确的续季 subject 判否。宁可不设基准，交给名字重叠 + bgm 相关性排序。
     est = release_time
-    if release_time is not None and isinstance(episode, (int, float)) and 1 <= episode <= 30:
-        est = release_time - timedelta(weeks=int(episode) - 1)
+    date_ref = release_time      # 传给 _date_ok 的 release 基准；放弃校验时与 est 一起置 None
+    if isinstance(episode, (int, float)):
+        if 1 <= episode <= 30:
+            if release_time is not None:
+                est = release_time - timedelta(weeks=int(episode) - 1)
+        else:
+            est = date_ref = None    # 长番 / 绝对编号 / -1 特别篇 / -2 未识别
 
     try:
         async with httpx.AsyncClient(**config.http_client_kwargs(max(1, config.ENRICH_TIMEOUT))) as client:
@@ -234,14 +246,14 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
             votes: Counter = Counter()
             gap: dict = {}
             for name in names:
-                hit = await _search_one(client, name, est, release_time)
+                hit = await _search_one(client, name, est, date_ref)
                 if hit:
                     d, bdt = hit   # bdt 已由 _search_one 解析（且必非 None，命中前已校验）
                     bid = d.get("id")
                     if bid is None:
                         continue
                     votes[bid] += 1
-                    g = abs(((est or release_time) - bdt).days) if (bdt and (est or release_time)) else 999
+                    g = abs(((est or date_ref) - bdt).days) if (bdt and (est or date_ref)) else 999
                     gap[bid] = min(gap.get(bid, 10 ** 9), g)
             bgm_id = None
             if votes:

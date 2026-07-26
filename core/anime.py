@@ -156,9 +156,9 @@ def _kw_match(kw: str, raw: str) -> bool:
     return kw.lower() in (raw or "").lower()
 
 
-def _apply_bgm(a: Anime, info: dict | None, keep_quarter: bool = False) -> None:
+def _apply_bgm(a: Anime, info: dict | None, keep_path: bool = False) -> None:
     """把 enrich 结果写进 TV 番（engine 落库 + 按 bgm 规范名纠正季号）。"""
-    engine.apply_bgm_meta(a, info, keep_quarter)
+    engine.apply_bgm_meta(a, info, keep_path)
     # 季号以 bgm 规范名为准：ANi 罗马音标题常写 "Season 3" 本地解析不到而回 1，
     # 而 bgm 规范名带『第三季』，能纠正（名字没季标记则保留本地解析值）。
     sn = season_from_name(a.display_name) or season_from_name(a.jp_name)
@@ -240,6 +240,35 @@ def _warn_unknown_episode(it) -> None:
         log.warning("集数解析失败 - %s", it.raw_title)
 
 
+def _learn_and_normalize_episode(s, a, item) -> float:
+    """跨源集号归一：返回这条种子该按哪个集号入库（顺带学习该番的 ep_offset）。
+
+    有的源用【全系列绝对集号】（第二季第 4 集写成 16），有的用【季内集号】（写 04）。集去重键是
+    (anime_id, episode)，两种写法会被当成两集各下一份到【同一个目录】——库里真的发生过
+    （anime 16「地狱模式 第二季」total_episodes=13，ANi 的 16 与 LoliHouse 的 4 是同一集，
+    两条 save_path 完全相同）。而且只要两源继续更新就每周复发，删一次挡不住下周。
+
+    归一只在【有确凿证据】时做：
+      · 学：标题写成 '16(88)' 的双编号种子直接给出 offset = 88 - 16（LoliHouse 系常带）。
+      · 用：该番已知 offset，且这条的集号超过 bgm 总集数（说明它用的是绝对编号）→ 减去 offset。
+    推不出 offset 就【什么都不做】，由详情页标『疑似同集不同编号』交人工，绝不按发布时间瞎配对
+    （补番/跳周/合集都会误判成同集而漏下）。
+    """
+    ep = item.episode
+    if a is None or not isinstance(ep, (int, float)) or ep < 1:
+        return ep                       # 特别篇/未知集不参与
+    # ① 学：双编号种子给出确凿偏移（只在还没学到时写，别被个别错标题改掉已定的值）
+    if a.ep_offset is None and item.episode_abs and item.episode_abs > ep:
+        a.ep_offset = int(item.episode_abs - ep)
+        s.add(a)
+        log.info("集号偏移：%s 第%s季 → offset=%d（据 %s）", a.title, a.season, a.ep_offset, item.raw_title[:40])
+    # ② 用：本条用的是绝对编号（超过总集数）→ 折回季内集号
+    total = a.total_episodes or 0
+    if a.ep_offset and total and ep > total and ep - a.ep_offset >= 1:
+        return ep - a.ep_offset
+    return ep
+
+
 async def process_item(item) -> bool:
     """处理一条标准条目。返回 True 表示是新种子（之前没见过）。"""
     # 1) 种子级去重：同一 hash 见过就跳过（跨源相等）
@@ -253,6 +282,7 @@ async def process_item(item) -> bool:
     # 3) 入库种子（带 anime_id）。一般不在这里下：交给 flush_ready_downloads。
     with get_session() as s:
         a = s.get(Anime, anime_id)
+        episode = _learn_and_normalize_episode(s, a, item)   # 跨源集号归一（绝对编号 → 季内编号）
         torrent = AnimeTorrent(
             info_hash=item.info_hash,
             anime_id=anime_id,
@@ -261,7 +291,7 @@ async def process_item(item) -> bool:
             anime_title=item.anime_title,
             raw_title=item.raw_title,
             season=item.season,
-            episode=item.episode,
+            episode=episode,
             quarter=a.quarter if a else item.quarter,
             download_url=item.download_url,
             release_time=item.release_time,
@@ -294,17 +324,25 @@ async def process_item(item) -> bool:
                     AnimeTorrent.anime_id == anime_id,
                     AnimeTorrent.status.in_(HANDLED_STATUSES),
                     AnimeTorrent.id != torrent_id)).first()):
-            if _aired_before_start(a.air_date):
-                a.rejected = True   # 超期(早于开始使用日) → 判超期忽略(rejected 且 confirmed 仍 False)，不自动下（种子照常入库）
-            else:
+            # 超期的【不在这里替用户做忽略决定】，只是不自动确认、留在『待确认』等人工。
+            # 原来这里写 a.rejected=True，会咬到一类用户刚刚亲手操作过的番：
+            # 『待识别』番按定义一集都没下过（没有 bangumi_id → 从不自动确认 → 从不下载），
+            # 于是上面那道"有没有 HANDLED 种子"的守卫对它恒不成立。用户在详情页点『重新识别』或
+            # 『绑定 bgm』拿回 bangumi_id（UI 明说"回到待确认，去点确认下载"）后，只要该番
+            # air_date 早于开始使用日（长番/续季必然如此），下一条 auto 源新种子进来就会走到这里
+            # 把它判成超期忽略：番当场从『待确认』页消失、掉进『已忽略』、永久不再自动下，
+            # 而用户按指引回到『待确认』时那里是空的，只会以为"绑完就再没更新过"。
+            # 新入库的番仍在 _resolve_anime 建番处按开始使用日判超期（见上面 auto 分支），这条没丢；
+            # 对【已有】的番重算超期本来就有设置页那个带二次确认的显式入口，不该由后台悄悄代劳。
+            if not _aired_before_start(a.air_date):
                 a.confirmed = True
-            s.add(a)
-            s.commit()
+                s.add(a)
+                s.commit()
         should_download = bool(a and a.confirmed and not a.rejected)
         lock = a.pref_source if a else None   # 锁定源：入库即下也只放行锁定组
         kw = a.pref_keyword if a else None     # 版本关键词：即时下载也只放行命中该版本的
 
-    log.info("新增 - %s - %s 第%s季 第%s集", item.source, item.anime_title, item.season, item.episode)
+    log.info("新增 - %s - %s 第%s季 第%s集", item.source, item.anime_title, item.season, episode)
     _warn_unknown_episode(item)
     # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 + (未锁源或正是锁定源) → 入库就下，不等缓冲窗口。
     # 排除 -2(未知/批量)：与 flush 一致留人工处理，别让它是否被下取决于来源组优先级（instant 下、flush 不下）。
@@ -341,6 +379,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             season = t.season
             title = t.anime_title
             orig_status = t.status   # 供失败恢复：force 从终态(deleted/excluded)重下若失败，别降级成会触发复活/重下的 error
+            orig_archived = t.archived_at   # 同上：force 重下【已归档】的集若失败，要把归档标记原样放回去
             # 跨表【不】去重：番剧/剧场版各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer（曾致删/下竞态静默丢文件）。
             # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）。
@@ -371,19 +410,37 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             info_hash = t.info_hash
             a = s.get(Anime, anime_id) if anime_id else None
             # 季度/番名/季号统一由 _anime_path_parts 算（与 anime_save_path 同口径，B2）：季度/季号以 bgm 纠正后的
-            # Anime 为准（种子行是入库快照、重识别后会过时；有下载时 keep_quarter 已锁死 a.quarter）；名字优先 bgm 日文原名。
+            # Anime 为准（种子行是入库快照、重识别后会过时；有下载时 keep_path 已锁死 a.quarter 与名字）；名字优先 bgm 日文原名。
             quarter, folder_name, season = _anime_path_parts(a, t)
 
     # 失败落定态：从用户终态(deleted/excluded) force 重下若失败，恢复原终态而非 error——
     # 否则 deleted→error 会让该集不再含任何 _HANDLED 状态，被 _revive_orphaned_skipped 复活 skipped 兄弟、
     # flush 自动把用户删过的集重新下回来（违反 deleted『不重下』）。pending/error/skipped/stalled 仍落 error。
-    fail_status = orig_status if orig_status in MANUAL_TERMINAL_STATUSES else "error"
+    # 已归档的集 force 重下失败时也恢复原态（连同下面的 archived_at 一起还原）：
+    # 归档＝文件还在盘上、只是从 qB 移除了。取种/交付失败什么都没改变，它仍是「已归档·已下」。
+    # 若像以前那样降级成 error：① 该集脱离 HAVE_STATUSES → flush 当场挑同集另一个 pending 源，
+    # 一个轮询周期内把第二份下到同一目录；② 详情页删除按钮、delete_anime_files 全按 HAVE 门控，
+    # 于是那份归档旧文件在 UI 里再也没有任何入口能标记或删除，成了永久孤儿。
+    fail_status = (orig_status if (orig_status in MANUAL_TERMINAL_STATUSES or orig_archived is not None)
+                   else "error")
+
+    def _fail() -> None:
+        """失败回写：恢复状态，并把 in-lock 清掉的归档标记放回去（qb_* 保持清零即可，它本就不在 qB 里）。"""
+        _set_status(torrent_id, fail_status)
+        if orig_archived is not None:
+            with get_session() as s2:
+                t2 = s2.get(AnimeTorrent, torrent_id)
+                if t2 is not None and t2.status == fail_status:
+                    t2.archived_at = orig_archived
+                    s2.add(t2)
+                    s2.commit()
+
     # 组装保存路径（含越界校验），TV 按设置可加 Season N 子目录
     save_path = engine.build_save_path(quarter, folder_name, season=season,
                                        sub_dir=config.ANIME_DOWN_PATH)
     if save_path is None:
         log.error("拒绝越界保存路径 - %s -> %s / %s", title, quarter, folder_name)
-        _set_status(torrent_id, fail_status)
+        _fail()
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
@@ -394,15 +451,15 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
         # 从 deleted/excluded 强制重下时若正好被取消，写 pending 会让该集不再含任何"已处理"状态，
         # 于是被 _revive_orphaned_skipped 复活 + flush 自动重下——用户删掉的集又被下回来。
         # 取种最长 180s，这期间关程序就会中招，窗口并不小。
-        _set_status(torrent_id, fail_status)
+        _fail()
         raise
     except Exception as e:  # 失败回写：终态重下失败恢复原态，其余落 error，避免卡在 downloading
         log.error("下载失败 - %s - %s", title, e)
-        _set_status(torrent_id, fail_status)
+        _fail()
         return False
 
     if not ok:
-        _set_status(torrent_id, fail_status)
+        _fail()
         return False
     with get_session() as s:   # 记实际保存路径：改季度/重绑后据此移动或提醒旧位置
         t = s.get(AnimeTorrent, torrent_id)
@@ -715,6 +772,25 @@ def get_anime(anime_id: int) -> Anime | None:
         return s.get(Anime, anime_id)
 
 
+def episode_numbering_conflict(anime_id: int) -> list:
+    """该番是否存在【疑似同集不同编号】——返回可疑的绝对编号集号列表（空=没问题）。
+
+    判据：番的 bgm 总集数已知、且库里有集号【超过总集数】的种子，同时又存在集号在正常范围内的种子。
+    这说明两个源用了不同编号体系（绝对 vs 季内），同一集会被当成两集各下一份到同一目录。
+    能从双编号标题推出 ep_offset 的番已在入库时自动折算，走不到这里；这里剩下的是推不出的，
+    交给人工判断（详情页提示），绝不按发布时间瞎配对——补番/跳周/合集都会误判成同集而漏下。
+    """
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is None or not a.total_episodes or a.ep_offset is not None:
+            return []
+        eps = {t.episode for t in s.exec(
+            select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)) if t.episode and t.episode >= 1}
+    over = sorted(e for e in eps if e > a.total_episodes)
+    within = [e for e in eps if e <= a.total_episodes]
+    return over if (over and within) else []
+
+
 def list_episodes(anime_id: int) -> list[AnimeTorrent]:
     """某番剧的全部种子（按集数、再按入库时间倒序），供详细页展示分集/来源。"""
     with get_session() as s:
@@ -738,13 +814,22 @@ def downloaded_count(anime_id: int) -> int:
 
 # ---------------- 给 UI 的操作 ----------------
 
-def confirm_anime(anime_id: int, pref_source: str = "") -> None:
-    """确认下载该番；pref_source 非空则锁定下载源（本次及以后只下这个组，缺集不兜底）。"""
+def confirm_anime(anime_id: int, pref_source: str | None = None) -> None:
+    """确认下载该番；pref_source 语义是【三态】，别退回二态：
+
+      · None（默认）＝不动现有锁定源。详情页的『确认下载』不带这个参数，
+        而补齐/绑定 bgm 都会把番打回待确认、UI 明确指引用户回来点确认——
+        以前默认值是 ""、这里无条件 `pref_source or None`，等于按指引走一遍正常流程
+        就把用户显式设过的锁定源静默清空，此后按全局优先级挑源（最高优先级组会通吃）。
+      · ""   ＝显式解锁，恢复多源兜底。
+      · 非空 ＝锁定只下这个组，缺集不兜底。
+    """
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is not None:
             a.confirmed = True
-            a.pref_source = pref_source or None
+            if pref_source is not None:
+                a.pref_source = pref_source or None
             s.add(a)
             s.commit()
 
@@ -848,8 +933,15 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
         else:
             keeper.confirmed = keeper.confirmed or loser.confirmed
             keeper.rejected = keeper.rejected or loser.rejected
+        # 【合并时必须随 loser 迁过来的订阅控制字段清单】——以后再加同类字段（锁源/锁版本/
+        # 单番开关之类）务必同步加到这里。pref_keyword 之前就是漏在这儿的：keeper 恒是刚绑定的
+        # 『待确认』残条、loser 才是带关键词的主番，loser 随即被删，于是用户设的『版本』硬锁
+        # （繁日/简日/1080p）被静默清空，下一轮 flush 立刻按无关键词口径挑版本，
+        # 把用户明确排除过的版本投给 qB，详情页那个输入框也变空、无任何提示。
         if not keeper.pref_source and loser.pref_source:
             keeper.pref_source = loser.pref_source
+        if not keeper.pref_keyword and loser.pref_keyword:
+            keeper.pref_keyword = loser.pref_keyword
         # 季度：keeper 尚未落盘而 loser 已有在下/已下文件时采用 loser 的季度，
         # 免得合并后新集去了 keeper 的（可能不同）季度目录，与已落盘的旧集散在两处。
         if loser.quarter and not _has_downloads(s, keeper_id) and _has_downloads(s, loser_id):
@@ -899,7 +991,7 @@ async def enrich_anime(anime_id: int) -> bool:
         if a is None:
             return False
         # 无已下集就采用 bgm 季度（纠正种子解析得来的错季度）；有已下集才保留，避免散目录
-        _apply_bgm(a, info, keep_quarter=_has_downloads(s, anime_id))
+        _apply_bgm(a, info, keep_path=_has_downloads(s, anime_id))
         s.add(a)
         s.commit()
         # 身份守卫：若该 bgm_id 已被别的番占用，合并过来，杜绝同一部番裂成两条
@@ -924,7 +1016,7 @@ async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
             return False
         a.confirmed = False  # 绑定后进『待确认』，等人工确认下载
         # 无已下集就采用 bgm 季度（纠正错季度）；有已下集才保留，避免散目录
-        _apply_bgm(a, info, keep_quarter=_has_downloads(s, anime_id))
+        _apply_bgm(a, info, keep_path=_has_downloads(s, anime_id))
         s.add(a)
         s.commit()
         # 身份守卫：该 bgm_id 已被别的番占用 → 合并过来，杜绝一部番裂成两条
@@ -1375,7 +1467,8 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
             s.add(AnimeTorrent(
                 info_hash=it.info_hash, anime_id=anime_id, source=it.source, site=it.site,
                 anime_title=it.anime_title, raw_title=it.raw_title, season=it.season,
-                episode=it.episode, quarter=quarter or it.quarter,
+                # 与 process_item 同口径做跨源集号归一，否则补齐进来的绝对编号种子会绕过它
+                episode=_learn_and_normalize_episode(s, a_now, it), quarter=quarter or it.quarter,
                 download_url=it.download_url, release_time=it.release_time,
                 priority=it.priority, status="pending"))
             try:

@@ -123,6 +123,23 @@ def strip_season(title: str) -> str:
     return _SEASON_CN_RE.sub("", title)
 
 
+# 双编号写法：'- 16(88)' —— 括号外是【季内】集号、括号内是【全系列绝对】集号（LoliHouse 系常用）。
+# 它是跨源集号归一的现成锚点：offset = 绝对 - 季内，拿到之后就能把别的源（如 ANi 直接写 88）
+# 的绝对集号折算回季内集号，避免同一集因两种编号体系被当成两集、各下一份到同一目录。
+# 两数都限 1~3 位（真集号不会四位），且绝对号必须【严格大于】季内号——否则 '- 04(2024)' 这种
+# 年份括号、'- 12(3)' 这种碟片编号都会被误当双编号，推出一个荒唐的偏移量污染全番的集号折算。
+_EP_DUAL_RE = re.compile(r"(?<!\d)-\s*(\d{1,3})(?:\s*[vV]\d+)?\s*\(\s*(\d{1,3})\s*\)(?!\d)")
+
+
+def extract_episode_abs(text: str) -> int | None:
+    """标题带双编号 'NN(MM)' 时返回绝对集号 MM，否则 None。季内集号仍由 extract_episode 给。"""
+    m = _EP_DUAL_RE.search(text)
+    if not m:
+        return None
+    rel, absolute = int(m.group(1)), int(m.group(2))
+    return absolute if 1 <= rel < absolute <= 999 else None
+
+
 def extract_episode(text: str):
     """整数集→int，小数集(11.5)→float，中文数字(第二十三话)→int，特别篇/OVA→-1，无法识别→-2。"""
     for pat in _EP_PATTERNS:

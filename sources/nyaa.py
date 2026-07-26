@@ -13,8 +13,8 @@ import httpx
 
 import config
 from sources.base import ParsedItem, Source
-from sources.parse import (candidate_names, estimate_premiere, extract_quarter, is_batch,
-                           parse_multibracket, parse_title)
+from sources.parse import (candidate_names, estimate_premiere, extract_episode_abs,
+                           extract_quarter, is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
 
@@ -115,6 +115,7 @@ class NyaaSource(Source):
                 source_kind=self.policy,
                 priority=self.priority,
                 search_names=search_names,
+                episode_abs=extract_episode_abs(raw_title),
             )
         except Exception as e:
             log.error("解析条目失败: %s - %s", e, entry.get("title", "?"))

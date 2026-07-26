@@ -75,8 +75,12 @@ def _notify_relocate_movie(rep):
         parts.append(f"{rep['failed']} 个版本移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
     if rep.get("stalled_kept"):   # 停滞版本有意不动：保留停滞标记与删除入口，但文件没跟着走，要说清楚
         parts.append(f"{rep['stalled_kept']} 个版本处于停滞、未移动（保留停滞标记）")
+    if rep.get("delivering"):     # 正在交付给 qB 的版本：路径在交付前就定死了，搬不了也不能碰
+        parts.append(f"{rep['delivering']} 个版本正在交付给 qB、未移动"
+                     "（它会先落到旧目录，交付完成后再点一次即可搬过来）")
     msg = "；".join(parts) or "无需移动"
-    warn = bool(rep.get("redownload") or rep.get("failed") or rep.get("stalled_kept"))
+    warn = bool(rep.get("redownload") or rep.get("failed")
+                or rep.get("stalled_kept") or rep.get("delivering"))
     if (rep.get("redownload") or rep.get("stalled_kept")) and rep.get("old_path"):
         msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
     ui.notify(msg, type="warning" if warn else "positive")

@@ -4,7 +4,8 @@ from nicegui import ui
 from core import anime, engine
 import config
 from .layout import (WEEKDAY_CN, confirm, ep_str, meta_card, name_of, parse_bgm_id,
-                     qb_live_text, season_label, source_options, torrent_status_cn)
+                     qb_live_text, season_label, source_options, torrent_status_cn,
+                     warn_banner)
 
 
 def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> None:
@@ -117,6 +118,17 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.label(f"↓ {_sp}").classes(
                     "text-gray-500 text-xs break-all min-w-0 text-right").tooltip(
                     "下载时发送给 qB 的保存目录（按 工作目录/季度/番名/Season 规则算出）")
+        # 跨源集号体系不一致的兜底提示：能从 '16(88)' 双编号推出偏移的番已在入库时自动折算，
+        # 这里剩下的是推不出、必须人工判断的（同一集会被当成两集，各下一份到同一目录）。
+        _conf = anime.episode_numbering_conflict(anime_id)
+        if _conf:
+            warn_banner(
+                f"疑似同集不同编号：本番共 {cur.total_episodes} 集，但有种子标着第 "
+                + "、".join(ep_str(e) for e in _conf)
+                + " 集——多半是某个源用了【全系列绝对集号】而另一个用【季内集号】。"
+                  "这两种写法会被当成不同的集，同一集因此会被下两份到同一个目录。"
+                  "请核对后手动排除多余的那份；若某个源的标题里带 “16(88)” 这类双编号，"
+                  "系统会自动学到偏移量并从此自行折算。")
         if not eps:
             ui.label("（还没有种子）").classes("text-gray-400")
             return
@@ -330,8 +342,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             parts.append(f"{rep['failed']} 集移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
         if rep.get("stalled_kept"):   # 停滞集有意不动：不降级、不自动重下，但要告诉用户文件没跟着走
             parts.append(f"{rep['stalled_kept']} 集处于停滞、未移动（保留停滞标记，未自动重下）")
+        if rep.get("delivering"):     # 正在交付给 qB 的集：路径在交付前就定死了，搬不了也不能碰
+            parts.append(f"{rep['delivering']} 集正在交付给 qB、未移动"
+                         "（它会先落到旧目录，交付完成后再点一次『编辑季度』即可搬过来）")
         msg = "；".join(parts) or "无需移动"
-        warn = bool(rep.get("redownload") or rep.get("failed") or rep.get("stalled_kept"))
+        warn = bool(rep.get("redownload") or rep.get("failed")
+                    or rep.get("stalled_kept") or rep.get("delivering"))
         if (rep.get("redownload") or rep.get("stalled_kept")) and rep.get("old_path"):
             msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
         ui.notify(msg, type="warning" if warn else "positive")

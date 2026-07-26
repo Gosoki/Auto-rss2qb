@@ -5,7 +5,7 @@
 import re
 from contextlib import contextmanager
 
-from nicegui import ui
+from nicegui import context, ui
 
 import config
 from core import engine
@@ -359,8 +359,16 @@ def expand_collapse_bar(state: dict, refresh) -> None:
 
 async def confirm(title: str, note: str = "", ok_label: str = "确定",
                   ok_icon: str = "", ok_color: str = "negative") -> bool:
-    """弹一个确认框，等用户选择，用完即销毁自身（不残留隐藏 dialog 累积）。返回是否点了确认。"""
-    with ui.dialog() as dlg, ui.card().style("max-width:92vw"):
+    """弹一个确认框，等用户选择，用完即销毁自身（不残留隐藏 dialog 累积）。返回是否点了确认。
+
+    【必须建在 client.layout 里】ui.dialog 会在【调用方当前槽位】种一个隐藏 canary 元素，
+    并对它挂 weakref.finalize(→ dialog.delete())。而调用方常常是「先 refresh 面板、再 await confirm」
+    的处理器（如改季度后问要不要搬文件）；refresh 不被 await 时会排成 asyncio 任务，
+    恰好在 `await dlg` 这个挂起点才真正执行 container.clear() —— 把刚种下的 canary 一起清掉，
+    对话框在显示前就被销毁，await 永不返回、处理器协程静默泄漏，用户只看到操作"没反应"。
+    包进 client.layout 后 canary 落在页面级槽位，面板 refresh 碰不到它；销毁仍由末尾 finally 负责。
+    """
+    with context.client.layout, ui.dialog() as dlg, ui.card().style("max-width:92vw"):
         ui.label(title).classes("font-bold")
         if note:
             # pre-line：保留 note 里的换行（如"文件仍在 <路径>"这类要单独成行的提示），
