@@ -552,10 +552,11 @@ def movies_page(t: str = ""):
                     for r in rows:
                         text, color = _mov_live_status(r["status"], r["qb_state"], r["qb_progress"],
                                                        r["qb_synced_at"], r["qb_dlspeed"])
-                        with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
+                        # 同番剧侧：no-wrap + 标题 grow/min-w-0 + 徽标 shrink-0，徽标恒在右
+                        with ui.row().classes("items-center gap-3 w-full text-sm py-1 no-wrap").style(
                                 "border-bottom:1px solid rgba(255,255,255,.08)"):
-                            ui.label(r["name"]).classes("grow break-all")
-                            ui.badge(text).props(f"color={color}")
+                            ui.label(r["name"]).classes("grow break-all min-w-0")
+                            ui.badge(text).props(f"color={color}").classes("shrink-0 text-sm")
 
         @ui.refreshable
         def recent_panel():

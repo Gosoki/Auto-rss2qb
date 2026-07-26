@@ -411,11 +411,13 @@ def anime_page(t: str = ""):
                     for r in rows:
                         text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
                                                   r["qb_synced_at"], r["qb_dlspeed"])
-                        with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
+                        # no-wrap + 标题 grow/min-w-0 + 徽标 shrink-0：长标题在自己那一格里换行，
+                        # 徽标永远钉在右侧，不会被挤到下一行左边去
+                        with ui.row().classes("items-center gap-3 w-full text-sm py-1 no-wrap").style(
                                 "border-bottom:1px solid rgba(255,255,255,.08)"):
                             ui.label(f'{r["name"]}  第{ep_str(r["episode"])}集').classes(
-                                "grow break-all")
-                            ui.badge(text).props(f"color={color}")
+                                "grow break-all min-w-0")
+                            ui.badge(text).props(f"color={color}").classes("shrink-0 text-sm")
 
         @ui.refreshable
         def recent_panel():
