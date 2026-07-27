@@ -340,3 +340,43 @@ def parse_multibracket(raw_title: str):
     cjk = [n for n in names if _CJK.search(n)]
     anime_title = (cjk[0] if cjk else names[0]).replace(" ", "")
     return anime_title, names
+
+
+# ---- 搜种用番名（『补齐该源』用，与搜 bgm 的 candidate_names 分开）----
+# 洗完还带括号/促销星 → candidate_names 没洗干净（全括号命名的组），改用 parse_multibracket 的块级候选
+_MANGLED_RE = re.compile(r"[\[\]【】★]")
+# candidate_names 只锚掉『 - 07』式集号，这些写法会整段留在名字里：第03话 / EP03 / - 03 END
+_EP_LEFT_RE = re.compile(
+    r"\s*(?:第\s*\d{1,4}\s*[话話集]|\b(?:EP|Episode)\s*\.?\s*\d{1,3}\b|"
+    r"[-–]\s*\d{1,3}(?:\.\d+)?\s*(?:END|FIN|完结?)?\s*$)", re.I)
+
+
+def _split_langs(s: str) -> list[str]:
+    """把『中文名/罗马音』这类无空格并列的写法拆开（candidate_names 只拆有空格的 ' / '）。
+    仅当两侧语种不同（一侧含 CJK、一侧不含）才拆——同语种的 'Fate/Zero' 是名字本身，拆了反而搜不到。"""
+    parts = [p.strip() for p in s.split("/") if p.strip()]
+    if len(parts) > 1 and any(_CJK.search(p) for p in parts) and any(not _CJK.search(p) for p in parts):
+        return parts
+    return [s]
+
+
+def search_query_names(raw_title: str) -> list[str]:
+    """从一条种子标题提炼【去种子站搜同源新种】的关键词（补齐用）。返回去重后的候选，可能为空。
+
+    与 candidate_names（搜 bgm 用）的差别是必须把集号剥干净：带『第03话』『EP03』『- 03 END』的词
+    在 nyaa/Mikan 一条都搜不到。全括号命名的组走 parse_multibracket 兜底——这里【不】看
+    ANIME_MULTIBRACKET_PARSE 开关：那开关防的是"猜错名字建出垃圾番"，而这里的名字只当搜索词用，
+    补齐入库时挂的是既有 anime_id、还要过组名/季号过滤，猜歪最多白发一次请求。
+    """
+    cands = candidate_names(raw_title)
+    if not cands or any(_MANGLED_RE.search(c) for c in cands):
+        mb = parse_multibracket(raw_title)      # 全括号命名：番名整块在 [..] 里，candidate_names 洗不出来
+        if mb:
+            cands = mb[1]
+    out: list[str] = []
+    for c in cands:
+        for part in _split_langs(_PROMO_RE.sub("", c)):
+            part = _EP_LEFT_RE.sub("", _TAG_BLK_RE.sub("", part)).strip(" -–—_[]【】()（）★")
+            if len(part.replace(" ", "")) >= 2 and part not in out:
+                out.append(part)
+    return out

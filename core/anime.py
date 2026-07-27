@@ -19,7 +19,7 @@ from db import get_session
 from db.models import Anime, AnimeTorrent, MovieTorrent, SourceGroup, AnimeAlias
 from services import enrich
 from services.notify import notify
-from sources.parse import candidate_names, extract_quarter, season_from_name
+from sources.parse import extract_quarter, search_query_names, season_from_name
 
 log = logging.getLogger("autorss")
 
@@ -1386,19 +1386,6 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
         pref, quarter = a.pref_source, a.quarter
         jp, dn, title = a.jp_name, a.display_name, a.title
-        names = [n for n in (jp, dn) if n]     # 搜索名（有序：先 日/中，再罗马音）
-
-    latest = max(rows, key=lambda t: t.created_at, default=None)
-    if latest:
-        for n in candidate_names(latest.raw_title):
-            if n not in names:
-                names.append(n)
-    # 季号过滤基准：用本番种子【实际解析出的季号】而非 bgm 纠正后的 a.season——否则锁定源的续季番若种子标题
-    # 无季标记(解析成 season=1)，会与 a.season=2 全对不上而假阴、补齐永远搜不到。
-    existing_seasons = {t.season for t in rows}
-    queries = [n for n in names if len(n.replace(" ", "")) >= 2][:4]   # 限 4 个查询，别打太多请求
-    if not queries:
-        return {"found": 0, "kept": 0, "ingested": 0, "sites": [], "error": "没有可搜索的番名"}
 
     # 目标源(组名)+站点：锁定源→只补该源；没锁→补最高优先级的源（Mikan 群组同优先级即并列全取）
     tors = [(t.source, t.site, t.priority or 0) for t in rows if t.source]
@@ -1412,6 +1399,28 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
         site_groups.setdefault(site, set()).add(src)
     if not site_groups:
         return {"found": 0, "kept": 0, "ingested": 0, "sites": [], "error": "该番还没有任何来源，无法判断去哪搜"}
+
+    # 搜索名：【先用该源自己的种子标题提取】(search_query_names：剥集号、全括号命名走块级兜底)——补齐要找的
+    # 正是这个组的发布，用它自己的写法最容易命中；bgm 规范名(jp/dn)常带罗马数字/日文副标题，在种子站往往
+    # 一条都搜不到，故退到后面做保底。取该源最近 3 条种子（同组各集名字基本一样，去重后就一两个；多取一点
+    # 是为了兜住组中途改名）。
+    tset = set(targets)
+    src_rows = sorted((t for t in rows if (t.source, t.site) in tset),
+                      key=lambda t: t.created_at, reverse=True)
+    names: list[str] = []
+    for t in src_rows[:3]:
+        for n in search_query_names(t.raw_title):
+            if n not in names:
+                names.append(n)
+    for n in (jp, dn):                    # bgm 规范名（先日/中，再罗马音）殿后保底
+        if n and n not in names:
+            names.append(n)
+    # 季号过滤基准：用本番种子【实际解析出的季号】而非 bgm 纠正后的 a.season——否则锁定源的续季番若种子标题
+    # 无季标记(解析成 season=1)，会与 a.season=2 全对不上而假阴、补齐永远搜不到。
+    existing_seasons = {t.season for t in rows}
+    queries = [n for n in names if len(n.replace(" ", "")) >= 2][:5]   # 限 5 个查询(×站点数=请求数)，别打太多
+    if not queries:
+        return {"found": 0, "kept": 0, "ingested": 0, "sites": [], "error": "没有可搜索的番名"}
 
     # 抓取（唯一分站处）：按站构造搜索源，复用 Source._parse（含组名白名单/合集过滤/hash 校验）。
     # 各 (site × 查询名) 并发抓，墙钟=最慢一次而非累加，避免最坏 ~8×30s 串行阻塞几分钟。
