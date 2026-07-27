@@ -155,7 +155,13 @@ def anime_page(t: str = ""):
                                       "#00d3f3", "#fb64b6", "#9ae600", "#c27aff", "#00d5be"],
                             "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} 种子 · {d}%"},
                             "legend": {"type": "scroll", "orient": "vertical", "right": "2%",
-                                       "top": "middle", "textStyle": {"color": "#99a1af"},  # gray-400(灰2)
+                                       # 组名可以很长（"豌豆字幕组&风之圣殿字幕组&LoliHouse"），不截就把环图挤扁。
+                                       # 108px ≈ 8 个汉字 + 省略号（图例字号默认 12）。按【像素】截而不是按字数：
+                                       # 中英混排时各行收在同一竖线上，比"都留 8 个字"齐整。全名仍在——悬停切片，环心会显示。
+                                       "top": "middle", "textStyle": {"color": "#99a1af",  # gray-400(灰2)
+                                                                      "width": 108,
+                                                                      "overflow": "truncate",
+                                                                      "ellipsis": "…"},
                                        "selected": dict(_legend_sel)},  # 回填用户的图例排除态
                             "series": [{
                                 "name": "种子来源", "type": "pie",
