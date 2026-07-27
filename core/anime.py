@@ -1033,11 +1033,6 @@ async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
     return True
 
 
-async def reenrich_all() -> int:
-    """对所有番重跑一次富集（回填 jp_name/规范名/简介/评分等新字段）。返回命中数。"""
-    return await reenrich_scope(None)
-
-
 async def reenrich_scope(seasons: int | None = None) -> int:
     """按季度范围重新识别（bgm）：seasons=1 当季 / 2 近半年 / 4 近1年 / None 全部。返回命中数。
 

@@ -154,3 +154,24 @@ async def run_qb_sync() -> None:
         except Exception as e:
             # has_inflight()/has_active_downloading() 若因 DB 锁等抛错，别让它掀翻 while True（否则 qB 同步永久死掉）
             log.error("qB 同步内层循环异常（回退休眠，等下次 kick/保底）: %s", e)
+
+
+async def reactivate_all() -> None:
+    """手动『重新激活全部任务』（设置页按钮）：立刻跑一轮 = 抓所有源入库 → 放行到点的下载发往 qB
+    → 按需扫剧场版 → 唤醒 qB 状态检查（顺带完成归档）。等价于重启服务后各协程立刻做的那一轮，但不重启进程。
+
+    采集暂停时跳过抓源（与 run_worker 同口径，暂停就是暂停），qB 检查照做。
+    刻意【不】做 reset_downloading：那是启动时清上次异常退出的残留，运行中 status=downloading 的都是真在下的
+    种子，复位成 pending 会让 flush 认为该集『还没有』而另挑一个源重下一份。
+    """
+    if config.ANIME_POLL_ENABLED:
+        await poll_once()
+    else:
+        log.info("重新激活：采集处于暂停，跳过抓源")
+    try:
+        if await movies.auto_scan_tick():
+            log.info("重新激活：剧场版自动扫描完成")
+    except Exception as e:
+        log.error("重新激活：剧场版扫描异常: %s", e)
+    engine.qb_kick.set()      # 唤醒 qB 状态同步：刷新在下种子的实时态 + 完成归档
+    log.info("重新激活全部任务：完成")

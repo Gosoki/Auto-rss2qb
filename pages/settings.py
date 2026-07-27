@@ -7,7 +7,7 @@ import ipaddress
 
 from nicegui import context, run, ui
 
-from core import anime, engine, netguard
+from core import anime, engine, netguard, worker
 import config
 from sources.parse import format_quarter
 from .layout import confirm, frame, warn_banner
@@ -674,22 +674,28 @@ def settings():
             msg = "已保存，即时生效" + ("（Web 绑定地址/端口改动需重启）" if env_updates else "")
             ui.notify(msg, type="positive")
 
-        _reenrich_busy = {"v": False}
+        _reactivate_busy = {"v": False}
 
-        async def _reenrich():
-            if _reenrich_busy["v"]:
-                return                       # 防抖：跑着时连点直接忽略，别叠多遍并发全库扫描
-            if not await confirm("对全部番重跑 bgm 识别？", "会逐部走 bgm，番多时可能要几分钟。"):
+        async def _reactivate():
+            if _reactivate_busy["v"]:
+                return                       # 防抖：跑着时连点直接忽略，别叠多轮并发抓源
+            if not await confirm("重新激活全部任务？",
+                                 "立刻抓一遍所有源、把到点的下载发往 qB、按需扫剧场版，并唤醒 qB 状态检查"
+                                 "（约等于重启一次服务，但不重启进程）。源多时要一会儿。"):
                 return
-            _reenrich_busy["v"] = True
-            reenrich_btn.props("loading")
+            _reactivate_busy["v"] = True
+            reactivate_btn.props("loading")
             try:
-                n = await anime.reenrich_all()
-                ui.notify(f"重新识别完成：{n} 部命中", type="positive")
+                await worker.reactivate_all()
+                paused = "" if config.ANIME_POLL_ENABLED else "（采集处于暂停，未抓源）"
+                ui.notify(f"已重新激活{paused}，详情见日志页", type="positive")
+            except Exception as e:
+                ui.notify(f"重新激活异常：{e}", type="negative")
             finally:
-                _reenrich_busy["v"] = False
-                reenrich_btn.props(remove="loading")
+                _reactivate_busy["v"] = False
+                reactivate_btn.props(remove="loading")
 
         with ui.row().classes("items-center gap-2 mt-2"):
             ui.button("保存", icon="save", on_click=_save).props("color=primary unelevated")
-            reenrich_btn = ui.button("重新识别全部", icon="refresh", on_click=_reenrich).props("flat")
+            reactivate_btn = ui.button("重新激活全部任务", icon="restart_alt",
+                                       on_click=_reactivate).props("flat")

@@ -5,10 +5,37 @@
 import re
 from contextlib import contextmanager
 
-from nicegui import context, ui
+from nicegui import Client, context, ui
 
 import config
 from core import engine
+
+# ui.notify 认的是【当前槽位】：内部走 context.client → slot.parent.client，而 Slot 对 parent
+# 只有【弱引用】。处理器 await 期间，它所在的面板随时可能被刷掉——30s 定时器就在刷仪表盘，
+# refreshable.refresh() 会 clear() 掉整棵子树，元素一没人引用就即刻回收，那个弱引用随之落空，
+# notify 便抛 RuntimeError 掀翻整个处理器（nicegui 自己的兜底 handler 取 client 时会再抛一次，
+# 日志里成对出现的两段 traceback 就是这么来的）。
+# 只有【面板被清空与 notify 之间发生过 await】才会撞上：refresh() 是丢给后台任务做的，紧跟其后的
+# notify 跑在清空之前——所以"先 refresh_all() 再 notify"的上百处一直没事；真正中招的是耗时长的
+# 处理器（补下全部 / 扫描剧场版 / 重新识别 / 迁移数据…），它们 await 的工夫定时器把面板换掉了。
+# 与下面 confirm() 里那段 canary 注释是同一个坑的两副面孔。
+# 这里给 ui.notify 包一层：正常路径原样跑；槽位已随面板消失时，退回到还连着的客户端发。
+# 直接替换 ui.notify 而不是另起个名字，是不想留坑——以后新写的 ui.notify 也自动是安全的。
+_ui_notify = ui.notify
+
+
+def _slot_safe_notify(message, **kwargs) -> None:
+    try:
+        _ui_notify(message, **kwargs)
+    except RuntimeError:
+        # 自用工具，正常只开一个页面；真开了多个标签页就都弹一下——总比把这条结果丢了强。
+        for client in list(Client.instances.values()):
+            if client.has_socket_connection:
+                with client:
+                    _ui_notify(message, **kwargs)
+
+
+ui.notify = _slot_safe_notify
 
 # 下拉恒为『锚在输入框下方的菜单』。Quasar 的 behavior 默认值是 default，判定是
 # `platform.is.mobile !== true && behavior !== "dialog" ? false : behavior !== "menu" && …`——
