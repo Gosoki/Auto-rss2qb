@@ -11,7 +11,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import func, select
+from sqlmodel import func, or_, select
 
 import config
 from core import engine
@@ -428,52 +428,84 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     # 下轮 flush 自然重发。从终态 force 重下的仍恢复原终态（同 fail_status，别把用户的处理抹掉）。
     defer_status = orig_status if _from_terminal else "pending"
 
-    def _fail(status: str = "") -> None:
+    def _fail(status: str = "", reason: str = "") -> None:
         """失败回写：恢复状态，并把 in-lock 清掉的归档标记放回去（qb_* 保持清零即可，它本就不在 qB 里）。"""
         st = status or fail_status
         _set_status(torrent_id, st)
-        if orig_archived is not None:
-            with get_session() as s2:
-                t2 = s2.get(AnimeTorrent, torrent_id)
-                if t2 is not None and t2.status == st:
+        with get_session() as s2:
+            t2 = s2.get(AnimeTorrent, torrent_id)
+            if t2 is not None and t2.status == st:
+                t2.fail_reason = reason[:300]
+                if orig_archived is not None:
                     t2.archived_at = orig_archived
-                    s2.add(t2)
-                    s2.commit()
+                s2.add(t2)
+                s2.commit()
+
+    def _retry(reason: str) -> None:
+        """暂时性失败 → 排进重试队列：状态回 pending，等 retry_at 到点由 flush 自动重发。
+        退避表用满就落 error 留人工。从终态(deleted/excluded/已归档) force 重下的不进队列——
+        恢复原终态即可，否则用户特意删过的集会被自动重下回来。"""
+        if _from_terminal:
+            _fail(reason=reason)
+            return
+        with get_session() as s2:
+            t2 = s2.get(AnimeTorrent, torrent_id)
+            if t2 is None:
+                return
+            nxt = engine.next_retry_at(t2.retry_count)
+            if nxt is None:
+                t2.status, t2.retry_at = "error", None
+                log.error("重试 %d 次仍失败，落失败等人工 - %s：%s", t2.retry_count, title, reason)
+            else:
+                t2.status, t2.retry_at = "pending", nxt
+                t2.retry_count += 1
+                log.warning("暂时性失败，第 %d 次重试排在 %s - %s：%s",
+                            t2.retry_count, nxt.strftime("%H:%M"), title, reason)
+            t2.fail_reason = reason[:300]
+            s2.add(t2)
+            s2.commit()
 
     # 组装保存路径（含越界校验），TV 按设置可加 Season N 子目录
     save_path = engine.build_save_path(quarter, folder_name, season=season,
                                        sub_dir=config.ANIME_DOWN_PATH)
     if save_path is None:
         log.error("拒绝越界保存路径 - %s -> %s / %s", title, quarter, folder_name)
-        _fail()
+        _fail(reason="拒绝越界保存路径（检查下载目录设置）")   # 配置问题，重试无意义
         return False
+    stage = "取种"
     try:
         data = await engine.fetch_torrent_bytes(url)
+        stage = "交付"
         # 分类固定不带后缀，标签只放季度（qB 里按分类归大类、按标签筛季度）
         ok = await engine.add_to_qb(data, save_path, "AutoRSS-Anime", quarter, info_hash=info_hash)
     except asyncio.CancelledError:
-        # 被取消（关停等）→ 复位，别永久卡 downloading。用 fail_status 而非写死 pending：
+        # 被取消（关停等）→ 复位，别永久卡 downloading。走 _retry 而不是写死 pending：
         # 从 deleted/excluded 强制重下时若正好被取消，写 pending 会让该集不再含任何"已处理"状态，
         # 于是被 _revive_orphaned_skipped 复活 + flush 自动重下——用户删掉的集又被下回来。
-        # 取种最长 180s，这期间关程序就会中招，窗口并不小。
-        _fail()
+        # 取种最长 180s，这期间关程序就会中招，窗口并不小；下次启动重发一次即可，不该留个 error。
+        _retry(f"关停中断（{stage}中）")
         raise
-    except Exception as e:  # 失败回写：终态重下失败恢复原态，其余落 error，避免卡在 downloading
-        log.error("下载失败 - %s - %s", title, e)
-        _fail()
+    except Exception as e:
+        if stage == "取种":     # 源站超时/502/DNS…——与种子本身无关，排进重试队列
+            _retry(f"取种失败：{e}")
+        else:                   # 交付阶段的意外异常：不在约定的重试范围内，落失败留人工看
+            log.error("下载失败 - %s - %s", title, e)
+            _fail(reason=f"交付异常：{e}")
         return False
 
     if ok is None:             # qB 连不上：留在待下，下轮 flush 自动重发（别记 error 要人工）
         log.warning("qB 连不上，本集留待下轮重发 - %s 第%s季 第%s集", title, season, episode)
-        _fail(defer_status)
+        _fail(defer_status, reason="qB 连不上，等它回来自动重发")
         return False
     if not ok:
-        _fail()
+        _fail(reason="qB 未接受（种子无效 / 保存路径不可写 / 磁盘满）")   # 这一条自己的毛病，重试无用
         return False
     with get_session() as s:   # 记实际保存路径：改季度/重绑后据此移动或提醒旧位置
         t = s.get(AnimeTorrent, torrent_id)
         if t is not None:
             t.save_path = save_path
+            # 交付成功 → 清空重试痕迹，下次再失败从头退避
+            t.retry_count, t.retry_at, t.fail_reason = 0, None, ""
             s.add(t)
             s.commit()
     if config.QB_SYNC_STATUS:
@@ -568,7 +600,10 @@ async def flush_ready_downloads() -> int:
         special_groups: dict = {}          # anime_id -> [特别篇(-1)种子]，按番去重只放一份
         # 只自动放行 pending：error 不在这里无限重试（高优先级失败→本组还有 pending 低优先级自然降级；
         # 全 error 则本轮不重试，留给人工补下）。
-        for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.status == "pending")):
+        # retry_at 未到点的跳过——重试退避全靠这一条落地（人工补下不走这里，不受退避约束）
+        for t in s.exec(select(AnimeTorrent).where(
+                AnimeTorrent.status == "pending",
+                or_(AnimeTorrent.retry_at.is_(None), AnimeTorrent.retry_at <= now))):
             if t.anime_id not in auto_ids:
                 continue
             lock = pref_map.get(t.anime_id)

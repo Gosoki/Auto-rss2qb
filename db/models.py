@@ -119,6 +119,10 @@ class AnimeTorrent(SQLModel, table=True):
     qb_synced_at: datetime | None = Field(default=None)  # 最近一次从 qB 同步的时间
     qb_progress_at: datetime | None = Field(default=None)  # 进度上次推进的时间；长期不推进→标停滞(异常)判定用
     archived_at: datetime | None = Field(default=None)  # 完成归档时间：已从 qB 移除(留文件)、不再跟踪；空=未归档
+    # ---- 暂时性失败的自动重试（只给取种失败/关停中断，见 core.engine.RETRY_BACKOFF_MIN）----
+    retry_count: int = Field(default=0)     # 已重试次数；成功即清零，用满退避表就落 error 等人工
+    retry_at: datetime | None = Field(default=None)   # 早于此刻不重发（None=不在重试队列里）
+    fail_reason: str = Field(default="")    # 最近一次失败原因，详情页展示（成功即清空）
 
 
 class Movie(SQLModel, table=True):
@@ -180,3 +184,7 @@ class MovieTorrent(SQLModel, table=True):
     qb_synced_at: datetime | None = Field(default=None)
     qb_progress_at: datetime | None = Field(default=None)  # 进度上次推进的时间；长期不推进→标停滞(异常)判定用
     archived_at: datetime | None = Field(default=None)  # 完成归档时间：已从 qB 移除(留文件)、不再跟踪；空=未归档
+    # ---- 暂时性失败的自动重试（只给取种失败/关停中断，见 core.engine.RETRY_BACKOFF_MIN）----
+    retry_count: int = Field(default=0)     # 已重试次数；成功即清零，用满退避表就落 error 等人工
+    retry_at: datetime | None = Field(default=None)   # 早于此刻不重发（None=不在重试队列里）
+    fail_reason: str = Field(default="")    # 最近一次失败原因，详情页展示（成功即清空）

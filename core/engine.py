@@ -69,6 +69,23 @@ MANUAL_TERMINAL_STATUSES = ("deleted", "excluded")
 # 而 stalled 一旦进来就会被自动重下/换源（正是 ② 要挡住的）。
 DOWNLOADABLE_STATUSES = ("pending", "error")
 
+# 【暂时性失败】的重试退避（分钟）。第 n 次失败后等 RETRY_BACKOFF_MIN[n] 分钟再发，用满就落 error 等人工。
+# 只给两类用：取种失败（nyaa/Mikan 超时、502、DNS…）和关停中断（重启时正在交付的那几条）——
+# 它们与种子本身无关，重发大概率就好了。其余一律不进队列，重试没有意义甚至有害：
+#   · 越界保存路径 → 配置问题，重试多少次都一样
+#   · qB 明确拒收   → 种子文件坏了 / 路径不可写，同上
+#   · 在 qB 里消失  → 多半是你自己在 qB 里删的，自动重下＝违背意图（与 deleted『不重下』一个道理）
+# 注意实际间隔会被采集轮询周期【量化】：flush 每轮才跑一次（ANIME_POLL_INTERVAL，默认 1200s），
+# 所以 1 分钟这一档实质是"下一轮"。这是有意的——不为重试单开一条更快的循环。
+RETRY_BACKOFF_MIN = (1, 5, 30, 180, 720, 1440)
+
+
+def next_retry_at(retry_count: int):
+    """已重试 retry_count 次之后，下一次重发的时刻；退避表用满返回 None（＝放弃，落 error）。"""
+    if retry_count >= len(RETRY_BACKOFF_MIN):
+        return None
+    return datetime.now() + timedelta(minutes=RETRY_BACKOFF_MIN[retry_count])
+
 # 写回 Anime/Movie 的 bgm 字段；多数两者同名，个别（duration=片长）仅剧场版有，靠下方 hasattr 跳过番剧
 _BGM_FIELDS = ("bangumi_id", "display_name", "jp_name", "air_date", "air_weekday",
                "total_episodes", "platform", "cover_url", "rating", "summary",

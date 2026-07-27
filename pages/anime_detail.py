@@ -165,8 +165,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _done = (t.qb_progress or 0) >= 1
                         ui.badge(live).props(f"color={'green' if _done else 'blue'}").tooltip(
                             "qB 实时状态")
-                    elif t.status == "pending":  # 待下：未知集 / 将下载 / 备用
-                        if t.episode == -2:  # -2 后台不自动下，别标『将下载』
+                    elif t.status == "pending":  # 待下：重试中 / 未知集 / 将下载 / 备用
+                        if t.retry_at:   # 暂时性失败排队中：它仍是待下，但要让人看见"为什么还没下"
+                            ui.badge(f"重试中·第{t.retry_count}次").props("color=orange").tooltip(
+                                f"{t.fail_reason or '暂时性失败'} · "
+                                f"{t.retry_at.strftime('%m-%d %H:%M')} 之后自动重发"
+                                "（等不及就点右边『下载』立刻重试）")
+                        elif t.episode == -2:  # -2 后台不自动下，别标『将下载』
                             ui.badge("未知集").props("color=purple").tooltip(
                                 "批量/集号没解析出来，后台不自动下。点左边『第?集』改集号，或下方排除")
                         elif t.id in plan:
@@ -182,10 +187,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         # error 行问的是『点补下会不会挑它』——后台自动下从不重试 error，
                         # 故这里必须用 backfill_plan，不能用只含 pending 的 plan
                         _bf = t.id in backfill_plan
+                        _why = f"{t.fail_reason}；" if t.fail_reason else ""
+                        _tried = f"（已自动重试 {t.retry_count} 次仍不行）" if t.retry_count else ""
                         ui.badge("失败·可补下" if _bf else "失败").props(
                             f"color={'orange' if _bf else 'red'}").tooltip(
-                            "下载失败过；点右边『下载』或『补下本番』手动重试（后台不自动重试 error）"
-                            if _bf else "下载失败过")
+                            _why + (f"点右边『下载』或『补下本番』手动重试{_tried}"
+                                    if _bf else f"下载失败过{_tried}"))
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删/已排除)按状态
                         ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
                             "color=blue-grey")

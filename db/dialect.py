@@ -54,6 +54,11 @@ _COL_LEN = {
     "sourcegroup.name": 191,     # 唯一约束 + 索引，取保守值，老 InnoDB 也进得去
     "anime_alias.title": 191,    # 与 season 组成复合唯一约束，两列合计要留余量
     "setting.key": 191,          # 主键；虽然 setting 永远留在本地 SQLite，仍一并定型免得将来踩坑
+    # 下面两条不是索引列，是为了【躲开 MySQL 的 TEXT 不能有 DEFAULT】（错误 1101）：
+    # fail_reason 是 NOT NULL DEFAULT ''，落成 TEXT 时 ALTER TABLE 当场报错（SQLite 不报，只有真
+    # MySQL 拦得住）。写入侧本来就 reason[:300]，定长 VARCHAR(300) 正好对上，没有截断风险。
+    "animetorrent.fail_reason": 300,
+    "movietorrent.fail_reason": 300,
 }
 
 

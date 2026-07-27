@@ -549,22 +549,25 @@ async def download_movie_torrent(mt_id: int) -> bool:
     fail_status = orig_status if _from_terminal else "error"
     defer_status = orig_status if _from_terminal else "pending"   # qB 连不上时的落点，同番剧侧
 
-    def _fail(status: str = "") -> None:
+    # 剧场版【不做自动重试】：番剧那套退避挂在 flush_ready_downloads 上，而剧场版没有自动放行——
+    # 下载一律由用户在页面上点。失败时人就在跟前，给个能看的 fail_reason 比排队重发有用。
+    def _fail(status: str = "", reason: str = "") -> None:
         st = status or fail_status
         _set_status(mt_id, st)
-        if orig_archived is not None:
-            with get_session() as s2:
-                t2 = s2.get(MovieTorrent, mt_id)
-                if t2 is not None and t2.status == st:
+        with get_session() as s2:
+            t2 = s2.get(MovieTorrent, mt_id)
+            if t2 is not None and t2.status == st:
+                t2.fail_reason = reason[:300]
+                if orig_archived is not None:
                     t2.archived_at = orig_archived
-                    s2.add(t2)
-                    s2.commit()
+                s2.add(t2)
+                s2.commit()
 
     save_path = engine.build_save_path(quarter, folder, sub_dir=config.MOVIE_DOWN_PATH,
                                        quarter_fmt=config.MOVIE_QUARTER_FMT)
     if save_path is None:
         log.error("拒绝越界保存路径 - movie torrent %s", mt_id)
-        _fail()
+        _fail(reason="拒绝越界保存路径（检查下载目录设置）")
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
@@ -572,23 +575,24 @@ async def download_movie_torrent(mt_id: int) -> bool:
         ok = await engine.add_to_qb(data, save_path, "AutoRSS-Movie",
                                     format_quarter(quarter, "{yyyy}"), info_hash=info_hash)
     except asyncio.CancelledError:
-        _fail()
+        _fail(reason="关停中断")
         raise
     except Exception as e:
         log.error("剧场版下载失败 - %s", e)
-        _fail()
+        _fail(reason=f"下载失败：{e}")
         return False
     if ok is None:             # qB 连不上：留在待下，别记 error
         log.warning("qB 连不上，本条留待重发 - movie torrent %s", mt_id)
-        _fail(defer_status)
+        _fail(defer_status, reason="qB 连不上，稍后再点一次")
         return False
     if not ok:
-        _fail()
+        _fail(reason="qB 未接受（种子无效 / 保存路径不可写 / 磁盘满）")
         return False
     with get_session() as s:   # 记实际保存路径：改季度/重绑后据此移动或提醒旧位置
         t = s.get(MovieTorrent, mt_id)
         if t is not None:
             t.save_path = save_path
+            t.fail_reason = ""      # 下成功了就把上次的失败原因抹掉
             s.add(t)
             s.commit()
     if config.QB_SYNC_STATUS:
