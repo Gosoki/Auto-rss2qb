@@ -42,7 +42,15 @@ class QBittorrent:
                 data={"username": config.QB_USERNAME, "password": config.QB_PASSWORD},
                 headers={"Referer": config.QB_URL},
             )
-            if resp.status_code == 200 and resp.text.strip().lower().startswith("ok"):
+            # qB 对 /auth/login 有三种回法：
+            #   200 "Ok."    正常登录成功，Set-Cookie 下发 SID
+            #   200 "Fails." 账号或密码错（403 则是失败次数过多被临时封 IP）
+            #   204 空       该客户端【免鉴权】——qB 里勾了"对本机/白名单网段跳过身份验证"，
+            #                压根没有会话可建，后续请求本就直接放行
+            # 早先只认第一种，于是内网免鉴权的 qB（如 bypass_auth_subnet_whitelist=10.0.0.0/8）
+            # 一律被判成"连不上"，保存设置时还会顺手把『发送到 qB』开关自动关掉。
+            if resp.status_code == 204 or (resp.status_code == 200
+                                           and resp.text.strip().lower().startswith("ok")):
                 ok = True
                 return client
             log.error("qBittorrent 登录失败: %s %s", resp.status_code, resp.text[:80])
