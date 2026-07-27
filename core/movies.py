@@ -544,15 +544,18 @@ async def download_movie_torrent(mt_id: int) -> bool:
     # 与番剧侧对齐：失败不无条件写 error。终态(deleted/excluded)重下失败降级成 error 会丢掉
     # 『用户已处理』的语义；已归档重下失败降级则让那份仍在盘上的旧文件脱离 HAVE_STATUSES，
     # UI 上再没有入口能删它。CancelledError 以前写死 pending，同样会抹掉终态。
-    fail_status = (orig_status if (orig_status in engine.MANUAL_TERMINAL_STATUSES
-                                   or orig_archived is not None) else "error")
+    _from_terminal = (orig_status in engine.MANUAL_TERMINAL_STATUSES
+                      or orig_archived is not None)
+    fail_status = orig_status if _from_terminal else "error"
+    defer_status = orig_status if _from_terminal else "pending"   # qB 连不上时的落点，同番剧侧
 
-    def _fail() -> None:
-        _set_status(mt_id, fail_status)
+    def _fail(status: str = "") -> None:
+        st = status or fail_status
+        _set_status(mt_id, st)
         if orig_archived is not None:
             with get_session() as s2:
                 t2 = s2.get(MovieTorrent, mt_id)
-                if t2 is not None and t2.status == fail_status:
+                if t2 is not None and t2.status == st:
                     t2.archived_at = orig_archived
                     s2.add(t2)
                     s2.commit()
@@ -574,6 +577,10 @@ async def download_movie_torrent(mt_id: int) -> bool:
     except Exception as e:
         log.error("剧场版下载失败 - %s", e)
         _fail()
+        return False
+    if ok is None:             # qB 连不上：留在待下，别记 error
+        log.warning("qB 连不上，本条留待重发 - movie torrent %s", mt_id)
+        _fail(defer_status)
         return False
     if not ok:
         _fail()

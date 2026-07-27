@@ -586,8 +586,8 @@ def qb_is_local() -> bool:
 
 
 async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
-                    info_hash: str = "") -> bool:
-    """把种子加入 qB。返回是否成功。
+                    info_hash: str = "") -> bool | None:
+    """把种子加入 qB。True=已交付，False=qB 拒了这一条，【None=连不上 qB（暂时性，别当失败）】。
 
     qB 同机(loopback)时本地预建目录 + chmod（跨用户 qB 需要）；qB 远程时跳过——真正建目录的是 qB 自己
     （实测 qB add 会按 savepath 建目录），本地建只会在错的机器上落空目录。
@@ -601,14 +601,21 @@ async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
             os.chmod(save_path, 0o777)
         except OSError:
             pass
-    if await qb.add_torrent(data, save_path, category, tags):
+    res = await qb.add_torrent(data, save_path, category, tags)
+    if res:
         return True
-    if info_hash:
-        h = info_hash.lower()   # torrents_info 返回小写键；命中判定与日志统一归一（防上游传大写）
-        info = await qb.torrents_info([h])   # None=连不上(真失败)；dict 里有该 hash=已在 qB
-        if info and h in info:
-            log.info("add 被 qB 拒但该 hash 已在 qB（重复提交/跨表同种）→ 视作已交付 - %s", h[:12])
-            return True
+    if not info_hash:
+        return None if res is None else False   # 无从核实：连不上就报连不上
+    h = info_hash.lower()   # torrents_info 返回小写键；命中判定与日志统一归一（防上游传大写）
+    info = await qb.torrents_info([h])   # None=连不上；dict 里有该 hash=已在 qB
+    if info is None:
+        # 连不上 qB（add 那一下可能是没连上，也可能是连上后被拒但这会儿断了）——
+        # 一律按暂时性处理：宁可下轮重发一次（重复提交会被 409/兜底认成已交付），
+        # 也不要把没问题的种子打成 error 等人工。
+        return None
+    if h in info:
+        log.info("add 被 qB 拒但该 hash 已在 qB（重复提交/跨表同种）→ 视作已交付 - %s", h[:12])
+        return True
     return False
 
 

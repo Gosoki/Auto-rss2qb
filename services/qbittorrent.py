@@ -4,6 +4,7 @@
 『每次 API 调用都重登』(每分钟数次) 降到每 TTL 一次，减小 qB 压力与失败登录风控风险。
 """
 import asyncio
+import json
 import logging
 import time
 
@@ -19,6 +20,33 @@ log = logging.getLogger("autorss")
 _INFO_BATCH = 100
 
 _SESSION_TTL = 1800   # 复用已登录 client 的秒数；取小于 qB 默认 cookie 寿命(约 1h)，到点主动重登
+
+
+def _add_accepted(resp: httpx.Response) -> bool:
+    """/torrents/add 是否被受理。两代 qB 的回法完全不同，都要认。
+
+    · qB ≤5.0：200 + 纯文本 "Ok." / "Fails."
+    · qB 5.1+：200 + JSON，实测 5.2.3 回
+          {"added_torrent_ids":["<hash>"],"failure_count":0,"pending_count":0,"success_count":1}
+      重复提交、种子/磁链非法则一律 409 Conflict（纯文本）。
+
+    【这里踩过的坑】原先只按文本判，且拿"响应体里不含 fail"当成功标记——新版 JSON 里
+    "failure_count" 这个字段名正好含 fail，于是【每一次成功的 add 都被判成失败】：
+    先记一条 WARNING，再走 add_to_qb 的兜底去查 hash 在不在 qB。而 qB 是异步入库的，
+    刚 add 完立刻查 torrents/info 有时还没列出来 → 兜底扑空 → 好端端下上了的种子被标 error。
+    表现就是"失败数莫名其妙地多"，且时好时坏（取决于那一下有没有赶上）。
+    """
+    if resp.status_code != 200:
+        return False
+    body = resp.text.strip()
+    if body.startswith("{"):
+        try:
+            d = json.loads(body)
+        except ValueError:
+            return False
+        return bool(d.get("added_torrent_ids") or d.get("success_count"))
+    # 空体（反代/网关在 200 下塞的空响应）不当成功：落失败路径，由 add_to_qb 据 info_hash 兜底核实。
+    return bool(body) and "fail" not in body.lower()
 
 
 class QBittorrent:
@@ -128,38 +156,46 @@ class QBittorrent:
             return resp
         return None
 
-    async def add_torrent(self, torrent_bytes: bytes, save_path: str, category: str, tags: str) -> bool:
+    async def reachable(self) -> bool:
+        """qB 现在连得上且登得进吗。给交付前的预检用：一次 GET，比试着发一整批种子便宜得多。"""
+        return await self._request("GET", "/api/v2/app/version") is not None
+
+    async def add_torrent(self, torrent_bytes: bytes, save_path: str,
+                          category: str, tags: str) -> bool | None:
+        """True=已受理，False=qB 明确拒了这一条，【None=根本没连上 qB】。
+
+        三态而不是两态：连不上是【暂时性】的（qB 重启/网络抖动），种子本身没问题，
+        调用方该把它留在待下、下轮再来；而『被拒』多半是这一条自己的毛病（坏种子、路径不可写），
+        重试多少次都一样。两者都揉成 False，就会在 qB 掉线时把整批种子打成 error 要人工补下。
+        """
         files = {"torrents": ("t.torrent", torrent_bytes, "application/x-bittorrent")}
         data = {"savepath": save_path, "autoTMM": "false", "paused": "false",
                 "category": category, "tags": tags}
         resp = await self._request("POST", "/api/v2/torrents/add", data=data, files=files)
         if resp is None:
-            return False
-        # qB 的 add 成功回 "Ok."、失败回 "Fails."；两者皆 200，靠响应体区分。要求响应体【非空且不含 fail】
-        # 才算成功——空体（反代/网关在 200 下塞的空响应）不当成功，落失败路径由 add_to_qb 据 info_hash 兜底核实。
-        body = resp.text.strip().lower()
-        if resp.status_code == 200 and body and "fail" not in body:
+            return None
+        if _add_accepted(resp):
             return True
-        # 200+Fails 最常见成因是『该 hash 已在 qB』(重复提交/跨表同种)，调用方 engine.add_to_qb 会据
-        # info_hash 兜底判为已交付——故按 warning 记，别当 error 惊扰；真失败(坏种子)是 415/非 200 仍记 error。
-        # 附上 save_path：远程 qB 若因路径不可写而拒，这行是唯一线索。
+        # 被拒最常见的成因是『该 hash 已在 qB』(重复提交/跨表同种；新版回 409 Conflict)，调用方
+        # engine.add_to_qb 会据 info_hash 兜底判为已交付——故 200 按 warning 记，别当 error 惊扰。
+        # 响应体留 200 字：新版失败时的 failure_reasons 才不会被截掉（那是唯一的失败原因线索）。
+        # 附上 save_path：远程 qB 若因路径不可写而拒，这行是另一条线索。
         (log.warning if resp.status_code == 200 else log.error)(
-            "添加下载任务未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:80], save_path)
+            "添加下载任务未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:200], save_path)
         return False
 
     async def add_url(self, url: str, save_path: str, category: str, tags: str) -> bool:
         """把 magnet 链接（或 http .torrent 链接）交给 qB 自己抓取下载（urls= 参数）。成功回 True。
-        用于手动下载的 magnet：qB 支持 urls 收 magnet/URL；判成功同 add_torrent(200 且响应体不含 fail)。"""
+        用于手动下载的 magnet：qB 支持 urls 收 magnet/URL；判成功同 add_torrent（见 _add_accepted）。"""
         data = {"urls": url, "savepath": save_path, "autoTMM": "false", "paused": "false",
                 "category": category, "tags": tags}
         resp = await self._request("POST", "/api/v2/torrents/add", data=data)
         if resp is None:
             return False
-        body = resp.text.strip().lower()
-        if resp.status_code == 200 and body and "fail" not in body:
+        if _add_accepted(resp):
             return True
         (log.warning if resp.status_code == 200 else log.error)(
-            "添加下载任务(url)未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:80], save_path)
+            "添加下载任务(url)未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:200], save_path)
         return False
 
     async def torrents_info(self, hashes: list[str]) -> dict | None:

@@ -421,16 +421,21 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     # 若像以前那样降级成 error：① 该集脱离 HAVE_STATUSES → flush 当场挑同集另一个 pending 源，
     # 一个轮询周期内把第二份下到同一目录；② 详情页删除按钮、delete_anime_files 全按 HAVE 门控，
     # 于是那份归档旧文件在 UI 里再也没有任何入口能标记或删除，成了永久孤儿。
-    fail_status = (orig_status if (orig_status in MANUAL_TERMINAL_STATUSES or orig_archived is not None)
-                   else "error")
+    _from_terminal = orig_status in MANUAL_TERMINAL_STATUSES or orig_archived is not None
+    fail_status = orig_status if _from_terminal else "error"
+    # 【qB 连不上】时的落点：pending 而不是 error。error 不会被 flush 自动重试（见那里注释），
+    # qB 一次重启就能把这一轮放行的几十集全打成 error、等人工补下。种子本身没毛病，留在待下，
+    # 下轮 flush 自然重发。从终态 force 重下的仍恢复原终态（同 fail_status，别把用户的处理抹掉）。
+    defer_status = orig_status if _from_terminal else "pending"
 
-    def _fail() -> None:
+    def _fail(status: str = "") -> None:
         """失败回写：恢复状态，并把 in-lock 清掉的归档标记放回去（qb_* 保持清零即可，它本就不在 qB 里）。"""
-        _set_status(torrent_id, fail_status)
+        st = status or fail_status
+        _set_status(torrent_id, st)
         if orig_archived is not None:
             with get_session() as s2:
                 t2 = s2.get(AnimeTorrent, torrent_id)
-                if t2 is not None and t2.status == fail_status:
+                if t2 is not None and t2.status == st:
                     t2.archived_at = orig_archived
                     s2.add(t2)
                     s2.commit()
@@ -458,6 +463,10 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
         _fail()
         return False
 
+    if ok is None:             # qB 连不上：留在待下，下轮 flush 自动重发（别记 error 要人工）
+        log.warning("qB 连不上，本集留待下轮重发 - %s 第%s季 第%s集", title, season, episode)
+        _fail(defer_status)
+        return False
     if not ok:
         _fail()
         return False
@@ -527,6 +536,13 @@ async def flush_ready_downloads() -> int:
     config.ANIME_DOWNLOAD_GRACE_MIN 分钟才放行，到点从该集所有种子挑优先级最高的下一份（错误的排后，
     留作降级）。特别篇/未知集不做集去重，逐个下。返回实际触发下载的数量。
     """
+    # 交付前先探一次 qB：一个 GET 的代价，换掉"整轮几十集逐个去 nyaa 取种、再逐个发给一个根本
+    # 不在的 qB"。qB 掉线时本轮一行不动，种子留在待下，等它回来自然继续。
+    # （中途才挂掉的由 download_anime_torrent 的 defer_status 兜住，两处配合才没有重试风暴：
+    #   掉线期间每轮只多花这一个 GET。）
+    if config.QB_ENABLED and not await engine.qb.reachable():
+        log.warning("qB 连不上，本轮不放行下载（种子留在待下，qB 恢复后自动继续）")
+        return 0
     _revive_orphaned_skipped()   # 先把『首选源已失败、该集无其它下载』的 skipped 兄弟放回 pending，本轮即可换源
     grace = timedelta(minutes=max(0, config.ANIME_DOWNLOAD_GRACE_MIN))  # 负值会使门槛永假、废掉多源补齐，钳到 0
     now = datetime.now()
