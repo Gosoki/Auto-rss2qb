@@ -9,6 +9,7 @@ import logging
 from core import anime
 import config
 from core import engine, movies
+import db
 from core.anime import flush_ready_downloads, list_source_groups, process_item
 from sources.mikan import MikanSource
 from sources.nyaa import NyaaSource, nyaa_feed_url
@@ -55,12 +56,43 @@ async def poll_once() -> None:
         log.error("放行下载异常: %s", e)
 
 
+def init_business_state() -> None:
+    """业务库可用之后必做的一次性初始化。三个操作都幂等，重复调用无害。
+
+    启动时库是通的就直接调；【停摆着启动】则由 run_db_watch 探到库回来后补调——
+    否则这些复位永远不做，上次遗留的 downloading 会一直卡着。
+    """
+    anime.seed_source_groups()          # 首启种入 ANi/Mikan 两个源组
+    anime.reset_downloading()           # 复位上次遗留的 downloading（TV）
+    movies.reset_downloading()          # 复位上次遗留的 downloading（剧场版）
+    engine.backfill_legacy_progress_once()   # 一次性：历史 sent 标记为已完成
+
+
+async def run_db_watch() -> None:
+    """业务库健康看守：每 30s 探一次。
+
+    连不上 → 标停摆，各后台循环自己跳过本轮、页面显示明确提示（不回退本地库，理由见 db 模块）。
+    恢复   → 自动补跑迁移 + 补跑 init_business_state，不必重启。
+    探测本身极便宜（一条 SELECT 1），日志只在状态变化时由 probe_data_engine 记一行。
+    """
+    was_down = bool(db.data_down())
+    while True:
+        try:
+            now_down = bool(db.probe_data_engine())
+            if was_down and not now_down:
+                init_business_state()   # 停摆期间漏掉的初始化，这会儿补上
+            was_down = now_down
+        except Exception as e:          # 探测自己出岔子也别让看守协程死掉，否则永远发现不了恢复
+            log.error("数据库看守异常: %s", e)
+        await asyncio.sleep(30)
+
+
 async def run_worker() -> None:
     log.info("轮询器启动（采集%s），每 %d 秒一轮",
              "开" if config.ANIME_POLL_ENABLED else "关·在设置页开启", config.ANIME_POLL_INTERVAL)
     while True:
-        if not config.ANIME_POLL_ENABLED:
-            await asyncio.sleep(15)  # 暂停中：短睡轮询采集开关，打开约 15s 内生效
+        if not config.ANIME_POLL_ENABLED or db.data_down():
+            await asyncio.sleep(15)  # 暂停中/数据库停摆：短睡轮询开关，恢复后约 15s 内继续
             continue
         try:
             await poll_once()
@@ -79,8 +111,8 @@ async def run_reenrich_retry() -> None:
              config.REENRICH_RETRY_BASE, config.REENRICH_RETRY_MAX, config.REENRICH_MAX_TRIES)
     while True:
         await asyncio.sleep(max(60, min(config.REENRICH_RETRY_BASE * 60, 600)))  # 检查节拍(秒)：≤基准、封顶10分；先睡后查
-        if not config.ANIME_POLL_ENABLED:
-            continue                # 采集暂停 → 重试也暂停
+        if not config.ANIME_POLL_ENABLED or db.data_down():
+            continue                # 采集暂停 / 数据库停摆 → 重试也暂停
         try:
             await anime.retry_unmatched()
         except Exception as e:
@@ -97,7 +129,7 @@ async def run_movie_scan() -> None:
              "开" if config.MOVIE_SCAN_ENABLED else "关·在 /movies 订阅源开启", config.MOVIE_SCAN_INTERVAL)
     while True:
         try:
-            if await movies.auto_scan_tick():
+            if not db.data_down() and await movies.auto_scan_tick():
                 log.info("剧场版自动扫描完成")
         except Exception as e:
             log.error("剧场版自动扫描异常: %s", e)
@@ -114,9 +146,9 @@ async def run_qb_sync() -> None:
     log.info("qB 状态同步启动（事件驱动，活跃间隔 %ds，保底 %d 分钟）",
              config.QB_SYNC_INTERVAL, config.QB_SYNC_BACKSTOP_MIN)
     try:
-        if engine.has_inflight():
+        if not db.data_down() and engine.has_inflight():
             engine.qb_kick.set()      # 启动即自查：接上重启前遗留的『在下的』种子
-    except Exception as e:
+    except Exception as e:            # 停摆时直接跳过，别白查一次库再把异常记成噪声
         log.error("qB 同步启动自查异常（忽略，靠保底兜住）: %s", e)
     while True:
         # 三档节奏：① 高频轮询在下面内层 while（有活跃下载，每 QB_SYNC_INTERVAL 秒）；② 还有没下完的在下种子
@@ -138,7 +170,8 @@ async def run_qb_sync() -> None:
             log.error("完成归档异常（忽略，下轮再来）: %s", e)
         idle = 0                            # 连续几轮没在真下（局部计数，本次唤醒周期内累加、下次唤醒清零，无需入库）
         try:
-            while config.QB_ENABLED and config.QB_SYNC_STATUS and engine.has_inflight():
+            while (config.QB_ENABLED and config.QB_SYNC_STATUS
+                   and not db.data_down() and engine.has_inflight()):
                 try:
                     await anime.sync_qb_status()   # 每轮批量刷新所有在下的：有活种子时慢的/stalled 的也顺便一起更新
                     await movies.sync_qb_status()

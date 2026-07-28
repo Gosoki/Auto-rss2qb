@@ -13,7 +13,9 @@ from config import WEB_HOST, WEB_PORT
 from core import anime, engine, movies
 from core.logsetup import setup_logging
 from core.netguard import install as install_netguard
-from core.worker import run_movie_scan, run_qb_sync, run_reenrich_retry, run_worker
+from core.worker import (init_business_state, run_db_watch, run_movie_scan, run_qb_sync,
+                         run_reenrich_retry, run_worker)
+import db
 from db import apply_configured_backend, init_db
 
 setup_logging()   # 控制台 + 滚动文件(data/autorss.log) + 内存环形缓冲(供 /logs 页实时看)
@@ -29,10 +31,13 @@ async def _startup():
     # 配置读出来了才知道业务数据该连哪：DB_BACKEND=mysql 就把业务表切过去。
     # 配置本身恒在本地 SQLite，所以即使 MySQL 连不上也读得到设置、进得去设置页改（见 db 的双引擎说明）。
     log.info("业务数据库：%s", apply_configured_backend())
-    anime.seed_source_groups()       # 首启种入 ANi/Mikan 两个源组
-    anime.reset_downloading()        # 复位上次遗留的 downloading（TV）
-    movies.reset_downloading()      # 复位上次遗留的 downloading（剧场版）
-    engine.backfill_legacy_progress_once()  # 一次性：历史 sent 标记为已完成，免得被新模型误判『在下』
+    # 业务库连不上时【跳过】这几步初始化——它们全要写业务表，此刻必抛。不是放弃：
+    # run_db_watch 探到库回来会补跑同一个函数，所以这里静静让过去，别把启动整个掀翻。
+    if db.data_down():
+        log.error("业务数据库停摆中，采集/下载/同步全部暂停；到设置页『数据库』改连接或切回本地 SQLite")
+    else:
+        init_business_state()
+    asyncio.create_task(run_db_watch())    # 业务库健康看守：连不上→停摆；恢复→自动接上
     asyncio.create_task(run_worker())
     asyncio.create_task(run_qb_sync())    # qB 种子实时态同步（独立频率）
     asyncio.create_task(run_movie_scan())  # 剧场版/OVA 自动扫描（独立频率）

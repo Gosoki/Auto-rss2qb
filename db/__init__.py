@@ -59,6 +59,14 @@ adapt_metadata(SQLModel.metadata)
 meta_engine = _make_sqlite_engine(DB_PATH)   # 配置库：恒为本地 SQLite
 engine = meta_engine                          # 业务库：默认与配置同库；切到 MySQL 后指向 MySQL
 
+# 业务库健康状态：非空＝连不上，内容是最后一次的错误摘要（供 UI 与日志显示）。
+#
+# 【连不上【不】回退到本地 SQLite】——引擎照旧指着配置的那个库（SQLAlchemy 建引擎并不连接），
+# 整个系统停摆等它回来。回退看着"还能用"，实则是【另一份数据集】：停摆期间的确认/下载/改季度
+# 全写进本地库，MySQL 回来后这些改动凭空消失，而界面自始至终没有任何异样——比直接停摆危险得多。
+# 想用本地库必须去设置页手动切（那是明确的意思表示，切完 _data_down 自然清空）。
+_data_down = ""
+
 
 def _tables(meta: bool) -> list:
     """按归属拆表：meta=True 取 setting，False 取业务表。"""
@@ -168,23 +176,71 @@ def create_mysql_database(host: str, port: int, user: str, password: str,
         eng.dispose()
 
 
+def data_down() -> str:
+    """业务库当前连不上的原因；空串＝正常。全项目判『能不能干活』都读这个。"""
+    return _data_down
+
+
+def mark_data_down(reason: str) -> None:
+    """就地标记停摆。给【页面/处理器撞上连接层异常】的那一刻用：状态立刻对全站生效，
+    不必等看守协程下一次探测（那可能还有 30 秒，这期间后台照跑、别的页面照报错）。
+    已经是停摆则不覆盖，保留最先那条原因。"""
+    global _data_down
+    if not _data_down:
+        _data_down = reason[:200]
+        log.error("业务数据库连不上，系统停摆（不回退本地库，等它回来）：%s", _data_down)
+
+
+def probe_data_engine() -> str:
+    """探一次业务库（SELECT 1）。通了返回空串，否则返回错误摘要并把状态标成停摆。
+
+    从『不通』变回『通』时补跑一次 Alembic 升级：停摆期间可能漏过了版本升级——
+    比如换了带新迁移的代码才启动，而那会儿库还没回来，启动时的 init_data_engine 根本没跑成。
+    只在状态【变化】时记日志，否则每 30s 一条会把日志刷爆。
+    """
+    global _data_down
+    was = _data_down
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+    except Exception as e:
+        _data_down = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
+        if not was:
+            log.error("业务数据库连不上，系统停摆（不回退本地库，等它回来）：%s", _data_down)
+        return _data_down
+    _data_down = ""
+    if was:
+        try:
+            init_data_engine()
+        except Exception as e:
+            _data_down = f"版本升级失败 {type(e).__name__}: {str(e).splitlines()[0][:160]}"
+            log.error("业务数据库回来了，但升级失败，仍停摆：%s", _data_down)
+            return _data_down
+        log.info("业务数据库已恢复，系统继续：%s", data_target_desc())
+    return ""
+
+
 def apply_configured_backend() -> str:
     """启动时按 DB_BACKEND 把业务库连过去。返回人话结果，供启动日志用。
 
-    连不上【不让应用起不来】——退回本地 SQLite 并在日志里说清楚，用户还能进设置页改连接参数
-    （配置本来就在本地库，读得到）。否则一次 MySQL 抽风就把整个工具锁死在外面。
+    连不上【不让应用起不来】，也【不回退到本地 SQLite】（回退的危害见 _data_down 处注释）：
+    引擎照旧指着配置的库、系统标为停摆，应用照常起——配置在本地 SQLite，设置页进得去，
+    可以改连接参数或手动切回本地库；MySQL 复活后由 run_db_watch 自动接上，不用重启。
     """
+    global engine, _data_down
     import config
     if (config.DB_BACKEND or "sqlite") != "mysql":
+        probe_data_engine()
         return data_target_desc()
     url = configured_mysql_url()
     if url is None:
-        log.warning("DB_BACKEND=mysql 但连接参数不全，暂用本地 SQLite")
-        return data_target_desc()
-    try:
-        switch_data_engine(url)
-    except Exception as e:
-        log.error("连接 MySQL 失败（%s），暂用本地 SQLite；请到设置页『数据库』检查连接参数", e)
+        _data_down = "DB_BACKEND=mysql 但连接参数不全（去设置页『数据库』补全，或切回本地 SQLite）"
+        log.error("业务数据库停摆：%s", _data_down)
+        return f"停摆 — {_data_down}"
+    engine = engine_for(url)      # 只建引擎不连接；连不上也照样指着它，等它回来
+    if probe_data_engine():
+        return f"停摆 — {data_target_desc()}：{_data_down}"
+    init_data_engine()
     return data_target_desc()
 
 
@@ -220,6 +276,8 @@ def switch_data_engine(url: str | None) -> None:
         raise
     if old is not meta_engine:   # 默认态下 old 就是 meta_engine，不能 dispose（配置还要用它）
         old.dispose()
+    global _data_down
+    _data_down = ""              # 切过来的库刚跑通了迁移，必然是活的；停摆状态就此解除
     log.info("业务数据库已切换到：%s", data_target_desc())
 
 

@@ -6,8 +6,10 @@ import re
 from contextlib import contextmanager
 
 from nicegui import Client, context, ui
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 import config
+import db
 from core import engine
 
 # ui.notify 认的是【当前槽位】：内部走 context.client → slot.parent.client，而 Slot 对 parent
@@ -475,6 +477,40 @@ _HEAD_BADGE_CSS = (
     "}</style>")
 
 
+def _db_down_notice(detail: str = "") -> None:
+    """业务库停摆的说明块：说清是什么、影响什么、怎么办，并给两个出口。
+
+    刻意【不】自动回退到本地 SQLite：那样界面看着正常，实则在往另一份数据集里写，
+    等 MySQL 回来这些改动凭空消失（详见 db 模块 _data_down 处的注释）。
+    """
+    why = detail or db.data_down() or "未知原因"
+    with ui.column().classes("w-full gap-2 p-3 rounded").style(
+            "background:oklch(70.4% 0.191 22.216 / .12)"):        # red-400 @ 12%
+        with ui.row().classes("items-center gap-2 no-wrap"):
+            ui.icon("error").classes("text-xl").style("color:oklch(70.4% 0.191 22.216)")
+            ui.label("数据库连不上，系统已停摆").classes("text-base font-bold")
+        ui.label(f"业务库：{db.data_target_desc()}").classes("text-xs text-gray-400 break-all")
+        ui.label(why).classes("text-xs text-gray-500 break-all")
+        ui.label("采集、下载、qB 同步全部暂停，不会写入任何数据。设置照常可改（配置存在本地）。"
+                 "数据库恢复后 30 秒内自动接上，不用重启。").classes("text-xs text-gray-400")
+        with ui.row().classes("gap-2 flex-wrap"):
+            ui.button("立即重连", icon="refresh", on_click=_db_reconnect).props(
+                "unelevated color=primary no-caps").tooltip("马上探一次；通了就自动恢复并刷新本页")
+            ui.button("去设置页改数据库", icon="settings",
+                      on_click=lambda: ui.navigate.to("/settings")).props(
+                "flat color=primary no-caps").tooltip(
+                "改连接参数，或手动『切回本地 SQLite』先用着（那是明确选择，不会悄悄发生）")
+
+
+async def _db_reconnect() -> None:
+    err = db.probe_data_engine()
+    if err:
+        ui.notify(f"还是连不上：{err}", type="negative")
+    else:
+        ui.notify("数据库回来了，正在刷新…", type="positive")
+        ui.navigate.reload()
+
+
 @contextmanager
 def frame(active: str = ""):
     """页面骨架：暗色 + 顶栏（站名 + 导航 + 右侧动作位）。
@@ -539,5 +575,22 @@ def frame(active: str = ""):
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位
             ui.button(icon="refresh", on_click=lambda: ui.navigate.reload()).props(
                 "flat round dense color=white").tooltip("刷新本页")
-    with ui.column().classes("w-full max-w-5xl mx-auto p-2"):
-        yield header_right
+    # 业务库停摆时全站挂一条：任何页面都看得见，别让人对着一个"看着正常"的空界面猜。
+    already_notified = bool(db.data_down())
+    if already_notified:
+        with ui.column().classes("w-full max-w-5xl mx-auto px-2 pt-2 gap-1"):
+            _db_down_notice()
+    with ui.column().classes("w-full max-w-5xl mx-auto p-2") as body:
+        try:
+            yield header_right
+        except (OperationalError, InterfaceError) as e:
+            # 页面主体在这个 with 里跑，异常会被抛回 yield 点——正是唯一的兜底位置。
+            # 只接【连接层】异常：ProgrammingError（表不存在之类）是 schema 出了事，
+            # 那种要原样 500 冒出来让人看见，套上"数据库连不上"反而误导。
+            first = str(e).splitlines()[0]
+            db.mark_data_down(f"{type(e).__name__}: {first}")   # 让全站状态立刻一致，别等看守那 30s
+            # 不依赖页面主体画到哪一步：先清空，免得半截残骸叠在提示上面。
+            body.clear()
+            if not already_notified:      # 进页面时还是好的、渲染中途才断 → 这里才是第一次告诉用户
+                with body:
+                    _db_down_notice(first)
