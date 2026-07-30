@@ -10,6 +10,7 @@ from nicegui import ui
 from db.models import AnimeTorrent
 from core import anime, engine
 import config
+from .anime_detail import maybe_relocate_anime, render_anime_detail
 from .layout import (confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, recent_table, season_label, source_options,
@@ -576,7 +577,6 @@ def anime_page(t: str = ""):
         detail_dlg = ui.dialog()
 
         def open_detail(anime_id):
-            from .anime_detail import render_anime_detail
             detail_dlg.clear()
             with detail_dlg, ui.card().classes("w-full").style("max-width:860px"):
                 render_anime_detail(anime_id, refresh_outer=refresh_all, on_close=detail_dlg.close)
@@ -644,7 +644,8 @@ def anime_page(t: str = ""):
         def _del_files(anime_id, name, cnt):
             async def h():
                 if not await confirm(f"删除《{name}》的 {cnt} 个已下文件？",
-                                     "通过 qB 连同硬盘文件一起删除，不可撤销。",
+                                     "通过 qB 连同硬盘文件一起删除，不可撤销。\n"
+                                     "这一集若还有别的源的『备用项』待下，后台会在下一轮采集自动补下一份（删的是这一条种子，不是整集）。不想让它回来：先把备用项『排除』，或整部番用『忽略』。",
                                      ok_label="删除文件", ok_icon="delete_forever"):
                     return
                 n = await anime.delete_anime_files(anime_id)
@@ -674,18 +675,28 @@ def anime_page(t: str = ""):
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
+                # 【必须在识别之前记下旧目录】待识别的番 jp_name/display_name 都是空的，
+                # apply_bgm_meta 的 keep_path 只冻结【已有值】的字段，挡不住它们被 bgm 名整体写入
+                # → 归档目录当场就变了。不问搬迁的话，之前下好的集会被静默遗弃在旧目录，
+                # 同一部番裂成两个文件夹（详情页那条路径一直是问的，这里漏了）。
+                old_path = anime.anime_save_path(anime_id)
                 ok = await anime.bind_anime_bgm(anime_id, bid)
                 refresh_all()
                 ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
                           type="positive" if ok else "negative")
+                if ok:
+                    await maybe_relocate_anime(anime_id, old_path, refresh_all)
             return h
 
         def _refail(anime_id):
             async def h():
+                old_path = anime.anime_save_path(anime_id)   # 同 _bind：识别成功会改归档目录
                 ok = await anime.enrich_anime(anime_id)
                 refresh_all()
                 ui.notify("识别成功 ✓" if ok else "还是没识别到（可手动粘贴 bgm 链接绑定）",
                           type="positive" if ok else "warning")
+                if ok:
+                    await maybe_relocate_anime(anime_id, old_path, refresh_all)
             return h
 
         async def _download_all():
