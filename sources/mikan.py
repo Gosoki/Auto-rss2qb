@@ -18,6 +18,7 @@ import feedparser
 import httpx
 
 import config
+from services import fetch
 from sources.base import ParsedItem, Source
 from sources.parse import (SEASON_CN, candidate_names, estimate_premiere, extract_episode_abs,
                            extract_quarter,
@@ -70,9 +71,7 @@ class MikanSource(Source):
 
     async def fetch(self) -> list[ParsedItem]:
         async with httpx.AsyncClient(**config.http_client_kwargs(30)) as client:
-            resp = await client.get(self.rss_url)
-            resp.raise_for_status()
-            content = resp.content
+            content = await fetch.get_bytes(client, self.rss_url)   # 带上限+总超时，理由同 nyaa
 
         feed = feedparser.parse(content)
         items = []
@@ -157,9 +156,8 @@ def season_cn(quarter_letter: str) -> str:
 
 
 async def _get_text(client: httpx.AsyncClient, url: str) -> str:
-    resp = await client.get(url)
-    resp.raise_for_status()
-    return resp.text
+    """Mikan 页面取文本：同样封顶 + 总超时（季度浏览页是第三方 HTML，不可信输入）。"""
+    return await fetch.get_text(client, url)
 
 
 def _parse_movie_bucket(htm: str) -> list[tuple[str, str, str]]:
@@ -205,9 +203,7 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
     剧场版/OVA 常无规范集号，episode 允许 -1/-2；不做批量/字幕组过滤（剧场版逐版本人工挑着下）。
     """
     url = f"{config.MIKAN_BASE}/RSS/Bangumi?bangumiId={mikan_id}"
-    resp = await client.get(url)
-    resp.raise_for_status()
-    feed = feedparser.parse(resp.content)
+    feed = feedparser.parse(await fetch.get_bytes(client, url))   # 带上限+总超时，理由同 NyaaSource.fetch
     items: list[ParsedItem] = []
     for entry in feed.entries:
         try:
