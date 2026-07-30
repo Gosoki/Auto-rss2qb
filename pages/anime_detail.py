@@ -8,6 +8,66 @@ from .layout import (WEEKDAY_CN, confirm, ep_str, meta_card, name_of, parse_bgm_
                      warn_banner)
 
 
+def notify_relocate_anime(rep):
+    """把 relocate_anime 的结果转成用户提示（番剧侧唯一一份，两个页面共用）。"""
+    if rep.get("error"):
+        ui.notify(f"移动失败：{rep['error']}", type="negative")
+        return
+    parts = []
+    if rep.get("moved"):
+        parts.append(f"已移动 {rep['moved']} 集到新目录")
+    if rep.get("redownload"):
+        parts.append(f"{rep['redownload']} 集 qB 未跟踪/连不上 → 已清状态待重下到新目录")
+    if rep.get("failed"):
+        parts.append(f"{rep['failed']} 集移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
+    if rep.get("stalled_kept"):   # 停滞集有意不动：不降级、不自动重下，但要告诉用户文件没跟着走
+        parts.append(f"{rep['stalled_kept']} 集处于停滞、未移动（保留停滞标记，未自动重下）")
+    if rep.get("delivering"):     # 正在交付给 qB 的集：路径在交付前就定死了，搬不了也不能碰
+        parts.append(f"{rep['delivering']} 集正在交付给 qB、未移动"
+                     "（它会先落到旧目录，交付完成后再点一次『编辑季度』即可搬过来）")
+    msg = "；".join(parts) or "无需移动"
+    warn = bool(rep.get("redownload") or rep.get("failed")
+                or rep.get("stalled_kept") or rep.get("delivering"))
+    if (rep.get("redownload") or rep.get("stalled_kept")) and rep.get("old_path"):
+        msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
+    ui.notify(msg, type="warning" if warn else "positive")
+
+
+async def maybe_relocate_anime(anime_id: int, old_path, after=None):
+    """改季度/重绑/重识别后：归档目录变了且有已下集就问是否搬迁，并按结果提示。
+
+    【模块级、两个页面共用】详情页和列表页（『待识别』tab 的绑定/重试识别）都要走它——
+    早先只有详情页有，列表页那两条路径改完目录既不问也不提，已下的集被静默遗弃在旧目录，
+    同一部番裂成两个文件夹。对齐 movies 侧早已模块级的 _maybe_relocate_movie。
+    """
+    new_path = anime.anime_save_path(anime_id)
+    if not new_path or new_path == old_path:
+        return   # 路径没变，无需移动
+    # 计数必须与 relocate_anime 的选行【同谓词】：HAVE 且【未归档】。
+    # 已归档的早已不在 qB、setLocation 移不动，若算进来就会出现
+    #『弹窗说要搬 N 集 → 点确认 → 报"无需移动" → 文件静默留在旧目录』。
+    _eps = anime.list_episodes(anime_id)
+    dl = [t for t in _eps if t.status in engine.HAVE_STATUSES and not t.archived_at]
+    arch = [t for t in _eps if t.status in engine.HAVE_STATUSES and t.archived_at]
+    if not dl:
+        if arch:   # 只有归档文件：搬不了，但必须告诉用户它们留在哪儿
+            ui.notify(f"归档目录已更新。但有 {len(arch)} 集已归档（不在 qB，无法代为移动），"
+                      f"其文件仍在旧目录 {old_path or '原位置'}，需你手动处理", type="warning")
+        else:
+            ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
+        return
+    _extra = f"；另有 {len(arch)} 集已归档、无法代为移动（文件留在旧目录）" if arch else ""
+    if not await confirm("归档目录变了，移动已下文件？",
+                         f"{len(dl)} 集已下，移到新目录：{new_path}{_extra}",
+                         ok_label="移动文件", ok_icon="drive_file_move"):
+        ui.notify("已更新记录，未移动文件（新集将下到新目录，旧文件留在原处）", type="warning")
+        return
+    rep = await anime.relocate_anime(anime_id, old_path)
+    if after:
+        after()
+    notify_relocate_anime(rep)
+
+
 def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> None:
     """把某番详情渲染进当前容器。refresh_outer：改动数据后刷新外层列表（番剧列表/待确认/已忽略 等）。
     on_close：非空则在标题行右侧渲染 X 关闭键（关掉外层 dialog）。"""
@@ -165,15 +225,23 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _done = (t.qb_progress or 0) >= 1
                         ui.badge(live).props(f"color={'green' if _done else 'blue'}").tooltip(
                             "qB 实时状态")
-                    elif t.status == "pending":  # 待下：重试中 / 未知集 / 将下载 / 备用
-                        if t.retry_at:   # 暂时性失败排队中：它仍是待下，但要让人看见"为什么还没下"
+                    elif t.status == "pending":  # 待下：未知集 / 重试中 / 将下载 / 备用
+                        # 重试信息挂在各自徽标的 tooltip 里，让【集号状态】始终占着徽标位。
+                        _retry_tip = ("" if not t.retry_at else
+                                      f"；上次失败：{t.fail_reason or '暂时性失败'}"
+                                      f"（{t.retry_at.strftime('%m-%d %H:%M')} 后重试）")
+                        if t.episode == -2:  # -2 后台【永远】不自动下，这条最要紧，不能被别的徽标盖掉
+                            ui.badge("未知集").props("color=purple").tooltip(
+                                "批量/集号没解析出来，后台不自动下。点左边『第?集』改集号，或下方排除"
+                                # -2 不进 flush 的分组（见 flush_ready_downloads），排了队也不会被自动重发，
+                                # 所以这里绝不能说"会自动重试"——那是我们做不到的承诺。
+                                + (_retry_tip.replace("后重试", "后仍不会自动重发，需人工下")
+                                   if t.retry_at else ""))
+                        elif t.retry_at:   # 暂时性失败排队中：它仍是待下，但要让人看见"为什么还没下"
                             ui.badge(f"重试中·第{t.retry_count}次").props("color=orange").tooltip(
                                 f"{t.fail_reason or '暂时性失败'} · "
                                 f"{t.retry_at.strftime('%m-%d %H:%M')} 之后自动重发"
                                 "（等不及就点右边『下载』立刻重试）")
-                        elif t.episode == -2:  # -2 后台不自动下，别标『将下载』
-                            ui.badge("未知集").props("color=purple").tooltip(
-                                "批量/集号没解析出来，后台不自动下。点左边『第?集』改集号，或下方排除")
                         elif t.id in plan:
                             ui.badge("将下载").props("color=blue").tooltip(
                                 "这一集的首选版本，补下/自动下会下它")
@@ -243,10 +311,16 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                   else "已取消版本限定", type="warning" if v else "positive")
 
     async def _enrich():
+        # 识别成功会写入 bgm 名/季号 → 归档目录随之改变，必须和绑定(_bind)、列表页那两条路径
+        # 一样问一句要不要搬迁。剧场版侧的同名 _enrich 本来就是这么写的（pages/movies.py:213）；
+        # 番剧详情页这条一直漏着，已下的集会被静默遗弃在旧目录、同一部番裂成两个文件夹。
+        old_path = anime.anime_save_path(anime_id)
         anime.reset_enrich_tries(anime_id)   # 手动重识别：清零后台重试计数，重新获得自动重试机会
         ok = await anime.enrich_anime(anime_id)
         _after()
         ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）")
+        if ok:
+            await maybe_relocate_anime(anime_id, old_path, _after)
 
     async def _bind():
         dlg = ui.dialog()
@@ -273,7 +347,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         ui.notify("已绑定并识别 ✓（回到待确认，去点确认下载）" if ok
                   else "绑定失败：ID 不存在或取不到 bgm 数据", type="positive" if ok else "negative")
         if ok:
-            await _maybe_relocate(old_path)
+            await maybe_relocate_anime(anime_id, old_path, _after)
 
     async def _edit_quarter():
         cur = anime.get_anime(anime_id)
@@ -306,58 +380,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             return
         _after()
         ui.notify(f"季度已改为 {engine.quarter_label((val or '').strip().upper())}", type="positive")
-        await _maybe_relocate(old_path)
+        await maybe_relocate_anime(anime_id, old_path, _after)
 
-    async def _maybe_relocate(old_path):
-        """改季度/重绑后：路径变了且有已下集就问是否移动，并按结果提示。"""
-        new_path = anime.anime_save_path(anime_id)
-        if not new_path or new_path == old_path:
-            return   # 路径没变，无需移动
-        # 计数必须与 relocate_anime 的选行【同谓词】：HAVE 且【未归档】。
-        # 已归档的早已不在 qB、setLocation 移不动，若算进来就会出现
-        #『弹窗说要搬 N 集 → 点确认 → 报"无需移动" → 文件静默留在旧目录』。
-        _eps = anime.list_episodes(anime_id)
-        dl = [t for t in _eps if t.status in engine.HAVE_STATUSES and not t.archived_at]
-        arch = [t for t in _eps if t.status in engine.HAVE_STATUSES and t.archived_at]
-        if not dl:
-            if arch:   # 只有归档文件：搬不了，但必须告诉用户它们留在哪儿
-                ui.notify(f"归档目录已更新。但有 {len(arch)} 集已归档（不在 qB，无法代为移动），"
-                          f"其文件仍在旧目录 {old_path or '原位置'}，需你手动处理", type="warning")
-            else:
-                ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
-            return
-        _extra = f"；另有 {len(arch)} 集已归档、无法代为移动（文件留在旧目录）" if arch else ""
-        if not await confirm("归档目录变了，移动已下文件？",
-                             f"{len(dl)} 集已下，移到新目录：{new_path}{_extra}",
-                             ok_label="移动文件", ok_icon="drive_file_move"):
-            ui.notify("已更新记录，未移动文件（新集将下到新目录，旧文件留在原处）", type="warning")
-            return
-        rep = await anime.relocate_anime(anime_id, old_path)
-        _after()
-        _notify_relocate(rep)
-
-    def _notify_relocate(rep):
-        if rep.get("error"):
-            ui.notify(f"移动失败：{rep['error']}", type="negative")
-            return
-        parts = []
-        if rep.get("moved"):
-            parts.append(f"已移动 {rep['moved']} 集到新目录")
-        if rep.get("redownload"):
-            parts.append(f"{rep['redownload']} 集 qB 未跟踪/连不上 → 已清状态待重下到新目录")
-        if rep.get("failed"):
-            parts.append(f"{rep['failed']} 集移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
-        if rep.get("stalled_kept"):   # 停滞集有意不动：不降级、不自动重下，但要告诉用户文件没跟着走
-            parts.append(f"{rep['stalled_kept']} 集处于停滞、未移动（保留停滞标记，未自动重下）")
-        if rep.get("delivering"):     # 正在交付给 qB 的集：路径在交付前就定死了，搬不了也不能碰
-            parts.append(f"{rep['delivering']} 集正在交付给 qB、未移动"
-                         "（它会先落到旧目录，交付完成后再点一次『编辑季度』即可搬过来）")
-        msg = "；".join(parts) or "无需移动"
-        warn = bool(rep.get("redownload") or rep.get("failed")
-                    or rep.get("stalled_kept") or rep.get("delivering"))
-        if (rep.get("redownload") or rep.get("stalled_kept")) and rep.get("old_path"):
-            msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
-        ui.notify(msg, type="warning" if warn else "positive")
 
     async def _confirm():
         anime.confirm_anime(anime_id)
@@ -449,8 +473,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         f"想连文件一起删：先点『下载』把它重新挂回 qB，再删。",
                         ok_label="标记已删", ok_icon="delete_forever"):
                     return
+            # 已归档那个分支早就写明了"备用源会自动补下"，普通删除这条一直没提——
+            # 而它才是最常走的路径。用户多半是为了腾磁盘，二十分钟后文件换个字幕组回来了。
             elif not await confirm("删除这一集的文件？",
-                                   "通过 qB 连同硬盘文件一起删除，不可撤销。",
+                                   "通过 qB 连同硬盘文件一起删除，不可撤销。\n"
+                                   "这一集若还有别的源的『备用项』待下，后台会在下一轮采集自动补下一份（删的是这一条种子，不是整集）。不想让它回来：先把备用项『排除』，或整部番用『忽略』。",
                                    ok_label="删除文件", ok_icon="delete_forever"):
                 return
             ok = await anime.delete_anime_torrent(torrent_id)
