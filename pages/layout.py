@@ -2,6 +2,7 @@
 
 页面级组件放在自己的页面文件里；这里只放跨页面复用的东西。
 """
+import asyncio
 import re
 from contextlib import contextmanager
 
@@ -491,8 +492,15 @@ def _db_down_notice(detail: str = "") -> None:
             ui.label("数据库连不上，系统已停摆").classes("text-base font-bold")
         ui.label(f"业务库：{db.data_target_desc()}").classes("text-xs text-gray-400 break-all")
         ui.label(why).classes("text-xs text-gray-500 break-all")
-        ui.label("采集、下载、qB 同步全部暂停，不会写入任何数据。设置照常可改（配置存在本地）。"
-                 "数据库恢复后 30 秒内自动接上，不用重启。").classes("text-xs text-gray-400")
+        # 两种停摆的出路完全不同，文案必须分开：连不上的会自愈，配置错/启动失败的不会。
+        # 混着写会让用户干等——他以为"30 秒后会自己好"，而那条路根本不存在。
+        if db._data_fatal:
+            ui.label("采集、下载、qB 同步全部暂停，不会写入任何数据。设置照常可改（配置存在本地）。"
+                     "【这类故障不会自动恢复】：到设置页把连接参数补全后点『切到 MySQL』，"
+                     "或点『切回本地 SQLite』先用着。").classes("text-xs text-gray-400")
+        else:
+            ui.label("采集、下载、qB 同步全部暂停，不会写入任何数据。设置照常可改（配置存在本地）。"
+                     "数据库恢复后 30 秒内自动接上，不用重启。").classes("text-xs text-gray-400")
         with ui.row().classes("gap-2 flex-wrap"):
             ui.button("立即重连", icon="refresh", on_click=_db_reconnect).props(
                 "unelevated color=primary no-caps").tooltip("马上探一次；通了就自动恢复并刷新本页")
@@ -503,7 +511,15 @@ def _db_down_notice(detail: str = "") -> None:
 
 
 async def _db_reconnect() -> None:
-    err = db.probe_data_engine()
+    if db._data_fatal:
+        # 这类停摆不是"连不上"，探测解不了它（探的根本不是目标库）。直接说清该去哪，
+        # 别让用户反复点一个注定原地打转的按钮。
+        ui.notify("这不是连接问题：到设置页『数据库』补全参数后点『切到 MySQL』，"
+                  "或点『切回本地 SQLite』", type="warning")
+        return
+    # 同 run_db_watch：建连接是同步的，主机被 DROP 时要挂到 connect_timeout。
+    # 在处理器里直接调会连页面一起冻住，用户只会觉得"点了没反应"。
+    err = await asyncio.to_thread(db.probe_data_engine)
     if err:
         ui.notify(f"还是连不上：{err}", type="negative")
     else:
