@@ -12,6 +12,7 @@ import feedparser
 import httpx
 
 import config
+from services import fetch
 from sources.base import ParsedItem, Source
 from sources.parse import (candidate_names, estimate_premiere, extract_episode_abs,
                            extract_quarter, is_batch, parse_multibracket, parse_title)
@@ -53,9 +54,9 @@ class NyaaSource(Source):
 
     async def fetch(self) -> list[ParsedItem]:
         async with httpx.AsyncClient(**config.http_client_kwargs(30)) as client:
-            resp = await client.get(self.rss_url)
-            resp.raise_for_status()
-            content = resp.content
+            # 走带上限+总超时的取回：feed 地址是用户填的、内容来自第三方，
+            # 裸 client.get + resp.content 既能被涓流响应永久挂住，也能被超大 body 撑爆内存
+            content = await fetch.get_bytes(client, self.rss_url)
 
         feed = feedparser.parse(content)
         if feed.bozo:
