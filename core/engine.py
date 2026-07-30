@@ -243,6 +243,38 @@ def _ip_is_internal(ip) -> bool:
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
+async def _safe_ip_for(host: str) -> str | None:
+    """解析 host 并逐个校验，返回一个【已校验安全】的 IP；有任何一个地址落在内网/环回则返回 None。
+
+    返回 IP 而不是只回布尔，是为了让调用方把连接【钉】在这个地址上——见 _block_internal_request
+    里对 DNS 重绑定的说明。字面 IP 原样返回（校验通过的话），域名取第一个解析结果。
+    解析失败/无结果保守视作内网（反正也连不上）。
+    """
+    host = (host or "").strip("[]")            # 去 IPv6 字面量方括号
+    try:
+        return None if _ip_is_internal(ipaddress.ip_address(host)) else host
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not infos:
+        return None
+    first = None
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return None                        # 解析出无法识别的地址形态 → 保守拒
+        if _ip_is_internal(addr):
+            return None                        # 只要有一个内网地址就整体拒（别给轮询解析留缝）
+        if first is None:
+            first = info[4][0]
+    return first
+
+
 async def _host_is_internal(host: str) -> bool:
     """host（字面 IP 或域名）会不会连到内网/环回地址。
 
@@ -273,11 +305,33 @@ async def _host_is_internal(host: str) -> bool:
 
 async def _block_internal_request(request: httpx.Request) -> None:
     """请求级钩子：种子下载不许打到内网/环回地址（含重定向后的每一跳）——挡住 RSS 里的 SSRF 载荷。
-    已配代理时目标由代理侧解析、本地判定既无意义又会误伤，跳过。"""
+
+    【校验完还要把连接钉在校验过的那个 IP 上】否则是典型的 TOCTOU：我们在这里解析一次判定安全，
+    httpx 建连接时会【再解析一次】，两次之间没有任何绑定。攻击者用 TTL=0 的 DNS 交替应答
+    （第一次回公网 IP 放行、第二次回 127.0.0.1）即可绕过——实测可取回本机服务的响应。
+    把 URL 主机改写成已校验的 IP、Host 头保留原域名、https 再带上 sni_hostname，
+    证书校验与虚拟主机都照常工作（实测 http/https 均 200）。
+    本钩子对每一跳重定向都会跑，所以每跳各自钉各自的，不必自己重写重定向循环。
+
+    已配代理时目标由代理侧解析、本地判定既无意义又会误伤，跳过。
+    """
     if config.PROXY:
         return
-    if await _host_is_internal(request.url.host or ""):
-        raise ValueError(f"拒绝下载到内网/环回地址（防 SSRF）：{request.url.host}")
+    host = request.url.host or ""
+    ip = await _safe_ip_for(host)
+    if ip is None:
+        raise ValueError(f"拒绝下载到内网/环回地址（防 SSRF）：{host}")
+    # 【已知取舍】钉住单个地址 = 放弃 httpx/anyio 的 happy-eyeballs 多地址回退（RFC 6555）：
+    # 域名解析出多个地址时，原先连不通第一个会自动试下一个，现在只连我们选中的那个。
+    # 接受它的理由：多地址回退只在"第一个地址不通、其余通"时才有价值，而那对本工具的场景
+    # （固定几个种子站、走同一条家宽）很罕见；而不钉就等于把 DNS 重绑定的洞留着。
+    # 真要两者兼得，得在这条关键下载路径上加一层"逐个候选地址重试"的循环——
+    # 那条路径一旦写错就是【所有下载全挂】，代价不对等，故不做。
+    if ip != host:                     # 域名 → 钉到刚校验过的地址；字面 IP 无需改写
+        request.url = request.url.copy_with(host=ip)
+        request.headers["Host"] = host
+        if request.url.scheme == "https":
+            request.extensions["sni_hostname"] = host
 
 
 async def fetch_torrent_bytes(url: str) -> bytes:
@@ -494,7 +548,8 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
 
     两条线逻辑完全一致（此前是同一段 67 行抄两份），故实现放这里；差异只有名词与错误文案，走参数。
     · qB 跟踪该种子 → setLocation 原地搬 + 更新 save_path
-    · qB 关 / 连不上 / 不认识该 hash(remove-on-complete) → 清状态待重下到新目录
+    · qB 关(用户显式关掉发送) / 不认识该 hash(remove-on-complete) → 清状态待重下到新目录
+    · 【qB 连不上】→ 一行都不动，只回 error 让用户稍后重试（与"qB 说没有"是两码事，见下方长注释）
     · setLocation 报 403/409(新目录不可写) → 只报告、不动状态
     返回 {new_path, old_path, moved, redownload, untracked, failed, stalled_kept, delivering, fail_code?, error?}。
     """
@@ -564,9 +619,15 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         rep["redownload"] = _clear(all_ids)
         return rep
     info = await qb.torrents_info([h for _, h in pairs])
-    if info is None:            # qB 连不上：同上
-        rep["stalled_kept"] = _stalled_of(all_ids)
-        rep["redownload"] = _clear(all_ids)
+    if info is None:
+        # 【qB 连不上：一行都不动】——绝不能与上面"qB 关"或下面"qB 说不认识这个 hash"混为一谈。
+        # 连不上时那些种子好端端地在 qB 里做种，若照样 _clear 成 pending：下一轮 flush 会全部重发，
+        # qB 对已有 hash 回 409 → add_to_qb 的幂等兜底查到 hash 在 qB、判『已交付』并把 save_path
+        # 写成【新目录】，可 qB 侧的保存路径从头到尾没变过，文件一个都没动。
+        # 于是库/UI 声称文件在新目录、实际仍在旧目录，而移动报告还会提示『旧文件需你手动清理』——
+        # 用户照做就把这部番唯一的一份文件删光了。
+        # 与全项目对该信号的统一口径一致：sync_qb_status 连不上就本轮不动、flush 预检不过就整轮不放行。
+        rep["error"] = "qB 连不上，未做任何改动。等 qB 恢复后重试即可（文件与状态都原样保留）"
         return rep
     tracked = [(tid, h) for tid, h in pairs if h in info]
     untracked = [tid for tid, h in pairs if h not in info]
@@ -578,9 +639,13 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         if code == 200:
             _mark_moved([tid for tid, _ in tracked])
             rep["moved"] = len(tracked)
-        elif code is None:      # 中途连不上：退回清状态待重下
-            rep["stalled_kept"] += _stalled_of([tid for tid, _ in tracked])
-            rep["redownload"] += _clear([tid for tid, _ in tracked])
+        elif code is None:
+            # 中途连不上：同样【一行都不动】（理由见上面 info is None 处）。
+            # 这一批的 save_path 还指着旧目录、文件也确实在旧目录，保持原样才是自洽的。
+            # 前面若已有 untracked 被清，那部分是"qB 确实不认识"，与本分支无关，照旧计入报告。
+            _part = (f"（此前已有 {rep['untracked']} 集因 qB 确实不认识而清状态待重下）"
+                     if rep.get("untracked") else "")
+            rep["error"] = ("qB 中途连不上，这批文件未移动，状态原样保留。等 qB 恢复后重试" + _part)
         else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
             rep["failed"] = len(tracked)
             rep["fail_code"] = code
@@ -718,7 +783,16 @@ def qb_is_downloading(state: str) -> bool:
 def _inflight_where(model_cls):
     """『在下的种子』筛选条件（sync 查询与 has_inflight 共用，口径一致）：
     已交付(sent/downloading) 且 进度<100% 且 qB 态未落定(非做种/非文件缺失)。
-    进度满/做种(已完成)/文件缺失 都算落定 → 不再轮询，qB 压力只随『当前在下数』走。"""
+    进度满/做种(已完成)/文件缺失 都算落定 → 不再轮询，qB 压力只随『当前在下数』走。
+
+    【别以为 ix_*_inflight 那个 partial index 在起作用】它建出来了，但运行时用不上：
+    SQLAlchemy 把 status 列表发成绑定参数(?)，而 SQLite 要能【静态证明】查询条件蕴含索引谓词
+    才会选 partial index，占位符做不到这个证明。实测（9672 行）：
+        绑定参数 → SCAN animetorrent，0.79ms
+        字面量   → SEARCH ... USING COVERING INDEX，0.02ms
+    但整个 has_inflight() 也才 1.26ms，而它每 30 秒~2 小时才调一次，
+    所以【有意保持现状】：把状态内联成字面量能快 40 倍，却要在 SQL 里拼字符串、
+    给后人留一个看着像注入的写法，不值当。真到了几十万行再说。"""
     return (
         model_cls.status.in_(TRACKED_STATUSES),
         model_cls.qb_progress < 1.0,

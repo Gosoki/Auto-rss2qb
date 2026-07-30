@@ -530,6 +530,8 @@ async def download_movie_torrent(mt_id: int) -> bool:
             m = s.get(Movie, t.movie_id)
             orig_status = t.status        # 供失败恢复：从终态(deleted/excluded)重下失败别降级成 error
             orig_archived = t.archived_at  # 同上：重下【已归档】的版本失败要把归档标记原样放回
+            # 进锁时下面会清零这四个 qB 实时态；恢复原状态时要连它们一起放回（同番剧侧）
+            orig_qb = (t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at)
             t.status = "downloading"
             # 重新下：清归档标记 + 重置 qB 实时态，作『全新在下』重新跟踪、从新完成点重算归档倒计时（否则会被立刻再归档）
             t.archived_at = None
@@ -544,10 +546,11 @@ async def download_movie_torrent(mt_id: int) -> bool:
     # 与番剧侧对齐：失败不无条件写 error。终态(deleted/excluded)重下失败降级成 error 会丢掉
     # 『用户已处理』的语义；已归档重下失败降级则让那份仍在盘上的旧文件脱离 HAVE_STATUSES，
     # UI 上再没有入口能删它。CancelledError 以前写死 pending，同样会抹掉终态。
-    _from_terminal = (orig_status in engine.MANUAL_TERMINAL_STATUSES
-                      or orig_archived is not None)
-    fail_status = orig_status if _from_terminal else "error"
-    defer_status = orig_status if _from_terminal else "pending"   # qB 连不上时的落点，同番剧侧
+    # stalled 也保留原状态：半成品文件在盘、已留人工处理，抢救失败不该把这个标记抹掉（同番剧侧）
+    _keep_orig = (orig_status in engine.MANUAL_TERMINAL_STATUSES or orig_status == "stalled"
+                  or orig_archived is not None)
+    fail_status = orig_status if _keep_orig else "error"
+    defer_status = orig_status if _keep_orig else "pending"   # qB 连不上时的落点，同番剧侧
 
     # 剧场版【不做自动重试】：番剧那套退避挂在 flush_ready_downloads 上，而剧场版没有自动放行——
     # 下载一律由用户在页面上点。失败时人就在跟前，给个能看的 fail_reason 比排队重发有用。
@@ -558,8 +561,10 @@ async def download_movie_torrent(mt_id: int) -> bool:
             t2 = s2.get(MovieTorrent, mt_id)
             if t2 is not None and t2.status == st:
                 t2.fail_reason = reason[:300]
-                if orig_archived is not None:
+                if _keep_orig:      # 恢复原状态时把进锁清掉的 qB 实时态整组放回
                     t2.archived_at = orig_archived
+                    (t2.qb_progress, t2.qb_state,
+                     t2.qb_synced_at, t2.qb_progress_at) = orig_qb
                 s2.add(t2)
                 s2.commit()
 
@@ -615,8 +620,9 @@ async def delete_movie_torrent(mt_id: int) -> bool:
     """
     with get_session() as s:
         t = s.get(MovieTorrent, mt_id)
-        if t is None or t.status not in engine.HAVE_STATUSES:
-            return False  # stalled 也允许删
+        # 交付中(downloading)的行让路：qB 里还没这个 hash，删了会被交付协程静默写回（同番剧侧）
+        if t is None or t.status not in engine.HAVE_STATUSES or t.status == "downloading":
+            return False  # stalled 也允许删；downloading 是交付中的占位
         h = t.info_hash
         if t.archived_at is not None:      # 已归档：不在 qB，删不到文件，只改状态
             t.status = "deleted"

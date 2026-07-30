@@ -157,13 +157,26 @@ def _kw_match(kw: str, raw: str) -> bool:
 
 
 def _apply_bgm(a: Anime, info: dict | None, keep_path: bool = False) -> None:
-    """把 enrich 结果写进 TV 番（engine 落库 + 按 bgm 规范名纠正季号）。"""
+    """把 enrich 结果写进 TV 番（engine 落库 + 按 bgm 规范名纠正季号）。
+
+    写完还要补一次集号回折：回折的判据要同时有 ep_offset 和 total_episodes，而这两个值
+    【谁先到不一定】——种子先带来双编号标题(学到 offset)、bgm 后到(补上 total) 是常见顺序。
+    只在"学到 offset 那一刻"折一次的话，这种顺序下判据当时不成立、折不动，
+    而此后再也没有第二次机会，原来的混编号问题原样存活（同一集两个键各下一份到同一目录）。
+    这里是 total 落库的唯一入口，补一次正好补上另一半。判据幂等，白跑一次只是一条查询。
+    """
     engine.apply_bgm_meta(a, info, keep_path)
     # 季号以 bgm 规范名为准：ANi 罗马音标题常写 "Season 3" 本地解析不到而回 1，
     # 而 bgm 规范名带『第三季』，能纠正（名字没季标记则保留本地解析值）。
     sn = season_from_name(a.display_name) or season_from_name(a.jp_name)
     if sn:
         a.season = sn
+    if a.ep_offset and a.total_episodes and a.id:
+        # a 已在调用方的 session 里；用同一个 session 折，随调用方一起提交
+        from sqlmodel import Session
+        sess = Session.object_session(a)
+        if sess is not None:
+            _refold_absolute_episodes(sess, a)
 
 
 def _top_priority() -> int:
@@ -240,6 +253,29 @@ def _warn_unknown_episode(it) -> None:
         log.warning("集数解析失败 - %s", it.raw_title)
 
 
+def _refold_absolute_episodes(s, a) -> int:
+    """把该番已入库的【绝对编号】行折回季内集号。返回改动行数。
+
+    只在刚学到 ep_offset 时调用一次。判据与 _learn_and_normalize_episode 的 ② 完全一致：
+    集号超过 bgm 总集数、且减去 offset 后仍 ≥1。不碰其它行，也不碰特别篇/未知集。
+    改的只是集号这个【去重键】，文件路径按番建目录、与集号无关，故已下载的行一并折算是安全的
+    （而且必须折：不折的话它不在 have_eps 的季内键上，同一集还会被再下一份）。
+    """
+    total = a.total_episodes or 0
+    if not (a.ep_offset and total):
+        return 0
+    n = 0
+    for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == a.id)):
+        ep = t.episode
+        if isinstance(ep, (int, float)) and ep >= 1 and ep > total and ep - a.ep_offset >= 1:
+            t.episode = ep - a.ep_offset
+            s.add(t)
+            n += 1
+    if n:
+        log.info("集号回折：%s 把 %d 条绝对编号种子折回季内集号（offset=%d）", a.title, n, a.ep_offset)
+    return n
+
+
 def _learn_and_normalize_episode(s, a, item) -> float:
     """跨源集号归一：返回这条种子该按哪个集号入库（顺带学习该番的 ep_offset）。
 
@@ -262,6 +298,11 @@ def _learn_and_normalize_episode(s, a, item) -> float:
         a.ep_offset = int(item.episode_abs - ep)
         s.add(a)
         log.info("集号偏移：%s 第%s季 → offset=%d（据 %s）", a.title, a.season, a.ep_offset, item.raw_title[:40])
+        # 【学到的这一刻要把存量行也回折】否则归一只对【之后】进来的种子生效：
+        # 已经以绝对编号入库的那些行（16）与新折算出的季内号（4）在库里并存，
+        # 而集去重键是 (anime_id, episode) → flush 认为是两集，各放行一份到【完全相同】的目录。
+        # 判据与下面 ② 逐字相同，故天然幂等；只在首次学到 offset 时跑一次，成本可忽略。
+        _refold_absolute_episodes(s, a)
     # ② 用：本条用的是绝对编号（超过总集数）→ 折回季内集号
     total = a.total_episodes or 0
     if a.ep_offset and total and ep > total and ep - a.ep_offset >= 1:
@@ -358,8 +399,12 @@ async def process_item(item) -> bool:
 async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     """取种子文件并加入 qBittorrent。成功返回 True。
 
-    『选集去重 + 占位』整段放在 _download_lock 里做，且集去重同时看 downloading/sent，
-    这样 worker flush 与 UI 补下并发时也不会对同一集重复放行两份。
+    【并发下不会对同一集放行两份】worker flush 与 UI 补下可能同时挑中同一集的不同源。
+    真正扛住这件事的是下面那句『原子占位』：它在【任何 await 之前】就把状态落库成 downloading，
+    而 downloading ∈ TRACKED_STATUSES，后到的协程一进来就被上面的幂等短路挡掉。
+    单线程事件循环 + 该段内无 await（tests/test_invariants.py 全仓核过）⇒ 这段本身就是原子的。
+    _download_lock 因此是【冗余的保险】：实测去掉它并发测试仍全绿，而去掉原子占位则当场重复下载
+    （tests/test_concurrency.py 用变异测试量过）。留着它是为了将来万一有人往这段里加 await。
     force=True：强制下这一条（无视当前状态、跳过集去重），用于详情页手动指定下载。
     """
     if not config.QB_ENABLED:
@@ -380,6 +425,11 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             title = t.anime_title
             orig_status = t.status   # 供失败恢复：force 从终态(deleted/excluded)重下若失败，别降级成会触发复活/重下的 error
             orig_archived = t.archived_at   # 同上：force 重下【已归档】的集若失败，要把归档标记原样放回去
+            # 进锁时下面会把这四个 qB 实时态清零（好让它作为"全新在下"重新跟踪）。
+            # 失败要恢复原状态时必须连它们一起放回：只还状态不还进度，归档/停滞行会重新满足
+            # in-flight（TRACKED 且 progress<1）→ sync 查不到 → 两轮后判 error →
+            # 盘上的文件脱离 HAVE_STATUSES，UI 再没有入口能删它，同集还会被自动重下一份。
+            orig_qb = (t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at)
             # 跨表【不】去重：番剧/剧场版各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer（曾致删/下竞态静默丢文件）。
             # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）。
@@ -399,7 +449,7 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
                     s.commit()
                     log.info("跳过重复集 - %s 第%s季 第%s集（已有一份在下/已下）", title, season, episode)
                     return False
-            t.status = "downloading"  # 原子占位（锁内，别的协程看得到）
+            t.status = "downloading"  # 原子占位：先落库再 await，后到的协程一进来就被短路挡掉
             # 重新下：清归档标记 + 重置 qB 实时态，让它作为『全新在下』被重新跟踪、从新完成点重算归档倒计时——
             # 否则重下已归档的种子会带着旧 qb_progress=1/旧完成时间，被下一轮完成归档立刻再归档掉。
             t.archived_at = None
@@ -421,23 +471,37 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
     # 若像以前那样降级成 error：① 该集脱离 HAVE_STATUSES → flush 当场挑同集另一个 pending 源，
     # 一个轮询周期内把第二份下到同一目录；② 详情页删除按钮、delete_anime_files 全按 HAVE 门控，
     # 于是那份归档旧文件在 UI 里再也没有任何入口能标记或删除，成了永久孤儿。
-    _from_terminal = orig_status in MANUAL_TERMINAL_STATUSES or orig_archived is not None
-    fail_status = orig_status if _from_terminal else "error"
+    # 【停滞也要保留原状态】停滞＝半成品文件在盘上、已脱离轮询、明确留给人工处理。
+    # 人工点『下载』抢救、取种却暂时性失败时，若把它降级成 error/pending，就同时丢掉了：
+    # ① 停滞标记（用户再也找不到这条异常）；② HAVE 身份 —— 于是 flush 当场为这一集换源下第二份，
+    # 而半成品文件还在盘上。原状态本身就是最准确的落点，失败什么也没改变。
+    _keep_orig = (orig_status in MANUAL_TERMINAL_STATUSES or orig_status == "stalled"
+                  or orig_archived is not None)
+    fail_status = orig_status if _keep_orig else "error"
     # 【qB 连不上】时的落点：pending 而不是 error。error 不会被 flush 自动重试（见那里注释），
     # qB 一次重启就能把这一轮放行的几十集全打成 error、等人工补下。种子本身没毛病，留在待下，
     # 下轮 flush 自然重发。从终态 force 重下的仍恢复原终态（同 fail_status，别把用户的处理抹掉）。
-    defer_status = orig_status if _from_terminal else "pending"
+    defer_status = orig_status if _keep_orig else "pending"
 
     def _fail(status: str = "", reason: str = "") -> None:
-        """失败回写：恢复状态，并把 in-lock 清掉的归档标记放回去（qb_* 保持清零即可，它本就不在 qB 里）。"""
+        """失败回写：恢复状态，并把 in-lock 清掉的归档标记与进度一起放回去。
+
+        【qb_progress 必须一起还原】进锁时为了"作为全新在下重新跟踪"把 qb_progress 清成了 0。
+        归档行本是 sent+progress=1 的已完成态，若失败后只还原 status/archived_at 而进度留在 0，
+        这行就重新满足 _inflight_where（TRACKED 且 progress<1）→ 被 sync 当成在下的种子去问 qB，
+        而它早已从 qB 移除 → 两轮宽限后落 error：盘上那份归档文件脱离 HAVE_STATUSES，
+        UI 上再没有任何入口能删它，同时集去重闸失效、同集会被自动重下一份到同一目录。
+        """
         st = status or fail_status
         _set_status(torrent_id, st)
         with get_session() as s2:
             t2 = s2.get(AnimeTorrent, torrent_id)
             if t2 is not None and t2.status == st:
                 t2.fail_reason = reason[:300]
-                if orig_archived is not None:
+                if _keep_orig:      # 恢复原状态的同时，把进锁时清掉的 qB 实时态整组放回
                     t2.archived_at = orig_archived
+                    (t2.qb_progress, t2.qb_state,
+                     t2.qb_synced_at, t2.qb_progress_at) = orig_qb
                 s2.add(t2)
                 s2.commit()
 
@@ -445,7 +509,13 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
         """暂时性失败 → 排进重试队列：状态回 pending，等 retry_at 到点由 flush 自动重发。
         退避表用满就落 error 留人工。从终态(deleted/excluded/已归档) force 重下的不进队列——
         恢复原终态即可，否则用户特意删过的集会被自动重下回来。"""
-        if _from_terminal:
+        # 【只有 flush 真会重发的行才进队列】否则 UI 会挂出"某时刻后自动重发"，而后台永远不动它：
+        # · 终态(deleted/excluded/已归档) force 重下 —— 恢复原终态，不该被自动下回来
+        # · episode < -1（即 -2 未知集/疑似批量）—— flush 明确 continue 掉它（见 flush_ready_downloads），
+        #   排队等于骗人。落 error 反而对：详情页会显示『失败·可补下』+ 真实原因，
+        #   人工点『补下本番』确实能下（_select_downloads 里 -2 独立成组）。
+        #   -1 特别篇要留在队列里：flush 有 special_groups 分支，确实会重发。
+        if _keep_orig or episode is None or episode < -1:
             _fail(reason=reason)
             return
         with get_session() as s2:
@@ -833,8 +903,13 @@ def episode_numbering_conflict(anime_id: int) -> list:
     """
     with get_session() as s:
         a = s.get(Anime, anime_id)
-        if a is None or not a.total_episodes or a.ep_offset is not None:
+        if a is None or not a.total_episodes:
             return []
+        # 【不能因为"已知 offset"就短路返回】早先这里写着 `or a.ep_offset is not None: return []`，
+        # 理由是"能推出 offset 的番已在入库时自动折算，走不到这里"——那个断言只对【新入库】的行成立。
+        # 学到 offset 之前入库的绝对编号行不会自动变，于是"学到 offset"这件事本身
+        # 反而把人工兜底提示永久关掉了。现在存量行会被 _refold_absolute_episodes 回折，
+        # 而这里继续按【实际集号分布】判，才兜得住回折判据覆盖不到的残留。
         eps = {t.episode for t in s.exec(
             select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)) if t.episode and t.episode >= 1}
     over = sorted(e for e in eps if e > a.total_episodes)
@@ -854,12 +929,18 @@ def list_episodes(anime_id: int) -> list[AnimeTorrent]:
 
 
 def downloaded_count(anime_id: int) -> int:
-    """该番硬盘上有文件的种子数（已下/在下/停滞=HAVE_STATUSES）——供 UI 决定要不要显示『删除文件』。
-    含 stalled：半成品文件在盘、delete_anime_files 也会删它，故也应计入使删除按钮出现（deleted 文件已删，不计）。"""
+    """该番【删得掉的】文件数——供 UI 决定要不要显示『删除文件』、以及确认框里报几个。
+
+    含 stalled：半成品文件在盘、delete_anime_files 也会删它（deleted 文件已删，不计）。
+    【不含 downloading】：那是交付中的占位，qB 里还没有这个 hash，删除路径会跳过它
+    （见 delete_anime_torrent）。口径必须与删除路径逐字一致——否则确认框说"删 3 个"、
+    实际只删掉 2 个，或者对一条 downloading 点删除得到『没删成』的假错误提示。
+    """
     with get_session() as s:
         return len(s.exec(select(AnimeTorrent.id).where(
             AnimeTorrent.anime_id == anime_id,
             AnimeTorrent.status.in_(HAVE_STATUSES),
+            AnimeTorrent.status != "downloading",
         )).all())
 
 
@@ -1213,6 +1294,23 @@ async def download_pending_for_anime(anime_id: int) -> int:
     return n
 
 
+# 算下载计划只用得到这八列，故用【列投影】而不是取整行 ORM 对象。
+# 仪表盘每刷新一次就要为【全部已确认番】算一遍计划：取整行会把整张种子表实例化成 SQLModel 对象，
+# 实测 9700 条种子时光 ORM 装配就吃掉 150ms（13 条 SQL 本身只要 7ms），而对象里除这八列外一个都用不到。
+# Row 支持属性访问，所以 _select_downloads / pick_best 里仍旧是 t.episode、t.priority 这样用，无需改动。
+# 【下游要用新字段时，必须同步加到这里】——漏了会在运行时抛 AttributeError。
+_PLAN_COLS = (AnimeTorrent.id, AnimeTorrent.anime_id, AnimeTorrent.status, AnimeTorrent.episode,
+              AnimeTorrent.source, AnimeTorrent.raw_title, AnimeTorrent.priority,
+              AnimeTorrent.created_at)
+
+
+def _plan_statuses(for_backfill: bool) -> tuple:
+    """算计划时【真正会被用到】的状态：候选（待下/含失败）+ 已有一份（用来跳过该集）。
+    其余状态（skipped/deleted/excluded、非补下口径下的 error）取回来也是当场丢掉，
+    不如在 SQL 里就滤掉——库里积压的 skipped 往往比在下的还多。与下面循环的 if/elif 完全等价。"""
+    return tuple(set(DOWNLOADABLE_STATUSES if for_backfill else ("pending",)) | set(HAVE_STATUSES))
+
+
 def download_plan(anime_id: int, for_backfill: bool = False) -> set[int]:
     """这部番会被挑中下载的种子 id 集合，只算不下。供详情页/仪表盘标注。
 
@@ -1233,7 +1331,9 @@ def download_plan(anime_id: int, for_backfill: bool = False) -> set[int]:
         if a is None or a.rejected:
             return set()
         pref, kw = a.pref_source, a.pref_keyword
-        all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
+        all_rows = list(s.exec(select(*_PLAN_COLS).where(
+            AnimeTorrent.anime_id == anime_id,
+            AnimeTorrent.status.in_(_plan_statuses(for_backfill)))))
     have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
     pending = [t for t in all_rows
                if t.status in (DOWNLOADABLE_STATUSES if for_backfill else ("pending",))]
@@ -1260,7 +1360,9 @@ def download_plan_for_ids(anime_ids, for_backfill: bool = False) -> set[int]:
         ids = set(pref_map)      # 只保留过滤后仍在的番——否则被排除的番，其种子仍会被下面计划进去
         if not ids:
             return set()
-        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id.in_(ids))))
+        rows = list(s.exec(select(*_PLAN_COLS).where(
+            AnimeTorrent.anime_id.in_(ids),
+            AnimeTorrent.status.in_(_plan_statuses(for_backfill)))))
     by_anime: dict = {}
     have_by_anime: dict = {}
     for t in rows:
@@ -1442,9 +1544,14 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
     tors = [(t.source, t.site, t.priority or 0) for t in rows if t.source]
     if pref:
         targets = [(src, site) for src, site, _ in tors if pref == (src or "")]
+        target_pri = max((pr for src, _, pr in tors if pref == (src or "")), default=0)
     else:
         maxpri = max((pr for _, _, pr in tors), default=0)
         targets = [(src, site) for src, site, pr in tors if pr == maxpri]
+        target_pri = maxpri
+    # 【补进来的种子要带上该源本来的优先级】否则一律落 priority=0：pick_best 按优先级降序挑，
+    # 补齐回来的高优先级源（如 ANi=100）会输给库里任何一条已有的低优先级待下，
+    # 于是"补齐该源"补是补到了，真正被下的还是别人——功能等于白做。
     site_groups: dict = {}
     for src, site in targets:
         site_groups.setdefault(site, set()).add(src)
@@ -1478,9 +1585,11 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
     async def _fetch_one(site, groups, q):
         try:
             if site == "nyaa":
-                src_obj = NyaaSource("补齐", nyaa_search_url(q), subgroups=list(groups), title_filter=[])
+                src_obj = NyaaSource("补齐", nyaa_search_url(q), priority=target_pri,
+                                     subgroups=list(groups), title_filter=[])
             elif site == "mikan":
-                src_obj = MikanSource("补齐", mikan_search_url(q), subgroups=list(groups), title_filter=[])
+                src_obj = MikanSource("补齐", mikan_search_url(q), priority=target_pri,
+                                      subgroups=list(groups), title_filter=[])
             else:
                 return []
             return await src_obj.fetch()
@@ -1584,8 +1693,14 @@ async def delete_anime_torrent(torrent_id: int) -> bool:
     """
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
-        if t is None or t.status not in HAVE_STATUSES:
-            return False  # stalled 也允许删
+        # 【交付中(downloading)的行不能删】它只是"已挑中、正在 fetch+add"的瞬时占位，qB 里还没有这个 hash：
+        # qb.delete 打在不存在的 hash 上照样回 200（qB 的语义），于是这行被标 deleted、
+        # 而交付协程稍后无条件写回 sent + save_path，删除被静默撤销、文件照常落盘；
+        # 更糟的时序里会停在 deleted 而种子仍在 qB 下载——脱离 TRACKED 后 sync 再也不看它，
+        # 文件在盘上却没有任何 UI 入口能删。与 relocate(engine.py:delivering)、
+        # sync_qb_status 对交付中占位行的处理同口径：交付协程独占该行，旁人让路。
+        if t is None or t.status not in HAVE_STATUSES or t.status == "downloading":
+            return False  # stalled 也允许删；downloading 是交付中的占位，见上
         h = t.info_hash
         if t.archived_at is not None:      # 已归档：不在 qB，删不到文件，只改状态
             t.status = "deleted"
@@ -1616,6 +1731,7 @@ async def delete_anime_files(anime_id: int) -> int:
         rows = list(s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id,
             AnimeTorrent.status.in_(HAVE_STATUSES),   # 含停滞异常，一并清
+            AnimeTorrent.status != "downloading",      # 交付中的占位行让路（理由见 delete_anime_torrent）
         )))
         pairs = [(t.id, t.info_hash) for t in rows]
         archived_paths = [t.save_path for t in rows if t.archived_at is not None]
