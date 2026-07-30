@@ -33,6 +33,13 @@ def qb_done(request: Request, hash: str = "", t: str = "") -> dict:
         peer = getattr(request.client, "host", "") if request.client else ""
         if peer not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
             return {"ok": False, "error": "callback token required from non-local address"}
+        # 【同机反向代理也要拦】main.py 设了 proxy_headers=False，对端恒是直连方——
+        # 而同机 nginx/caddy 反代过来的请求，对端【正好就是 127.0.0.1】，于是外网任何人经反代打进来
+        # 都会落进这个免 token 分支（hash 从公开 RSS 就能抓，可把在下种子批量伪造成『已下完』）。
+        # 判据用『带没带转发头』：反代自己会追加 X-Forwarded-For/Forwarded，客户端删不掉它；
+        # 而真·本机 curl 本来就不会带。带了就说明这不是本机直连，必须要 token。
+        if request.headers.get("x-forwarded-for") or request.headers.get("forwarded"):
+            return {"ok": False, "error": "callback token required behind a reverse proxy"}
     # 两侧编码成 bytes 再常量时间比较：str 版 compare_digest 遇非 ASCII 的 t（外部可控 query 参数）会抛
     # TypeError→500 刷栈；bytes 版无此限制。仍是常量时间，堵计时侧信道（绑 0.0.0.0 时才有意义）。
     elif not hmac.compare_digest(t.encode("utf-8"), tok.encode("utf-8")):

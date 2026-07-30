@@ -138,8 +138,8 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
     #   · 全新空库 → 一路建表到 head，用户不必先切过去建一遍再回来迁；
     #   · 老版本的库 → 补齐缺的 revision，免得拿新模型的列往旧表结构里插而报 Unknown column。
     # 源库【不动】：迁移不该顺手改用户还在用的那一头，它自己启动时会升。
-    from . import migrate
-    migrate.upgrade(dst_engine, "data")
+    from . import schema
+    schema.upgrade(dst_engine, "data")
 
     src_counts = count_rows(src_engine)
     readable = _readable_source_tables(src_engine)   # 删目标之前先把源库真读一遍，读不动就在这里中止

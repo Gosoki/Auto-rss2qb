@@ -114,20 +114,20 @@ def data_target_desc() -> str:
 
 def init_db():
     """把两个引擎都升到最新版本。meta 与 data 指向同一个 SQLite 时，两边各管各的表、互不重复。"""
-    from . import migrate
-    migrate.upgrade(meta_engine, "meta")     # setting 表
-    init_data_engine()
+    from . import schema
+    schema.upgrade(meta_engine, "meta")     # setting 表
+    upgrade_data_schema()
 
 
-def init_data_engine() -> None:
-    """把当前 data 引擎升到最新版本。切库/迁移到新库后也要调它（新库可能完全是空的）。
+def upgrade_data_schema() -> None:
+    """把当前 data 引擎的【表结构】升到最新版本（不碰引擎本身，故不叫 init_*）。切库/迁移到新库后也要调它（新库可能完全是空的）。
 
     以前这里是 create_all + 五个"每次启动都比对补一遍"的临时迁移函数。改成 Alembic 之后
     库里有 alembic_version_data 记着版本号：全新库一路建到 head，已有库只跑缺的那几步，
     已是最新则一条 DDL 都不发。表结构与索引（含仅 SQLite 有的 partial index）都在版本脚本里。
     """
-    from . import migrate
-    migrate.upgrade(engine, "data")
+    from . import schema
+    schema.upgrade(engine, "data")
 
 
 def configured_mysql_url() -> str | None:
@@ -195,10 +195,20 @@ def create_mysql_database(host: str, port: int, user: str, password: str,
         eng.dispose()
 
 
-def data_down() -> str:
-    """业务库当前不可用的原因；空串＝正常。全项目判『能不能干活』都读这个。
-    配置层故障排在前面：它是根因，且自愈不了，先报它才不会误导。"""
+def data_down_reason() -> str:
+    """业务库当前不可用的【原因串】；空串＝正常。要判真假请用 is_data_down()。
+
+    名字带 _reason 是有必要的：它长得像谓词却返回字符串，调用点历史上混着
+    `bool(db.data_down())` / `if db.data_down():` / 直接把它拼进文案三种写法，
+    将来只要有人写 `if db.data_down() == True` 就会静默恒假。
+    配置层故障排在前面：它是根因，且自愈不了，先报它才不会误导。
+    """
     return _data_fatal or _data_down
+
+
+def is_data_down() -> bool:
+    """业务库现在能不能干活。各后台循环/页面的把门判据统一走它。"""
+    return bool(data_down_reason())
 
 
 def mark_data_fatal(reason: str) -> None:
@@ -228,7 +238,7 @@ def probe_data_engine() -> str:
     """探一次业务库（SELECT 1）。通了返回空串，否则返回错误摘要并把状态标成停摆。
 
     从『不通』变回『通』时补跑一次 Alembic 升级：停摆期间可能漏过了版本升级——
-    比如换了带新迁移的代码才启动，而那会儿库还没回来，启动时的 init_data_engine 根本没跑成。
+    比如换了带新迁移的代码才启动，而那会儿库还没回来，启动时的 upgrade_data_schema 根本没跑成。
     只在状态【变化】时记日志，否则每 30s 一条会把日志刷爆。
     """
     global _data_down
@@ -258,7 +268,7 @@ def probe_data_engine() -> str:
         # 【顺序要紧】升级跑完了才清停摆标记。本函数会被丢到线程里跑（见 worker.run_db_watch），
         # 若先清标记再升级，事件循环上的协程会在【迁移进行到一半】时看到"库已恢复"而涌进来查表。
         try:
-            init_data_engine()
+            upgrade_data_schema()
         except Exception as e:
             _data_down = f"版本升级失败 {type(e).__name__}: {str(e).splitlines()[0][:160]}"
             log.error("业务数据库回来了，但升级失败，仍停摆：%s", _data_down)
@@ -291,7 +301,7 @@ def apply_configured_backend() -> str:
     engine = engine_for(url)      # 只建引擎不连接；连不上也照样指着它，等它回来
     if probe_data_engine():
         return f"停摆 — {data_target_desc()}：{_data_down}"
-    init_data_engine()
+    upgrade_data_schema()
     return data_target_desc()
 
 
@@ -319,7 +329,7 @@ def switch_data_engine(url: str | None) -> None:
     old = engine
     engine = engine_for(url)
     try:
-        init_data_engine()
+        upgrade_data_schema()
     except Exception:
         if engine is not old:
             engine.dispose()

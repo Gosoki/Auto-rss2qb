@@ -152,18 +152,19 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 _kwin.on("blur", lambda: _set_keyword(_kwin.value))
                 _kwin.on("keydown.enter", lambda: _set_keyword(_kwin.value))
             if not cur.rejected and not cur.confirmed:
-                ui.button("确认下载", on_click=_confirm).props("color=primary unelevated")
+                ui.button("确认下载", on_click=_approve).props("color=primary unelevated")
             _dln = ui.button("下载该源", icon="download", on_click=_download).props("flat")
             _dln.set_enabled(config.QB_ENABLED)
             _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
-                         else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过")
+                         else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过。"
+                              "只下正集——特别篇/未知集要对准下面那一条点『下载』")
             _btn_bf_loose = ui.button("补齐该源", icon="playlist_add", on_click=_backfill_loose).props(
                 "flat dense size=sm").style("font-size:14px")
             _btn_bf_loose.tooltip("去 nyaa/Mikan 按名搜『当前下载源』的种子补漏收（季度过滤，你人工审核）。"
                          "入库后转『待确认』，点『确认下载』才下。")
-            _btn_bf_strict = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_strict).props(
+            _btn_bf_auto = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_auto).props(
                 "flat dense size=sm").style("font-size:14px")
-            _btn_bf_strict.tooltip("同『补齐该源』，但额外用番名近似过滤挡掉同名衍生作/别的季，更少需人工把关。")
+            _btn_bf_auto.tooltip("同『补齐该源』，但额外用番名近似过滤挡掉同名衍生作/别的季，更少需人工把关。")
 
         # 分集 / 种子（每条可单独强制下载）；标题右侧灰字标注会发送给 qB 的保存目录（按规则算出，全番同一目录）
         with ui.row().classes("items-center gap-2 w-full mt-2 flex-wrap"):
@@ -191,8 +192,21 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 + "、".join(ep_str(e) for e in _conf)
                 + " 集——多半是某个源用了【全系列绝对集号】而另一个用【季内集号】。"
                   "这两种写法会被当成不同的集，同一集因此会被下两份到同一个目录。"
-                  "请核对后手动排除多余的那份；若某个源的标题里带 “16(88)” 这类双编号，"
-                  "系统会自动学到偏移量并从此自行折算。")
+                  "请核对后手动排除多余的那份。"
+                + ("本番两套编号的取值范围重叠，系统【不会】自动折算，请手动改集号合并。"
+                   if (cur.ep_offset and cur.total_episodes and cur.ep_offset < cur.total_episodes)
+                   else "若某个源的标题里带 “16(88)” 这类双编号，系统会自动学到偏移量并从此自行折算。"))
+        # 【歧义段】前面各季共 O 集(ep_offset)、本季 T 集：绝对编号取值域 [O+1,O+T] 与季内编号
+        # [1,T] 在 O<T 时于 [O+1,T] 上重叠，光看集号分辨不出是哪一套，系统一条都不折
+        #（折一半会让同一个源的前后半季撞成同一个去重键、静默漏掉半季，见 core.anime._foldable）。
+        # 这里只陈述事实、不做猜测：告诉用户这一段可能各下一份、要合并请手动改集号。
+        if cur.ep_offset and cur.total_episodes and cur.ep_offset < cur.total_episodes:
+            warn_banner(
+                f"本番有集号歧义段：前面各季共 {cur.ep_offset} 集、本季 {cur.total_episodes} 集，"
+                f"于是第 {cur.ep_offset + 1}~{cur.total_episodes} 集这一段，"
+                "『全系列绝对集号』与『季内集号』两种写法的取值范围重叠、分辨不出。"
+                "系统对这段【既不自动合并、也不跨源去重】：同一集最多每个源各下一份，宁可多下也不冒险把两集不同内容当成一集而漏下。"
+                "如确认某两条其实是同一集，点左边集号手动改成一致即可。")
         if not eps:
             ui.label("（还没有种子）").classes("text-gray-400")
             return
@@ -234,11 +248,16 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _retry_tip = ("" if not t.retry_at else
                                       f"；上次失败：{t.fail_reason or '暂时性失败'}"
                                       f"（{t.retry_at.strftime('%m-%d %H:%M')} 后重试）")
-                        if t.episode == -2:  # -2 后台【永远】不自动下，这条最要紧，不能被别的徽标盖掉
-                            ui.badge("未知集").props("color=purple").tooltip(
-                                "批量/集号没解析出来，后台不自动下。点左边『第?集』改集号，或下方排除"
-                                # -2 不进 flush 的分组（见 flush_ready_downloads），排了队也不会被自动重发，
-                                # 所以这里绝不能说"会自动重试"——那是我们做不到的承诺。
+                        # 【-1/-2 后台永远不自动下】这条最要紧，不能被别的徽标盖掉。
+                        # 它们连"排队重试"都不会有（见 core.anime.auto_downloadable_ep 与 _retry），
+                        # 所以措辞里绝不能出现"会自动重试"——那是我们做不到的承诺。
+                        if t.episode is not None and t.episode < 0:
+                            _neg_lab, _neg_tip = (
+                                ("未知集", "批量/集号没解析出来，后台不自动下。点左边『第?集』改集号，或下方排除")
+                                if t.episode == -2 else
+                                ("特别篇", "特别篇/OVA 不自动下（多组多版本，自动挑一份常挑错）。要它就点右边『下载』"))
+                            ui.badge(_neg_lab).props("color=purple").tooltip(
+                                _neg_tip
                                 + (_retry_tip.replace("后重试", "后仍不会自动重发，需人工下")
                                    if t.retry_at else ""))
                         elif t.retry_at:   # 暂时性失败排队中：它仍是待下，但要让人看见"为什么还没下"
@@ -249,7 +268,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         elif t.id in plan:
                             ui.badge("将下载").props("color=blue").tooltip(
                                 "这一集的首选版本，补下/自动下会下它")
-                        elif t.episode in covered or t.episode < 0:
+                        elif t.episode in covered:
                             ui.badge("备用项").props("color=blue-grey").tooltip(
                                 "同集已有『将下载/已下』的更优版本；要这条就点右边下载")
                         else:  # 该集没有任何将下/已下版本——被锁定源/版本过滤光了=真·缺集
@@ -392,7 +411,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         await maybe_relocate_anime(anime_id, old_path, _after)
 
 
-    async def _confirm():
+    async def _approve():
         anime.confirm_anime(anime_id)
         n = await anime.download_pending_for_anime(anime_id)
         _after()
@@ -414,7 +433,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         _after()
         ui.notify(f"已触发下载 {n} 集")
 
-    async def _run_backfill(strict):
+    async def _run_backfill(name_filter):
         # 防抖挂在【番 id】上而不是弹窗闭包里：闭包随详情弹窗重建而重置，关掉再打开就绕过去了，
         # 而补齐是几十秒的多站并发搜索 + 批量入库，重入会重复打站点、并把番反复踢回待确认。
         # 挂在模块级集合上还顺带挡住"两个标签页对同一部番同时点"。
@@ -425,11 +444,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 双击的两次点击都能在占位前通过检查、各弹一个框，两个都确认就并发跑两轮。
         _backfill_running.add(anime_id)
         try:
-            return await _run_backfill_inner(strict)
+            return await _run_backfill_inner(name_filter)
         finally:
             _backfill_running.discard(anime_id)
 
-    async def _run_backfill_inner(strict):
+    async def _run_backfill_inner(name_filter):
         cur = anime.get_anime(anime_id)
         if cur is not None and cur.confirmed and not cur.rejected:
             # 已确认番：补齐入库新种子会把整部番退回『待确认』，后台从此暂停自动下新集，直到重新确认——先告知
@@ -441,7 +460,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 return
         ui.notify("正在搜索补齐…（去 nyaa/Mikan 按名搜，请稍候）")
         try:
-            res = await anime.backfill_source(anime_id, strict)
+            res = await anime.backfill_source(anime_id, name_filter)
         except Exception as e:            # 兜住 fetch 之外的意外，别逃逸崩掉处理器
             ui.notify(f"补齐出错：{e}", type="negative")
             return
@@ -464,7 +483,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
     async def _backfill_loose():
         await _run_backfill(False)
 
-    async def _backfill_strict():
+    async def _backfill_auto():
         await _run_backfill(True)
 
     def _force(torrent_id):

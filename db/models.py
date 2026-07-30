@@ -102,7 +102,10 @@ class AnimeTorrent(SQLModel, table=True):
     raw_title: str = Field(default="")          # 原始种子完整标题（含语言/画质标签，用于区分同集不同版本）
     season: int = Field(default=1)
     episode: float = Field(default=-2)          # 支持 .5；-1特别篇 -2未知
-    quarter: str = Field(default="")
+    quarter: str = Field(default="")                  # 入库时的解析快照，【不权威】：
+    # 决定实际保存目录的是 Anime.quarter（同名但语义不同）；这里只在番还没识别出来时
+    # 作为路径回退用。历史上按种子行的 quarter 归拢，曾把同一部番劈成两个季度卡。
+
     # 应用侧生命周期（全集见 core.engine 状态词表）：pending 待下 / downloading 交付中 / sent 已交付qB
     # / error 失败 / skipped 同集去重落选 / deleted 人工删过 / excluded 人工排除 / stalled 停滞异常
     status: str = Field(default="pending")
@@ -138,7 +141,9 @@ class Movie(SQLModel, table=True):
     title: str = Field(default="")                    # Mikan/解析名（兜底）
     display_name: str | None = Field(default=None)    # bgm 规范名（UI 显示）
     jp_name: str | None = Field(default=None)         # bgm 日文原名（建下载文件夹用）
-    quarter: str = Field(default="")                  # 首播季（bgm 放送日），决定下载文件夹
+    quarter: str = Field(default="")                  # 首播季键（如 26C，bgm 放送日推出）。
+    # 【剧场版实际只用其中的年份】归档目录走 MOVIE_QUARTER_FMT（默认 {yyyy}）、年份统计取 q[:2]，
+    # 页面上也叫『年份』——与番剧侧的"季度"语义不同，别按 TV 的口径读它。
     # ---- bgm 元数据 ----
     air_date: str | None = Field(default=None)
     air_weekday: int | None = Field(default=None)

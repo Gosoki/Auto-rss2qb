@@ -21,7 +21,7 @@ import config
 from services import fetch
 from sources.base import ParsedItem, Source
 from sources.parse import (SEASON_CN, candidate_names, clip_title, estimate_premiere,
-                           extract_episode_abs, extract_quarter,
+                           extract_episode_abs, quarter_of,
                            is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
@@ -114,7 +114,7 @@ class MikanSource(Source):
                 release_time = datetime(*pp[:6])
             quarter = ""
             if release_time is not None:
-                quarter = extract_quarter(estimate_premiere(release_time, episode, season))
+                quarter = quarter_of(estimate_premiere(release_time, episode, season))
 
             return ParsedItem(
                 info_hash=info_hash,
@@ -214,7 +214,7 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
             pp = entry.get("published_parsed")
             if pp:
                 release_time = datetime(*pp[:6])
-            quarter = extract_quarter(release_time) if release_time else ""
+            quarter = quarter_of(release_time) if release_time else ""
             items.append(ParsedItem(
                 info_hash=info_hash,
                 raw_title=raw_title,

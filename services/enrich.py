@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
-from sources.parse import extract_quarter
+from sources.parse import quarter_of
 
 log = logging.getLogger("autorss")
 
@@ -81,7 +81,7 @@ def _date_ok(bgm_dt: datetime, est: datetime | None, release: datetime | None) -
     return False
 
 
-def _name_plausible(query: str, subject: dict) -> bool:
+def _name_not_contradicted(query: str, subject: dict) -> bool:
     """中文/日文名做字符重叠校验；纯罗马音交给搜索相关性+日期，不额外卡。"""
     if not _CJK_RE.search(query):
         return True
@@ -112,7 +112,7 @@ async def _search_one(client, name, est, release):
         dt = _parse_date(d.get("date"))
         if dt is None:
             continue
-        if _date_ok(dt, est, release) and _name_plausible(name, d):
+        if _date_ok(dt, est, release) and _name_not_contradicted(name, d):
             return d, dt   # 连同已解析的放送日返回，供 resolve 复用、免二次解析
     return None
 
@@ -201,7 +201,7 @@ def _subject_to_info(bgm_id, meta: dict) -> dict:
         "jp_name": jp_name,
         "air_date": dt.strftime("%Y-%m-%d") if dt else None,
         "air_weekday": dt.weekday() if dt else None,     # 0=周一
-        "quarter": extract_quarter(dt) if dt else None,
+        "quarter": quarter_of(dt) if dt else None,
         "total_episodes": meta.get("total_episodes") or meta.get("eps") or None,
         "platform": meta.get("platform") or None,        # TV/剧场版/OVA…
         "cover_url": (meta.get("images") or {}).get("large") or None,

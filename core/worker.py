@@ -69,7 +69,7 @@ async def poll_once() -> None:
 
 
 # 【本进程是否还欠一次"启动复位"】只有 main.py 在【启动时业务库就不可用】的那一支会置 True：
-# 那时 init_business_state 被跳过，而库从进程启动起就一直 down、所有后台循环都按 data_down() 空转，
+# 那时 init_business_state 被跳过，而库从进程启动起就一直 down、所有后台循环都按 is_data_down() 空转，
 # 所以此刻库里的 downloading 必定是【上个进程】留下的残骸，复位它们是安全且必须的。
 # 默认 False：运行中掉线再恢复、以及切库，都可能有交付协程正卡在 await（取种最长 180s），
 # 打回 pending 会当场解除集去重 → 同一集被两个源各下一份到同一目录。
@@ -100,7 +100,7 @@ async def run_db_watch() -> None:
     恢复   → 自动补跑迁移 + 补跑 init_business_state，不必重启。
     探测本身极便宜（一条 SELECT 1），日志只在状态变化时由 probe_data_engine 记一行。
     """
-    was_down = bool(db.data_down())
+    was_down = db.is_data_down()
     while True:
         try:
             # 【必须丢到线程里】建连接是同步调用：目标主机关机或被防火墙 DROP 时，
@@ -122,7 +122,7 @@ async def run_worker() -> None:
     log.info("轮询器启动（采集%s），每 %d 秒一轮",
              "开" if config.ANIME_POLL_ENABLED else "关·在设置页开启", config.ANIME_POLL_INTERVAL)
     while True:
-        if not config.ANIME_POLL_ENABLED or db.data_down():
+        if not config.ANIME_POLL_ENABLED or db.is_data_down():
             await asyncio.sleep(15)  # 暂停中/数据库停摆：短睡轮询开关，恢复后约 15s 内继续
             continue
         try:
@@ -143,7 +143,7 @@ async def run_reenrich_retry() -> None:
              config.REENRICH_RETRY_BASE, config.REENRICH_RETRY_MAX, config.REENRICH_MAX_TRIES)
     while True:
         await asyncio.sleep(max(60, min(config.REENRICH_RETRY_BASE * 60, 600)))  # 检查节拍(秒)：≤基准、封顶10分；先睡后查
-        if not config.ANIME_POLL_ENABLED or db.data_down():
+        if not config.ANIME_POLL_ENABLED or db.is_data_down():
             continue                # 采集暂停 / 数据库停摆 → 重试也暂停
         try:
             await anime.retry_unmatched()
@@ -161,7 +161,7 @@ async def run_movie_scan() -> None:
              "开" if config.MOVIE_SCAN_ENABLED else "关·在 /movies 订阅源开启", config.MOVIE_SCAN_INTERVAL)
     while True:
         try:
-            if not db.data_down():
+            if not db.is_data_down():
                 # 与 /movies『立即扫描』和手动『重新激活』互斥（同一把 _scan_lock），别并发跑两轮整年扫描
                 async with _scan_lock:
                     if await movies.auto_scan_tick():
@@ -181,7 +181,7 @@ async def run_qb_sync() -> None:
     log.info("qB 状态同步启动（事件驱动，活跃间隔 %ds，保底 %d 分钟）",
              config.QB_SYNC_INTERVAL, config.QB_SYNC_BACKSTOP_MIN)
     try:
-        if not db.data_down() and engine.has_inflight():
+        if not db.is_data_down() and engine.has_inflight():
             engine.qb_kick.set()      # 启动即自查：接上重启前遗留的『在下的』种子
     except Exception as e:            # 停摆时直接跳过，别白查一次库再把异常记成噪声
         log.error("qB 同步启动自查异常（忽略，靠保底兜住）: %s", e)
@@ -206,7 +206,7 @@ async def run_qb_sync() -> None:
         idle = 0                            # 连续几轮没在真下（局部计数，本次唤醒周期内累加、下次唤醒清零，无需入库）
         try:
             while (config.QB_ENABLED and config.QB_SYNC_STATUS
-                   and not db.data_down() and engine.has_inflight()):
+                   and not db.is_data_down() and engine.has_inflight()):
                 try:
                     await anime.sync_qb_status()   # 每轮批量刷新所有在下的：有活种子时慢的/stalled 的也顺便一起更新
                     await movies.sync_qb_status()
@@ -236,19 +236,19 @@ async def scan_movies_now(year: int, letters: list) -> dict | None:
         return await movies.scan_now(year, letters)
 
 
-async def reactivate_all() -> tuple[bool, str]:
+async def run_all_once() -> tuple[bool, str]:
     """手动『重新激活全部任务』（设置页按钮）：立刻跑一轮 = 抓所有源入库 → 放行到点的下载发往 qB
     → 按需扫剧场版 → 唤醒 qB 状态检查（顺带完成归档）。等价于重启服务后各协程立刻做的那一轮，但不重启进程。
     返回 (是否全部照做, 给用户看的结果)——有任何一段被跳过就是 False，页面据此用警告色，
     别把『其实什么都没做』显示成绿色的成功。
 
     采集暂停时跳过抓源（与 run_worker 同口径，暂停就是暂停）；数据库停摆时整个跳过（各后台循环都按
-    db.data_down() 把门，这里不该是唯一的例外——那只会撞一串写库异常）。
+    db.is_data_down() 把门，这里不该是唯一的例外——那只会撞一串写库异常）。
     两段轮次各自看自己的锁：后台正在跑哪一段就跳过哪一段，另一段照做，不会因为剧场版在扫描就连采集也不跑。
     刻意【不】做 reset_downloading：那是启动时清上次异常退出的残留，运行中 status=downloading 的都是真在下的
     种子，复位成 pending 会让 flush 认为该集『还没有』而另挑一个源重下一份。
     """
-    if db.data_down():
+    if db.is_data_down():
         return False, "数据库停摆中，未执行（先到设置页『数据库』修好连接）"
     # qB 检查【无条件先做】：qb_kick 只是置一个 Event，与别的轮在不在跑毫无关系，
     # 而"刷新在下种子的进度 + 完成归档"正是用户点这个按钮最常见的诉求，不该被别的段的跳过连累。

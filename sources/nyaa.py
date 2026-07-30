@@ -15,7 +15,7 @@ import config
 from services import fetch
 from sources.base import ParsedItem, Source
 from sources.parse import (candidate_names, clip_title, estimate_premiere, extract_episode_abs,
-                           extract_quarter, is_batch, parse_multibracket, parse_title)
+                           quarter_of, is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
 
@@ -100,7 +100,7 @@ class NyaaSource(Source):
 
             quarter = ""
             if release_time is not None:
-                quarter = extract_quarter(estimate_premiere(release_time, episode, season))
+                quarter = quarter_of(estimate_premiere(release_time, episode, season))
 
             return ParsedItem(
                 info_hash=info_hash,

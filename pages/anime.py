@@ -25,7 +25,14 @@ def _state_rank(a):
     return 1 if not a.confirmed else 0
 
 
-_TAB_KEYS = ("overview", "manage", "confirm", "fail", "reject", "sources")
+# 本页的 tab：{键: 显示名}。设置页『默认标签页』下拉直接用它，页面侧的合法键集合由它派生——
+# 早先两处各记一份（这里一个元组、settings 一个字典），加/改 tab 时漏改一处就静默不一致。
+# 图标一并放进来：否则"只留一份"只兑现了【键】，显示名仍要在 ui.tab 里再抄一遍（改了也不报错）。
+_TABS_DEF = (("overview", "仪表盘", "dashboard"), ("manage", "番剧表", "movie"),
+             ("confirm", "待确认", "help_outline"), ("fail", "待识别", "sync_problem"),
+             ("reject", "已忽略", "block"), ("sources", "订阅源", "rss_feed"))
+ANIME_TAB_LABELS = {k: name for k, name, _ in _TABS_DEF}   # 设置页『默认标签页』下拉直接用它
+_TAB_KEYS = tuple(ANIME_TAB_LABELS)
 
 
 @ui.page("/")
@@ -65,7 +72,7 @@ def anime_page(t: str = ""):
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
                        "|",
                        ("已交付", k["done"], "green", None),
-                       ("未知集", ps["unknown"], "purple", _open_unknown),
+                       ("特别篇/未知集", ps["unknown"], "purple", _open_unknown),
                        # 名字与下方 chip『失败数』(仅 error) 区分开：这张卡是"需要处理的总数"，
                        # 含长期停滞，和点开后的 failed_rows()/弹窗标题『失败 / 异常』一致
                        ("失败/异常", ov["status"]["error"] + ov["status"]["stalled"], "red",
@@ -197,10 +204,11 @@ def anime_page(t: str = ""):
                 # sent = 已发给 qB（含仍在下的）；真正下完的数在下方 qB 实时区的『已完成』
                 ("已交付", ov["status"]["sent"], "green",
                  "已发送给 qB 的种子数（含仍在下载的）。真正下完的看下方『已完成』"),
-                ("将下载", ps["will"], "blue", "已确认番·本集首选（含特别篇），会自动下"),
-                ("备用项", ps["backup"], "blue-grey", "同集已有更优版本，不会自动下"),
+                ("将下载", ps["will"], "blue", "已确认番·本集首选，会自动下（特别篇/未知集不在其列，需手动下）"),
+                ("备用项", ps["backup"], "blue-grey", "同集已有『将下载/已下』的更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
-                ("未知集", ps["unknown"], "purple", "批量/未知集，后台不自动下，需在详情页手动下"),
+                ("特别篇/未知集", ps["unknown"], "purple",
+                 "特别篇·OVA 与批量/未知集：后台一律不自动下，需在详情页对准那一条点『下载』"),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
                  "同集已有别版在下/已下被去重，或忽略番的积压；换源兜底时可能被复活"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的种子"),
@@ -294,7 +302,7 @@ def anime_page(t: str = ""):
                                 sel = ui.select(source_options(srcs, "从哪下：按优先级"),
                                                 value=(a.pref_source or "")).props(
                                     "dense outlined").classes("min-w-48")
-                                ui.button("确认下载", on_click=_confirm(a.id, sel)).props("color=primary unelevated")
+                                ui.button("确认下载", on_click=_approve(a.id, sel)).props("color=primary unelevated")
                                 ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
         @ui.refreshable
@@ -587,38 +595,50 @@ def anime_page(t: str = ""):
         # 不关掉它——关了详情仍回到这层列表，一层一层来。
         list_dlg = ui.dialog()
 
-        def _open_torrent_list(title, desc, fetch):
+        _LIST_PAGE_SIZE = 50   # 弹窗每页条数：挂机久了这两类可能上百条，一次建几百个元素会明显卡
+
+        def _open_torrent_list(title, desc, fetch, page: int = 1):
+            """未知集 / 失败异常 的明细弹窗。分页而不是一次全渲染——总数照实显示在标题里。"""
             list_dlg.clear()
             rows = fetch()
+            shown, pages, page = paginate(rows, page, _LIST_PAGE_SIZE)
             with list_dlg, ui.card().classes("w-full").style("max-width:720px"):
                 ui.label(f"{title} · {len(rows)}").classes("text-base font-bold")
                 if desc:
                     ui.label(desc).classes("text-xs text-gray-400")
                 if not rows:
                     ui.label("（空）").classes("text-gray-500 p-2")
-                for r in rows:
+                for r in shown:
                     with ui.column().classes("gap-0 w-full py-1").style(
                             "border-bottom:1px solid rgba(255,255,255,.08)"):
                         ui.label(r["name"]).classes(
                             "text-sm text-blue-400 cursor-pointer hover:underline").on(
                             "click", lambda aid=r["anime_id"]: open_detail(aid))  # 不关本弹窗，详情叠上面
                         ui.label(r["raw"] or "—").classes("text-xs text-gray-500 break-all")
-                ui.button("关闭", on_click=list_dlg.close).props("flat")
+                with ui.row().classes("items-center gap-3 w-full mt-1"):
+                    if pages > 1:
+                        # 翻页＝按新页码重建本弹窗（fetch 会重查，数据变了页码也会被 paginate 夹回合法范围）
+                        ui.pagination(1, pages, value=page, direction_links=True,
+                                      on_change=lambda e: _open_torrent_list(
+                                          title, desc, fetch, int(e.value))).props("dense")
+                        ui.label(f"第 {page}/{pages} 页").classes("text-xs text-gray-500")
+                    ui.space()
+                    ui.button("关闭", on_click=list_dlg.close).props("flat")
             list_dlg.open()
 
         def _open_unknown():
             _open_torrent_list(
-                "未知集", "批量打包 / 集号没解析出来的种子，后台不自动下。点番名进详情页处理（下载/忽略）。",
+                "特别篇 / 未知集", "特别篇·OVA 与批量打包/集号没解析出来的种子，后台一律不自动下。点番名进详情页、对准那一条点『下载』（或忽略）。",
                 anime.unknown_episode_rows)
 
         def _open_failed():
             _open_torrent_list(
                 "失败 / 异常",
-                "下载失败过（取种/发送失败）或长期停滞无进展的种子。点番名进详情页补下重试 / 忽略。",
+                "下载失败过（取种/发送失败）或长期停滞无进展的种子。正集可在详情页『补下本番』重试；特别篇/未知集只能对准那一条点『下载』。",
                 anime.failed_rows)
 
         # ---- 事件处理（闭包，直接引用上面的刷新函数）----
-        def _confirm(anime_id, sel=None):
+        def _approve(anime_id, sel=None):
             async def h():
                 pref = (sel.value if sel is not None else "") or ""
                 anime.confirm_anime(anime_id, pref)
@@ -764,12 +784,8 @@ def anime_page(t: str = ""):
 
         # ---- 页面布局 ----
         with ui.tabs().classes("w-full") as tabs:
-            ui.tab("overview", "仪表盘", "dashboard")
-            ui.tab("manage", "番剧表", "movie")
-            ui.tab("confirm", "待确认", "help_outline")
-            ui.tab("fail", "待识别", "sync_problem")
-            ui.tab("reject", "已忽略", "block")
-            ui.tab("sources", "订阅源", "rss_feed")
+            for _k, _name, _icon in _TABS_DEF:
+                ui.tab(_k, _name, _icon)
         # 懒加载：首屏只构建当前 tab 的内容；切到别的 tab 首次才建（6 个面板 → 1 个，砍首屏构建/推送）。
         # 面板都是 @ui.refreshable，未构建过的 .refresh() 是安全 no-op，所以刷新逻辑无需改动。
         _builders = {

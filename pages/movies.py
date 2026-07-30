@@ -16,7 +16,12 @@ from .layout import (WEEKDAY_CN, barline, confirm, expand_collapse_bar, frame,
                      name_of, paginate, parse_bgm_id, qb_live_text,
                      recent_table, torrent_status_cn, warn_banner)
 
-_TABS = ("overview", "list", "fail", "reject", "sources")
+# 同 pages/anime.py：{键: 显示名} 只留这一份，设置页的下拉与本页的键集合都从它来
+_TABS_DEF = (("overview", "仪表盘", "dashboard"), ("list", "列表", "movie"),
+             ("fail", "待识别", "sync_problem"), ("reject", "已忽略", "block"),
+             ("sources", "订阅源", "rss_feed"))
+MOVIE_TAB_LABELS = {k: name for k, name, _ in _TABS_DEF}
+_TABS = tuple(MOVIE_TAB_LABELS)
 
 
 def _mov_live_status(*a):
@@ -833,11 +838,8 @@ def movies_page(t: str = ""):
 
         # ---- 标签 ----
         with ui.tabs().classes("w-full") as tabs:
-            ui.tab("overview", "仪表盘", "dashboard")
-            ui.tab("list", "列表", "movie")
-            ui.tab("fail", "待识别", "sync_problem")
-            ui.tab("reject", "已忽略", "block")
-            ui.tab("sources", "订阅源", "rss_feed")
+            for _k, _name, _icon in _TABS_DEF:
+                ui.tab(_k, _name, _icon)
         # 懒加载：首屏只构建当前 tab，切到别的 tab 首次才建（未建过的 .refresh() 是安全 no-op）
         _builders = {
             "overview": lambda: (overview_panel(), inflight_panel(), recent_panel()),

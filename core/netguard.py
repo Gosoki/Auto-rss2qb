@@ -3,6 +3,8 @@
 绑 0.0.0.0 对内网开放时，用它把访问收窄到可信网段（如 192.168.1.0/24）。WEB_ALLOW_CIDRS 为空=不限制。
 本机回环（127.0.0.0/8、::1）恒放行，避免误配把自己锁在外面。作用于 HTTP 与 WebSocket 两种连接。
 看的是直连对端 IP——经反向代理时对端是代理，此表应留空、改在代理层做鉴权（X-Forwarded-For 可伪造，不采信）。
+【这条靠 main.py 的 ui.run(proxy_headers=False) 落实】：uvicorn 默认会把 ProxyHeadersMiddleware 包在本
+中间件【外面】，据 XFF 改写 scope['client']，那样本模块看到的就不是直连对端了。改动见 main.py 那处注释。
 配置走数据库、即时生效，改白名单无需重启。
 """
 import ipaddress
@@ -45,10 +47,13 @@ def _allowed(ip_str, nets: tuple) -> bool:
             or any(ip in n for n in nets if n.version == ip.version))
 
 
-def would_allow(ip: str, raw_cidrs: str) -> bool:
-    """给定白名单串，该 IP 是否会被放行——供设置页『存前自锁检测』复用与中间件完全相同的规则。
+def not_blocked_by(ip: str, raw_cidrs: str) -> bool:
+    """给定白名单串，该 IP 会【不会】被它挡在外面——供设置页『存前自锁检测』复用中间件的同一套规则。
 
-    空串=不限制=一律放行；否则回环恒放行、白名单内放行。ip 为空(取不到)时返回 True（无法判定不拦）。
+    空串=不限制=谁都不挡；否则回环恒放行、白名单内放行。
+    【ip 为空(取不到对端)时返回 True】——那是"无法判定"，不是"确定放行"，所以名字用
+    not_blocked_by 而不是 would_allow：调用方若要的是"确定能进"，必须自己先确保 ip 非空
+    （见 pages/settings.py 的自锁检测：`my_ip and not_blocked_by(...)`）。
     """
     raw = (raw_cidrs or "").strip()
     if not raw or not ip:

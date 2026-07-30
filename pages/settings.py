@@ -58,11 +58,10 @@ def _bad_cidrs(v: str) -> list:
     return bad
 
 
-# 各页标签 {键: 显示名}，键须与 pages/anime.py、pages/movies.py 的 ui.tab 一致（用于『默认标签页』下拉）
-_ANIME_TABS = {"overview": "仪表盘", "manage": "番剧表", "confirm": "待确认",
-               "fail": "待识别", "reject": "已忽略", "sources": "订阅源"}
-_MOVIE_TABS = {"overview": "仪表盘", "list": "列表", "fail": "待识别",
-               "reject": "已忽略", "sources": "订阅源"}
+# 各页标签表【从页面模块直接引用】，不再在这里抄一份——抄一份就得靠人记得同步，
+# 而它是"改了也不报错、只是下拉里少一项"的那种静默失配。
+from .anime import ANIME_TAB_LABELS   # noqa: E402
+from .movies import MOVIE_TAB_LABELS  # noqa: E402
 
 _QUARTER_PRESETS = {
     "{yyyy}": "年份  → 2026",
@@ -415,7 +414,8 @@ def settings():
                      "开=跟 qB 实时进度：交付即跟、活跃时高频轮询、有未完成但不活跃时按『中档自查』兜、全下完休眠；"
                      "『慢速地板+判慢轮次』判定是否还在真下。关=发送即当『已下』、完全不查 qB。"
                      "『停滞超时』：进度连续这么久无推进→标『停滞(异常)』供人工处理（不自动换源）。"
-                     "『完成归档』：完成超这么多天→从 qB 移除【留文件】、标『已归档』、不再跟踪。")
+                     "『完成归档』：完成超这么多天→从 qB 移除【留文件】、标『已归档』、不再跟踪。\n"
+                     "它依赖上面的『读取 qB 实时状态』——关掉跟踪时我们不知道种子有没有真下完，归档会整个停用（否则会把还在下的种子从 qB 摘掉、只留半成品）。")
             _switch_field("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
             _switch_field("QB_SYNC_STATUS", "读取 qB 实时状态（关=发送过去即『已下』，完全不轮询 qB）",
                     config.QB_SYNC_STATUS)
@@ -630,7 +630,7 @@ def settings():
             _switch_field("ANIME_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.ANIME_SHOW_PENDING)
             _switch_field("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
             with ui.element("div").classes("field-grid w-full"):
-                _select("ANIME_DEFAULT_TAB", "默认标签页", _ANIME_TABS, config.ANIME_DEFAULT_TAB)
+                _select("ANIME_DEFAULT_TAB", "默认标签页", ANIME_TAB_LABELS, config.ANIME_DEFAULT_TAB)
                 _num("ANIME_PAGE_YEARS", "分页 · 每页年数", config.ANIME_PAGE_YEARS, 1, 5)
 
         # ========== 折叠 ③ 剧场版 ==========
@@ -640,7 +640,7 @@ def settings():
                      "默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
                      "自动扫描开关/间隔在『剧场版页 → 订阅源』里。")
             with ui.element("div").classes("field-grid w-full"):
-                _select("MOVIE_DEFAULT_TAB", "默认标签页", _MOVIE_TABS, config.MOVIE_DEFAULT_TAB)
+                _select("MOVIE_DEFAULT_TAB", "默认标签页", MOVIE_TAB_LABELS, config.MOVIE_DEFAULT_TAB)
                 _num("MOVIE_PAGE_YEARS", "分页 · 每页年数", config.MOVIE_PAGE_YEARS, 1, 5)
             _quarter_setting(f, "MOVIE_QUARTER_FMT", "下载文件夹命名（默认按年份）",
                              "电影按此建下载文件夹（默认年份，如 2026；同年归一个文件夹）；留空＝不分类、直接放片名。",
@@ -692,7 +692,7 @@ def settings():
                     my_ip = context.client.ip
                 except Exception:
                     my_ip = ""
-                if not (my_ip and netguard.would_allow(my_ip, new_cidrs)):
+                if not (my_ip and netguard.not_blocked_by(my_ip, new_cidrs)):
                     where = f"你正从 {my_ip} 访问，该地址不在" if my_ip else "无法确认你当前访问 IP 是否在"
                     ui.notify(f"{where}要保存的允许网段内——保存后可能把你自己挡在门外，已取消保存。"
                               f"请把你所在网段一并加入（或留空=不限制）。", type="negative")
@@ -762,7 +762,7 @@ def settings():
             try:
                 # 结果文案与成败都由 worker 出：它才知道这一轮到底做没做（库停摆/已有一轮在跑都会跳过），
                 # 跳过时必须用警告色——否则『其实什么都没做』会被显示成绿色的成功。
-                ok, msg = await worker.reactivate_all()
+                ok, msg = await worker.run_all_once()
                 ui.notify(msg, type="positive" if ok else "warning")
             except Exception as e:
                 ui.notify(f"重新激活异常：{e}", type="negative")

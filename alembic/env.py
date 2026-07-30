@@ -8,7 +8,7 @@
 同一个 revision 在两边都会被执行，脚本内部按 role 决定自己要做哪部分（见 versions/ 下的脚本）。
 版本表也按 role 分名，免得两个引擎指向同一个 SQLite 文件时（默认布局就是如此）互相覆盖版本号。
 
-url 与 role 由 db/migrate.py 通过 -x 参数注入；直接用 CLI 时也得自己带上，例如：
+url 与 role 由 db/schema.py 通过 -x 参数注入；直接用 CLI 时也得自己带上，例如：
     alembic -x role=data -x url=sqlite:///data/autorss.db upgrade head
 """
 from logging.config import fileConfig
@@ -22,7 +22,7 @@ from db import META_TABLES
 from db.dialect import adapt_metadata
 
 config = context.config
-# 只有从 CLI 跑时才让 alembic 配 logging。程序内调用（db/migrate.py）会传
+# 只有从 CLI 跑时才让 alembic 配 logging。程序内调用（db/schema.py）会传
 # configure_logger=False —— 否则它会重配全局 logging，把 "setup plugin …" 之类
 # 灌进 data/autorss.log，还会覆盖掉 core.logsetup 已经装好的处理器。
 if config.config_file_name is not None and config.attributes.get("configure_logger", True):

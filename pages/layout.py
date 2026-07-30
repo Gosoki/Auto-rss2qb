@@ -488,7 +488,7 @@ def _db_down_notice(detail: str = "") -> None:
     刻意【不】自动回退到本地 SQLite：那样界面看着正常，实则在往另一份数据集里写，
     等 MySQL 回来这些改动凭空消失（详见 db 模块 _data_down 处的注释）。
     """
-    why = detail or db.data_down() or "未知原因"
+    why = detail or db.data_down_reason() or "未知原因"
     with ui.column().classes("w-full gap-2 p-3 rounded").style(
             "background:oklch(70.4% 0.191 22.216 / .12)"):        # red-400 @ 12%
         with ui.row().classes("items-center gap-2 no-wrap"):
@@ -596,7 +596,7 @@ def frame(active: str = ""):
             ui.button(icon="refresh", on_click=lambda: ui.navigate.reload()).props(
                 "flat round dense color=white").tooltip("刷新本页")
     # 业务库停摆时全站挂一条：任何页面都看得见，别让人对着一个"看着正常"的空界面猜。
-    already_notified = bool(db.data_down())
+    already_notified = db.is_data_down()
     if already_notified:
         with ui.column().classes("w-full max-w-5xl mx-auto px-2 pt-2 gap-1"):
             _db_down_notice()

@@ -197,7 +197,7 @@ def estimate_premiere(release_time: datetime, episode, season: int) -> datetime:
     return release_time
 
 
-def extract_quarter(dt: datetime) -> str:
+def quarter_of(dt: datetime) -> str:
     """按日期归季度：A冬(12/1/2) B春(3/4/5) C夏(6/7/8) D秋(9/10/11)。"""
     year, month = dt.year, dt.month
     if month in (12, 1, 2):
@@ -213,7 +213,7 @@ def extract_quarter(dt: datetime) -> str:
     return f"{str(year)[2:]}{q}"
 
 
-# ABCD ↔ 季节 / 首月（与 extract_quarter 一致：A冬1月 B春4月 C夏7月 D秋10月）
+# ABCD ↔ 季节 / 首月（与 quarter_of 一致：A冬1月 B春4月 C夏7月 D秋10月）
 # 季度字母→季名的唯一来源；mikan.season_cn 与 /movies 季度选择器都复用它，避免各处各维护一份。
 SEASON_CN = {"A": "冬", "B": "春", "C": "夏", "D": "秋"}
 _Q_MONTH = {"A": 1, "B": 4, "C": 7, "D": 10}

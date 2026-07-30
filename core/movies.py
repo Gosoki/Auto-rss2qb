@@ -31,7 +31,7 @@ log = logging.getLogger("autorss")
 _dl_lock = asyncio.Lock()  # 串行化剧场版下载，防同一片并发重复交 qB
 
 
-def _has_downloads(s, movie_id: int) -> bool:
+def _has_handled_torrents(s, movie_id: int) -> bool:
     """该片是否已下过（在下/已下/停滞/曾删）——有则季度已落盘/曾落盘，重识别不该改（与番剧 _has_handled_torrents 同判据）。
     含 deleted（删过也算季度已定）+ stalled（半成品仍在盘、save_path 按旧季度写过），否则重识别把季度冲掉、文件散目录。"""
     return s.exec(select(MovieTorrent).where(
@@ -82,7 +82,7 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         movie.mikan_type = mikan_type   # Mikan 桶判定（剧场版/OVA），列表徽标用
         if not movie.display_name:
             movie.display_name = title  # 无 bgm 时先用 Mikan 展示名兜底
-        engine.apply_bgm_meta(movie, info, keep_path=(not is_new and _has_downloads(s, movie.id)))
+        engine.apply_bgm_meta(movie, info, keep_path=(not is_new and _has_handled_torrents(s, movie.id)))
         s.add(movie)
         s.commit()
         s.refresh(movie)

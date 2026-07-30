@@ -19,7 +19,8 @@ from db import get_session
 from db.models import Anime, AnimeTorrent, MovieTorrent, SourceGroup, AnimeAlias
 from services import enrich
 from services.notify import notify
-from sources.parse import extract_quarter, search_query_names, season_from_name
+from sources.parse import (extract_episode_abs, parse_title, quarter_of, search_query_names,
+                           season_from_name)
 
 log = logging.getLogger("autorss")
 
@@ -48,7 +49,7 @@ def _anime_path_parts(a, t=None):
 
 def quarter_brief() -> list[dict]:
     """番剧列表页顶部小结：当季 + 上季 的番剧流水线分布 + 种子维度。"""
-    cur = extract_quarter(datetime.now())
+    cur = quarter_of(datetime.now())
     prev = engine.prev_quarter(cur)
     with get_session() as s:
         # 番数按当季/上季两季拉；种子维度按 (季度,状态) 在库内聚合，都不整表扫、不把种子行拉进内存
@@ -246,6 +247,21 @@ async def _resolve_anime(item) -> int:
         return anime.id
 
 
+def auto_downloadable_ep(ep) -> bool:
+    """这个集号能不能被【自动/批量】下载。用户拍板：特别篇(-1) 与 未知集/疑似批量(-2) 一律不自动下。
+
+    理由是这两类都不是"周更正片序列"上的一集：-1 常有多个字幕组的多个版本（剧场版/OVA/总集编都可能
+    落这里）、-2 更是一堆解析失败或整季合集包，自动挑一份下往往下错东西。要它们就到详情页对准那一条
+    点『下载』（force 路径不受本判据约束）。
+
+    【四条路径必须共用这一个判据】flush 放行 / instant 即时下 / 『下载该源』『补下全部』的挑选
+    / download_plan 的『将下载』标记。历史上 -2 就是在 instant 与 flush 之间漂移过——同一条种子
+    因为走哪条路而命运不同，而页面标注取自第三条，于是标着『将下载』的东西永远下不来。
+    小数集（11.5 这类插入话）仍算正集：它在周更序列上，>=0 天然覆盖。
+    """
+    return isinstance(ep, (int, float)) and ep >= 0
+
+
 def _warn_unknown_episode(it) -> None:
     """集号没解析出来（-2）时报一次。
 
@@ -259,24 +275,106 @@ def _warn_unknown_episode(it) -> None:
         log.warning("集数解析失败 - %s", it.raw_title)
 
 
-def _refold_absolute_episodes(s, a) -> int:
-    """把该番已入库的【绝对编号】行折回季内集号。返回改动行数。
+def _orig_episode(raw_title: str) -> float:
+    """这一行【标题里原本写的集号】——归一之前的值。
 
-    只在刚学到 ep_offset 时调用一次。判据与 _learn_and_normalize_episode 的 ② 完全一致：
-    集号超过 bgm 总集数、且减去 offset 后仍 ≥1。不碰其它行，也不碰特别篇/未知集。
-    改的只是集号这个【去重键】，文件路径按番建目录、与集号无关，故已下载的行一并折算是安全的
-    （而且必须折：不折的话它不在 have_eps 的季内键上，同一集还会被再下一份）。
+    parse_title 是纯函数、raw_title 原样入库，所以任何时刻都能复算出来；而 episode 列可能已经被
+    折算过、或被用户在详情页手工改过。折算要拿它当【幂等锚】：只动"集号还等于标题原值"的行，
+    于是重复调用不会折第二次（bgm 改了 total_episodes 触发再次回折时尤其要紧），
+    也不会把用户手工改好的集号又推回去。
     """
-    total = a.total_episodes or 0
-    if not (a.ep_offset and total):
-        return 0
+    return parse_title(raw_title or "")[3]
+
+
+def _foldable(a) -> bool:
+    """这部番能不能安全地做绝对号→季内号折算。
+
+    设前面各季共 O 集（ep_offset）、本季 T 集（total_episodes）：
+      · 绝对编号的取值域是 [O+1, O+T]
+      · 季内编号的取值域是 [1, T]
+    两者【不相交】当且仅当 O+1 > T，即 **O ≥ T**。只有此时 `ep > T` 这个判据才是完备且无误的：
+    每个绝对号都 > T、每个季内号都 ≤ T，一条都不会认错（**前提是 bgm 的 T 准确**；
+    T 少记一集时那一集会被误折，这是 bgm 数据质量的残留风险，与判据本身无关）。
+
+    **O < T 时一条都不折**，这是本次修正的核心。此前无条件用 `ep > T` 折，在 O < T 时只折得动
+    (T, O+T] 那一段、[O+1, T] 这段折不动，于是【同一个源】的前半季（未折）与后半季（已折）
+    双双落在键 [O+1, T] 上——两批内容不同的集撞成同一个去重键，flush 每键只放行一份，
+    实测 O=12/T=24 的番会静默漏掉整整 12 集。而完全不折时，季内源自己就覆盖了全季，
+    绝对源的行只是多出来的重复份：**漏集是不可逆的损失，多下一份只是占盘**，两害相权取后者。
+
+    也考虑过"按源取证"（某源出现过 ep>T 就判定它整源用绝对编号）：对抗验证实测它会被两种常见
+    情形骗过——bgm 少记一集（総集編/第0話没算进 eps），以及字幕组中途接手（库里没有它 ≤O 的行）——
+    一旦误判，整源被平移 offset，漏得比现在更多，且没有撤销入口。故不采用。
+    """
+    return bool(a.ep_offset and a.total_episodes and a.ep_offset >= a.total_episodes)
+
+
+def ambiguous_range(a) -> tuple | None:
+    """该番的【集号歧义段】(O, T]，没有则 None。O=ep_offset、T=total_episodes，仅在 O < T 时存在。
+
+    这一段上两套编号的取值范围重叠：绝对号 O+k 与季内号 O+k 写出来一模一样，却是【不同的两集】
+    （绝对号 O+k 其实是本季第 k 集）。所以【集去重不能在这一段按集号生效】——
+    实测绝对源先把键 13..24 占住之后，季内源真正的第 13..24 集会被 have_eps 永久挡掉，
+    flush 跳过、『补下本番』也恒返回 0，用户看到的还是一句『同集已有更优版本』。
+    这一段改成按 (集号, 源) 去重：同一集最多每源一份，宁可多下也不漏（漏集不可逆，多下只占盘）。
+    """
+    if not (a and a.ep_offset and a.total_episodes and a.ep_offset < a.total_episodes):
+        return None
+    return (a.ep_offset, a.total_episodes)
+
+
+def dedup_key(amb, aid, ep, source):
+    """集去重键：歧义段带上源，其余按 (番, 集)。amb=ambiguous_range(番) 的结果（None=无歧义段）。
+
+    四条去重路径（flush 的 have_eps、_select_downloads、download_anime_torrent 的同集闸、
+    download_plan 的标注）必须共用它，否则同一条种子会因走哪条路而命运不同。
+    """
+    if amb and isinstance(ep, (int, float)) and amb[0] < ep <= amb[1]:
+        return (aid, ep, source or "")
+    return (aid, ep)
+
+
+def _refold_absolute_episodes(s, a) -> int:
+    """把该番已入库的【绝对编号】行折回季内集号；不可折的番则把【旧规则误折过的行】展开回去。
+    返回改动行数。
+
+    判据与 _learn_and_normalize_episode 的 ② 完全一致：该番可折（见 _foldable）+ 集号在
+    绝对域 (T, O+T] 内。不碰特别篇/未知集。改的只是集号这个【去重键】，文件路径按番建目录、
+    与集号无关，故已下载的行一并折算是安全的（而且必须折：不折的话它不在 have_eps 的季内键上，
+    同一集还会被再下一份）。
+    """
+    off = a.ep_offset or 0
+    if not _foldable(a):
+        # 【存量回滚】O < T（判不出来、现在一条都不折）的番，库里可能还留着【旧规则】折出来的行——
+        # 旧规则无条件按 ep > T 折，在 O < T 时只折得动 (T, O+T] 那一段，于是同一个源的前后半季
+        # 撞成同一个键、静默漏掉半季。升级后若不展开回去，老库的行为与升级前一模一样。
+        # 判据是现成的：折过的行满足『标题原值 == 现集号 + offset』。展开后 orig == ep，天然幂等。
+        if not (off and a.total_episodes):
+            return 0
+        n = 0
+        for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == a.id)):
+            ep = t.episode
+            if isinstance(ep, (int, float)) and ep >= 1 and _orig_episode(t.raw_title) == ep + off:
+                t.episode = ep + off
+                s.add(t)
+                n += 1
+        if n:
+            log.info("集号展开：%s 把 %d 条【旧规则误折】的行还原成标题原值（本番 O=%d < T=%d，判不出编号体系、不折）",
+                     a.title, n, off, a.total_episodes)
+        return n
+    total = a.total_episodes
     n = 0
     for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == a.id)):
         ep = t.episode
-        if isinstance(ep, (int, float)) and ep >= 1 and ep > total and ep - a.ep_offset >= 1:
-            t.episode = ep - a.ep_offset
-            s.add(t)
-            n += 1
+        if not (isinstance(ep, (int, float)) and total < ep <= off + total and ep - off >= 1):
+            continue
+        if _orig_episode(t.raw_title) != ep:
+            continue    # 已经折过 / 被人工改过 —— 幂等锚，见 _orig_episode
+        if extract_episode_abs(t.raw_title):
+            continue    # 标题自带双编号 → 这个 ep 已经是季内号（同 _learn_and_normalize_episode 的守卫）
+        t.episode = ep - off
+        s.add(t)
+        n += 1
     if n:
         log.info("集号回折：%s 把 %d 条绝对编号种子折回季内集号（offset=%d）", a.title, n, a.ep_offset)
     return n
@@ -292,8 +390,9 @@ def _learn_and_normalize_episode(s, a, item) -> float:
 
     归一只在【有确凿证据】时做：
       · 学：标题写成 '16(88)' 的双编号种子直接给出 offset = 88 - 16（LoliHouse 系常带）。
-      · 用：该番已知 offset，且这条的集号超过 bgm 总集数（说明它用的是绝对编号）→ 减去 offset。
-    推不出 offset 就【什么都不做】，由详情页标『疑似同集不同编号』交人工，绝不按发布时间瞎配对
+      · 用：该番的两套编号取值域【互不相交】(见 _foldable，要求 O ≥ T)，且这条落在绝对域
+        (T, O+T] 内 → 减去 offset。O < T 时两域重叠、判不出来，就一条都不折（宁可重复，不可漏集）。
+    推不出 offset、或 O < T 判不出来，就【什么都不做】，绝不按发布时间瞎配对
     （补番/跳周/合集都会误判成同集而漏下）。
     """
     ep = item.episode
@@ -309,9 +408,12 @@ def _learn_and_normalize_episode(s, a, item) -> float:
         # 而集去重键是 (anime_id, episode) → flush 认为是两集，各放行一份到【完全相同】的目录。
         # 判据与下面 ② 逐字相同，故天然幂等；只在首次学到 offset 时跑一次，成本可忽略。
         _refold_absolute_episodes(s, a)
-    # ② 用：本条用的是绝对编号（超过总集数）→ 折回季内集号
-    total = a.total_episodes or 0
-    if a.ep_offset and total and ep > total and ep - a.ep_offset >= 1:
+    # ② 用：本条落在【绝对域】(T, O+T] 内 → 折回季内集号。
+    # 上界 O+T 也是判据的一部分：合法的绝对号不可能超过它，卡住它就顺手挡掉把分辨率/年份/
+    # 三位话数误解析成集号的垃圾值（'- 1080'、[201] 之类），免得被减去 offset 后变成一个像样的集号。
+    if item.episode_abs:
+        return ep     # 标题自己写了『季内(绝对)』两个号（如 '13(25)'），ep 就是季内号，再折就错了
+    if _foldable(a) and a.total_episodes < ep <= a.ep_offset + a.total_episodes and ep - a.ep_offset >= 1:
         return ep - a.ep_offset
     return ep
 
@@ -392,9 +494,9 @@ async def process_item(item) -> bool:
     log.info("新增 - %s - %s 第%s季 第%s集", item.source, item.anime_title, item.season, episode)
     _warn_unknown_episode(item)
     # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 + (未锁源或正是锁定源) → 入库就下，不等缓冲窗口。
-    # 排除 -2(未知/批量)：与 flush 一致留人工处理，别让它是否被下取决于来源组优先级（instant 下、flush 不下）。
+    # 只放行正集（见 auto_downloadable_ep）：与 flush 同一判据，别让一条种子是否被下取决于它走了哪条路。
     if (config.ANIME_TOP_PRIORITY_INSTANT and should_download
-            and item.episode != -2
+            and auto_downloadable_ep(item.episode)
             and (item.priority or 0) >= _top_priority()
             and (not lock or lock == (item.source or ""))
             and (not kw or _kw_match(kw, item.raw_title))):
@@ -441,13 +543,21 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
             # 同集去重：同一 (anime_id, 集) 已有别的种子在下/已下 → 跳过（force 时不去重，强制下这条）。
             # 注：deleted 不进去重集——用户删的是"那一条种子"，同集来了新 hash 允许照常自动下（deleted 本身
             # 状态非 pending、flush 不会自动选它，同 hash 也在入库处去重，故被删的那条不会自动回来；force 例外）。
-            # 含特别篇 -1（每番只放一份，与 flush 的 have_special 意图一致）；-2 未知集按设计逐个下、不去重。
-            if not force and isinstance(episode, (int, float)) and (episode >= 0 or episode == -1) and anime_id:
+            # 只对【正集】去重：特别篇(-1)/未知集(-2) 现在只可能由 force 路径进来（自动/批量四条路径
+            # 都被 auto_downloadable_ep 挡在外面），而 force 本就不走这道闸——同一部番的多个特别篇、
+            # 多个批量包彼此不是同一集，逐条点就该逐条下。
+            if not force and auto_downloadable_ep(episode) and anime_id:
+                # 歧义段((O,T]，见 ambiguous_range)按 (集号,源) 去重：那一段同键的两行不一定是同一集，
+                # 只按集号挡会把真·另一集永久压成 skipped。口径必须与 flush/补下逐字一致。
+                _amb = ambiguous_range(s.get(Anime, anime_id))
+                _same_src = [AnimeTorrent.source == (t.source or "")] if (
+                    _amb and _amb[0] < episode <= _amb[1]) else []
                 dup = s.exec(select(AnimeTorrent).where(
                     AnimeTorrent.anime_id == anime_id,
                     AnimeTorrent.episode == episode,
                     AnimeTorrent.status.in_(HAVE_STATUSES),   # 含 stalled：instant 路径不经 flush 的 have_eps，
                     AnimeTorrent.id != torrent_id,           # 这里是它唯一的集去重闸，口径必须与 flush 一致
+                    *_same_src,
                 )).first()
                 if dup is not None:
                     t.status = "skipped"
@@ -517,11 +627,9 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool:
         恢复原终态即可，否则用户特意删过的集会被自动重下回来。"""
         # 【只有 flush 真会重发的行才进队列】否则 UI 会挂出"某时刻后自动重发"，而后台永远不动它：
         # · 终态(deleted/excluded/已归档) force 重下 —— 恢复原终态，不该被自动下回来
-        # · episode < -1（即 -2 未知集/疑似批量）—— flush 明确 continue 掉它（见 flush_ready_downloads），
-        #   排队等于骗人。落 error 反而对：详情页会显示『失败·可补下』+ 真实原因，
-        #   人工点『补下本番』确实能下（_select_downloads 里 -2 独立成组）。
-        #   -1 特别篇要留在队列里：flush 有 special_groups 分支，确实会重发。
-        if _keep_orig or episode is None or episode < -1:
+        # · 特别篇(-1)/未知集(-2) —— flush 明确不放行它们（见 auto_downloadable_ep），排队等于骗人。
+        #   落 error 反而对：详情页会显示失败 + 真实原因，人工对准那条点『下载』即可重试。
+        if _keep_orig or not auto_downloadable_ep(episode):
             _fail(reason=reason)
             return
         with get_session() as s2:
@@ -648,7 +756,7 @@ async def flush_ready_downloads() -> int:
     对『自动下载且已确认』的番，把待下种子按 (anime_id, 集) 归组——因为按番的真实身份
     分组，不同组不同写法的同一集会算作同一集，天然只留一份。每集首次被发现后满
     config.ANIME_DOWNLOAD_GRACE_MIN 分钟才放行，到点从该集所有种子挑优先级最高的下一份（错误的排后，
-    留作降级）。特别篇/未知集不做集去重，逐个下。返回实际触发下载的数量。
+    留作降级）。特别篇(-1)/未知集(-2) 一律不放行（见 auto_downloadable_ep）。返回实际触发下载的数量。
     """
     # 交付前先探一次 qB：一个 GET 的代价，换掉"整轮几十集逐个去 nyaa 取种、再逐个发给一个根本
     # 不在的 qB"。qB 掉线时本轮一行不动，种子留在待下，等它回来自然继续。
@@ -676,10 +784,13 @@ async def flush_ready_downloads() -> int:
         # 【只取两列】这里只要 (番, 集) 这个去重键。整行 ORM 装配是本函数最贵的一步，而 sent 是只增
         # 不减的终态、行数随挂机线性增长：仓库自测 9700 行时光装配就 150ms（13 条 SQL 本身才 7ms），
         # 这期间事件循环整个停摆（页面/qB 同步/剧场版扫描一起卡）。列投影后同样的活儿只剩几毫秒。
-        have_eps = set(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode).where(
-            AnimeTorrent.status.in_(HAVE_STATUSES))).all())
+        # 歧义段（O<T 的番在 (O,T] 上两套编号重叠）按 (番,集,源) 去重，其余按 (番,集)——见 dedup_key。
+        amb_map = {a.id: ambiguous_range(a) for a in auto}
+        have_eps = {dedup_key(amb_map.get(aid), aid, ep, src)
+                    for aid, ep, src in s.exec(select(
+                        AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.source).where(
+                        AnimeTorrent.status.in_(HAVE_STATUSES))).all()}
         groups: dict = {}
-        special_groups: dict = {}          # anime_id -> [特别篇(-1)种子]，按番去重只放一份
         # 只自动放行 pending：error 不在这里无限重试（高优先级失败→本组还有 pending 低优先级自然降级；
         # 全 error 则本轮不重试，留给人工补下）。
         # retry_at 未到点的跳过——重试退避全靠这一条落地（人工补下不走这里，不受退避约束）
@@ -694,11 +805,10 @@ async def flush_ready_downloads() -> int:
             kw = kw_map.get(t.anime_id)
             if kw and not _kw_match(kw, t.raw_title):
                 continue  # 版本关键词：只收命中该版本的（硬锁、不兜底）
-            if t.episode is None or t.episode < 0:
-                if t.episode == -1:
-                    special_groups.setdefault(t.anime_id, []).append(t)  # 特别篇按番归组
-                continue  # -2(未知/疑似批量) 不自动下，可人工补下
-            groups.setdefault((t.anime_id, t.episode), []).append(t)
+            if not auto_downloadable_ep(t.episode):
+                continue   # 特别篇(-1)/未知集(-2) 不自动下，到详情页对准那条点『下载』（见 auto_downloadable_ep）
+            groups.setdefault(dedup_key(amb_map.get(t.anime_id), t.anime_id, t.episode, t.source),
+                              []).append(t)
 
     def _pick(ts, aid):
         return engine.pick_best(ts, pref_map.get(aid))
@@ -709,15 +819,7 @@ async def flush_ready_downloads() -> int:
         first_seen = min(t.created_at for t in ts)
         if now - first_seen < grace:
             continue  # 缓冲窗口未到，等偏好组
-        chosen.append(_pick(ts, key[0]).id)  # key = (anime_id, episode)
-    # 特别篇：每番只放一份（多字幕组版本别全下），走同样的缓冲窗口，且该番未下过特别篇才放
-    have_special = {aid for (aid, ep) in have_eps if ep == -1}
-    for aid, ts in special_groups.items():
-        if aid in have_special:
-            continue
-        if now - min(t.created_at for t in ts) < grace:
-            continue
-        chosen.append(_pick(ts, aid).id)
+        chosen.append(_pick(ts, key[0]).id)  # key[0] 恒为 anime_id（见 dedup_key）
 
     n = 0
     for tid in chosen:
@@ -1219,7 +1321,7 @@ async def reenrich_scope(seasons: int | None = None) -> int:
     """
     quarters = None
     if seasons:
-        quarters, q = set(), extract_quarter(datetime.now())
+        quarters, q = set(), quarter_of(datetime.now())
         for _ in range(seasons):
             quarters.add(q)
             q = engine.prev_quarter(q)
@@ -1295,23 +1397,27 @@ async def retry_unmatched() -> int:
     return n
 
 
-def _select_downloads(rows: list, pref: str | None = None, have_eps: set | None = None) -> list:
+def _select_downloads(rows: list, pref: str | None = None, have_eps: set | None = None,
+                      amb: tuple | None = None) -> list:
     """从一部番的待下种子里挑要下的：按集号分组，每集选一份（首选源优先、其次优先级）。
-    特别篇(-1)、未知集(-2) 各自作为独立集号，互不挤占（下过 -1 不再挡待下的 -2，反之亦然）。
-    have_eps 里的集（已在下/已下）跳过。返回选中的 AnimeTorrent 列表。
+    have_eps 里的集（已在下/已下）跳过。只挑【正集】，理由见 auto_downloadable_ep。
+    amb=ambiguous_range(番)：歧义段按 (集号,源) 分组与去重，与 flush 同口径（见 dedup_key）。
+    调用方传进来的 have_eps 必须用同一个键算，否则两侧对不上。
+    返回选中的 AnimeTorrent 列表。
     """
     have = have_eps or set()
 
     def _best(cands: list):
         return engine.pick_best(cands, pref)
 
-    # 按集号分组：正集每集一份；负集 -1/-2 各自独立成组、各一份。早前把所有负集并成一个
-    # 互斥槽，会让下过 -1 就整组跳过、挡住待下的 -2（反之亦然）；按集号细分即可各行其是。
     by_ep: dict = {}
     for t in rows:
-        if t.episode in have:
+        if not auto_downloadable_ep(t.episode):
             continue
-        by_ep.setdefault(t.episode, []).append(t)
+        k = dedup_key(amb, 0, t.episode, t.source)[1:]   # 单番内不必带 anime_id
+        if k in have:
+            continue
+        by_ep.setdefault(k, []).append(t)
     return [_best(ts) for ts in by_ep.values()]
 
 
@@ -1319,7 +1425,8 @@ async def download_pending_for_anime(anime_id: int) -> int:
     """把某番剧下 status=pending/error 的种子补下（人工确认后放行）。返回触发的下载数。
 
     加番剧级授权闸门：只对『已确认且未拒绝』的番补下。
-    正集按集去重、负集整组一份（见 _select_downloads）——避免同一集/同片多版本被全部拉下。
+    只补【正集】、每集一份（见 _select_downloads / auto_downloadable_ep）：特别篇与未知集要人工
+    对准那一条点『下载』，这个批量按钮不碰它们。
     """
     with get_session() as s:
         a = s.get(Anime, anime_id)
@@ -1327,13 +1434,15 @@ async def download_pending_for_anime(anime_id: int) -> int:
             return 0
         pref, kw = a.pref_source, a.pref_keyword
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-    have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
+    amb = ambiguous_range(a)     # 歧义段按 (集号,源) 去重，与 flush 同口径（见 dedup_key）
+    have_eps = {dedup_key(amb, 0, t.episode, t.source)[1:] for t in all_rows
+                if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
     pending = [t for t in all_rows if t.status in DOWNLOADABLE_STATUSES]
     if pref:  # 锁定源：只补锁定组的待下集（硬锁、不兜底）
         pending = [t for t in pending if pref == (t.source or "")]
     if kw:     # 版本关键词：再过滤到命中该版本的（繁日/简日/画质…；硬锁、不兜底）
         pending = [t for t in pending if _kw_match(kw, t.raw_title)]
-    chosen = _select_downloads(pending, pref, have_eps)
+    chosen = _select_downloads(pending, pref, have_eps, amb)
     n = 0
     for t in chosen:
         if await download_anime_torrent(t.id):
@@ -1368,7 +1477,7 @@ def download_plan(anime_id: int, for_backfill: bool = False) -> set[int]:
     · for_backfill=True ＝『点补下会挑哪条』：候选含 pending+error（补下确实重试失败的），
       只用于给 error 行判『失败·可补下』还是『失败』。
 
-    两者走同一套挑选（锁定源/版本关键词过滤 + 跳过已有一份的集 + 每集一份、负集各一份）。
+    两者走同一套挑选（锁定源/版本关键词过滤 + 跳过已有一份的集 + 只算正集、每集一份）。
     """
     with get_session() as s:
         a = s.get(Anime, anime_id)
@@ -1381,20 +1490,22 @@ def download_plan(anime_id: int, for_backfill: bool = False) -> set[int]:
         all_rows = list(s.exec(select(*_PLAN_COLS).where(
             AnimeTorrent.anime_id == anime_id,
             AnimeTorrent.status.in_(_plan_statuses(for_backfill)))))
-    have_eps = {t.episode for t in all_rows if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
+    amb = ambiguous_range(a)     # 同 download_pending_for_anime：标注口径必须与执行口径一致
+    have_eps = {dedup_key(amb, 0, t.episode, t.source)[1:] for t in all_rows
+                if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
     pending = [t for t in all_rows
                if t.status in (DOWNLOADABLE_STATUSES if for_backfill else ("pending",))]
     if pref:
         pending = [t for t in pending if pref == (t.source or "")]
     if kw:
         pending = [t for t in pending if _kw_match(kw, t.raw_title)]
-    return {t.id for t in _select_downloads(pending, pref, have_eps)}
+    return {t.id for t in _select_downloads(pending, pref, have_eps, amb)}
 
 
 def download_plan_for_ids(anime_ids, for_backfill: bool = False) -> set[int]:
     """批量版 download_plan（口径同上：默认只算 pending＝后台自动会下的，for_backfill 才含 error）。
     给定一组番 id，返回它们会被挑中的种子 id 并集（供新入库一次性标将下载/备用）。
-    与 download_all_pending 同一挑选口径（锁定源过滤 + 跳过已下/在下集 + 每集一份、负集整组一份），只算不下。
+    与 download_all_pending 同一挑选口径（锁定源过滤 + 跳过已下/在下集 + 只算正集、每集一份），只算不下。
     把逐番 N 次查询压成 2 次：一次拿这些番的锁定源、一次拿它们的全部种子；等价于对每个 id 调 download_plan 求并。"""
     ids = {i for i in anime_ids if i}
     if not ids:
@@ -1404,6 +1515,7 @@ def download_plan_for_ids(anime_ids, for_backfill: bool = False) -> set[int]:
             Anime.id.in_(ids), Anime.rejected.is_not(True))))
         pref_map = {a.id: a.pref_source for a in animes}
         kw_map = {a.id: a.pref_keyword for a in animes}
+        amb_map = {a.id: ambiguous_range(a) for a in animes}   # 歧义段口径，与逐番版一致
         ids = set(pref_map)      # 只保留过滤后仍在的番——否则被排除的番，其种子仍会被下面计划进去
         if not ids:
             return set()
@@ -1416,7 +1528,8 @@ def download_plan_for_ids(anime_ids, for_backfill: bool = False) -> set[int]:
         if t.status in (DOWNLOADABLE_STATUSES if for_backfill else ("pending",)):
             by_anime.setdefault(t.anime_id, []).append(t)
         elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
-            have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
+            have_by_anime.setdefault(t.anime_id, set()).add(
+                dedup_key(amb_map.get(t.anime_id), 0, t.episode, t.source)[1:])
     plan: set = set()
     for aid, pending in by_anime.items():
         lock = pref_map.get(aid)
@@ -1425,15 +1538,17 @@ def download_plan_for_ids(anime_ids, for_backfill: bool = False) -> set[int]:
         kw = kw_map.get(aid)
         if kw:
             pending = [t for t in pending if _kw_match(kw, t.raw_title)]
-        plan |= {t.id for t in _select_downloads(pending, lock, have_by_anime.get(aid))}
+        plan |= {t.id for t in _select_downloads(pending, lock, have_by_anime.get(aid),
+                                                 amb_map.get(aid))}
     return plan
 
 
 def pending_breakdown() -> dict:
     """把『待下』(pending)拆成 将下载/备用/待确认/未知，供仪表盘种子状态区看清那一大坨到底是什么。
-    · 未知   = 批量/未知集(-2)——flush 后台不自动下（即便被 _select_downloads 挑中），需人工在详情页下。
-              【最先判】不论番确不确认，与 unknown_episode_rows（点开的列表）同口径，卡片数=列表条数。
-    · 将下载 = 已确认番·本集首选（download_plan 会挑中，会自动下；含特别篇 -1 的首选）
+    · 未知   = 特别篇(-1) 与 批量/未知集(-2)——后台一律不自动下（见 auto_downloadable_ep），需人工在详情页
+              对准那一条点『下载』。【最先判】不论番确不确认，与 unknown_episode_rows（点开的列表）同口径，
+              卡片数=列表条数——否则特别篇会掉进『备用项』，而那张卡的说明是『同集已有更优版本』，纯属误导。
+    · 将下载 = 已确认番·本集首选（download_plan 会挑中，会自动下；只有正集会被标）
     · 备用   = 已确认番·同集已有更优版本（不会自动下）；含已拒绝番/孤儿的残留
     · 待确认 = 番还没确认（要点确认才下）；集号 -2 的已归入『未知』，不重复计
     四者之和 = 待下总数。复用批量 download_plan_for_ids，仅几条查询、只在仪表盘打开时算。"""
@@ -1446,13 +1561,13 @@ def pending_breakdown() -> dict:
     will = backup = unconfirmed = unknown = 0
     for tid, aid, ep in pend:
         c = conf.get(aid)
-        if ep == -2:             # 未知集最先判：不论番确不确认，后台都不自动下、都得人工处理。
-            unknown += 1         # 放最前才与点开的列表(unknown_episode_rows=所有待下 -2)同口径，卡片数=列表条数。
+        if not auto_downloadable_ep(ep):   # 特别篇/未知集最先判：不论番确不确认，后台都不自动下、都得人工处理。
+            unknown += 1         # 放最前才与点开的列表(unknown_episode_rows)同口径，卡片数=列表条数。
         elif c is None:          # 番已拒绝/孤儿 → 不会自动下
             backup += 1
         elif not c:              # 番未确认
             unconfirmed += 1
-        elif tid in plan:        # 已确认·本集首选（含 -1 特别篇的首选）
+        elif tid in plan:        # 已确认·本集首选（只有正集进得了 plan）
             will += 1
         else:                    # 已确认·非首选（同集有更优）
             backup += 1
@@ -1477,7 +1592,7 @@ def _torrent_rows(*where) -> list[dict]:
 
 def unknown_episode_rows() -> list[dict]:
     """待下里 episode==-2（批量/无法解析集号，flush 不自动下）的种子，供 KPI『未知集』点开手动处理。"""
-    return _torrent_rows(AnimeTorrent.status == "pending", AnimeTorrent.episode == -2)
+    return _torrent_rows(AnimeTorrent.status == "pending", AnimeTorrent.episode < 0)
 
 
 def failed_rows() -> list[dict]:
@@ -1535,11 +1650,12 @@ def unexclude_torrent(torrent_id: int) -> bool:
 async def download_all_pending() -> int:
     """补下所有『已订阅且已确认』番剧的待下/失败种子。返回触发数。
 
-    按番各自去重（正集每集一份、负集整组一份），避免多版本/多特别篇被一次全拉。
+    只补【正集】、每集一份（特别篇/未知集不在其列，见 auto_downloadable_ep）。
     """
     with get_session() as s:
         auto = list(s.exec(select(Anime).where(  # noqa: E712
             Anime.confirmed == True, Anime.rejected.is_not(True))))
+        amb_map = {a.id: ambiguous_range(a) for a in auto}   # 歧义段口径，与逐番版一致
         pref_map = {a.id: a.pref_source for a in auto}
         kw_map = {a.id: a.pref_keyword for a in auto}
         auto_ids = set(pref_map)
@@ -1550,7 +1666,8 @@ async def download_all_pending() -> int:
         if t.status in DOWNLOADABLE_STATUSES:
             by_anime.setdefault(t.anime_id, []).append(t)
         elif t.status in HAVE_STATUSES:   # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
-            have_by_anime.setdefault(t.anime_id, set()).add(t.episode)
+            have_by_anime.setdefault(t.anime_id, set()).add(
+                dedup_key(amb_map.get(t.anime_id), 0, t.episode, t.source)[1:])
     n = 0
     for aid, pending in by_anime.items():
         lock = pref_map.get(aid)
@@ -1559,7 +1676,7 @@ async def download_all_pending() -> int:
         kw = kw_map.get(aid)
         if kw:  # 版本关键词：再过滤到命中该版本的
             pending = [t for t in pending if _kw_match(kw, t.raw_title)]
-        for t in _select_downloads(pending, lock, have_by_anime.get(aid)):
+        for t in _select_downloads(pending, lock, have_by_anime.get(aid), amb_map.get(aid)):
             if await download_anime_torrent(t.id):
                 n += 1
     return n
@@ -1570,11 +1687,11 @@ def _norm_name(s: str) -> str:
     return re.sub(r"\s+", "", (s or "")).lower()
 
 
-async def backfill_source(anime_id: int, strict: bool = False) -> dict:
+async def backfill_source(anime_id: int, name_filter: bool = False) -> dict:
     """『补齐该源』/『自动补齐』：去 nyaa/Mikan 按名搜『该源』的种子，把漏收的补进这部番。
 
     该源 = 锁定源(pref_source)；没锁则取该番最高优先级的源。搜到的按 hash 去重、【季号过滤】（挡 S1/S2 混淆），
-    strict=True(自动补齐) 再加【番名近似过滤】挡同名衍生作；新的入库 pending 且把番置 confirmed=False（复用待确认
+    name_filter=True(『自动补齐』按钮) 再加【番名近似过滤】挡同名衍生作；新的入库 pending 且把番置 confirmed=False（复用待确认
     审核，不自动下——交给用户点『确认下载』）。返回 {found, kept, ingested, sites}。已忽略(rejected)的番不改订阅态。"""
     from sources.nyaa import NyaaSource, nyaa_search_url
     from sources.mikan import MikanSource, mikan_search_url
@@ -1650,15 +1767,15 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
         for it in items:
             found.setdefault(it.info_hash, it)
 
-    # 过滤：季号一致（挡 S1/S2 混淆）+ strict 番名近似（挡同名衍生作/恶搞）
-    # ref_names 仅 strict 分支用到 → 只在 strict 时构建（含逐条 _norm_name 正则），非 strict 不白算
+    # 过滤：季号一致（挡 S1/S2 混淆）+ name_filter 番名近似（挡同名衍生作/恶搞）
+    # ref_names 仅该分支用到 → 只在开了番名过滤时构建（含逐条 _norm_name 正则），否则不白算
     ref_names = ({_norm_name(x) for x in (jp, dn, title) if x}
-                 | {_norm_name(t.anime_title) for t in rows if t.anime_title}) if strict else set()
+                 | {_norm_name(t.anime_title) for t in rows if t.anime_title}) if name_filter else set()
     kept = []
     for it in found.values():
         if it.season not in existing_seasons:
             continue
-        if strict:
+        if name_filter:
             res = {_norm_name(it.anime_title)} | {_norm_name(x) for x in (it.search_names or [])}
             if not (ref_names & res):
                 continue
@@ -1704,8 +1821,8 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
             s.add(a_now)
             s.commit()
             to_confirm = True
-    log.info("补齐 anime=%s strict=%s：搜到 %d（站 %s）→ 留 %d → 入库 %d%s",
-             anime_id, strict, len(found), list(site_groups), len(kept), ingested,
+    log.info("补齐 anime=%s 番名过滤=%s：搜到 %d（站 %s）→ 留 %d → 入库 %d%s",
+             anime_id, name_filter, len(found), list(site_groups), len(kept), ingested,
              f"（另跳过 {stolen} 条：对照表显示属于别的番）" if stolen else "")
     return {"found": len(found), "kept": len(kept), "ingested": ingested, "stolen": stolen,
             "sites": list(site_groups), "to_confirm": to_confirm}

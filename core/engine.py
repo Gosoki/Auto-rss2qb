@@ -396,11 +396,18 @@ def set_torrent_status(model_cls, tid: int, status: str) -> None:
 def settle_sent(model_cls, tid: int) -> None:
     """把交付成功的种子直接落定为『已下完』(status=sent, qb_progress=1，脱离 in-flight)。
     关状态跟踪(QB_SYNC_STATUS=off)时用：发送即已下、不轮询 qB——若不落定 qb_progress，它会永久满足
-    _inflight_where(progress<1 且 state 空未落定)，永远挂在『正在下载』区、且 has_inflight 恒真。"""
+    _inflight_where(progress<1 且 state 空未落定)，永远挂在『正在下载』区、且 has_inflight 恒真。
+
+    【qb_synced_at 留空】它是【完成归档】的倒计时基准，语义是"看到这条真的下完的时刻"。
+    这条路径根本没看 qB，写 now() 就等于谎称"刚刚确认下完了"：等用户把跟踪重新打开，
+    archive_old_completed 第一次跑就会把整个关闭窗口里交付的种子成批 qb.delete 出去——
+    其中可能有还在下的，下载当场中断、盘上留半成品、UI 却显示『已归档』、集去重认定该集已有一份、
+    永不补下。留 None 则它天然不满足归档的 `qb_synced_at is not null`，而 qB 完成回调
+    (mark_done_by_hash) 写的【真实完成时刻】仍然有效、仍可归档。"""
     with get_session() as s:
         t = s.get(model_cls, tid)
         if t is not None:
-            t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "sent", 1.0, "", datetime.now()
+            t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "sent", 1.0, "", None
             s.add(t)
             s.commit()
 
@@ -413,11 +420,12 @@ def settle_inflight_off() -> int:
     再无路径推进 → 会永久满足 _inflight_where、恒挂『正在下载』区、has_inflight 恒真。此处一次性落定，语义与
     settle_sent/『off=发送即已下』一致。settle_sent 只对【新交付】单条生效，故切换时刻的旧行须靠这里兜。"""
     n = 0
-    now = datetime.now()
     with get_session() as s:
         for model_cls in (AnimeTorrent, MovieTorrent):
             for t in s.exec(select(model_cls).where(*_inflight_where(model_cls))):
-                t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "sent", 1.0, "", now
+                # qb_synced_at 留空，理由同 settle_sent：它是归档倒计时的基准，而这里并没有
+                # 真的看到"下完"——写 now() 会让这批行在跟踪重新打开后被追溯归档、砍掉还在下的种子。
+                t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "sent", 1.0, "", None
                 s.add(t)
                 n += 1
         s.commit()
@@ -446,9 +454,15 @@ async def archive_old_completed() -> int:
     /不重下等一切沿用 sent 语义，只是从 qB 列表清出、UI 显示『已归档』。
 
     完成时间以 qb_synced_at 为准：种子完成即脱离轮询、该时间冻结在完成点。跨表同 hash 安全：只删种子不删文件，
-    另一侧下轮各自归档（qb.delete 对已不在的 hash 幂等）。qB 连不上/删失败则本轮跳过、下轮再来。返回归档数。"""
+    另一侧下轮各自归档（qb.delete 对已不在的 hash 幂等）。qB 连不上/删失败则本轮跳过、下轮再来。返回归档数。
+
+    【关掉状态跟踪(QB_SYNC_STATUS=off)时整个不做】上面那句"qb_synced_at 冻结在完成点"只在开跟踪时成立：
+    关跟踪时 settle_sent / settle_inflight_off 在【交付那一刻】就写死 sent + qb_progress=1 + qb_synced_at=now，
+    此后没有任何路径会再更新它（sync 内层循环被开关挡住）。于是归档倒计时从交付开始算，而 qB 那边可能还在下——
+    N 天后这里会把【没下完】的种子从 qB 移除：下载当场中断、盘上留半成品、库里仍是 sent、UI 显示『已归档』、
+    集去重认定该集已有一份、永不补下。关跟踪时我们根本不知道有没有下完，也就没有归档的语义基础。"""
     days = config.QB_ARCHIVE_AFTER_DAYS
-    if days <= 0 or not config.QB_ENABLED:
+    if days <= 0 or not config.QB_ENABLED or not config.QB_SYNC_STATUS:
         return 0
     cutoff = datetime.now() - timedelta(days=days)
     n = 0
