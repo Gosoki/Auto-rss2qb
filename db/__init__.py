@@ -165,7 +165,7 @@ def create_mysql_database(host: str, port: int, user: str, password: str,
     连的是【服务器】不是具体库——库还不存在，带库名根本连不上。
     库名与字符集是拼进 SQL 的（CREATE DATABASE 的标识符不接受绑定参数），
     故先过 db.dialect 里的白名单校验再拼，且用反引号包起来。
-    排序规则跟着字符集走：utf8mb4 用 utf8mb4_unicode_ci，其余交给服务端默认。
+    排序规则跟着字符集走：utf8mb4 用 BINARY_COLLATION(utf8mb4_bin)，其余交给服务端默认。
     """
     from .dialect import BINARY_COLLATION, mysql_server_url, valid_charset, valid_db_name
     name = (name or "").strip()

@@ -87,6 +87,34 @@ def _reset_autoincrement(engine, name: str) -> None:
             f"ALTER TABLE {quote(engine, name)} AUTO_INCREMENT = {int(mx or 0) + 1}")
 
 
+def _readable_source_tables(src_engine) -> set:
+    """【清空目标之前】先真读一次源库：每张表按模型的完整列取一行。返回可读的表名集合。
+
+    非做不可的理由是执行顺序：真正的 `select(t)`（带模型全部列）在复制循环里才第一次发出，
+    而那已经在 overwrite 清空目标【之后】——源库缺表/缺列时异常抛在那一刻，结果是目标数据
+    已被删光、源库一行都没搬进来，且不可恢复。这里把同样的读提前到删数据之前。
+
+    count_rows 兜不住这一层：它对缺表直接记 0（当成空表），也从不碰具体的列。
+    缺表按"0 行"跳过（与 count_rows 同口径，UI 确认框里那句"源 N 行"已如实告知用户）；
+    表在、却读不出模型要的列（源库版本过旧，而迁移有意不升级源库）则直接抛，中止整次迁移。
+    """
+    insp = sa.inspect(src_engine)
+    ok = set()
+    with src_engine.connect() as conn:
+        for name in TABLE_ORDER:
+            if not insp.has_table(name):
+                continue
+            try:
+                conn.execute(sa.select(_table(name)).limit(1)).fetchall()
+            except Exception as e:
+                raise ValueError(
+                    f"源库的表 {name} 读不出来，迁移中止（目标库未被改动）："
+                    f"{type(e).__name__}: {str(e).splitlines()[0][:120]}。"
+                    "多半是源库版本过旧、缺少新版才有的列——用本程序打开它跑一次升级后再迁。") from e
+            ok.add(name)
+    return ok
+
+
 def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
                  progress=None) -> dict:
     """把业务表从 src 复制到 dst。
@@ -114,6 +142,7 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
     migrate.upgrade(dst_engine, "data")
 
     src_counts = count_rows(src_engine)
+    readable = _readable_source_tables(src_engine)   # 删目标之前先把源库真读一遍，读不动就在这里中止
     dst_counts = count_rows(dst_engine)
     if not overwrite and any(dst_counts.values()):
         busy = "、".join(f"{k} {v} 行" for k, v in dst_counts.items() if v)
@@ -131,6 +160,9 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
         t = _table(name)
         total = src_counts.get(name, 0)
         done = 0
+        if name not in readable:      # 源库压根没这张表 → 按 0 行处理（同 count_rows 口径）
+            moved[name] = 0
+            continue
         cols = list(t.c.keys())
         with src_engine.connect() as sconn:
             # 按主键排序取，保证分页稳定；stream_results 让大表不必一次读进内存

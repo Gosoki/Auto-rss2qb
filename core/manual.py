@@ -106,8 +106,12 @@ async def add_manual(torrent_input: str, torrent_bytes, save_path: str) -> dict:
         return {"ok": False, "error": str(e)}
     if ok:
         log.info("手动下载已交 qB: %s → %s", (ih or inp or "上传文件")[:16], save_path)
-    return {"ok": ok, "info_hash": ih, "save_path": save_path,
-            "error": None if ok else "qB 未接受（种子无效/路径不可写/重复）"}
+    # add_torrent/add_url 是三态：None=连不上 qB（暂时性，重试就好），False=qB 明确拒了这一条
+    #（种子坏/路径不可写/重复）。把 None 也说成"未接受"是误诊，会让用户去查种子和路径，
+    # 而真正该做的只是等 qB 起来再点一次。
+    err = None if ok else ("连不上 qB（在重启/网络不通？稍后再点一次）" if ok is None
+                           else "qB 未接受（种子无效/路径不可写/重复）")
+    return {"ok": bool(ok), "info_hash": ih, "save_path": save_path, "error": err}
 
 
 async def identify_folder(bgm_input: str) -> dict:

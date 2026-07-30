@@ -4,11 +4,13 @@
 仅 WEB_PORT 这类绑定项仍走 .env（_RESTART_ONLY），改了要重启。数字项做校验，避免写入非数字。
 """
 import ipaddress
+import json
 
 from nicegui import context, run, ui
 
 from core import anime, engine, netguard, worker
 import config
+from db.dialect import BINARY_COLLATION
 from sources.parse import format_quarter
 from .layout import confirm, frame, warn_banner
 
@@ -209,7 +211,12 @@ def _db_panel(f: dict) -> None:
         if not await confirm(
                 f"在 {host} 上创建数据库 `{name}`？",
                 f"会执行：CREATE DATABASE `{name}` CHARACTER SET "
-                f"{config.DB_MYSQL_CHARSET or 'utf8mb4'} COLLATE utf8mb4_unicode_ci\n"
+                f"{config.DB_MYSQL_CHARSET or 'utf8mb4'}"
+                # 排序规则必须跟 create_mysql_database 实跑的一致（那边用 BINARY_COLLATION）：
+                # 写 _unicode_ci 而实跑 _bin，用户按确认框的文字去核对库属性会对不上。
+                # 非 utf8mb4 时那边不带 COLLATE（交给服务端默认），这里也照样不写。
+                + (f" COLLATE {BINARY_COLLATION}"
+                   if (config.DB_MYSQL_CHARSET or "utf8mb4") == "utf8mb4" else "") + "\n"
                 "只建空库、不建表也不写数据（表会在你『切换』过去时自动建）。\n"
                 "库已存在则什么都不做。需要该账号有 CREATE 权限。",
                 ok_label="创建", ok_icon="add", ok_color="primary"):
@@ -228,7 +235,7 @@ def _db_panel(f: dict) -> None:
         ui.notify(msg + "。接下来可以点『切到 MySQL』建表，或先『迁移数据』把现有数据搬过去。",
                   type="positive")
 
-    async def _switch(to_mysql: bool):
+    async def _switch_backend(to_mysql: bool):
         """只切连接、不动数据。"""
         url = db.configured_mysql_url() if to_mysql else None
         if to_mysql and url is None:
@@ -255,10 +262,14 @@ def _db_panel(f: dict) -> None:
         # 【新库要补业务初始化】switch_data_engine 只负责建表/升版本。切到一个全新空库后
         # sourcegroup 是空的 → build_sources() 返回空列表 → 采集循环每轮抓 0 个源、
         # 一条日志都不报，用户只会觉得"切完就再也不更新了"，重启进程才恢复。
-        # reset_leftovers=False：可能有交付协程正卡在 await，把它的 downloading 占位打回 pending
-        # 会当场解除集去重（理由见 worker.init_business_state 文档）。
+        # 复位遗留 downloading 的条件严格按 _startup_reset_pending 走（理由见 worker.init_business_state）：
+        #   · 常态（运行中切库）标志是 False → 不复位。可能有交付协程正卡在 await，把它的 downloading
+        #     占位打回 pending 会当场解除集去重。
+        #   · 『启动时库就不可用、用户到这里补全参数才恢复』标志是 True → 必须在这里【就地消费掉】。
+        #     否则它一直挂着，而 run_db_watch 的 was_down 也仍是 True，下一次 30 秒心跳探通时会补做
+        #     一次复位——那已是系统恢复运行【之后】，采集/UI 都可能有交付在途，正好踩中上面那个坑。
         try:
-            worker.init_business_state(reset_leftovers=False)
+            worker.init_business_state(reset_leftovers=worker._startup_reset_pending)
         except Exception as e:
             ui.notify(f"已切库，但业务初始化失败（源组可能为空）：{type(e).__name__}: {str(e)[:120]}",
                       type="warning")
@@ -334,9 +345,9 @@ def _db_panel(f: dict) -> None:
     ui.label("用于目标库里已经有数据、或想先切到空库再迁。切错了再切回来即可，数据不会丢。").classes(
         "text-xs text-gray-500 mb-1")
     with ui.row().classes("gap-2 flex-wrap"):
-        ui.button("切到 MySQL", icon="storage", on_click=lambda: _switch(True)).props(
+        ui.button("切到 MySQL", icon="storage", on_click=lambda: _switch_backend(True)).props(
             "color=primary unelevated no-caps")
-        ui.button("切回本地 SQLite", icon="undo", on_click=lambda: _switch(False)).props(
+        ui.button("切回本地 SQLite", icon="undo", on_click=lambda: _switch_backend(False)).props(
             "flat color=grey no-caps")
 
     ui.separator().classes("my-2")
@@ -363,7 +374,7 @@ def settings():
 
         f: dict = {}  # 表单控件，key = .env 键名
 
-        def _switch(key, label, val):
+        def _switch_field(key, label, val):
             f[key] = ui.switch(label, value=val).props("dense")
 
         def _text(key, label, val, ph=""):
@@ -405,8 +416,8 @@ def settings():
                      "『慢速地板+判慢轮次』判定是否还在真下。关=发送即当『已下』、完全不查 qB。"
                      "『停滞超时』：进度连续这么久无推进→标『停滞(异常)』供人工处理（不自动换源）。"
                      "『完成归档』：完成超这么多天→从 qB 移除【留文件】、标『已归档』、不再跟踪。")
-            _switch("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
-            _switch("QB_SYNC_STATUS", "读取 qB 实时状态（关=发送过去即『已下』，完全不轮询 qB）",
+            _switch_field("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
+            _switch_field("QB_SYNC_STATUS", "读取 qB 实时状态（关=发送过去即『已下』，完全不轮询 qB）",
                     config.QB_SYNC_STATUS)
             with ui.element("div").classes("field-grid w-full"):
                 _num("QB_SYNC_INTERVAL", "活跃轮询间隔（秒）", config.QB_SYNC_INTERVAL)
@@ -438,11 +449,24 @@ def settings():
                         cmd = (f'curl -s -X POST "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
                                + (f'&t={tok}' if tok else '') + '"')
 
-                        def _copy(c=cmd):
-                            # ui.clipboard.write 是同步函数（返回 None），await 它必抛 TypeError，
-                            # 于是下面那句成功提示【永远不会执行】，每点一次还刷一条 traceback。
-                            ui.clipboard.write(c)
-                            ui.notify("已复制命令到剪贴板", type="positive")
+                        async def _copy(c=cmd):
+                            # ui.clipboard.write 是【单向】的 run_javascript：非安全上下文（局域网
+                            # http:// 而非 https/localhost）里 navigator.clipboard 压根不存在，浏览器
+                            # 只在 console 里报一句，Python 侧收不到任何失败信号——于是恒弹绿色『已复制』
+                            # 而剪贴板里什么都没有。改成自己发一段【带回执】的 JS，按真实结果提示；
+                            # 复制不了也不是死路：左边那个只读输入框本来就能手动全选复制。
+                            try:
+                                ok = await ui.run_javascript(
+                                    "(async () => { try { await navigator.clipboard.writeText("
+                                    + json.dumps(c) + "); return true } catch (e) { return false } })()",
+                                    timeout=3.0)
+                            except Exception:      # 客户端没回应/已断开
+                                ok = False
+                            if ok:
+                                ui.notify("已复制命令到剪贴板", type="positive")
+                            else:
+                                ui.notify("浏览器不允许自动复制（局域网 http 属非安全上下文）—— "
+                                          "请手动全选左边那行命令复制", type="warning")
 
                         with ui.row().classes("items-center gap-2 w-full no-wrap"):
                             ui.input(value=cmd).props("dense outlined readonly").classes(
@@ -474,7 +498,7 @@ def settings():
             _section("网络 / 通知",
                      "代理支持 http:// / https://；socks5:// 需另装 socksio 包（未装时填 socks5:// 会在请求时出错）。"
                      "代理账号/密码仅『需认证的代理』才填，留空=不认证。通知 URL：留空=关闭推送。")
-            _switch("OPEN_PROXY", "启用代理", config.OPEN_PROXY)
+            _switch_field("OPEN_PROXY", "启用代理", config.OPEN_PROXY)
             with ui.element("div").classes("field-grid w-full"):
                 _text("PROXY_URL", "代理地址", config.PROXY_URL, "http://… 或 https://…（socks5 需装 socksio）")
                 f["PROXY_URL"].classes(add="col-span-2")   # 代理地址占 1/2（4 列栅格里跨 2 格）
@@ -536,15 +560,15 @@ def settings():
                 "番剧", icon="movie", value=True).classes("w-full").props("dense"):
             _section("采集",
                      "Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在『源管理』页配置。")
-            _switch("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
+            _switch_field("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
                     config.ANIME_POLL_ENABLED)
             with ui.element("div").classes("field-grid w-full"):
                 _num("ANIME_POLL_INTERVAL", "轮询间隔（秒）", config.ANIME_POLL_INTERVAL)
                 _num("ANIME_DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）",
                      config.ANIME_DOWNLOAD_GRACE_MIN)
-            _switch("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
+            _switch_field("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
                     config.ANIME_TOP_PRIORITY_INSTANT)
-            _switch("ANIME_MULTIBRACKET_PARSE",
+            _switch_field("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（识别 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
             ui.label("默认关：认不出番名的种子直接进『待识别』。开=尝试从括号块猜名（可能猜错，拿不准自动跳过；"
@@ -590,7 +614,7 @@ def settings():
 
             ui.separator()
             _section("归档")
-            _switch("ANIME_SEASON_SUBFOLDER",
+            _switch_field("ANIME_SEASON_SUBFOLDER",
                     "番名目录下再建『Season N』二级子目录（关=番剧文件直接放番名目录）",
                     config.ANIME_SEASON_SUBFOLDER)
             ui.label("开：… / 番剧 / 26C · 7月 · 夏 / 番名 / Season 3 / 番剧.mp4"
@@ -603,8 +627,8 @@ def settings():
             _section("番剧表显示",
                      "番剧表默认只显示订阅中，上两项决定要不要带上『待确认/已忽略』。默认标签页=进番剧页先落哪个标签"
                      "（地址带 ?t= 时以其为准）。分页：1 年=4 个季度。")
-            _switch("ANIME_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.ANIME_SHOW_PENDING)
-            _switch("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
+            _switch_field("ANIME_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.ANIME_SHOW_PENDING)
+            _switch_field("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
             with ui.element("div").classes("field-grid w-full"):
                 _select("ANIME_DEFAULT_TAB", "默认标签页", _ANIME_TABS, config.ANIME_DEFAULT_TAB)
                 _num("ANIME_PAGE_YEARS", "分页 · 每页年数", config.ANIME_PAGE_YEARS, 1, 5)
@@ -736,9 +760,10 @@ def settings():
             _reactivate_busy["v"] = True
             reactivate_btn.props("loading")
             try:
-                await worker.reactivate_all()
-                paused = "" if config.ANIME_POLL_ENABLED else "（采集处于暂停，未抓源）"
-                ui.notify(f"已重新激活{paused}，详情见日志页", type="positive")
+                # 结果文案与成败都由 worker 出：它才知道这一轮到底做没做（库停摆/已有一轮在跑都会跳过），
+                # 跳过时必须用警告色——否则『其实什么都没做』会被显示成绿色的成功。
+                ok, msg = await worker.reactivate_all()
+                ui.notify(msg, type="positive" if ok else "warning")
             except Exception as e:
                 ui.notify(f"重新激活异常：{e}", type="negative")
             finally:

@@ -9,7 +9,7 @@ from nicegui import ui
 
 import config
 from db.models import MovieTorrent
-from core import engine, movies as mov
+from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN
 from .layout import (WEEKDAY_CN, barline, confirm, expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
@@ -184,8 +184,15 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.badge(live).props(f"color={'green' if _done else 'blue'}").tooltip(
                             "qB 实时状态")
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余按状态
-                        ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
+                        # 失败原因挂在徽标 tooltip 上。剧场版【没有】番剧那套自动退避重发（core/movies.py
+                        # 的论证正是"失败时人就在跟前，给个能看的 fail_reason 比排队重发有用"）——
+                        # 而这个字段原本任何页面都不显示，那句论证在 UI 上是落空的：qB 连不上时状态还会
+                        # 落回 pending，列表只显示『待下』，用户完全看不出点过一次且失败了。
+                        _b = ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
                             "color=blue-grey")
+                        if t.fail_reason:
+                            _b.props("color=orange").tooltip(
+                                f"上次失败：{t.fail_reason}（剧场版不自动重发，要重试就点右边『下载』）")
                     _vdl = ui.button("下载", icon="download", on_click=_force(t.id)).props(
                         "size=sm flat dense").style("font-size:12px")
                     _vdl.set_enabled(config.QB_ENABLED)
@@ -360,7 +367,14 @@ def movies_page(t: str = ""):
                 ui.notify("至少选一个季度", type="warning")
                 return
             ui.notify(f"扫描 {yr} 年 {len(letters)} 个季度的剧场版/OVA…（走 Mikan+bgm，请稍候）")
-            res = await mov.scan_now(yr, letters)
+            # 走 worker 那把 _scan_lock 而不是页面自己的标志：一次全年扫描是几分钟的 Mikan+bgm 串行请求，
+            # 而页面级防抖只在【本浏览器标签】里有效——挡不住后台自动扫描那一轮，也挡不住第二个标签页。
+            # 并发跑两轮不只是请求翻倍：_upsert_movie 是"先查后插"、mikan_id 上没有唯一约束，
+            # 两轮交错时未识别的番组会留下两行重复 Movie。
+            res = await worker.scan_movies_now(yr, letters)
+            if res is None:
+                ui.notify("已有一轮剧场版扫描在跑（后台自动扫描或另一处触发），本次跳过", type="warning")
+                return
             refresh_all()
             tail = f"，{res['errors']} 个出错" if res["errors"] else ""
             ui.notify(
@@ -396,7 +410,7 @@ def movies_page(t: str = ""):
                 ui.notify("已恢复到可下")
             return h
 
-        def _bind(movie_id, inp):
+        def _bind_from_input(movie_id, inp):
             async def h():
                 bid = parse_bgm_id(inp.value or "")
                 if bid is None:
@@ -693,7 +707,7 @@ def movies_page(t: str = ""):
                             "text-xs text-gray-400")
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         inp = ui.input(placeholder="bgm 链接或 ID").props("dense outlined").classes("min-w-96")
-                        ui.button("绑定", icon="link", on_click=_bind(m.id, inp)).props("color=primary unelevated")
+                        ui.button("绑定", icon="link", on_click=_bind_from_input(m.id, inp)).props("color=primary unelevated")
                         ui.button("重试识别", icon="refresh", on_click=_refail(m.id)).props("flat color=grey")
                         ui.button("忽略", on_click=_reject(m.id)).props("flat color=grey")
 

@@ -7,6 +7,10 @@ from .layout import (WEEKDAY_CN, confirm, ep_str, meta_card, name_of, parse_bgm_
                      qb_live_text, season_label, source_options, torrent_status_cn,
                      warn_banner)
 
+# 正在补齐的番 id。挂模块级而不是弹窗闭包里：闭包随详情弹窗重建而重置（关掉再打开就绕过了），
+# 而补齐是几十秒的多站搜索 + 批量入库。模块级还顺带挡住"多个标签页对同一部番同时点"。
+_backfill_running: set = set()
+
 
 def notify_relocate_anime(rep):
     """把 relocate_anime 的结果转成用户提示（番剧侧唯一一份，两个页面共用）。"""
@@ -153,13 +157,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             _dln.set_enabled(config.QB_ENABLED)
             _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
                          else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过")
-            _bf1 = ui.button("补齐该源", icon="playlist_add", on_click=_backfill_loose).props(
+            _btn_bf_loose = ui.button("补齐该源", icon="playlist_add", on_click=_backfill_loose).props(
                 "flat dense size=sm").style("font-size:14px")
-            _bf1.tooltip("去 nyaa/Mikan 按名搜『当前下载源』的种子补漏收（季度过滤，你人工审核）。"
+            _btn_bf_loose.tooltip("去 nyaa/Mikan 按名搜『当前下载源』的种子补漏收（季度过滤，你人工审核）。"
                          "入库后转『待确认』，点『确认下载』才下。")
-            _bf2 = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_strict).props(
+            _btn_bf_strict = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_strict).props(
                 "flat dense size=sm").style("font-size:14px")
-            _bf2.tooltip("同『补齐该源』，但额外用番名近似过滤挡掉同名衍生作/别的季，更少需人工把关。")
+            _btn_bf_strict.tooltip("同『补齐该源』，但额外用番名近似过滤挡掉同名衍生作/别的季，更少需人工把关。")
 
         # 分集 / 种子（每条可单独强制下载）；标题右侧灰字标注会发送给 qB 的保存目录（按规则算出，全番同一目录）
         with ui.row().classes("items-center gap-2 w-full mt-2 flex-wrap"):
@@ -305,6 +309,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
 
     def _set_keyword(val):
         v = (val or "").strip()
+        # 【没改就什么都不做】blur 每次失焦都触发——点一下输入框再点别处，本来什么都没改，
+        # 却会写一次库、整块 body.refresh()（正在滚动/展开的状态全丢）、还弹一条橙色警告。
+        cur_kw = getattr(anime.get_anime(anime_id), "pref_keyword", "") or ""
+        if v == cur_kw:
+            return
         anime.set_pref_keyword(anime_id, v)
         body.refresh()
         ui.notify(f"版本限定『{v}』：只下原名含此词的版本（缺此版本的集不兜底）" if v
@@ -405,12 +414,22 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         _after()
         ui.notify(f"已触发下载 {n} 集")
 
-    _bf_busy = {"v": False}   # 防长耗时补齐期间重复点击/双击并发跑多次
-
     async def _run_backfill(strict):
-        if _bf_busy["v"]:
+        # 防抖挂在【番 id】上而不是弹窗闭包里：闭包随详情弹窗重建而重置，关掉再打开就绕过去了，
+        # 而补齐是几十秒的多站并发搜索 + 批量入库，重入会重复打站点、并把番反复踢回待确认。
+        # 挂在模块级集合上还顺带挡住"两个标签页对同一部番同时点"。
+        if anime_id in _backfill_running:
             ui.notify("正在补齐中，请稍候…", type="info")
             return
+        # 【先占位再问】下面的确认框是个 await，会让出事件循环等用户点按钮：若等确认之后才占位，
+        # 双击的两次点击都能在占位前通过检查、各弹一个框，两个都确认就并发跑两轮。
+        _backfill_running.add(anime_id)
+        try:
+            return await _run_backfill_inner(strict)
+        finally:
+            _backfill_running.discard(anime_id)
+
+    async def _run_backfill_inner(strict):
         cur = anime.get_anime(anime_id)
         if cur is not None and cur.confirmed and not cur.rejected:
             # 已确认番：补齐入库新种子会把整部番退回『待确认』，后台从此暂停自动下新集，直到重新确认——先告知
@@ -420,15 +439,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     "后台将暂停自动下新集，直到你去『待确认』页重新点确认。继续？",
                     ok_label="继续补齐", ok_icon="playlist_add", ok_color="primary"):
                 return
-        _bf_busy["v"] = True
         ui.notify("正在搜索补齐…（去 nyaa/Mikan 按名搜，请稍候）")
         try:
             res = await anime.backfill_source(anime_id, strict)
         except Exception as e:            # 兜住 fetch 之外的意外，别逃逸崩掉处理器
             ui.notify(f"补齐出错：{e}", type="negative")
             return
-        finally:
-            _bf_busy["v"] = False
         _after()
         if res.get("error"):
             ui.notify(res["error"], type="warning")
@@ -440,7 +456,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}），但本番仍在『已忽略』；"
                           "需先『恢复订阅』这些才会下载", type="warning")
         else:
-            ui.notify(f"没有新种子可补（搜到 {res['found']}，都已有或被季号/名字过滤）", type="info")
+            # 归属检查跳掉的那些要单独说：它与两个补齐按钮的松紧【无关】，换另一个按钮再点结果一样，
+            # 不点明的话用户只会以为"过滤太严"而白试一遍。
+            _st = f"；其中 {res['stolen']} 条对照表显示属于别的番（详见 /logs）" if res.get("stolen") else ""
+            ui.notify(f"没有新种子可补（搜到 {res['found']}，都已有或被季号/名字过滤{_st}）", type="info")
 
     async def _backfill_loose():
         await _run_backfill(False)

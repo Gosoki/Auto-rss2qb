@@ -306,6 +306,7 @@ def anime_page(t: str = ""):
                 ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番 N+1
+            dlmap = anime.downloaded_counts([a.id for a in rej])   # 同上：可删文件数也一次取齐
             for i, (q, items) in enumerate(group_by_quarter(rej)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
                     for a in items:
@@ -323,7 +324,7 @@ def anime_page(t: str = ""):
                             with ui.row().classes("items-stretch gap-3 flex-wrap"):
                                 ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
                                     "color=primary unelevated")
-                                nf = anime.downloaded_count(a.id)
+                                nf = dlmap.get(a.id, 0)
                                 if nf:  # 只有确实下过文件才给『删除文件』
                                     ui.button("删除文件", icon="delete_forever",
                                               on_click=_del_files(a.id, name_of(a), nf)).props(
@@ -718,11 +719,20 @@ def anime_page(t: str = ""):
             inflight_panel.refresh()                     # 『正在下载』列表的进度条也跟着更新
             ui.notify(f"已同步 {n} 条种子的进度" if n else "没有正在下载的种子", type="positive")
 
+        _reident_busy = {"v": False}   # 防抖：整轮 bgm 遍历可能跑几分钟，期间连点会叠出多轮并发请求
+
         def _reident(seasons):
             async def h():
+                if _reident_busy["v"]:
+                    ui.notify("正在重新识别中，请稍候…", type="info")
+                    return
                 scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
                 ui.notify(f"正在重新识别（{scope}）…走 bgm，可能要一会儿")
-                cnt = await anime.reenrich_scope(seasons)
+                _reident_busy["v"] = True
+                try:
+                    cnt = await anime.reenrich_scope(seasons)
+                finally:
+                    _reident_busy["v"] = False
                 _refresh_overview(charts=True)   # 重识别改了数据，连图表一起刷
                 ui.notify(f"识别完成：{cnt} 部命中", type="positive")
             return h

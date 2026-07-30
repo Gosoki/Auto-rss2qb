@@ -293,6 +293,14 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
                     meta = {}
                 cast = await _fetch_cast(client, bgm_id)   # 声优另调 /characters（只抓主角）
 
+        if bgm_id is not None and not meta:
+            # 【搜到了 id、却没取到详情】(bgm 502/限流/超时，或 subject 被删) 不能算识别成功：
+            # _subject_to_info 会给出一个只有 bangumi_id、其余字段全空的 info，调用方据此把番记成
+            # 『已识别』——从此 display_name/原名/放送日/总集数 永久为空，而 retry_unmatched 只捞
+            # 『没有 bangumi_id』的番，这一部再也轮不到自动重试，只能人工进详情页点重新识别。
+            # 当作本次识别失败：番停在『待识别』，下一次退避重试会连搜带取重来一遍。
+            log.warning("富集：搜到 bgm id=%s 但详情取不到，按未识别处理（等下次重试）", bgm_id)
+            return None
         if bgm_id is None and _parse_date(meta.get("date")) is None:   # bgm_id 命中即短路，跳过多余解析
             return None
         info = _subject_to_info(bgm_id, meta)

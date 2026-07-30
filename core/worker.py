@@ -16,6 +16,18 @@ from sources.nyaa import NyaaSource, nyaa_feed_url
 
 log = logging.getLogger("autorss")
 
+# 【两把独立的轮次锁】常态下后台协程各自定时跑；页面上还有几个随时可点的手动入口（设置页『重新激活
+# 全部任务』、/movies『立即扫描』），它们做的是同一件事，并发跑就是把同一批请求重打一遍：
+#   · 采集轮：同一批 RSS 被抓两遍、同一批条目走两遍 process_item；
+#   · 剧场版整年扫描：MOVIE_SCAN_LAST 要等整轮跑完才写，扫描期间 auto_scan_tick 恒判『到点』，
+#     于是两轮 Mikan+bgm 的整年请求并发打出去（有被限流的风险），且 _upsert_movie 是"先查后插"、
+#     mikan_id 上没有唯一约束——两轮交错时未识别的番组会留下两行重复 Movie。
+# 【必须是两把、不能合成一把】采集与剧场版扫描本就互不相干（run_movie_scan 的 docstring 明写"只碰
+# 剧场版"）。合成一把的话，一次十几分钟的整年扫描会把 TV 采集连同 flush_ready_downloads 整段憋住。
+# 后台协程【等】自己那把锁（本来就在定时循环里，晚一点无所谓）；手动入口【不等】，直接回报"已有一轮在跑"。
+_poll_lock = asyncio.Lock()    # 采集一轮：抓所有源 + 放行到点的下载
+_scan_lock = asyncio.Lock()    # 剧场版整年扫描
+
 
 def build_sources() -> list:
     """据 DB 里启用的源组构建本轮的源实例（按优先级从高到低）。"""
@@ -114,7 +126,8 @@ async def run_worker() -> None:
             await asyncio.sleep(15)  # 暂停中/数据库停摆：短睡轮询开关，恢复后约 15s 内继续
             continue
         try:
-            await poll_once()
+            async with _poll_lock:       # 与手动『重新激活』互斥，别把同一批源抓两遍
+                await poll_once()
         except Exception as e:
             log.error("本轮异常: %s", e)
         await asyncio.sleep(max(60, config.ANIME_POLL_INTERVAL))  # 每轮读当前值；下限 60s 兜底，防坏值(0/负)忙循环
@@ -148,8 +161,11 @@ async def run_movie_scan() -> None:
              "开" if config.MOVIE_SCAN_ENABLED else "关·在 /movies 订阅源开启", config.MOVIE_SCAN_INTERVAL)
     while True:
         try:
-            if not db.data_down() and await movies.auto_scan_tick():
-                log.info("剧场版自动扫描完成")
+            if not db.data_down():
+                # 与 /movies『立即扫描』和手动『重新激活』互斥（同一把 _scan_lock），别并发跑两轮整年扫描
+                async with _scan_lock:
+                    if await movies.auto_scan_tick():
+                        log.info("剧场版自动扫描完成")
         except Exception as e:
             log.error("剧场版自动扫描异常: %s", e)
         await asyncio.sleep(300)  # 5 分钟心跳，到点才真扫
@@ -208,22 +224,54 @@ async def run_qb_sync() -> None:
             log.error("qB 同步内层循环异常（回退休眠，等下次 kick/保底）: %s", e)
 
 
-async def reactivate_all() -> None:
+async def scan_movies_now(year: int, letters: list) -> dict | None:
+    """剧场版手动扫描（/movies 的『扫描』按钮走这里）：与后台整年扫描共用 _scan_lock。
+
+    页面自己的防抖只在单个浏览器标签里有效，挡不住后台那一轮、也挡不住第二个标签页，
+    而这正是最容易并发跑两轮整年扫描的入口。返回 movies.scan_now 的结果；已有一轮在跑则返回 None。
+    """
+    if _scan_lock.locked():
+        return None
+    async with _scan_lock:
+        return await movies.scan_now(year, letters)
+
+
+async def reactivate_all() -> tuple[bool, str]:
     """手动『重新激活全部任务』（设置页按钮）：立刻跑一轮 = 抓所有源入库 → 放行到点的下载发往 qB
     → 按需扫剧场版 → 唤醒 qB 状态检查（顺带完成归档）。等价于重启服务后各协程立刻做的那一轮，但不重启进程。
+    返回 (是否全部照做, 给用户看的结果)——有任何一段被跳过就是 False，页面据此用警告色，
+    别把『其实什么都没做』显示成绿色的成功。
 
-    采集暂停时跳过抓源（与 run_worker 同口径，暂停就是暂停），qB 检查照做。
+    采集暂停时跳过抓源（与 run_worker 同口径，暂停就是暂停）；数据库停摆时整个跳过（各后台循环都按
+    db.data_down() 把门，这里不该是唯一的例外——那只会撞一串写库异常）。
+    两段轮次各自看自己的锁：后台正在跑哪一段就跳过哪一段，另一段照做，不会因为剧场版在扫描就连采集也不跑。
     刻意【不】做 reset_downloading：那是启动时清上次异常退出的残留，运行中 status=downloading 的都是真在下的
     种子，复位成 pending 会让 flush 认为该集『还没有』而另挑一个源重下一份。
     """
-    if config.ANIME_POLL_ENABLED:
-        await poll_once()
-    else:
+    if db.data_down():
+        return False, "数据库停摆中，未执行（先到设置页『数据库』修好连接）"
+    # qB 检查【无条件先做】：qb_kick 只是置一个 Event，与别的轮在不在跑毫无关系，
+    # 而"刷新在下种子的进度 + 完成归档"正是用户点这个按钮最常见的诉求，不该被别的段的跳过连累。
+    engine.qb_kick.set()
+    notes = []
+    if not config.ANIME_POLL_ENABLED:
         log.info("重新激活：采集处于暂停，跳过抓源")
-    try:
-        if await movies.auto_scan_tick():
-            log.info("重新激活：剧场版自动扫描完成")
-    except Exception as e:
-        log.error("重新激活：剧场版扫描异常: %s", e)
-    engine.qb_kick.set()      # 唤醒 qB 状态同步：刷新在下种子的实时态 + 完成归档
-    log.info("重新激活全部任务：完成")
+        notes.append("采集处于暂停、未抓源")
+    elif _poll_lock.locked():
+        notes.append("已有一轮采集在跑、未重复抓源")
+    else:
+        async with _poll_lock:
+            await poll_once()
+    if _scan_lock.locked():
+        notes.append("已有一轮剧场版扫描在跑")
+    else:
+        try:
+            async with _scan_lock:
+                if await movies.auto_scan_tick():
+                    log.info("重新激活：剧场版自动扫描完成")
+        except Exception as e:
+            log.error("重新激活：剧场版扫描异常: %s", e)
+            notes.append("剧场版扫描出错（详见日志）")
+    log.info("重新激活全部任务：完成%s", ("（" + "；".join(notes) + "）") if notes else "")
+    tail = ("（" + "；".join(notes) + "）") if notes else ""
+    return not notes, f"已重新激活{tail}，详情见日志页"

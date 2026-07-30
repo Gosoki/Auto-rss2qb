@@ -12,6 +12,24 @@ SITE_OPTS = {"nyaa": "nyaa", "mikan": "mikan"}
 POLICY_OPTS = {"auto": "自动下载", "review": "人工审核"}
 
 
+def _bad_priority(priority) -> bool:
+    """优先级输入框为空/非数字时拦下保存并提示。True=有问题，调用方直接 return。
+
+    以前是 `int(priority.value or 0)`：清空输入框（ui.number 给回 None）就静默写成 0，
+    而优先级决定多源择优挑哪一份——用户只是想改别的字段，却把这个源悄悄降到了最低。
+    """
+    v = priority.value
+    if v is None or str(v).strip() == "":
+        ui.notify("优先级要填数字（留空会被当成 0，多源择优时这个源就永远挑不中了）", type="warning")
+        return True
+    try:
+        int(v)
+    except (TypeError, ValueError):
+        ui.notify("优先级只能填数字", type="warning")
+        return True
+    return False
+
+
 def render_sources() -> None:
     """把源管理 UI 渲染进当前容器（由调用方套 frame）。"""
     ui.label("每个组 = feed（nyaa 用户名或完整 RSS URL）+ 策略 + 优先级。"
@@ -66,14 +84,16 @@ def render_sources() -> None:
             if not name.value or not feed.value:
                 ui.notify("名字和 feed 不能为空", type="warning")
                 return
+            if _bad_priority(priority):
+                return
             if not anime.update_source_group(
                 gid, name=name.value.strip(), site=site.value, policy=policy.value,
                 priority=int(priority.value or 0), enabled=bool(enabled.value),
                 feed=feed.value.strip(), subgroups=(subgroups.value or "").strip(),
                 title_filter=(tfilter.value or "").strip(),
             ):
-                ui.notify(f"保存失败：已有叫『{name.value.strip()}』的源组，换个名字",
-                          type="warning")
+                ui.notify(f"保存失败：多半是已有叫『{name.value.strip()}』的源组（换个名字），"
+                          "也可能是某个字段太长写不进库——具体原因看 /logs", type="warning")
                 return
             group_list.refresh()
             ui.notify("已保存（下一轮生效）")
@@ -97,14 +117,16 @@ def render_sources() -> None:
             if not name.value or not feed.value:
                 ui.notify("名字和 feed 不能为空", type="warning")
                 return
+            if _bad_priority(priority):
+                return
             if not anime.add_source_group(
                 name.value.strip(), site.value, feed.value.strip(),
                 policy.value, int(priority.value or 0),
                 subgroups=(subgroups.value or "").strip(),
                 title_filter=(tfilter.value or "").strip(),
             ):
-                ui.notify(f"添加失败：已有叫『{name.value.strip()}』的源组，换个名字",
-                          type="warning")
+                ui.notify(f"添加失败：多半是已有叫『{name.value.strip()}』的源组（换个名字），"
+                          "也可能是某个字段太长写不进库——具体原因看 /logs", type="warning")
                 return
             group_list.refresh()
             ui.notify("已添加（下一轮生效）")

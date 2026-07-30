@@ -5,6 +5,7 @@
 import asyncio
 import re
 from contextlib import contextmanager
+from html import escape
 
 from nicegui import Client, context, ui
 from sqlalchemy.exc import InterfaceError, OperationalError
@@ -231,8 +232,11 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
         with ui.row().classes("gap-4 items-start w-full flex-col sm:flex-row sm:flex-nowrap"):   # 窄屏竖排；宽屏三列不换行(长标题在中列内换行、不把评分挤下去)
             # 左列：海报原图完整（不裁）——锁定高度、宽度随图片自然比例走（原生 img：高定死、宽 auto）
             if cover_url:
-                ui.html(f'<img src="{cover_url}" style="height:18.5rem;width:auto" '
-                        f'class="rounded">').classes("shrink-0 w-fit")
+                # cover_url 来自 bgm 接口（第三方、不可信）。ui.html 是原样注入，不转义的话
+                # 一个引号就能闭合 src 属性、往 <img> 上挂任意属性（onerror=… 即 XSS）。
+                # 这里仍用原生 img 而不是 ui.image：本列要的是"高定死、宽随比例"，q-img 做不到。
+                ui.html(f'<img src="{escape(cover_url, quote=True)}" '
+                        f'style="height:18.5rem;width:auto" class="rounded">').classes("shrink-0 w-fit")
             # 中列：两列 kv 网格 + bgm 链接。self-stretch 让本列撑到封面等高，bgm 链接 mt-auto 贴底
             with ui.column().classes("gap-1 grow min-w-0 self-stretch"):
                 with ui.grid(columns=2).classes("w-full gap-x-8 gap-y-1 items-baseline").style(

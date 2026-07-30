@@ -76,6 +76,19 @@ _TAG_BLK_RE = re.compile(r"[\[【][^\]】]*[\]】]")
 _PROMO_RE = re.compile(r"★[^★]*★")
 
 
+# 单条种子标题的长度上限。真实标题一般 60~150 字符，300 已是极端；这里给到 512 纯属留余量。
+# 为什么必须有这道闸：标题来自第三方 RSS（不可信输入），而本模块多条正则是"先 findall/sub 再逐段
+# 处理"的写法，对超长输入是超线性的——一条几百 KB 的畸形标题就能让解析在事件循环里空转很久，
+# 而采集是常驻协程，一次卡住就是"好几天没更新了"。截断只影响那条畸形标题的可读性，不影响正常条目。
+MAX_TITLE_LEN = 512
+
+
+def clip_title(raw: str) -> str:
+    """把 RSS 给的标题截到 MAX_TITLE_LEN。各 source 的 _parse 一进门就调它（唯一入口）。"""
+    raw = raw or ""
+    return raw if len(raw) <= MAX_TITLE_LEN else raw[:MAX_TITLE_LEN]
+
+
 def is_batch(title: str) -> bool:
     """批量/合集/蓝光/连续集范围帖——各源共用，抓到就丢。"""
     if _BATCH_RE.search(title):

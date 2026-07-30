@@ -14,7 +14,7 @@ import httpx
 import config
 from services import fetch
 from sources.base import ParsedItem, Source
-from sources.parse import (candidate_names, estimate_premiere, extract_episode_abs,
+from sources.parse import (candidate_names, clip_title, estimate_premiere, extract_episode_abs,
                            extract_quarter, is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
@@ -71,7 +71,7 @@ class NyaaSource(Source):
 
     def _parse(self, entry) -> ParsedItem | None:
         try:
-            raw_title = entry.title
+            raw_title = clip_title(entry.title)   # 第三方标题，先截长（理由见 parse.clip_title）
             info_hash = (entry.get("nyaa_infohash") or "").strip().lower()
             if not _HEX40_RE.fullmatch(info_hash):
                 return None  # 必须是 40 位 hex：既能跨源去重，也防脏 hash 注入 qB 的 '|' 分隔符

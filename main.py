@@ -4,8 +4,18 @@
 """
 import asyncio
 import logging
+import sys
 
-from nicegui import app, ui
+# 【版本闸放在最前面，早于任何业务导入】网络层全靠 asyncio.timeout 做总超时（services/fetch.py、
+# services/enrich.py、engine.fetch_torrent_bytes），而它是 Python 3.11 才有的。3.10 上模块能导入、
+# 页面能开、设置能存——只有每次真去抓取时才抛 AttributeError，且被各处的宽 except 收成一行日志：
+# 表现正是下面 _startup 注释最忌的那种"看着一切正常，实则什么都没在跑"。宁可起不来，也别假装正常。
+if sys.version_info < (3, 11):
+    raise SystemExit(
+        f"需要 Python ≥ 3.11，当前是 {sys.version.split()[0]}。"
+        "（网络层用了 3.11 的 asyncio.timeout；在 3.10 上界面能开但采集/识别/下载会全部静默失败）")
+
+from nicegui import app, ui  # noqa: E402
 
 import config
 import pages  # noqa: F401  导入即注册页面

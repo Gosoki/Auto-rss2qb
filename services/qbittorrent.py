@@ -184,14 +184,15 @@ class QBittorrent:
             "添加下载任务未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:200], save_path)
         return False
 
-    async def add_url(self, url: str, save_path: str, category: str, tags: str) -> bool:
-        """把 magnet 链接（或 http .torrent 链接）交给 qB 自己抓取下载（urls= 参数）。成功回 True。
-        用于手动下载的 magnet：qB 支持 urls 收 magnet/URL；判成功同 add_torrent（见 _add_accepted）。"""
+    async def add_url(self, url: str, save_path: str, category: str, tags: str) -> bool | None:
+        """把 magnet 链接（或 http .torrent 链接）交给 qB 自己抓取下载（urls= 参数）。
+        三态与 add_torrent 完全一致：True=已受理 / False=qB 明确拒了 / None=根本没连上
+        （理由见 add_torrent 的说明；两者揉成 False 会让调用方把『qB 掉线』误诊成『种子有问题』）。"""
         data = {"urls": url, "savepath": save_path, "autoTMM": "false", "paused": "false",
                 "category": category, "tags": tags}
         resp = await self._request("POST", "/api/v2/torrents/add", data=data)
         if resp is None:
-            return False
+            return None
         if _add_accepted(resp):
             return True
         (log.warning if resp.status_code == 200 else log.error)(

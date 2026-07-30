@@ -50,4 +50,10 @@ async def get_text(client: httpx.AsyncClient, url: str, *,
                 buf += chunk
                 if len(buf) > cap:
                     raise TooLarge(f"响应体超过 {cap} 字节上限：{url}")
-            return bytes(buf).decode(enc, "replace")
+            try:
+                return bytes(buf).decode(enc, "replace")
+            except LookupError:
+                # 字符集名来自第三方响应头（Content-Type: charset=xxx），是不可信输入：
+                # 编造一个不存在的编码名就能让 decode 抛 LookupError——它不属 httpx 异常族，
+                # 会从各调用点的 except httpx.HTTPError 里漏出去打断整轮采集。回落 utf-8 照常解。
+                return bytes(buf).decode("utf-8", "replace")

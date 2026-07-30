@@ -20,8 +20,8 @@ import httpx
 import config
 from services import fetch
 from sources.base import ParsedItem, Source
-from sources.parse import (SEASON_CN, candidate_names, estimate_premiere, extract_episode_abs,
-                           extract_quarter,
+from sources.parse import (SEASON_CN, candidate_names, clip_title, estimate_premiere,
+                           extract_episode_abs, extract_quarter,
                            is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
@@ -83,7 +83,7 @@ class MikanSource(Source):
 
     def _parse(self, entry) -> ParsedItem | None:
         try:
-            raw_title = entry.title
+            raw_title = clip_title(entry.title)   # 第三方标题，先截长（理由见 parse.clip_title）
             info_hash = _hash_from_link(entry.get("link", ""))
             if not _HEX40_RE.fullmatch(info_hash):
                 return None  # 必须是 40 位 hex，才能与 nyaa 的 hash 精确对齐去重
@@ -155,11 +155,6 @@ def season_cn(quarter_letter: str) -> str:
     return SEASON_CN.get(quarter_letter, "")
 
 
-async def _get_text(client: httpx.AsyncClient, url: str) -> str:
-    """Mikan 页面取文本：同样封顶 + 总超时（季度浏览页是第三方 HTML，不可信输入）。"""
-    return await fetch.get_text(client, url)
-
-
 def _parse_movie_bucket(htm: str) -> list[tuple[str, str, str]]:
     """从季度浏览页 HTML 抽剧场版/OVA 块：返回 [(mikan_id, 展示名, 桶标签)]。
 
@@ -186,13 +181,13 @@ async def discover_movie_bucket(client, year: int, season_letter: str) -> list[t
         return []
     url = (f"{config.MIKAN_BASE}/Home/BangumiCoverFlowByDayOfWeek"
            f"?year={year}&seasonStr={quote(scn)}")
-    htm = await _get_text(client, url)
+    htm = await fetch.get_text(client, url)
     return _parse_movie_bucket(htm)
 
 
 async def fetch_detail(client, mikan_id: str) -> int | None:
     """Mikan 番组详情页 → bgm_id（取不到返回 None）。剧场版只需 bgm 精确联动键，不接字幕组白名单。"""
-    htm = await _get_text(client, f"{config.MIKAN_BASE}/Home/Bangumi/{mikan_id}")
+    htm = await fetch.get_text(client, f"{config.MIKAN_BASE}/Home/Bangumi/{mikan_id}")
     bm = _BGM_RE.search(htm)
     return int(bm.group(1)) if bm else None
 
@@ -207,7 +202,7 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
     items: list[ParsedItem] = []
     for entry in feed.entries:
         try:
-            raw_title = entry.title
+            raw_title = clip_title(entry.title)   # 第三方标题，先截长（理由见 parse.clip_title）
             info_hash = _hash_from_link(entry.get("link", ""))
             if not _HEX40_RE.fullmatch(info_hash):
                 continue

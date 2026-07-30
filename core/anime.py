@@ -10,7 +10,7 @@ import re
 from collections import Counter
 from datetime import datetime, timedelta
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DatabaseError, IntegrityError
 from sqlmodel import func, or_, select
 
 import config
@@ -235,8 +235,14 @@ async def _resolve_anime(item) -> int:
             s.add(AnimeAlias(title=item.anime_title, season=item.season, anime_id=anime.id))
             try:
                 s.commit()
-            except IntegrityError:
+            except DatabaseError:
+                # 捕获 DatabaseError 而不只是 IntegrityError（并发下已存在）：MySQL 侧
+                # anime_alias.title 是 VARCHAR(191)，超长番名（畸形标题解析出来的）写进去抛的是
+                # DataError。只接 IntegrityError 的话它会一路逃到 poll_once 的 per-item except，
+                # 该条目每轮复报一次『处理失败』且永远入不了库（SQLite 上不会，只在 MySQL 上）。
+                # 对照登记失败不致命：番已经建好了，下次同名条目再试一次即可。
                 s.rollback()
+                log.warning("番名对照登记失败（跳过，不影响入库）：%s 第%s季", item.anime_title[:60], item.season)
         return anime.id
 
 
@@ -607,21 +613,27 @@ def _revive_orphaned_skipped() -> None:
             Anime.confirmed == True, Anime.rejected.is_not(True))))  # noqa: E712
         if not auto_ids:
             return
-        rows = list(s.exec(select(AnimeTorrent).where(
+        # 只取判断要用的四列：这一段几乎是全表扫（error+skipped+已处理的全部状态），
+        # 整行 ORM 装配的开销随 sent 行数线性增长，而下面只用到 (id, 番, 集, 状态)。
+        # 真正要改写的那几行在下面按 id 单独取（通常只有个位数）。
+        rows = list(s.exec(select(AnimeTorrent.id, AnimeTorrent.anime_id,
+                                  AnimeTorrent.episode, AnimeTorrent.status).where(
             AnimeTorrent.anime_id.in_(auto_ids),
             AnimeTorrent.status.in_(("error", "skipped") + HANDLED_STATUSES))))
         by_ep: dict = {}
-        for t in rows:
-            by_ep.setdefault((t.anime_id, t.episode), set()).add(t.status)
+        for _tid, aid, ep, st in rows:
+            by_ep.setdefault((aid, ep), set()).add(st)
         # 目标集：有 error，且无 sent/downloading/deleted/stalled（首选已败、该集尚无可用/已删/停滞的下载）。
         # stalled 也算『已处理』→ 不复活兄弟源：停滞的那条留人工处理，不自动换源（与 flush 阻断口径一致）。
         revive = {k for k, sts in by_ep.items()
                   if "error" in sts and not (set(HANDLED_STATUSES) & sts)}
         if not revive:
             return
+        ids = [tid for tid, aid, ep, st in rows if st == "skipped" and (aid, ep) in revive]
         changed = 0
-        for t in rows:
-            if t.status == "skipped" and (t.anime_id, t.episode) in revive:
+        for tid in ids:                    # 只把真要改的那几行取成 ORM 实例
+            t = s.get(AnimeTorrent, tid)
+            if t is not None and t.status == "skipped":
                 t.status = "pending"
                 s.add(t)
                 changed += 1
@@ -661,11 +673,11 @@ async def flush_ready_downloads() -> int:
         # 『该集已有一份』阻断自动换源的集，统一用 HAVE_STATUSES（sent/downloading/stalled）：
         # 含 downloading（在下的交付，不必再挑同集别的）+ stalled（停滞异常，留人工、不自动换源）。
         # 不含 deleted——删的那条不自动回来，但同集来新 hash 仍允许自动下（非整集拉黑）。
-        have_eps = {
-            (t.anime_id, t.episode)
-            for t in s.exec(select(AnimeTorrent).where(
-                AnimeTorrent.status.in_(HAVE_STATUSES)))
-        }
+        # 【只取两列】这里只要 (番, 集) 这个去重键。整行 ORM 装配是本函数最贵的一步，而 sent 是只增
+        # 不减的终态、行数随挂机线性增长：仓库自测 9700 行时光装配就 150ms（13 条 SQL 本身才 7ms），
+        # 这期间事件循环整个停摆（页面/qB 同步/剧场版扫描一起卡）。列投影后同样的活儿只剩几毫秒。
+        have_eps = set(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode).where(
+            AnimeTorrent.status.in_(HAVE_STATUSES))).all())
         groups: dict = {}
         special_groups: dict = {}          # anime_id -> [特别篇(-1)种子]，按番去重只放一份
         # 只自动放行 pending：error 不在这里无限重试（高优先级失败→本组还有 pending 低优先级自然降级；
@@ -936,12 +948,25 @@ def downloaded_count(anime_id: int) -> int:
     （见 delete_anime_torrent）。口径必须与删除路径逐字一致——否则确认框说"删 3 个"、
     实际只删掉 2 个，或者对一条 downloading 点删除得到『没删成』的假错误提示。
     """
+    return downloaded_counts([anime_id]).get(anime_id, 0)
+
+
+def downloaded_counts(anime_ids) -> dict:
+    """一次 SQL 取多部番的可删文件数 {anime_id: n}（口径与 downloaded_count 完全一致，共用同一组判据）。
+
+    给列表页用：『已忽略』面板要为每部番决定显不显示『删除文件』，逐番调 downloaded_count
+    等于每番开一个 session 打一条 SQL（N+1），而这个面板会被任意操作和 30 秒定时器整体重建。
+    """
+    ids = list(anime_ids)
+    if not ids:
+        return {}
     with get_session() as s:
-        return len(s.exec(select(AnimeTorrent.id).where(
-            AnimeTorrent.anime_id == anime_id,
+        rows = s.exec(select(AnimeTorrent.anime_id, func.count()).where(
+            AnimeTorrent.anime_id.in_(ids),
             AnimeTorrent.status.in_(HAVE_STATUSES),
             AnimeTorrent.status != "downloading",
-        )).all())
+        ).group_by(AnimeTorrent.anime_id)).all()
+    return {aid: n for aid, n in rows}
 
 
 # ---------------- 给 UI 的操作 ----------------
@@ -1076,7 +1101,7 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
             keeper.pref_keyword = loser.pref_keyword
         # 季度：keeper 尚未落盘而 loser 已有在下/已下文件时采用 loser 的季度，
         # 免得合并后新集去了 keeper 的（可能不同）季度目录，与已落盘的旧集散在两处。
-        if loser.quarter and not _has_downloads(s, keeper_id) and _has_downloads(s, loser_id):
+        if loser.quarter and not _has_handled_torrents(s, keeper_id) and _has_handled_torrents(s, loser_id):
             keeper.quarter = loser.quarter
         s.add(keeper)
     for al in s.exec(select(AnimeAlias).where(AnimeAlias.anime_id == loser_id)):
@@ -1090,7 +1115,7 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
     s.commit()
 
 
-def _has_downloads(s, anime_id: int) -> bool:
+def _has_handled_torrents(s, anime_id: int) -> bool:
     """该番是否已下过（在下/已下/停滞/曾删）——有则季度已落盘/曾落盘，不该被重识别改（避免散目录）。
 
     用 HANDLED_STATUSES（sent/downloading/stalled/deleted）：deleted=删过也算季度已定；
@@ -1099,6 +1124,21 @@ def _has_downloads(s, anime_id: int) -> bool:
     return s.exec(select(AnimeTorrent).where(
         AnimeTorrent.anime_id == anime_id,
         AnimeTorrent.status.in_(HANDLED_STATUSES),
+    )).first() is not None
+
+
+def _has_unmovable_files(s, anime_id: int) -> bool:
+    """该番是否有【搬不动】的已下文件：盘上有文件(HAVE)但已归档(archived_at 非空)。
+
+    归档=从 qB 移除只留文件，relocate 明确把这类行排除在外（engine.relocate 的选行带
+    archived_at.is_(None)，注释写明"已归档的不在 qB，setLocation 移不动"）。
+    所以只要存在这种行，改名/改季度就会造成【程序侧再也补救不了】的散目录：新集落新目录、
+    这批文件永久留在旧目录，UI 上没有任何按钮能把它们搬过去。此时宁可不改名。
+    """
+    return s.exec(select(AnimeTorrent).where(
+        AnimeTorrent.anime_id == anime_id,
+        AnimeTorrent.status.in_(HAVE_STATUSES),
+        AnimeTorrent.archived_at.is_not(None),
     )).first() is not None
 
 
@@ -1123,7 +1163,7 @@ async def enrich_anime(anime_id: int) -> bool:
         if a is None:
             return False
         # 无已下集就采用 bgm 季度（纠正种子解析得来的错季度）；有已下集才保留，避免散目录
-        _apply_bgm(a, info, keep_path=_has_downloads(s, anime_id))
+        _apply_bgm(a, info, keep_path=_has_handled_torrents(s, anime_id))
         s.add(a)
         s.commit()
         # 身份守卫：若该 bgm_id 已被别的番占用，合并过来，杜绝同一部番裂成两条
@@ -1147,8 +1187,15 @@ async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
         if a is None:
             return False
         a.confirmed = False  # 绑定后进『待确认』，等人工确认下载
-        # 无已下集就采用 bgm 季度（纠正错季度）；有已下集才保留，避免散目录
-        _apply_bgm(a, info, keep_path=_has_downloads(s, anime_id))
+        # 【显式绑定要能真的纠正名字与季度】原本是 keep_path=_has_handled_torrents(...)，理由写的是
+        # "有已下集才保留，避免散目录"。但那个判据太宽：番一旦下过任何一集（连 deleted 都算）就再也
+        # 改不动番名/季度，只有 bangumi_id 被换成新番的——身份与名字/目录长期互相矛盾，而这是【全项目
+        # 唯一的人工纠名入口】（movies.bind_movie_bgm 早就是 keep_path=False）。
+        # 现在只对【真的搬不动】的情形冻结：本函数的两个调用点（详情页『绑定 bgm』、列表页待识别的
+        # 『绑定』）成功后都会调 maybe_relocate_anime 把已下的集搬到新目录，散目录本该由它兜住——
+        # 唯独【已归档】的行搬不了（不在 qB，relocate 显式排除），那种情况改名就是制造无法补救的散目录。
+        # 自动路径 enrich_anime 的冻结保持原样（那是后台自作主张，更不该动目录）。
+        _apply_bgm(a, info, keep_path=_has_unmovable_files(s, anime_id))
         s.add(a)
         s.commit()
         # 身份守卫：该 bgm_id 已被别的番占用 → 合并过来，杜绝一部番裂成两条
@@ -1625,8 +1672,19 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
         if a_now is None:
             return {"found": len(found), "kept": len(kept), "ingested": 0,
                     "sites": list(site_groups), "error": "该番已被合并或删除，补齐取消"}
+        stolen = 0
         for it in kept:
             if s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == it.info_hash)).first():
+                continue
+            # 【绝不抢别的番的种子】站内搜索是词级 AND，同一字幕组的续作/剧场版/衍生作很容易一起命中，
+            # 而这里是拿 anime_id 硬挂入库、不查对照表。一旦挂错，这条 hash 就被本番占死：真正属于
+            # 它的那部番之后走 process_item 会在 hash 去重处静默 return False，永远收不到它。
+            # 对照表已明确指向【另一部番】的条目一律跳过。这与两个补齐按钮的松紧无关（那是"要不要再做
+            # 番名近似"的取舍），纯粹是归属正确性，两边都该守。
+            owner = s.exec(select(AnimeAlias).where(
+                AnimeAlias.title == it.anime_title, AnimeAlias.season == it.season)).first()
+            if owner is not None and owner.anime_id != anime_id:
+                stolen += 1
                 continue
             s.add(AnimeTorrent(
                 info_hash=it.info_hash, anime_id=anime_id, source=it.source, site=it.site,
@@ -1646,9 +1704,10 @@ async def backfill_source(anime_id: int, strict: bool = False) -> dict:
             s.add(a_now)
             s.commit()
             to_confirm = True
-    log.info("补齐 anime=%s strict=%s：搜到 %d（站 %s）→ 留 %d → 入库 %d",
-             anime_id, strict, len(found), list(site_groups), len(kept), ingested)
-    return {"found": len(found), "kept": len(kept), "ingested": ingested,
+    log.info("补齐 anime=%s strict=%s：搜到 %d（站 %s）→ 留 %d → 入库 %d%s",
+             anime_id, strict, len(found), list(site_groups), len(kept), ingested,
+             f"（另跳过 {stolen} 条：对照表显示属于别的番）" if stolen else "")
+    return {"found": len(found), "kept": len(kept), "ingested": ingested, "stolen": stolen,
             "sites": list(site_groups), "to_confirm": to_confirm}
 
 
@@ -1767,22 +1826,28 @@ def list_source_groups(enabled_only: bool = False) -> list[SourceGroup]:
 
 def add_source_group(name, site, feed, policy, priority, enabled=True,
                      subgroups="", title_filter="") -> bool:
-    """新增源组。组名撞了唯一约束返回 False（调用方据此提示）——不捕获的话 IntegrityError
-    会逃到 NiceGUI 的事件处理器里只落日志，用户侧完全静默，看上去就是『点了没反应』。"""
+    """新增源组。写不进去返回 False（调用方据此提示）——不捕获的话异常会逃到 NiceGUI 的事件
+    处理器里只落日志，用户侧完全静默，看上去就是『点了没反应』。
+
+    捕获 DatabaseError 而不只是 IntegrityError：撞唯一约束（重名）是 IntegrityError，而 MySQL 侧
+    把超长字符串写进 VARCHAR(191) 抛的是【DataError】（同为 DatabaseError 的兄弟类）。只接前者的话，
+    用户粘一条很长的 feed URL / 一大串字幕组白名单，在 SQLite 上能存、切到 MySQL 就静默失败。
+    """
     with get_session() as s:
         s.add(SourceGroup(name=name, site=site, feed=feed, policy=policy,
                           priority=int(priority), enabled=enabled, subgroups=subgroups,
                           title_filter=title_filter))
         try:
             s.commit()
-        except IntegrityError:
+        except DatabaseError as e:
             s.rollback()
+            log.warning("新增源组失败 name=%s: %s", name, str(e).splitlines()[0][:160])
             return False
     return True
 
 
 def update_source_group(gid: int, **fields) -> bool:
-    """改源组。组名改成已存在的名字同样撞唯一约束 → 返回 False，理由同上。"""
+    """改源组。写不进去返回 False，捕获范围与理由同 add_source_group。"""
     with get_session() as s:
         g = s.get(SourceGroup, gid)
         if g is None:
@@ -1792,8 +1857,9 @@ def update_source_group(gid: int, **fields) -> bool:
         s.add(g)
         try:
             s.commit()
-        except IntegrityError:
+        except DatabaseError as e:
             s.rollback()
+            log.warning("保存源组失败 gid=%s: %s", gid, str(e).splitlines()[0][:160])
             return False
     return True
 
