@@ -21,6 +21,11 @@ from sources.parse import extract_quarter
 log = logging.getLogger("autorss")
 
 
+# 单次尝试的总时长上限（秒）。比 ENRICH_TIMEOUT（逐块超时，默认十几秒）宽松得多，
+# 只用来兜住"涓流响应把识别协程挂到天荒地老"这一种情形，正常请求碰不到它。
+_ATTEMPT_TIMEOUT = 90
+
+
 async def _retryable(make_request):
     """执行一次 HTTP 请求；遇瞬时错误(超时/连接/读)按 config.ENRICH_RETRY_TIMES 重试(指数退避)。
 
@@ -30,10 +35,21 @@ async def _retryable(make_request):
     times = max(1, config.ENRICH_RETRY_TIMES)
     for i in range(times):
         try:
-            return await make_request()
+            # 【总超时】httpx 的 timeout 是每次读的、逐块重置，服务端涓流发送就能永久挂住，
+            # 而这是常驻的识别协程。给每次尝试套一个硬上限，和 sources/ 那边同一思路
+            # （那边走 services.fetch；这里调用方要的是 Response 对象，只补总超时即可）。
+            async with asyncio.timeout(_ATTEMPT_TIMEOUT):
+                return await make_request()
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
-                httpx.RemoteProtocolError):
+                httpx.RemoteProtocolError, TimeoutError) as e:
             if i + 1 >= times:
+                # 【必须换成 httpx 的异常类型再抛】本模块所有调用点接的都是 except httpx.HTTPError
+                # （_search_one / _mikan_bridge / _fetch_cast / fetch_by_id / resolve），
+                # 而 asyncio.timeout 抛的 TimeoutError 是 OSError 的子类、不在那一支里，
+                # 直接抛会穿透【全部】兜底，把"尽力而为、拿不到返回 None"的契约变成崩溃，
+                # 进而掀翻整条识别链路（本模块 docstring 明写"绝不阻断主下载链路"）。
+                if isinstance(e, TimeoutError) and not isinstance(e, httpx.TimeoutException):
+                    raise httpx.TimeoutException(f"整体超时（{_ATTEMPT_TIMEOUT}s）") from e
                 raise
             await asyncio.sleep(0.5 * (2 ** i))   # 0.5s → 1s → 2s …
 
