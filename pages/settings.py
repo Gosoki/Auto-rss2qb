@@ -19,7 +19,17 @@ _NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_S
             "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES",
             "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT", "DB_MYSQL_PORT"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
-_RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}  # 绑监听地址/端口，仍走 .env、改了要重启；其余都进 DB 即时生效
+# 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
+_RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
+
+
+def _env_values() -> dict:
+    """读 .env 的当前值（供 _RESTART_ONLY 那两项渲染用）。文件不在/读不动就回空，调用方自行回落。"""
+    try:
+        from dotenv import dotenv_values
+        return {k: v for k, v in dotenv_values(config.ENV_PATH).items() if v is not None}
+    except Exception:
+        return {}
 
 
 def _valid_host(v: str) -> bool:
@@ -242,6 +252,16 @@ def _db_panel(f: dict) -> None:
                 ui.notify(f"切换失败，已留在原库：{type(e).__name__}: {str(e)[:160]}", type="negative")
             return
         config.set_many({"DB_BACKEND": "mysql" if to_mysql else "sqlite"})
+        # 【新库要补业务初始化】switch_data_engine 只负责建表/升版本。切到一个全新空库后
+        # sourcegroup 是空的 → build_sources() 返回空列表 → 采集循环每轮抓 0 个源、
+        # 一条日志都不报，用户只会觉得"切完就再也不更新了"，重启进程才恢复。
+        # reset_leftovers=False：可能有交付协程正卡在 await，把它的 downloading 占位打回 pending
+        # 会当场解除集去重（理由见 worker.init_business_state 文档）。
+        try:
+            worker.init_business_state(reset_leftovers=False)
+        except Exception as e:
+            ui.notify(f"已切库，但业务初始化失败（源组可能为空）：{type(e).__name__}: {str(e)[:120]}",
+                      type="warning")
         _status.refresh()
         ui.notify(f"已切到 {db.data_target_desc()}（数据未改动）。刷新页面看新库内容。", type="positive")
 
@@ -418,8 +438,10 @@ def settings():
                         cmd = (f'curl -s -X POST "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
                                + (f'&t={tok}' if tok else '') + '"')
 
-                        async def _copy(c=cmd):
-                            await ui.clipboard.write(c)
+                        def _copy(c=cmd):
+                            # ui.clipboard.write 是同步函数（返回 None），await 它必抛 TypeError，
+                            # 于是下面那句成功提示【永远不会执行】，每点一次还刷一条 traceback。
+                            ui.clipboard.write(c)
                             ui.notify("已复制命令到剪贴板", type="positive")
 
                         with ui.row().classes("items-center gap-2 w-full no-wrap"):
@@ -464,10 +486,38 @@ def settings():
             _section("Web 访问",
                      "绑定地址：127.0.0.1=仅本机；0.0.0.0=整个局域网可访问。改绑定地址/端口写 .env、需重启；"
                      "非法地址保存时会被拦下，留空=回落 127.0.0.1。")
+            # 【这两项要读 .env 的当前值，不能读内存】它们是 _RESTART_ONLY：保存只写 .env，
+            # 而 config.WEB_HOST/WEB_PORT 是进程启动时读的、代表"现在实际绑着的"，不会跟着变。
+            # 若表单渲染内存值：改成 8081 保存 → .env=8081、内存仍 8080 → 页面重新渲染后框里又是 8080
+            # → 再点一次保存就把 .env 悄悄写回 8080，用户的改动【静默丢失】。
+            # 反过来也不能把 .env 的值灌回 config：那会让 config.WEB_PORT 从"实际绑着的端口"
+            # 变成"重启后才生效的端口"，而上面那条 qB 完成回调命令正是拿它拼的，
+            # 改完没重启就会给出一条指向【没人监听的端口】的命令。两个语义必须分开。
+            # 【.env 里的值必须先过校验再往框里放】否则会把用户锁死：_save 对绑定地址只认 IP/localhost，
+            # 而 .env 里完全可能是主机名（uvicorn 收得下 'nas.local'）。框里一旦渲染出这种值，
+            # 保存时校验不过 →『已取消保存』→ 这一页【任何】设置都再也存不下去，
+            # 而用户根本想不到是绑定地址那一栏在作梗。校验不过就回落到运行值，并在下面单独提示。
+            _env_now = _env_values()
+            _env_raw_host = _env_now.get("WEB_HOST") or ""
+            _env_host = _env_raw_host if _valid_host(_env_raw_host) else config.WEB_HOST
+            _bad_env_host = bool(_env_raw_host) and not _valid_host(_env_raw_host)
+            try:
+                _env_port = int(_env_now.get("WEB_PORT") or config.WEB_PORT)
+                if not 1 <= _env_port <= 65535:
+                    raise ValueError
+            except (TypeError, ValueError):     # .env 被手改成非数字/越界：回落到运行值，别让整页 500
+                _env_port = config.WEB_PORT
             with ui.element("div").classes("field-grid w-full"):
-                _text("WEB_HOST", "绑定地址", config.WEB_HOST)
-                _num("WEB_PORT", "Web 端口", config.WEB_PORT)
+                _text("WEB_HOST", "绑定地址", _env_host)
+                _num("WEB_PORT", "Web 端口", _env_port)
                 _text("WEB_ALLOW_CIDRS", "允许网段(CIDR)", config.WEB_ALLOW_CIDRS)
+            if _bad_env_host:
+                warn_banner(f".env 里的 WEB_HOST 是 {_env_raw_host!r}，本页只接受 IP 或 localhost，"
+                            f"已用当前实际绑定值 {config.WEB_HOST} 填入。"
+                            "直接保存会把 .env 里那个值覆盖掉；要保留它请手改 .env、别在这里存。")
+            elif (_env_host, _env_port) != (config.WEB_HOST, config.WEB_PORT):
+                warn_banner(f"这两项已改成 {_env_host}:{_env_port}，但当前进程仍绑着 "
+                            f"{config.WEB_HOST}:{config.WEB_PORT} —— 重启后才生效。")
             warn_banner("本工具无鉴权、本页含 qB 密码。绑 0.0.0.0 时用『允许网段』把访问限定在可信内网（如 "
                         "192.168.1.0/24，多个用逗号），即时生效、留空=不限制。本机恒放行；若新网段会把你当前访问挡在门外，"
                         "保存时会被拦下。经反向代理时对端是代理 IP，此项应留空、鉴权交给代理。")
