@@ -43,11 +43,23 @@ def _make_sqlite_engine(path: str):
     return eng
 
 
+MYSQL_CONNECT_TIMEOUT = 5   # 秒。只管【建连接】，不限制查询本身
+
+
 def make_mysql_engine(url: str):
     """建 MySQL 引擎。pool_pre_ping 必开：服务端 wait_timeout(默认 8 小时) 会掐掉空闲长连接，
-    而我们的后台协程正是"长期空闲后突然要查"，不 ping 就会撞 'MySQL server has gone away'。"""
+    而我们的后台协程正是"长期空闲后突然要查"，不 ping 就会撞 'MySQL server has gone away'。
+
+    为什么要收紧 connect_timeout（pymysql 默认已有 10 秒，实测确认）：
+    主机【关机或被防火墙 DROP】时（拒绝连接那种是立刻返回，不算），建连接会一直挂到超时。
+    而建连接是【同步】调用——页面处理器里随手一条查询就能把整个事件循环冻住这么久，
+    界面、下载、qB 同步一起停。看守协程那条路径已经丢进线程池了（见 worker.run_db_watch，
+    实测把界面冻结从 5 秒降到 29 毫秒），但普通查询这条路没有，只能靠超时兜底。
+    5 秒对局域网/常见云库都绰绰有余，最坏卡顿也压到勉强可接受。
+    """
     return create_engine(url, echo=False, pool_pre_ping=True, pool_recycle=3600,
-                         pool_size=5, max_overflow=5)
+                         pool_size=5, max_overflow=5,
+                         connect_args={"connect_timeout": MYSQL_CONNECT_TIMEOUT})
 
 
 # 【顺序要紧】metadata 是 import models 时才被填充的，必须先导入模型、再定型，最后才建引擎/建表。
@@ -66,6 +78,13 @@ engine = meta_engine                          # 业务库：默认与配置同�
 # 全写进本地库，MySQL 回来后这些改动凭空消失，而界面自始至终没有任何异样——比直接停摆危险得多。
 # 想用本地库必须去设置页手动切（那是明确的意思表示，切完 _data_down 自然清空）。
 _data_down = ""
+# 【自愈不了的停摆】与"连不上"分开记：探测通了也不解除，必须人工介入（改配置 / 切库 / 修好再重启）。
+# 目前有两个来源：① 配置参数不全，压根没有正确的库可指；② 启动初始化就失败（建表/迁移抛异常）。
+# 踩过的坑：参数不全时只标 _data_down，而 engine 此时仍是本地 SQLite（没有别的地方可指），
+# 看守协程 30 秒后拿这个引擎探一次 SELECT 1——探的是本地库，必然成功——于是停摆被自动解除，
+# 系统就在【错误的库】上继续跑，正是本文件极力要避免的那种静默回退。
+# 这一条 probe 解不了：只有改完配置、重新走 apply_configured_backend / switch_data_engine 才清除。
+_data_fatal = ""
 
 
 def _tables(meta: bool) -> list:
@@ -177,8 +196,22 @@ def create_mysql_database(host: str, port: int, user: str, password: str,
 
 
 def data_down() -> str:
-    """业务库当前连不上的原因；空串＝正常。全项目判『能不能干活』都读这个。"""
-    return _data_down
+    """业务库当前不可用的原因；空串＝正常。全项目判『能不能干活』都读这个。
+    配置层故障排在前面：它是根因，且自愈不了，先报它才不会误导。"""
+    return _data_fatal or _data_down
+
+
+def mark_data_fatal(reason: str) -> None:
+    """标记【自愈不了】的停摆：看守协程探通了也不会解除它。
+
+    给"探测本身证明不了系统可用"的故障用——比如启动时建表/迁移就失败：
+    此刻 SELECT 1 照样能通（连接是好的），但表结构可能是半截的，让后台跑起来只会到处报错。
+    解除方式只有人工介入：改配置后重新 apply_configured_backend，或手动 switch_data_engine。
+    """
+    global _data_fatal
+    if not _data_fatal:
+        _data_fatal = reason[:200]
+        log.error("业务数据库停摆（需人工处理，不会自动恢复）：%s", _data_fatal)
 
 
 def mark_data_down(reason: str) -> None:
@@ -199,17 +232,31 @@ def probe_data_engine() -> str:
     只在状态【变化】时记日志，否则每 30s 一条会把日志刷爆。
     """
     global _data_down
+    if _data_fatal:
+        # 配置就是错的，engine 根本没指向目标库——此刻去探它，探通了也毫无意义
+        # （多半探的是本地 SQLite），反而会把停摆解除。直接原样返回，等人去改配置。
+        return _data_fatal
     was = _data_down
+    # 【先把引擎快照下来，写结论前再核一次】本函数会被丢进线程池跑（worker.run_db_watch、
+    # 页面的『立即重连』），而 switch_data_engine 在事件循环上随时可能把模块级 engine 换掉。
+    # 不核对的话会出现：探测在【旧库】上失败 → 期间用户切到了新库并成功 →
+    # 这条陈旧结论把刚切好的库标成停摆，而它其实好好的。
+    eng = engine
     try:
-        with engine.connect() as conn:
+        with eng.connect() as conn:
             conn.exec_driver_sql("SELECT 1")
     except Exception as e:
+        if eng is not engine:
+            return ""      # 期间切库了：这次探的是旧库，结论作废，不要污染新状态
         _data_down = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
         if not was:
             log.error("业务数据库连不上，系统停摆（不回退本地库，等它回来）：%s", _data_down)
         return _data_down
-    _data_down = ""
+    if eng is not engine:
+        return ""          # 探的是旧库、期间切走了；新库的状态由 switch_data_engine 自己负责
     if was:
+        # 【顺序要紧】升级跑完了才清停摆标记。本函数会被丢到线程里跑（见 worker.run_db_watch），
+        # 若先清标记再升级，事件循环上的协程会在【迁移进行到一半】时看到"库已恢复"而涌进来查表。
         try:
             init_data_engine()
         except Exception as e:
@@ -217,6 +264,7 @@ def probe_data_engine() -> str:
             log.error("业务数据库回来了，但升级失败，仍停摆：%s", _data_down)
             return _data_down
         log.info("业务数据库已恢复，系统继续：%s", data_target_desc())
+    _data_down = ""
     return ""
 
 
@@ -227,16 +275,19 @@ def apply_configured_backend() -> str:
     引擎照旧指着配置的库、系统标为停摆，应用照常起——配置在本地 SQLite，设置页进得去，
     可以改连接参数或手动切回本地库；MySQL 复活后由 run_db_watch 自动接上，不用重启。
     """
-    global engine, _data_down
+    global engine, _data_fatal
     import config
+    _data_fatal = ""       # 每次重新按配置连都重算，别让上一次的配置错误粘住
     if (config.DB_BACKEND or "sqlite") != "mysql":
         probe_data_engine()
         return data_target_desc()
     url = configured_mysql_url()
     if url is None:
-        _data_down = "DB_BACKEND=mysql 但连接参数不全（去设置页『数据库』补全，或切回本地 SQLite）"
-        log.error("业务数据库停摆：%s", _data_down)
-        return f"停摆 — {_data_down}"
+        # 走【配置层】停摆而不是 _data_down：此刻 engine 仍是本地 SQLite，
+        # 若记成连接层故障，看守协程一探本地库就通过、把停摆解除，系统在错的库上继续跑。
+        _data_fatal = "DB_BACKEND=mysql 但连接参数不全（去设置页『数据库』补全，或切回本地 SQLite）"
+        log.error("业务数据库停摆：%s", _data_fatal)
+        return f"停摆 — {_data_fatal}"
     engine = engine_for(url)      # 只建引擎不连接；连不上也照样指着它，等它回来
     if probe_data_engine():
         return f"停摆 — {data_target_desc()}：{_data_down}"
@@ -276,8 +327,10 @@ def switch_data_engine(url: str | None) -> None:
         raise
     if old is not meta_engine:   # 默认态下 old 就是 meta_engine，不能 dispose（配置还要用它）
         old.dispose()
-    global _data_down
-    _data_down = ""              # 切过来的库刚跑通了迁移，必然是活的；停摆状态就此解除
+    global _data_down, _data_fatal
+    # 切过来的库刚跑通了迁移，必然是活的；两种停摆一并解除
+    # （配置层那条也要清：用户在设置页补全参数后正是靠这个动作恢复的）
+    _data_down = _data_fatal = ""
     log.info("业务数据库已切换到：%s", data_target_desc())
 
 

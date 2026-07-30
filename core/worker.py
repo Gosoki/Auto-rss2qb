@@ -56,15 +56,28 @@ async def poll_once() -> None:
         log.error("放行下载异常: %s", e)
 
 
-def init_business_state() -> None:
-    """业务库可用之后必做的一次性初始化。三个操作都幂等，重复调用无害。
+# 【本进程是否还欠一次"启动复位"】只有 main.py 在【启动时业务库就不可用】的那一支会置 True：
+# 那时 init_business_state 被跳过，而库从进程启动起就一直 down、所有后台循环都按 data_down() 空转，
+# 所以此刻库里的 downloading 必定是【上个进程】留下的残骸，复位它们是安全且必须的。
+# 默认 False：运行中掉线再恢复、以及切库，都可能有交付协程正卡在 await（取种最长 180s），
+# 打回 pending 会当场解除集去重 → 同一集被两个源各下一份到同一目录。
+_startup_reset_pending = False
 
-    启动时库是通的就直接调；【停摆着启动】则由 run_db_watch 探到库回来后补调——
-    否则这些复位永远不做，上次遗留的 downloading 会一直卡着。
+
+def init_business_state(reset_leftovers: bool = True) -> None:
+    """业务库可用之后必做的初始化。三个操作都幂等，重复调用无害。
+
+    reset_leftovers 的取值规则见上面 _startup_reset_pending 的说明：
+    只有"进程启动时库就不可用、现在才首次可用"这一种情形才该复位遗留的 downloading。
+    这些残骸没有第二条出路——sync_qb_status 显式跳过 downloading 行（交付协程独占），
+    而 downloading ∈ HAVE_STATUSES，集去重闸会认定该集"已有一份"，flush/补下都不会再碰它。
     """
+    global _startup_reset_pending
     anime.seed_source_groups()          # 首启种入 ANi/Mikan 两个源组
-    anime.reset_downloading()           # 复位上次遗留的 downloading（TV）
-    movies.reset_downloading()          # 复位上次遗留的 downloading（剧场版）
+    if reset_leftovers:
+        anime.reset_downloading()       # 复位上次遗留的 downloading（TV）
+        movies.reset_downloading()      # 复位上次遗留的 downloading（剧场版）
+        _startup_reset_pending = False  # 复位成功才清；失败则下一次探测继续尝试
     engine.backfill_legacy_progress_once()   # 一次性：历史 sent 标记为已完成
 
 
@@ -78,9 +91,15 @@ async def run_db_watch() -> None:
     was_down = bool(db.data_down())
     while True:
         try:
-            now_down = bool(db.probe_data_engine())
+            # 【必须丢到线程里】建连接是同步调用：目标主机关机或被防火墙 DROP 时，
+            # TCP 连接要挂到超时才返回（已用 db.MYSQL_CONNECT_TIMEOUT 压到 5 秒，但仍是 5 秒），
+            # 直接 await 不了的同步调用会把整个事件循环卡死——页面、下载、qB 同步一起停。
+            now_down = bool(await asyncio.to_thread(db.probe_data_engine))
             if was_down and not now_down:
-                init_business_state()   # 停摆期间漏掉的初始化，这会儿补上
+                # 补跑停摆期间漏掉的初始化。是否复位遗留的 downloading 看本进程欠不欠那一次：
+                # 【启动时就停摆】→ 欠（main.py 跳过了初始化，且此刻不可能有交付协程在跑）；
+                # 【运行中掉线又回来】→ 不欠（可能有协程正卡在 await，打回 pending 会重复下载）。
+                init_business_state(reset_leftovers=_startup_reset_pending)
             was_down = now_down
         except Exception as e:          # 探测自己出岔子也别让看守协程死掉，否则永远发现不了恢复
             log.error("数据库看守异常: %s", e)
