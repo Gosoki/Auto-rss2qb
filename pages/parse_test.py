@@ -14,6 +14,9 @@ _EXAMPLES = [
     ("大组·正常", "[ANi] 葬送的芙莉莲 - 07 [1080P][Baha][WEB-DL][AAC AVC][CHT][MP4]"),
     ("大组·续作季", "[Lilith-Raws] 药屋少女的呢喃 第二季 - 15 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4]"),
     ("版本号 v2", "[绿茶字幕组&LoliHouse] 世界在起舞 / The World Is Dancing - 01v2 [WebRip 1080p HEVC-10bit AAC]"),
+    ("集号后还带分隔符", "[三明治摆烂组] 才女的侍从 在满是高岭之花的贵族学校暗中照顾（毫无生活自理能力的）"
+     "学院第一大小姐 / Saijo no Osewa / 才女のお世话 - 05 - [简日内嵌][AVC 8bit 1080P]"),
+    ("组名带『搬运』", "[天月搬运组] 番剧名 / Bangumi Mei - 05 [1080P][MP4][简日双语]"),
     ("中文数字集", "[某字幕组] 某番 第二十三话 [1080p][简繁内封]"),
     ("特例·。44:", "[LoliHouse] 死亡遊戯で飯を食う。44:CLOUDY BEACH [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"),
     ("BD盘(合集)", "[BDMV] 葬送のフリーレン | Sousou no Frieren | Frieren: Beyond Journey's End"),

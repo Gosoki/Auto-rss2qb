@@ -39,41 +39,66 @@ ONE_COUR = 12
 #   误判成范围而丢单集；裸范围两侧还须被【非连字符】的非字母数字包围，才不把 "x264-10bit" 的 "264-10"、
 #   或日期 "[2024-05-10]" 的 "05-10" 误判成范围（相邻连字符＝编码残段/日期分段，都不是合集）。
 _BATCH_RE = re.compile(
-    r"合集|整理|搬运|BD-?RIP|BDMV|BD\s?Remux|\bBatch\b|Vol\.\s*\d+|\bTV\s*\+\s*SP\b|第\s*\d+\s*[巻卷]"
+    r"合集|BD-?RIP|BDMV|BD\s?Remux|\bBatch\b|Vol\.\s*\d+|\bTV\s*\+\s*SP\b|第\s*\d+\s*[巻卷]"
     r"|(?<![A-Za-z])EP\d{1,3}\s*[-~〜]\s*\d{1,3}", re.I)
+# 『搬运/整理』只在【剥掉开头 [组] 块之后】的正文里才算合集信号——这两个词同样是组名的常用字
+# （天月搬运组、XX整理组…），按整条标题匹配等于把这些组的【每一条单集】都当合集丢掉，
+# 表现是"某个组一集都收不到"，而且丢在 _parse 最前面、日志里连条记录都没有。
+# BDMV/BDRIP 这些不能挪进来：'[BDMV] 番名' 的关键词本来就在开头那个块里。
+_BATCH_BODY_RE = re.compile(r"搬运|搬運|整理")
 # 裸集号范围(01-12/01~12)：连续集合集。单独拆出 + 在 is_batch 里守卫：标题能抽出单集集号时(如
 # '[组] Show - 24 (最終回 23-24 総集編)' 的 '23-24')多是注解而非合集范围，不当合集静默丢弃整条。
 _BARE_RANGE_RE = re.compile(r"(?<![-A-Za-z0-9])\d{2,3}\s*[-~〜]\s*\d{2,3}(?![-A-Za-z0-9])")
 
-# 集数识别（按优先级）：'- 07'/'- 11.5'/'- 07v2' → S02E07 → 第07話/第二十三话 → [07]/[07v2]
+# 集数识别（按优先级）：'- 07'/'- 11.5'/'- 07v2' → S02E07 → 第07話/第二十三话 → [07]/[07v2] → EP07
 # 第1条用负向后顾避免吃到范围 01-12 的第二个数，并容忍 v2 版本后缀；第3条兼中文数字；第4条限 1~3 位避免命中 [2024]
 # 完结标记：字幕组常在最终话写 『- 24 END』『- 12 完』『- 13 Fin』，它卡在集号与 [tag] 之间，
 # 早先的收尾锚点容不下它 → 整条落 -2（未知集），最终话永远不会被自动下。
 _FINALE = r"(?:\s*(?:END|FIN|COMPLETE|完|終|终|エンド))?"
+# 集号右界：行尾 / 标签块起始 / 【当分隔符用的】连字符。
+# 第三种是因为『[组] 番名 - 05 - [简日内嵌][AVC 8bit 1080P]』这类写法——集号后面【还有一个分隔符】
+# 才接标签块。旧的右界只认 行尾/左括号，这类标题整条落 -2（未识别）：不自动下、堆进"待识别"，
+# 而且 _EP_TAIL_RE 同样锚不到 → 番名脏成 '番名-05-'，别名键与 bgm 搜索词一起废掉。
+# 连字符后面若紧跟一个【裸集号】(‘- 01 - 12’) 就不认：那是连续集范围(合集)，不是"集号+分隔符"。
+# 判据是"数字后面不再跟字母数字"——1080P/720P/4K 这些带字母尾巴的不算裸集号，
+# 所以 '- 05 - 1080P AVC' 这种没有标签块的写法照样能认出 05。
+_EP_END = r"\s*(?:$|[\[【(（]|[-–—](?!\s*\d{1,3}(?![0-9A-Za-z])))"
 _EP_PATTERNS = [
-    re.compile(r"(?<!\d)-\s*(\d{1,4}(?:\.\d+)?)(?:\s*[vV]\d+)?" + _FINALE + r"\s*(?:$|[\[【(（])",
-               re.I),
+    # 左分隔符连 – — 一起认（右界本来就认）：偶有组用长破折号写『番名 – 05 [1080p]』。
+    # 收尾锚点仍是 _EP_END，所以副标题里的 '—2nd Season' 照旧吃不到（后面不是 行尾/括号/分隔符）。
+    re.compile(r"(?<!\d)[-–—]\s*(\d{1,4}(?:\.\d+)?)(?:\s*[vV]\d+)?" + _FINALE + _EP_END, re.I),
     re.compile(r"[Ss]\d{1,2}[Ee](\d{1,3})"),
     re.compile(r"第\s*([一二三四五六七八九十]+|\d+(?:\.\d+)?)\s*[话話集]"),
     re.compile(r"[\[【](\d{1,3}(?:\.\d+)?)(?:[vV]\d+)?[\]】]"),
+    # EP07 / Episode 7 / [EP07]：放最后当兜底（上面四条都认不出才轮到它）。
+    # 前面禁字母数字，免得吃到 'Deep 3' 的 ep、'S02EP07' 由第 2 条先管。
+    re.compile(r"(?<![A-Za-z0-9])(?:EP|Episode)\s*\.?\s*(\d{1,3})(?!\d)", re.I),
 ]
 # 常见视频扩展名后缀（ANi 等种子名带 .mp4/.mkv 结尾，先剥掉再抽集数段，否则 '- 07 .mp4' 的集数段锚不到行尾）
 _EXT_RE = re.compile(r"\.(mp4|mkv|avi|ts|flv|rmvb|wmv|mov|m2ts|webm)\s*$", re.I)
-# 从番名里剥掉的集数段：锚定到『空格-空格数字(可带 v2)后接括号或行尾』，别吃副标题里的 -2nd
-_EP_TAIL = (r"\s-\s*\d{1,4}(?:\.\d+)?(?:\s*[vV]\d+)?" + _FINALE + r"\s*(?:$|[\[【(（])")
+# 从番名里剥掉的集数段：锚定到『空格-空格数字(可带 v2)后接括号/行尾/分隔连字符』，别吃副标题里的 -2nd
+_EP_TAIL = (r"\s[-–—]\s*\d{1,4}(?:\.\d+)?(?:\s*[vV]\d+)?" + _FINALE + _EP_END)
 _EP_TAIL_RE = re.compile(_EP_TAIL, re.I)        # 预编译（_clean_for_search 用）
 # 【必须与 _EP_TAIL_RE 同样带 re.I】它们复用同一个 _EP_TAIL 字符串，而完结标记里有 END/FIN/Complete
 # 这些字母：少了 re.I 就会出现"集号认出来了、番名却没洗干净"的半吊子——
 # '[ANi] Some Show - 24 Fin' 的集号是 24（_EP_PATTERNS 带 re.I），番名却留成 'SomeShow-24Fin'，
 # 而番名是别名键，等于给同一部番造了个新身份。
+# 不带季号的集号写法（第07话 / EP07）——与 _EP_PATTERNS 对齐：集号认得出来，就要从名字里洗得掉。
+_EP_MARK = (r"第\s*(?:[一二三四五六七八九十]+|\d+)\s*[话話集]", r"(?<![A-Za-z0-9])EP\s*\.?\s*\d{1,3}(?!\d)")
 _STRIP_PATTERNS = [re.compile(p, re.I) for p in (     # 预编译（_clean_name 循环用）
-    _EP_TAIL, r"[Ss]\d{1,2}[Ee]\d{1,3}", r"第\s*(?:[一二三四五六七八九十]+|\d+)\s*[话話集]")]
+    _EP_TAIL, r"[Ss]\d{1,2}[Ee]\d{1,3}", *_EP_MARK)]
+# 搜 bgm 用的同款集号段，但【不含 S02E07】：那条带着季号，留在搜索词里有助于命中正确的季条目
+# （_clean_for_search 的既定策略就是"去集号、留季标记"）。
+_SEARCH_STRIP_PATTERNS = [re.compile(p, re.I) for p in (_EP_TAIL, *_EP_MARK)]
 # 标签块 [..]/【..】（含空括号，整体替换）——_clean_name/_clean_for_search/parse_multibracket 共用。
 # 勿与 _INNER_BLK(带捕获组、+ 不匹配空括号) 混用：对空括号 [] 的 sub 结果不同。
 _TAG_BLK_RE = re.compile(r"[\[【][^\]】]*[\]】]")
 # 宣传标记『★07月新番★』（喵萌等）：它后面紧跟的 [ 会因语言分段被切走而失去右括号，
 # _TAG_BLK_RE 要求成对故删不掉，残留在番名里污染 别名键 与 bgm 搜索词。
-_PROMO_RE = re.compile(r"★[^★]*★")
+# 收尾星号可缺：有的组只写单边（'[漫貓字幕組]★04月新番[番名][05]…'）。少了这一支，整条标题
+# 洗完只剩 '★04月新番'——它会被当成番名建库，等于每个季度给每个这种组造一部假番。
+# 右界同时收在 [ 【 上：不是"吃到下一个星号为止"，免得没有收尾星时把后面的番名块一起吞掉。
+_PROMO_RE = re.compile(r"★[^★\[【]*★?")
 
 
 # 单条种子标题的长度上限。真实标题一般 60~150 字符，300 已是极端；这里给到 512 纯属留余量。
@@ -92,6 +117,8 @@ def clip_title(raw: str) -> str:
 def is_batch(title: str) -> bool:
     """批量/合集/蓝光/连续集范围帖——各源共用，抓到就丢。"""
     if _BATCH_RE.search(title):
+        return True
+    if _BATCH_BODY_RE.search(_group_and_body(title)[1]):   # 搬运/整理：只看正文，别被组名带沟里
         return True
     # 裸集号范围(01-12) 仅在标题【抽不出单集集号】时才判合集：标准合集帖(如 'Show 01-12')抽不到单集→判合集；
     # 而 'Show - 24 (23-24 総集編)' 能抽到第24集→那个 23-24 是注解，不误当合集把单集丢掉。
@@ -166,6 +193,7 @@ def extract_episode_abs(text: str) -> int | None:
 
 def extract_episode(text: str):
     """整数集→int，小数集(11.5)→float，中文数字(第二十三话)→int，特别篇/OVA→-1，无法识别→-2。"""
+    text = _EXT_RE.sub("", text)   # 先剥 .mkv/.mp4：'Show - 05.mkv' 的集号段否则锚不到行尾
     for pat in _EP_PATTERNS:
         m = pat.search(text)
         if m:
@@ -284,9 +312,13 @@ def _clean_for_search(s: str) -> str:
     # _clean_name(157) 与 search_query_names(378) 早就在去它，唯独这条路漏了——parse.py:63 的
     # 注释本来就写着它的存在理由是"污染别名键与 bgm 搜索词"。
     s = _PROMO_RE.sub("", _EXT_RE.sub("", _TAG_BLK_RE.sub("", s)))
-    m = _EP_TAIL_RE.search(s)                   # 去 " - 07" 及其后（锚定，不吃 -2nd 副标题）
-    if m:
-        s = s[:m.start()]
+    # 去 " - 07" / "第07话" / "EP07" 及其后（都锚定，不吃 -2nd 副标题）。集号没写在独立括号块里、
+    # 而是贴在名字后面时（'番名 第05话 [1080p]'），只锚 " - 07" 会把集号一起当成搜索词发给 bgm。
+    for pat in _SEARCH_STRIP_PATTERNS:
+        m = pat.search(s)
+        if m:
+            s = s[:m.start()]
+            break
     # 再剥掉首尾【落单】的括号：形如 [猫与龙 / Nekokaburi] 的标题会先被斜杠切成两段，
     # 于是各自剩下半个括号（'[猫与龙' / 'Nekokaburi]'），_TAG_BLK_RE 要成对才认，管不到。
     # 带着半个括号去搜 bgm 是必然搜不中的。
@@ -299,10 +331,9 @@ def candidate_names(raw_title: str) -> list[str]:
     有日文汉字/假名就一并带上（最准）；ANi 一般是 罗马音 + 繁体中文。
     """
     _, body = _group_and_body(raw_title)
-    if _SLASH_RE.search(body):
-        parts = _SLASH_RE.split(body, 1)   # 罗马音段 + 中文段
-    else:
-        parts = [body]
+    # 全拆，不是只拆一刀：三段式『中文 / 罗马音 / 日文』很常见，只拆一刀会把后两段黏成一个候选
+    # （'Saijo no Osewa / 才女のお世话 - 05 -'），既搜不中 bgm，还白白丢掉最准的那个日文原名。
+    parts = _SLASH_RE.split(body) if _SLASH_RE.search(body) else [body]
 
     names: list[str] = []
     for p in parts:
@@ -326,10 +357,13 @@ _INNER_BLK = re.compile(r"[\[【]([^\]】]+)[\]】]")
 # 明显不是番名的块：分类 / 年份 / 画质 / 编码 / 来源 / 语言 / 纯集号——回退挑名字时跳过它们
 _NAME_BLOCK_SKIP = re.compile(
     r"^(?:国漫|国番|日漫|港漫|美漫|新番|完结|補番|补番|\d{4}|\d{1,4}(?:\.\d+)?|"
-    r"\d+P|\d+x\d+|4K|x26[45]|H\.?26[45]|HEVC|AVC|AAC|FLAC|OPUS|DDP|"
+    r"\d+P|\d+x\d+|4K|\d{1,2}\s*bits?|x26[45]|H\.?26[45]|HEVC|AVC|AAC|FLAC|OPUS|DDP|"
     r"GB|BIG5|CHT|CHS|BDRIP|BD|WEB-?RIP|WEB-?DL|Baha|B-?Global|CR|Crunchyroll|"
     r"Bilibili|IQIYI|Netflix|ViuTV|NTV|MKV|MP4|TS|SRT|ASS|"
-    r"简体?|繁體?|日語?|简繁日?|简日|繁日)$", re.I)
+    # 语言块：简/繁/日… 后面常挂 内嵌/内封/外挂/双语（'简日内嵌'『繁日內嵌』）。逐块列举列不完，
+    # 按『语言字 ×1~3 + 可选字幕形式』整体匹配。真番名不会长成这样（'日常' 的 '常' 不在语言字里，
+    # 整块匹配不上 → 不会被误跳过）。
+    r"(?:[简繁中日英港台][体體语語文]?){1,3}(?:内嵌|內嵌|内封|內封|外挂|外掛|双语|雙語|双字|雙字|字幕)?)$", re.I)
 
 
 def _is_skip_block(blk: str) -> bool:
@@ -377,9 +411,11 @@ def parse_multibracket(raw_title: str):
 # 洗完还带括号/促销星 → candidate_names 没洗干净（全括号命名的组），改用 parse_multibracket 的块级候选
 _MANGLED_RE = re.compile(r"[\[\]【】★]")
 # candidate_names 只锚掉『 - 07』式集号，这些写法会整段留在名字里：第03话 / EP03 / - 03 END
+# 末尾允许再挂一个分隔符（'番名 - 05 -'）：清理跑在 strip 之前，不带上它就只剥掉那根光杆连字符、
+# 把 '- 05' 留在搜索词里，去种子站一条都搜不到（补齐该源因此永远空手而归）。
 _EP_LEFT_RE = re.compile(
     r"\s*(?:第\s*\d{1,4}\s*[话話集]|\b(?:EP|Episode)\s*\.?\s*\d{1,3}\b|"
-    r"[-–]\s*\d{1,3}(?:\.\d+)?\s*(?:END|FIN|完结?)?\s*$)", re.I)
+    r"[-–—]\s*\d{1,3}(?:\.\d+)?\s*(?:END|FIN|完结?)?\s*[-–—]?\s*$)", re.I)
 
 
 def _split_langs(s: str) -> list[str]:
