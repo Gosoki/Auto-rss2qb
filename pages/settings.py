@@ -561,7 +561,8 @@ def settings():
                      "有工作目录时，番剧/剧场版目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
                      "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，番剧/剧场版须各填【绝对】路径（可不同盘）。"
                      "两侧都空又无工作目录=无处下载、保存拦下。")
-            _text("DOWN_PATH", "工作目录（下载根）", config.DOWN_PATH)
+            _text("DOWN_PATH", "工作目录（下载根）", config.DOWN_PATH,
+                  "必填，如 /mnt/media —— 留空则下载会被拒绝（不会乱下到系统目录）")
             _text("ANIME_DOWN_PATH", "番剧下载目录", config.ANIME_DOWN_PATH, _sub_ph)
             _text("MOVIE_DOWN_PATH", "剧场版下载目录", config.MOVIE_DOWN_PATH, _sub_ph)
             if config.QB_ENABLED and not engine.qb_is_local():

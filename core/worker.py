@@ -12,8 +12,8 @@ from core import engine, movies
 import db
 from core.anime import existing_hashes, flush_ready_downloads, list_source_groups, process_item
 from services.notify import state as notify_state
-from sources.mikan import MikanSource
-from sources.nyaa import NyaaSource, nyaa_feed_url
+from sources import SOURCES
+from sources.nyaa import nyaa_feed_url
 
 log = logging.getLogger("autorss")
 
@@ -36,12 +36,22 @@ def build_sources() -> list:
     for g in list_source_groups(enabled_only=True):
         subs = [x.strip() for x in (g.subgroups or "").split(",") if x.strip()]
         tfilter = [x.strip() for x in (g.title_filter or "").split(",") if x.strip()]
-        if g.site == "nyaa":
-            srcs.append(NyaaSource(g.name, nyaa_feed_url(g.feed), g.policy, g.priority, subs, tfilter))
-        elif g.site == "mikan":
-            srcs.append(MikanSource(g.name, g.feed, g.policy, g.priority, subs, tfilter))
-        else:
+        cls = SOURCES.get(g.site)
+        if cls is None:
             log.warning("未知源类型 %s（组 %s），跳过", g.site, g.name)
+            continue
+        # 【每个组各自兜住】build_sources 是在 poll_once 的 for 语句【之外】求值的，
+        # 所以下面那个 per-source 的 try 够不着这里：一个组构造失败（feed 为空让
+        # nyaa_feed_url raise、或将来别的校验）就会掀翻【整轮采集】——连同 flush_ready_downloads
+        # 一起不跑，而日志里只有一行不含组名的"本轮异常"。
+        # 同一份数据在上面那个未知 site 的分支里只是 warning 跳过，两边口径本就该一致。
+        try:
+            # nyaa 的 feed 可以只填用户名，要先拼成 RSS URL；mikan 的 feed 本来就是 URL。
+            # 这是两个源之间唯一还需要分情况的地方，所以留在这儿而不是塞进源类。
+            url = nyaa_feed_url(g.feed) if g.site == "nyaa" else g.feed
+            srcs.append(cls(g.name, url, g.policy, g.priority, subs, tfilter))
+        except Exception as e:
+            log.error("源组『%s』配置有问题，本轮跳过它（其余源照抓）：%s", g.name, e)
     return srcs
 
 

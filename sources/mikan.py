@@ -1,7 +1,8 @@
 """Mikan（蜜柑计划）整合：① 全站 RSS 发现源（周更番，MikanSource）；② 季度剧场版/OVA 发现（catalog）。
 
-① RSS 源：抓 Mikan Classic 全站 feed，产出标准条目交主流程（默认『待人工确认』）。噪声大，可用
-   MIKAN_SUBGROUPS 白名单收窄。info_hash 从剧集页链接（/Home/Episode/<hash>）取，与 nyaa 精确对齐去重。
+① RSS 源：抓 Mikan Classic 全站 feed，产出标准条目交主流程（默认『待人工确认』）。噪声大，可在
+   『订阅源』页给该组填字幕组白名单收窄（SourceGroup.subgroups）。
+   info_hash 从剧集页链接（/Home/Episode/<hash>）取，与 nyaa 精确对齐去重。
 
 ② 季度剧场版/OVA：周更番走 RSS，剧场版/OVA 不适合，改用 Mikan 季度浏览页发现：
    /Home/BangumiCoverFlowByDayOfWeek?year=..&seasonStr=..  按放送星期分块 + 末尾『剧场版/OVA』桶。
@@ -11,7 +12,7 @@
 import html
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import feedparser
@@ -19,10 +20,8 @@ import httpx
 
 import config
 from services import fetch
-from sources.base import ParsedItem, Source
-from sources.parse import (SEASON_CN, candidate_names, clip_title, estimate_premiere,
-                           extract_episode_abs, kw_match, quarter_of,
-                           is_batch, parse_multibracket, parse_title)
+from sources.base import _HEX40_RE as _BASE_HEX40, ParsedItem, RssSource
+from sources.parse import SEASON_CN, candidate_names, clip_title, parse_title, quarter_of
 
 log = logging.getLogger("autorss")
 
@@ -33,7 +32,7 @@ _ROW_LABEL_RE = re.compile(r'id="data-row-\d+"[^>]*>\s*(.*?)\s*</div>', re.S)
 _BANGUMI_RE = re.compile(r'/Home/Bangumi/(\d+)"[^>]*?title="([^"]*)"')
 _BGM_RE = re.compile(r'bgm\.tv/subject/(\d+)')
 _HASH_FROM_LINK_RE = re.compile(r'/Home/Episode/([0-9a-f]{40})')
-_HEX40_RE = re.compile(r"[0-9a-f]{40}")   # info_hash 校验（每条种子热路径，预编译）
+_HEX40_RE = _BASE_HEX40      # 复用 sources/base 里那一份，别各自留一个拷贝   # info_hash 校验（每条种子热路径，预编译）
 
 
 def _hash_from_link(link: str) -> str:
@@ -56,88 +55,36 @@ def _enclosure(entry) -> str:
 
 # ---------------- ① 全站 RSS 发现源 ----------------
 
-class MikanSource(Source):
+class MikanSource(RssSource):
+    """Mikan 的 RSS 源。除了下面这三样，全部逻辑在 RssSource 里（见那里的说明）。"""
+
     site = "mikan"
+    # Mikan 的 pubDate 【不带时区】（实为北京时间 UTC+8），而 feedparser 一律按 GMT 解释。
+    # 这条知识以前存在 core/engine.py 的 _SITE_TZ 字典里——那是全项目唯一一处
+    # "新增一个源时漏改了不会报错、只是发布时间整天错"的地方，现在收回源自己身上。
+    TZ = timezone(timedelta(hours=8))
 
     def __init__(self, name: str = "Mikan", rss_url: str = "",
                  policy: str = "review", priority: int = 0, subgroups: list | None = None,
                  title_filter: list | None = None):
-        self.name = name
-        self.rss_url = rss_url or config.MIKAN_RSS_URL
-        self.policy = policy
-        self.priority = priority
-        self.subgroups = subgroups or []      # 字幕组白名单（子串匹配组名，空=全部）
-        self.title_filter = title_filter or []  # 标题关键词过滤（标题需含其一，空=不限）
+        # 只为一件事覆写：rss_url 留空时回落到全站 Classic feed（nyaa 没有这个概念）。
+        #
+        # 【与 nyaa 的不对称是有意的，但要提醒】nyaa 的空 feed 是个事故（拼不出用户名 → 全站
+        # firehose），所以那边直接 raise；而 Mikan 的全站 feed 是一个【正当配置】——
+        # 本项目默认种入的 Mikan 组用的就是它，配的是 review 策略（人工确认后才下）。
+        # 真正危险的组合是"空 feed + auto 策略"：那等于自动下载整个 Mikan。
+        # UI 两道闸已经不让存空 feed 了，这里是给直接改库/老数据留的一句提醒。
+        if not rss_url and policy == "auto":
+            log.warning("源组『%s』没填 feed，将订阅 Mikan 全站，而策略是【自动下载】——"
+                        "这几乎肯定不是你想要的，去『订阅源』页填上 feed 或改成人工审核", name)
+        super().__init__(name, rss_url or config.MIKAN_RSS_URL, policy, priority,
+                         subgroups, title_filter)
 
-    async def fetch(self) -> list[ParsedItem]:
-        async with httpx.AsyncClient(**config.http_client_kwargs(30)) as client:
-            content = await fetch.get_bytes(client, self.rss_url)   # 带上限+总超时，理由同 nyaa
+    def _hash_of(self, entry) -> str:
+        return _hash_from_link(entry.get("link", ""))
 
-        feed = feedparser.parse(content)
-        items = []
-        for entry in feed.entries:
-            item = self._parse(entry)
-            if item is not None:
-                items.append(item)
-        return items
-
-    def _parse(self, entry) -> ParsedItem | None:
-        try:
-            raw_title = clip_title(entry.title)   # 第三方标题，先截长（理由见 parse.clip_title）
-            info_hash = _hash_from_link(entry.get("link", ""))
-            if not _HEX40_RE.fullmatch(info_hash):
-                return None  # 必须是 40 位 hex，才能与 nyaa 的 hash 精确对齐去重
-
-            if is_batch(raw_title):
-                return None  # 批量/合集帖
-            if self.title_filter and not any(kw_match(k, raw_title) for k in self.title_filter):
-                return None  # 标题不含所需关键词（如按语言 繁日/简日 过滤）
-
-            group, anime_title, season, episode = parse_title(raw_title)
-            search_names = candidate_names(raw_title)
-            if not anime_title and config.ANIME_MULTIBRACKET_PARSE:
-                mb = parse_multibracket(raw_title)   # 开关开：全括号命名回退捕获番名
-                if mb:
-                    anime_title, search_names = mb
-            # 白名单：子串匹配，兼顾联合发布（如 "喵萌奶茶屋&LoliHouse"）
-            # 【与标题关键词同口径：大小写不敏感】紧邻下面那行的 title_filter 早已改成 kw_match，
-            # 唯独这里还是裸 in —— 用户填 lolihouse 而站上写 LoliHouse，该源组每轮全灭，
-            # 日志只有一行"0 条"，没有任何指向。与 R2 判为 P1 的那条是逐字相同的失效模式。
-            if self.subgroups and not any(kw_match(g, group) for g in self.subgroups):
-                return None
-            if not anime_title:
-                return None
-            download_url = _enclosure(entry)
-            if not download_url:
-                return None
-
-            release_time = None
-            pp = entry.get("published_parsed")
-            if pp:
-                release_time = datetime(*pp[:6])
-            quarter = ""
-            if release_time is not None:
-                quarter = quarter_of(estimate_premiere(release_time, episode, season))
-
-            return ParsedItem(
-                info_hash=info_hash,
-                raw_title=raw_title,
-                anime_title=anime_title,
-                season=season,
-                episode=episode,
-                quarter=quarter,
-                release_time=release_time,
-                download_url=download_url,
-                source=group or self.name,
-                site="mikan",
-                source_kind=self.policy,
-                priority=self.priority,
-                search_names=search_names,
-                episode_abs=extract_episode_abs(raw_title),
-            )
-        except Exception as e:
-            log.error("Mikan 解析失败: %s - %s", e, entry.get("title", "?"))
-            return None
+    def _url_of(self, entry) -> str:
+        return _enclosure(entry)
 
 
 # ---------------- ② 季度剧场版/OVA 发现（catalog） ----------------
@@ -201,12 +148,18 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
     剧场版/OVA 常无规范集号，episode 允许 -1/-2；不做批量/字幕组过滤（剧场版逐版本人工挑着下）。
     """
     url = f"{config.MIKAN_BASE}/RSS/Bangumi?bangumiId={mikan_id}"
-    feed = feedparser.parse(await fetch.get_bytes(client, url))   # 带上限+总超时，理由同 NyaaSource.fetch
+    feed = feedparser.parse(await fetch.get_bytes(client, url))   # 带上限+总超时，理由同 RssSource.fetch
+    if feed.bozo:
+        # 【与 RssSource.fetch 同口径】feed 结构坏掉（站点改版、返回错误页）时表现同样是"0 条"，
+        # 没有这行告警就没人知道为什么。这是本文件的【第三条】RSS 解析路径——
+        # 番剧那两条已经合并进 RssSource，它因为语义不同（剧场版不过滤、允许 -1/-2 集号）留在这里，
+        # 所以那次合并修好的几件事要手动同步过来。
+        log.warning("Mikan 番组 %s 的种子 Feed 解析异常（bozo），尽力处理已解析条目", mikan_id)
     items: list[ParsedItem] = []
     for entry in feed.entries:
         try:
             raw_title = clip_title(entry.title)   # 第三方标题，先截长（理由见 parse.clip_title）
-            info_hash = _hash_from_link(entry.get("link", ""))
+            info_hash = (_hash_from_link(entry.get("link", "")) or "").strip().lower()
             if not _HEX40_RE.fullmatch(info_hash):
                 continue
             group, anime_title, season, episode = parse_title(raw_title)
@@ -229,9 +182,15 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
                 download_url=download_url,
                 source=group or "Mikan",
                 site="mikan",
-                priority=0,          # 剧场版逐版本人工挑，不参与优先级选择（source_kind 不落 MovieTorrent，故不设）
+                priority=0,          # 剧场版逐版本人工挑，不参与优先级选择（policy 不落 MovieTorrent，故不设）
                 search_names=candidate_names(raw_title),
             ))
         except Exception as e:
-            log.error("Mikan 剧场版种子解析失败: %s - %s", e, entry.get("title", "?"))
+            # 【兜底自己不能再抛】同 RssSource._parse：条目畸形到连 .get 都没有时，
+            # 处理器自己炸掉，异常逃出去掀翻整轮扫描——而这个 except 的全部意义就是别让一条坏条目连累其余。
+            try:
+                what = str(entry.get("title", "?"))[:80]
+            except Exception:
+                what = repr(entry)[:80]
+            log.error("Mikan 剧场版种子解析失败: %s: %s - %s", type(e).__name__, e, what)
     return items

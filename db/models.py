@@ -151,15 +151,19 @@ class Movie(SQLModel, table=True):
     """
     id: int | None = Field(default=None, primary_key=True)
     bangumi_id: int | None = Field(default=None, index=True)   # 身份键（可空）
-    mikan_id: str | None = Field(default=None, index=True)     # Mikan 番组 id（刷新种子 RSS 用）
+    # Mikan 番组 id。详情页的『刷新版本』按它重拉 /RSS/Bangumi?bangumiId=<id>
+    # （core.movies.refresh_movie_torrents）——BD 常在首映后 6~18 个月才出，
+    # 而发现是按整年扫的，没有这个按钮就只能整年重扫。
+    mikan_id: str | None = Field(default=None, index=True, unique=True)
     mikan_type: str | None = Field(default=None)      # Mikan 桶判定：剧场版 / OVA（列表徽标；『是不是电影』以此为准）
     # ---- 名称 / 归档 ----
     title: str = Field(default="")                    # Mikan/解析名（兜底）
     display_name: str | None = Field(default=None)    # bgm 规范名（UI 显示）
     jp_name: str | None = Field(default=None)         # bgm 日文原名（建下载文件夹用）
     quarter: str = Field(default="")                  # 首播季键（如 26C，bgm 放送日推出）。
-    # 【剧场版实际只用其中的年份】归档目录走 MOVIE_QUARTER_FMT（默认 {yyyy}）、年份统计取 q[:2]，
+    # 【剧场版实际只用其中的年份】归档目录走 MOVIE_QUARTER_FMT（默认 {yyyy}）、统计与分组按年，
     # 页面上也叫『年份』——与番剧侧的"季度"语义不同，别按 TV 的口径读它。
+    # 列名不改（改列要迁移、且它确实存着一个季度键），取年份一律用 core.engine.quarter_year()。
     # ---- bgm 元数据 ----
     air_date: str | None = Field(default=None)
     air_weekday: int | None = Field(default=None)

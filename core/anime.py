@@ -16,6 +16,7 @@ from sqlmodel import func, or_, select
 import config
 from core import engine
 from db import get_session
+from db.dialect import ALIAS_TITLE_LEN
 from db.models import Anime, AnimeTorrent, MovieTorrent, SourceGroup, AnimeAlias
 from services import enrich
 from services.notify import event as notify_event, state as notify_state
@@ -166,7 +167,15 @@ def _apply_bgm(a: Anime, info: dict | None, keep_path: bool = False) -> None:
     而此后再也没有第二次机会，原来的混编号问题原样存活（同一集两个键各下一份到同一目录）。
     这里是 total 落库的唯一入口，补一次正好补上另一半。判据幂等，白跑一次只是一条查询。
     """
+    old_total = a.total_episodes
     engine.apply_bgm_meta(a, info, keep_path)
+    if a.finished_at is not None and a.total_episodes != old_total:
+        # 【总集数一变，"1..total 全部到手"这个结论就作废】——分割播出的番被 bgm 并成
+        # 24 集、或先前少记了一集，都会走到这里。巡检的 stale 分支本来也会撤销，
+        # 但那要等下一个周期；而这中间用户看到的是一个【已经知道不对】的完结徽标，
+        # 且开了停订的话新集会被一直挡在门外。与合并两部番时的处理同口径（见 _merge_anime）。
+        log.info("总集数 %s → %s，撤销完结标记：%s", old_total, a.total_episodes, display_of(a))
+        a.finished_at = None
     # 季号以 bgm 规范名为准：ANi 罗马音标题常写 "Season 3" 本地解析不到而回 1，
     # 而 bgm 规范名带『第三季』，能纠正（名字没季标记则保留本地解析值）。
     sn = season_from_name(a.display_name) or season_from_name(a.jp_name)
@@ -198,7 +207,8 @@ async def _resolve_anime(item) -> int:
     """
     with get_session() as s:
         alias = s.exec(select(AnimeAlias).where(
-            AnimeAlias.title == item.anime_title, AnimeAlias.season == item.season)).first()
+            AnimeAlias.title == alias_key(item.anime_title),
+            AnimeAlias.season == item.season)).first()
         if alias is not None:
             return alias.anime_id
 
@@ -207,7 +217,8 @@ async def _resolve_anime(item) -> int:
 
     with get_session() as s:
         alias = s.exec(select(AnimeAlias).where(  # 重入保护：再查一次
-            AnimeAlias.title == item.anime_title, AnimeAlias.season == item.season)).first()
+            AnimeAlias.title == alias_key(item.anime_title),
+            AnimeAlias.season == item.season)).first()
         if alias is not None:
             return alias.anime_id
 
@@ -217,7 +228,7 @@ async def _resolve_anime(item) -> int:
             anime = s.exec(select(Anime).where(Anime.bangumi_id == bgm_id)).first()
         if anime is None:
             # 未匹配到 bgm 的番，即使来自自动源也不自动确认/下载——进『富集失败』等人工绑定
-            auto = _is_auto(item.source_kind) and bgm_id is not None
+            auto = _is_auto(item.policy) and bgm_id is not None
             anime = Anime(
                 title=item.anime_title, season=item.season, quarter=item.quarter,
                 confirmed=auto,
@@ -231,9 +242,10 @@ async def _resolve_anime(item) -> int:
             s.commit()          # Anime 无唯一约束，(title,季) 的去重由 AnimeAlias 负责，此处不会撞约束
             s.refresh(anime)
         # 登记番名对照（并发/竞态下可能已存在则忽略）
+        akey = alias_key(item.anime_title)
         if not s.exec(select(AnimeAlias).where(
-                AnimeAlias.title == item.anime_title, AnimeAlias.season == item.season)).first():
-            s.add(AnimeAlias(title=item.anime_title, season=item.season, anime_id=anime.id))
+                AnimeAlias.title == akey, AnimeAlias.season == item.season)).first():
+            s.add(AnimeAlias(title=akey, season=item.season, anime_id=anime.id))
             try:
                 s.commit()
             except DatabaseError:
@@ -243,8 +255,25 @@ async def _resolve_anime(item) -> int:
                 # 该条目每轮复报一次『处理失败』且永远入不了库（SQLite 上不会，只在 MySQL 上）。
                 # 对照登记失败不致命：番已经建好了，下次同名条目再试一次即可。
                 s.rollback()
-                log.warning("番名对照登记失败（跳过，不影响入库）：%s 第%s季", item.anime_title[:60], item.season)
+                log.warning("番名对照登记失败（跳过，不影响入库）：%s 第%s季", akey[:60], item.season)
         return anime.id
+
+
+def alias_key(title: str) -> str:
+    """番名对照的键：按 anime_alias.title 的列长截断。**查询侧与插入侧必须都用它。**
+
+    【为什么必须截断，而且两侧口径要一致】MySQL 上这一列是 VARCHAR(191)：
+      · 插入侧：超长番名在 STRICT_TRANS_TABLES 下【报错】（DataError），别名根本存不进去；
+      · 查询侧：拿一个 250 字符的参数去比 VARCHAR(191) 里的值，【永远不可能相等】。
+    两者叠加就是一条静默的死路：每来一条该番的种子 → 对照查不到 → 当成新番建一部 →
+    别名又插不进去 → 下一条重复一遍。在真实 MySQL 上实测：4 条种子建出 4 部重复番、0 条别名，
+    而日志里只有一行"番名对照登记失败（不影响入库）"，看不出它其实每轮都在增番。
+    SQLite 上没有这个上限，但两边【一律截断】才能保证同一个库在迁移前后行为一致。
+
+    191 字符对真实番名绰绰有余（生产库实测最长 39）；会超的都是解析畸形标题得到的垃圾串，
+    截断之后它们至少能稳定地对应到同一部番，而不是每条种子各建一部。
+    """
+    return (title or "")[:ALIAS_TITLE_LEN]
 
 
 def auto_downloadable_ep(ep) -> bool:
@@ -491,7 +520,7 @@ async def process_item(item, known_hashes: set | None = None) -> bool:
         #     『超期忽略』，从主列表消失、永久停更，而它压根不在弹窗指引的『待确认』页，用户无从发现。
         # 判据用"有没有 HANDLED 状态的种子"：补齐/重绑的番按定义已下过，待救的两种情形则没有。
         if (a is not None and not a.confirmed and not a.rejected
-                and a.bangumi_id is not None and _is_auto(item.source_kind)
+                and a.bangumi_id is not None and _is_auto(item.policy)
                 and not s.exec(select(AnimeTorrent).where(
                     AnimeTorrent.anime_id == anime_id,
                     AnimeTorrent.status.in_(HANDLED_STATUSES),
@@ -691,7 +720,9 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool |
                                        sub_dir=config.ANIME_DOWN_PATH)
     if save_path is None:
         log.error("拒绝越界保存路径 - %s -> %s / %s", title, quarter, folder_name)
-        _fail(reason="拒绝越界保存路径（检查下载目录设置）")   # 配置问题，重试无意义
+        _fail(reason=("未配置下载目录，请到设置页填『工作目录』"
+                      if not (config.DOWN_PATH or config.ANIME_DOWN_PATH)
+                      else "拒绝越界保存路径（检查下载目录设置）"))   # 配置问题，重试无意义
         # None 而不是 False：路径算不出来是【下载目录配置】的毛病，同一集换个源照样算不出来。
         # 返回 False 会让调用方的候选循环把该集剩下的候选全部烧成 error。
         return None
@@ -870,7 +901,13 @@ async def flush_ready_downloads() -> int:
                               []).append(t)
 
     def _pick(ts, aid):
-        return engine.pick_best(ts, pref_map.get(aid))
+        # prefer_fresh=True：与标注侧（_download_candidates）、补下侧【同一个口径】。
+        # 这里的 status 恒是 pending（上面的 SQL 就这么筛的），所以起作用的只有第二个键
+        # "失败过的往后排"——而 pending 里确实有失败过的：暂时性失败会留在 pending 上
+        # 排队重试（retry_at + retry_count），详情页把它标成『重试中·第N次』。
+        # 不加这个键的话，同集里那条已经失败过 3 次的会因为优先级高而每轮都被再挑一次，
+        # 健康的兄弟永远轮不到；而标注侧看到的『将下载』又是另一条——两边分家。
+        return engine.pick_best(ts, pref_map.get(aid), prefer_fresh=True)
 
     for key, ts in groups.items():
         if key in have_eps:
@@ -1112,27 +1149,40 @@ def is_finished(a, covered: set) -> bool:
 _FINISH_BACKFILL_KEY = "_FINISH_BACKFILL_DONE"
 
 
-def _finish_backfilled() -> bool:
-    """本库是否已经做过一次"完结回填"。走 meta 库（与 MOVIE_SCAN_LAST 同款），跨重启有效。"""
+# 巡检类功能第一次上线时，历史存量会被【一次性】全部判中——那不是"刚发生"的消息，
+# 几十条推送只会把限流额度占满、把真正的新事件挤掉。每种巡检各记一条"回填做过了"，
+# 走 meta 库（与 MOVIE_SCAN_LAST 同款）、跨重启有效。
+_IDLE_BACKFILL_KEY = "_idle_backfilled"
+
+
+def _backfilled(key: str) -> bool:
     from db import get_meta_session
     from db.models import Setting
     try:
         with get_meta_session() as s:
-            return s.get(Setting, _FINISH_BACKFILL_KEY) is not None
+            return s.get(Setting, key) is not None
     except Exception:
         return True     # 读不到就当作"做过"——宁可少发一批通知，也别在库有问题时刷屏
 
 
-def _mark_finish_backfilled() -> None:
+def _mark_backfilled(key: str) -> None:
     from db import get_meta_session
     from db.models import Setting
     try:
         with get_meta_session() as s:
-            if s.get(Setting, _FINISH_BACKFILL_KEY) is None:
-                s.add(Setting(key=_FINISH_BACKFILL_KEY, value="1"))
+            if s.get(Setting, key) is None:
+                s.add(Setting(key=key, value="1"))
                 s.commit()
     except Exception as e:
-        log.warning("记录完结回填标记失败（下轮可能重复回填一次）：%s", e)
+        log.warning("记录回填标记 %s 失败（下轮可能重复回填一次）：%s", key, e)
+
+
+def _finish_backfilled() -> bool:
+    return _backfilled(_FINISH_BACKFILL_KEY)
+
+
+def _mark_finish_backfilled() -> None:
+    _mark_backfilled(_FINISH_BACKFILL_KEY)
 
 
 async def sweep_finished() -> int:
@@ -1197,8 +1247,14 @@ async def sweep_finished() -> int:
         log.info("完结判定：首轮回填 %d 部（不推送，避免把限流额度占满）", len(done))
     else:
         for a in done:
+            # 【按番去重 + 长冷却】finished_at 只挡得住"标记还在"的重复，挡不住【反复翻转】：
+            # 删掉一集 → 巡检撤销标记 → 补下回来 → 再判完结，每翻一次就多一条"全 N 集已下齐"。
+            # qB 里删种、临时 missingFiles、总集数被 bgm 改来改去，都会让它翻。
+            # 冷却是进程内的（重启即忘），所以这是【压住抖动】不是【跨重启去重】——
+            # 后者的正解是给 Anime 加一列 finish_notified_at，要开 revision，留给下一版。
             await notify_event("finished", f"{display_of(a)} 全 {a.total_episodes} 集已下齐"
-                                           + ("，已停止自动下新集" if config.ANIME_FINISH_UNSUB else ""))
+                                           + ("，已停止自动下新集" if config.ANIME_FINISH_UNSUB else ""),
+                               key=str(a.id), cooldown=7 * 24 * 3600)
             # 完结这条【不】因为通知没发出去就回滚标记：finished_at 是业务状态（它决定停不停订），
             # 不是"通知记账"。通知丢了顶多少一条推送，而详情页的徽标一直在。
     if undone:
@@ -1216,7 +1272,7 @@ async def sweep_idle() -> int:
     表现只是"好几天没更新了"，而那正是用户最晚才会察觉的一种。
 
     【已判完结的不提醒】它本来就该没有新种子了。
-    【用 created_at 而不是 release_time】release_time 的时区基准按站分裂（见 engine._SITE_TZ），
+    【用 created_at 而不是 release_time】release_time 的时区基准按站分裂（每个源类自带 TZ），
     且明确只用于显示层；created_at 是我们自己入库的时刻，口径统一、且正是"多久没收到新东西"要问的。
     """
     days = config.ANIME_IDLE_DAYS
@@ -1234,8 +1290,10 @@ async def sweep_idle() -> int:
             # 所以会一直复发。
             Anime.finish_optout.is_not(True),
             Anime.finished_at.is_(None))))
-        if not subs:
-            return 0
+        # 【注意不要在这里早退】"一部在追的番都没有"恰恰是首轮回填最该跑的场景之一：
+        # worker 里 sweep_finished 就在本函数【前面】跑且默认开着，升级当天所有"老且集齐"的番
+        # 会先被打上 finished_at、当场掉出 subs——若在这里 return，回填对它们覆盖率是 0，
+        # 而它们日后一旦被撤销完结标记回到订阅态，就会各报一条几百天前的假断更。实测踩过。
         latest = {aid: t for aid, t in s.exec(
             select(AnimeTorrent.anime_id, func.max(AnimeTorrent.created_at))
             .where(AnimeTorrent.anime_id.in_([a.id for a in subs]))
@@ -1250,13 +1308,49 @@ async def sweep_idle() -> int:
     # 之所以仍然接受：断更提醒的定位是"及时发现源失效"，一个两个月前就断的番早已不是"及时"，
     # 而详情页与仪表盘一直看得到它的最后更新时间。设置页的说明里写了这个窗口。
     floor = datetime.now() - timedelta(days=days * 4)
+    # 【下界只对"已经成功提醒过一次"的番生效】上面那段说的代价是真的：通知在那段时间里
+    # 一直没送出去（NOTIFY_URL 还没配、被限流吞掉、推送服务挂了），番就悄悄滑出窗口、
+    # 用户从头到尾收不到任何消息——而这正是"源失效"最容易发生的时候（新装、刚改配置）。
+    # 豁免掉这种番的下界，等于把承诺从"窗口内提醒"改成"每部番退出前一定成功送达过一次"。
+    # 存量老番靠下面的一次性回填挡住，不会在升级后灌一波。
+    if not _backfilled(_IDLE_BACKFILL_KEY):
+        # 【回填范围必须【大于】subs，不能复用上面那批】豁免判据作用在"所有番"上，
+        # 而 subs 只含"在追且未完结"的。两者口径不一致时，被漏掉的番日后一旦回到订阅态
+        # （qB 里删一集 → sweep_finished 撤销完结标记 / 恢复订阅 / 改总集数），
+        # 就会带着 idle_notified_at=None 直接命中豁免，被当成"从没提醒过"报一条 800 天前的假断更。
+        # 更要命的是时序：worker 里 sweep_finished 就跑在 sweep_idle 【前面】且默认开着，
+        # 于是升级当天所有"老且集齐"的番先被打上 finished_at、当场掉出 subs——
+        # 回填对它最想挡的那批番覆盖率正好是 0（实测 0/5）。所以这里【重新查一遍全表】。
+        now0 = datetime.now()
+        with get_session() as s:
+            all_latest = {aid: t for aid, t in s.exec(
+                select(AnimeTorrent.anime_id, func.max(AnimeTorrent.created_at))
+                .group_by(AnimeTorrent.anime_id))}
+            done_ids = [aid for aid, t in all_latest.items() if t is not None and t < floor]
+            n = 0
+            for aid in done_ids:
+                row = s.get(Anime, aid)
+                if row is not None and row.idle_notified_at is None:
+                    row.idle_notified_at = now0
+                    s.add(row)
+                    n += 1
+            s.commit()
+        if n:
+            log.info("断更巡检：首轮回填 %d 部早已静默的番（不推送；含已完结/已忽略的）", n)
+        _mark_backfilled(_IDLE_BACKFILL_KEY)
+        _done = set(done_ids)
+        for a in subs:
+            if a.id in _done and a.idle_notified_at is None:
+                a.idle_notified_at = now0   # 本轮内存副本同步，免得下面又选中它
+    if not subs:
+        return 0            # 回填已经做过了（若需要），到这里就没有可提醒的对象了
     stale = []
     for a in subs:
         last = latest.get(a.id)
         if last is None or last >= cutoff:
             continue          # 一条种子都没有的番不算"断更"——它是还没开播/没收到过，另一回事
-        if last < floor:
-            continue          # 安静太久了，那不是"断更"是"早就完了"
+        if last < floor and a.idle_notified_at is not None:
+            continue          # 安静太久【且已经提醒过】：那不是"断更"是"早就完了"
         if a.idle_notified_at and a.idle_notified_at >= cutoff:
             continue          # 提醒过了且还没跨过一个完整的静默期，别每轮重发
         stale.append((a, last))
@@ -1643,8 +1737,20 @@ def _has_unmovable_files(s, anime_id: int) -> bool:
     )).first() is not None
 
 
-async def enrich_anime(anime_id: int) -> bool:
-    """手动富集某番剧：用它已有的名字 + 最近一条种子回退，重取 bgm 元数据并覆盖。"""
+async def enrich_anime(anime_id: int, freeze_empty_path: bool = False) -> bool:
+    """富集某番剧：用它已有的名字 + 最近一条种子回退，重取 bgm 元数据并覆盖。
+
+    freeze_empty_path=True 给【不会 relocate 的调用方】用（后台 retry_unmatched、批量重新识别）。
+    apply_bgm_meta 的 keep_path 只冻结**已经有值**的路径字段——空值照样会被填上，而
+    「空 → 有值」同样会改归档目录：一部还没识别出 bgm 就被人工点下过的番，
+    jp_name 是空的、文件落在 <根>/<季度>/<种子解析名>/，后台识别成功后 jp_name 被填上，
+    新集就去了日文原名的目录，已下的集留在旧目录，同一部番裂成两个文件夹、全程无提示。
+    带 relocate 的入口（详情页/列表页的单番按钮）不需要它——那两条会把文件一起搬过去。
+
+    【为什么不像 movies._upsert_movie 那样无条件冻】剧场版的后台与人工是两个不同函数，
+    这边三个入口共用本函数。无条件冻会把详情页那条唯一的补救路径一起冻死：
+    用户点『重新识别』想把目录修正过来，结果名字根本不变、relocate 判 new==old 直接早退。
+    """
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is None:
@@ -1664,7 +1770,13 @@ async def enrich_anime(anime_id: int) -> bool:
         if a is None:
             return False
         # 无已下集就采用 bgm 季度（纠正种子解析得来的错季度）；有已下集才保留，避免散目录
-        _apply_bgm(a, info, keep_path=_has_handled_torrents(s, anime_id))
+        handled = _has_handled_torrents(s, anime_id)
+        snap = ({k: getattr(a, k) for k in ("quarter", "jp_name", "display_name")}
+                if (freeze_empty_path and handled) else None)
+        _apply_bgm(a, info, keep_path=handled)
+        if snap is not None:
+            for k, v in snap.items():
+                setattr(a, k, v)      # 连"原本为空"的也还原，见本函数 docstring
         s.add(a)
         s.commit()
         # 身份守卫：若该 bgm_id 已被别的番占用，合并过来，杜绝同一部番裂成两条
@@ -1734,9 +1846,10 @@ async def reenrich_scope(seasons: int | None = None) -> int:
             ids = list(s.exec(base.where(Anime.quarter.in_(quarters))))
     n = 0
     for aid in ids:
-        reset_enrich_tries(aid)   # 手动重识别：清零后台重试计数，让未识别番重新获得自动重试机会
         try:
-            if await enrich_anime(aid):
+            # freeze_empty_path：本入口是【批量】的，页面上不问"要不要搬迁"（几十部番逐个弹框
+            # 不现实），所以它与后台 retry_unmatched 同类——不能让它改已下番的归档目录。
+            if await manual_enrich(aid, freeze_empty_path=True):   # 含清零后台重试计数
                 n += 1
         except Exception as e:
             log.warning("重新识别失败 anime=%s: %s", aid, e)
@@ -1744,8 +1857,23 @@ async def reenrich_scope(seasons: int | None = None) -> int:
     return n
 
 
+async def manual_enrich(anime_id: int, freeze_empty_path: bool = False) -> bool:
+    """**人工触发的一次重新识别**——所有『重试识别 / 重新识别』按钮都该走这里。
+
+    比 enrich_anime 多做一件事：清零 enrich_tries。这一步不是可选的：
+    后台重试池的闸是 `enrich_tries < REENRICH_MAX_TRIES`，一部试满 5 次的番已经掉出池子，
+    用户点了『重试识别』若不清零，它就只是【当场试一次】，此后照旧一次都不会自动重试——
+    而用户的本意恰恰是"我看它一直没识别出来，帮它再试试"。
+
+    【为什么要有这个函数】三个入口曾各写各的：详情页清、『待识别』tab 不清、批量重识别清。
+    同一个按钮名在两个页面上行为不同，而差别只有在几小时后"它怎么还没识别出来"时才显形。
+    """
+    reset_enrich_tries(anime_id)
+    return await enrich_anime(anime_id, freeze_empty_path=freeze_empty_path)
+
+
 def reset_enrich_tries(anime_id: int) -> None:
-    """清零某番的 bgm 后台重试计数（手动『重新识别』时调用，让它重新获得自动重试机会）。"""
+    """清零某番的 bgm 后台重试计数（manual_enrich 调用；单独用请三思，见那里的说明）。"""
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is not None and a.enrich_tries:
@@ -1791,7 +1919,8 @@ async def retry_unmatched() -> int:
             consumed += 1
         before = enrich.net_failures()
         try:
-            if await enrich_anime(aid):
+            # freeze_empty_path：后台重试没有 UI、不会 relocate，绝不能改已下番的归档目录
+            if await enrich_anime(aid, freeze_empty_path=True):
                 n += 1
         except Exception as e:
             log.warning("延迟重识别失败 anime=%s: %s", aid, e)
@@ -1831,11 +1960,11 @@ def _download_candidates(rows: list, pref: str | None = None, have_eps: set | No
     轮不到，该集永久停滞。执行侧（补下）按这个顺序逐条试到成功为止；标注侧（计划/徽标）取 [0]。
     排序里已把"失败过的往后排"压在最前（见 engine.pick_order 的 prefer_fresh）。
 
-    【标注侧与执行侧的第一条不保证是同一条，这是有意的】算下载计划走的是列投影（_PLAN_COLS，
-    上面没有 retry_count），于是 prefer_fresh 的第二个键在那条路径上恒为 0，排序退化成
-    "优先级 + 入库时间"两键——【与后台 flush 的 pick_best 完全一致】。
-    要三条路径严格统一，得同时给 _PLAN_COLS 补列【并且】让 flush 也用 prefer_fresh；
-    只做前一半会让"标注"与"后台自动下载"分家，那才是真的回归。见 docs/audit-2026-08.md 的 Q4。
+    【三条路径现在同口径】标注(计划) / 补下 / 后台 flush 都用 prefer_fresh 的四键排序。
+    以前不是：_PLAN_COLS 的列投影里没有 retry_count，于是 prefer_fresh 的第二个键在标注侧
+    恒为 0、退化成两键，而补下侧是四键——同一集，详情页标『将下载』的那条与点补下真正去试的
+    那条可以不是同一条。D-08 把 retry_count 补进投影、并让 flush 也开 prefer_fresh，
+    【两半必须一起做】：只补列不改 flush，就变成标注与后台自动下载分家，那才是真的回归。
     """
     have = have_eps or set()
     by_ep: dict = {}
@@ -1892,7 +2021,20 @@ async def download_pending_for_anime(anime_id: int) -> int:
 # 【下游要用新字段时，必须同步加到这里】——漏了会在运行时抛 AttributeError。
 _PLAN_COLS = (AnimeTorrent.id, AnimeTorrent.anime_id, AnimeTorrent.status, AnimeTorrent.episode,
               AnimeTorrent.source, AnimeTorrent.raw_title, AnimeTorrent.priority,
-              AnimeTorrent.created_at)
+              AnimeTorrent.created_at, AnimeTorrent.retry_count, AnimeTorrent.retry_at)
+
+
+def _retry_ready(t, now) -> bool:
+    """这条 pending 现在【到点】了吗——退避排队中的不算候选。
+
+    **flush 与标注侧必须用同一个判据**，否则同一集里"两条都失败重试过、退避时间不同"时
+    （_fail 同时写 status=pending 与 retry_at，所以 pending 且 retry_count>0 必然带 retry_at），
+    详情页/新入库把 A 标『将下载』而后台实际下 B ——正是 _download_candidates 的 docstring
+    声称已经消灭的那种失效形状。
+    补下口径（for_backfill）【刻意不用】它：人工点补下不受退避约束，与 download_pending_for_anime 一致。
+    """
+    at = getattr(t, "retry_at", None)
+    return at is None or at <= now
 
 
 def _plan_statuses(for_backfill: bool) -> tuple:
@@ -1928,8 +2070,10 @@ def download_plan(anime_id: int, for_backfill: bool = False) -> set[int]:
     amb = ambiguous_range(a)     # 同 download_pending_for_anime：标注口径必须与执行口径一致
     have_eps = {dedup_key(amb, 0, t.episode, t.source)[1:] for t in all_rows
                 if t.status in HAVE_STATUSES}  # 已有一份(downloading/stalled)；deleted 不算，同集新 hash 照常下
+    _now = datetime.now()
     pending = [t for t in all_rows
-               if t.status in (DOWNLOADABLE_STATUSES if for_backfill else ("pending",))]
+               if t.status in (DOWNLOADABLE_STATUSES if for_backfill else ("pending",))
+               and (for_backfill or _retry_ready(t, _now))]   # 与 flush 同口径，见 _retry_ready
     if pref:
         pending = [t for t in pending if pref == (t.source or "")]
     if kw:
@@ -1988,6 +2132,7 @@ def _plans_for_ids(anime_ids, modes: tuple) -> dict:
             AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.source).where(
             AnimeTorrent.anime_id.in_(ids),
             AnimeTorrent.status.in_(HAVE_STATUSES)).distinct()))
+    _plan_now = datetime.now()
     by_anime: dict = {}
     have_by_anime: dict = {}
     for t in rows:
@@ -2003,8 +2148,8 @@ def _plans_for_ids(anime_ids, modes: tuple) -> dict:
             all_cands = [t for t in all_cands if _kw_match(kw, t.raw_title)]
         for m in modes:
             keep = DOWNLOADABLE_STATUSES if m else ("pending",)
-            cands = all_cands if len(keep) == len(cand_statuses) else [
-                t for t in all_cands if t.status in keep]
+            cands = [t for t in all_cands
+                     if t.status in keep and (m or _retry_ready(t, _plan_now))]  # 见 _retry_ready
             out[m] |= {c[0].id for c in _download_candidates(cands, lock, have_by_anime.get(aid),
                                                              amb_map.get(aid))}
     return out
@@ -2174,8 +2319,7 @@ async def backfill_source(anime_id: int, name_filter: bool = False) -> dict:
     该源 = 锁定源(pref_source)；没锁则取该番最高优先级的源。搜到的按 hash 去重、【季号过滤】（挡 S1/S2 混淆），
     name_filter=True(『自动补齐』按钮) 再加【番名近似过滤】挡同名衍生作；新的入库 pending 且把番置 confirmed=False（复用待确认
     审核，不自动下——交给用户点『确认下载』）。返回 {found, kept, ingested, sites}。已忽略(rejected)的番不改订阅态。"""
-    from sources.nyaa import NyaaSource, nyaa_search_url
-    from sources.mikan import MikanSource, mikan_search_url
+    from sources import SEARCH_URL, SOURCES
 
     with get_session() as s:
         a = s.get(Anime, anime_id)
@@ -2225,18 +2369,18 @@ async def backfill_source(anime_id: int, name_filter: bool = False) -> dict:
     if not queries:
         return {"found": 0, "kept": 0, "ingested": 0, "sites": [], "error": "没有可搜索的番名"}
 
-    # 抓取（唯一分站处）：按站构造搜索源，复用 Source._parse（含组名白名单/合集过滤/hash 校验）。
+    # 抓取：按站构造搜索源，复用 RssSource._parse（含组名白名单/合集过滤/hash 校验）。
     # 各 (site × 查询名) 并发抓，墙钟=最慢一次而非累加，避免最坏 ~8×30s 串行阻塞几分钟。
+    # 【查表而不是 if/elif】以前这里是本文件的"唯一分站处"，漏改的后果是静默 return []：
+    # 详情页点『补齐』永远返回 0 条，日志里一个字都没有。
     async def _fetch_one(site, groups, q):
+        cls, search = SOURCES.get(site), SEARCH_URL.get(site)
+        if cls is None or search is None:
+            log.warning("补齐：站点 %s 没有搜索入口，跳过", site)
+            return []
         try:
-            if site == "nyaa":
-                src_obj = NyaaSource("补齐", nyaa_search_url(q), priority=target_pri,
-                                     subgroups=list(groups), title_filter=[])
-            elif site == "mikan":
-                src_obj = MikanSource("补齐", mikan_search_url(q), priority=target_pri,
-                                      subgroups=list(groups), title_filter=[])
-            else:
-                return []
+            src_obj = cls("补齐", search(q), priority=target_pri,
+                          subgroups=list(groups), title_filter=[])
             return await src_obj.fetch()
         except Exception as e:
             log.warning("补齐搜索失败 site=%s q=%s: %s", site, q, e)
@@ -2279,8 +2423,9 @@ async def backfill_source(anime_id: int, name_filter: bool = False) -> dict:
             # 它的那部番之后走 process_item 会在 hash 去重处静默 return False，永远收不到它。
             # 对照表已明确指向【另一部番】的条目一律跳过。这与两个补齐按钮的松紧无关（那是"要不要再做
             # 番名近似"的取舍），纯粹是归属正确性，两边都该守。
-            owner = s.exec(select(AnimeAlias).where(
-                AnimeAlias.title == it.anime_title, AnimeAlias.season == it.season)).first()
+            owner = s.exec(select(AnimeAlias).where(       # 同 process_item：键要按列长截断
+                AnimeAlias.title == alias_key(it.anime_title),
+                AnimeAlias.season == it.season)).first()
             if owner is not None and owner.anime_id != anime_id:
                 stolen += 1
                 continue
@@ -2309,9 +2454,9 @@ async def backfill_source(anime_id: int, name_filter: bool = False) -> dict:
             "sites": list(site_groups), "to_confirm": to_confirm}
 
 
-async def sync_qb_status() -> int:
+async def sync_qb_status(manual: bool = False) -> int:
     """从 qB 同步 TV 种子实时态（剧场版走 movies.sync_qb_status）。"""
-    return await engine.sync_qb_status(AnimeTorrent)
+    return await engine.sync_qb_status(AnimeTorrent, manual=manual)
 
 
 def anime_save_path(anime_id: int) -> str | None:

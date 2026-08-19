@@ -115,6 +115,98 @@ def _readable_source_tables(src_engine) -> set:
     return ok
 
 
+def _dup_unique_values(src_engine, dst_engine) -> list:
+    """源库里有哪些值会撞上目标库的唯一约束。返回 ["表.列: 值 x 有 N 行", …]。
+
+    【与 _overlong_values 是同一件事的另一半】那道预检问「值塞不塞得下」，这道问「值撞不撞车」。
+    两道都必须在清空目标之前跑，理由一模一样：迁移是"先清空目标、再逐批写入"，
+    撞车会让它炸在中间某张表上，留下一个半个库。
+
+    【为什么以前不需要】以前业务表上一条唯一约束都没有（除了主键与 sourcegroup.name）。
+    movie.mikan_id 的唯一索引是新加的，而它【自动对迁移生效】——加约束的那一轮只验了
+    「建库」与「升级」两条路径，没人想到第三条。这正是"约束的作用域比验证的作用域大"。
+
+    判据取自【目标库反射出来的】唯一索引/约束，不是硬编码的列名：以后再加唯一约束，
+    这道预检自动跟上，不必再想起来改这里。
+    """
+    insp_dst = sa.inspect(dst_engine)
+    bad = []
+    for name in TABLE_ORDER:
+        if not insp_dst.has_table(name) or not sa.inspect(src_engine).has_table(name):
+            continue
+        t = _table(name)
+        uniques = [ix["column_names"] for ix in insp_dst.get_indexes(name) if ix.get("unique")]
+        uniques += [uc["column_names"] for uc in insp_dst.get_unique_constraints(name)]
+        with src_engine.connect() as conn:
+            for cols in uniques:
+                cols = [c for c in cols if c and c in t.c]
+                if not cols:
+                    continue          # 目标库上有、源库模型里没有的列：跳过而不是崩
+                key = [t.c[c] for c in cols]
+                # NULL 不参与唯一性（两种后端一致），所以只查全部非空的那些行
+                q = sa.select(*key, sa.func.count()).where(
+                    sa.and_(*[c.is_not(None) for c in key])).group_by(*key).having(sa.func.count() > 1)
+                for row in conn.execute(q):
+                    vals = "+".join(str(v)[:40] for v in row[:-1])
+                    bad.append(f"{name}.{'+'.join(cols)}: {vals} 有 {row[-1]} 行")
+    return bad
+
+
+def _overlong_values(src_engine, dst_engine) -> list:
+    """源库里有哪些值塞不进目标库的定长列。返回 ["表.列: 最长 N > 上限 M（k 行超限）", …]。
+
+    【为什么必须在清空目标之前查】迁移是"先清空目标、再逐批写入"，而 MySQL 在
+    STRICT_TRANS_TABLES 下遇到超长值是【报错】不是截断。没有这道预检的话，一条 250 字符的
+    畸形番名会让整件事炸在第三张表上——此时目标库已经被清空、前两张表已经写进去了，
+    留下一个半个库：anime 全在、animetorrent 还空。用户再点一次『切换』就会把 RSS 窗口
+    整批当成新种子重下一遍。
+
+    只查目标库真有长度限制的列（SQLite 侧 VARCHAR 不限长，所以目标是 SQLite 时这里恒为空）。
+
+    【清空之前一共三道预检】源表读得出来(_readable_source_tables) / 值塞得下(本函数) /
+    值不撞唯一约束(_dup_unique_values)。以后再给业务表加任何一类约束，都要问一句
+    "它会不会让写入中途失败"——会的话就得在这里多一道，否则又是一个半个库。
+    """
+    insp_dst = sa.inspect(dst_engine)
+    src_insp = sa.inspect(src_engine)
+    bad = []
+    for name in TABLE_ORDER:
+        if not insp_dst.has_table(name) or not src_insp.has_table(name):
+            continue
+        t = _table(name)
+        limits = {}
+        for col in insp_dst.get_columns(name):
+            n = getattr(col["type"], "length", None)
+            if n:
+                limits[col["name"]] = n
+        if not limits:
+            continue
+        with src_engine.connect() as conn:
+            for col, lim in limits.items():
+                if col not in t.c:
+                    continue
+                c = t.c[col]
+                # 【两个坑，都是"只在一种方言上正确"】这条预检两个迁移方向都要跑
+                # （SQLite→MySQL 与 MySQL→SQLite），任何一半只对一种方言就等于另一个方向崩：
+                #   ① 计数不能用 .filter()：SQLAlchemy 会原样发出 `count(*) FILTER (WHERE ...)`，
+                #      那是 SQLite/PG 语法，MySQL 9.7 上直接 1064。用 CASE。
+                #   ② 长度不能用 length()：**MySQL 的 LENGTH() 数的是字节**，而我们比的是目标库的
+                #      【字符】上限。实测 LENGTH('番剧名字')=12 而 CHAR_LENGTH=4——于是一条合法的
+                #      191 字符中文别名（573 字节）会被误判成超限，把 MySQL→SQLite 这条唯一的
+                #      退路永久堵死，错误文案还指引用户去删正常数据。
+                #      SQLite 的 length() 数的本来就是字符、且它没有 char_length()，所以按方言分。
+                chars = (sa.func.char_length(c) if conn.dialect.name == "mysql"
+                         else sa.func.length(c))
+                row = conn.execute(sa.select(
+                    sa.func.max(chars),
+                    sa.func.coalesce(sa.func.sum(
+                        sa.case((chars > lim, 1), else_=0)), 0))).first()
+                mx, over = (row[0] or 0), (row[1] or 0)
+                if over:
+                    bad.append(f"{name}.{col}: 最长 {mx} > 上限 {lim}（{over} 行超限）")
+    return bad
+
+
 def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
                  progress=None) -> dict:
     """把业务表从 src 复制到 dst。
@@ -143,6 +235,24 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
 
     src_counts = count_rows(src_engine)
     readable = _readable_source_tables(src_engine)   # 删目标之前先把源库真读一遍，读不动就在这里中止
+    # 【同样必须在清空之前】数据宽度不合法时中止，别留半个库（见 _overlong_values）
+    too_long = _overlong_values(src_engine, dst_engine)
+    if too_long:
+        raise ValueError(
+            "源库里有值超过目标库的列长上限，迁移中止（目标库的【数据未被改动】，"
+            "但表结构已按新版本升级过——那一步在预检之前）：\n  "
+            + "\n  ".join(too_long)
+            + "\n这些多半是解析畸形标题产生的垃圾番名。新版本入库时已自动截断，"
+              "但老数据要先处理掉：到『番剧表』里找到它们删掉或改名，再重新迁移。")
+    # 【第三道，同样在清空之前】唯一约束撞车。见 _dup_unique_values。
+    dups = _dup_unique_values(src_engine, dst_engine)
+    if dups:
+        raise ValueError(
+            "源库里有值会撞上目标库的唯一约束，迁移中止（目标库的【数据未被改动】，"
+            "但表结构已按新版本升级过——那一步在预检之前）：\n  "
+            + "\n  ".join(dups)
+            + "\n最常见的是老库里同一个 Mikan 番组留下了两行剧场版。"
+              "办法：先用本程序把【源库】当业务库打开一次，启动时的升级会自动摘掉重复的链接，再回来迁。")
     dst_counts = count_rows(dst_engine)
     if not overwrite and any(dst_counts.values()):
         busy = "、".join(f"{k} {v} 行" for k, v in dst_counts.items() if v)

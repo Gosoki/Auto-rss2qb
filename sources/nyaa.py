@@ -3,23 +3,10 @@
 feed 可以是 nyaa 用户名（自动拼 RSS）或一条完整 RSS URL（应对按关键词搜的 feed）。
 每条种子打上所属组的策略(policy)+优先级(priority)，交给主流程决定下不下、下哪份。
 """
-import logging
-import re
-from datetime import datetime
+from datetime import timezone
 from urllib.parse import quote
 
-import feedparser
-import httpx
-
-import config
-from services import fetch
-from sources.base import ParsedItem, Source
-from sources.parse import (candidate_names, clip_title, estimate_premiere, extract_episode_abs,
-                           kw_match, quarter_of, is_batch, parse_multibracket, parse_title)
-
-log = logging.getLogger("autorss")
-
-_HEX40_RE = re.compile(r"[0-9a-f]{40}")   # info_hash 校验（每条种子热路径，预编译）
+from sources.base import RssSource
 
 
 def nyaa_feed_url(feed: str) -> str:
@@ -45,87 +32,14 @@ def nyaa_search_url(query: str) -> str:
     return f"https://nyaa.si/?page=rss&q={quote(query)}&c=1_0&f=0"
 
 
-class NyaaSource(Source):
+class NyaaSource(RssSource):
+    """nyaa 的 RSS 源。除了下面这三样，全部逻辑在 RssSource 里（见那里的说明）。"""
+
     site = "nyaa"
+    TZ = timezone.utc          # nyaa 的 pubDate 带 -0000，feedparser 归一后就是真 UTC
 
-    def __init__(self, name: str, rss_url: str, policy: str = "auto", priority: int = 0,
-                 subgroups: list | None = None, title_filter: list | None = None):
-        self.name = name
-        self.rss_url = rss_url
-        self.policy = policy
-        self.priority = priority
-        self.subgroups = subgroups or []      # 字幕组白名单（子串匹配组名，空=全部）
-        self.title_filter = title_filter or []  # 标题关键词过滤（标题需含其一，空=不限）
+    def _hash_of(self, entry) -> str:
+        return entry.get("nyaa_infohash") or ""
 
-    async def fetch(self) -> list[ParsedItem]:
-        async with httpx.AsyncClient(**config.http_client_kwargs(30)) as client:
-            # 走带上限+总超时的取回：feed 地址是用户填的、内容来自第三方，
-            # 裸 client.get + resp.content 既能被涓流响应永久挂住，也能被超大 body 撑爆内存
-            content = await fetch.get_bytes(client, self.rss_url)
-
-        feed = feedparser.parse(content)
-        if feed.bozo:
-            log.warning("%s Feed 解析异常（bozo），尽力处理已解析条目", self.name)
-
-        items = []
-        for entry in feed.entries:
-            item = self._parse(entry)
-            if item is not None:
-                items.append(item)
-        return items
-
-    def _parse(self, entry) -> ParsedItem | None:
-        try:
-            raw_title = clip_title(entry.title)   # 第三方标题，先截长（理由见 parse.clip_title）
-            info_hash = (entry.get("nyaa_infohash") or "").strip().lower()
-            if not _HEX40_RE.fullmatch(info_hash):
-                return None  # 必须是 40 位 hex：既能跨源去重，也防脏 hash 注入 qB 的 '|' 分隔符
-            if is_batch(raw_title):
-                return None  # 合集/BDRip/连续集范围 整理帖
-            if self.title_filter and not any(kw_match(k, raw_title) for k in self.title_filter):
-                return None  # 标题不含所需关键词（如按语言 繁日/简日 过滤）
-
-            group, anime_title, season, episode = parse_title(raw_title)
-            search_names = candidate_names(raw_title)
-            if not anime_title and config.ANIME_MULTIBRACKET_PARSE:
-                mb = parse_multibracket(raw_title)   # 开关开：全括号命名回退捕获番名
-                if mb:
-                    anime_title, search_names = mb
-            if not anime_title:
-                return None  # 番名解析为空（如纯多括号格式）→ 无法定位/去重，跳过免撞库
-            # 【与标题关键词同口径：大小写不敏感】紧邻下面那行的 title_filter 早已改成 kw_match，
-            # 唯独这里还是裸 in —— 用户填 lolihouse 而站上写 LoliHouse，该源组每轮全灭，
-            # 日志只有一行"0 条"，没有任何指向。与 R2 判为 P1 的那条是逐字相同的失效模式。
-            if self.subgroups and not any(kw_match(g, group) for g in self.subgroups):
-                return None  # 不在白名单的字幕组
-            release_time = None
-            # 用 feedparser 已解析的 published_parsed（C 层解析、与进程 LC_TIME 无关），与 mikan 一致。
-            # 曾用 datetime.strptime(含 %a/%b 英文缩写)：非英文 locale(如 ja_JP.UTF-8)下会 ValueError→丢 release_time，
-            # 退化 bgm 季度识别、丢 quarter。published_parsed 已归一到 UTC，取前 6 位即 naive UTC，语义等价。
-            pp = entry.get("published_parsed")
-            if pp:
-                release_time = datetime(*pp[:6])
-
-            quarter = ""
-            if release_time is not None:
-                quarter = quarter_of(estimate_premiere(release_time, episode, season))
-
-            return ParsedItem(
-                info_hash=info_hash,
-                raw_title=raw_title,
-                anime_title=anime_title,
-                season=season,
-                episode=episode,
-                quarter=quarter,
-                release_time=release_time,
-                download_url=entry.link,   # nyaa 的 link 就是 .torrent 下载地址
-                source=(group or self.name),
-                site="nyaa",
-                source_kind=self.policy,
-                priority=self.priority,
-                search_names=search_names,
-                episode_abs=extract_episode_abs(raw_title),
-            )
-        except Exception as e:
-            log.error("解析条目失败: %s - %s", e, entry.get("title", "?"))
-            return None
+    def _url_of(self, entry) -> str:
+        return entry.get("link") or ""      # nyaa 的 link 就是 .torrent 下载地址

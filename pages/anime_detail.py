@@ -274,6 +274,17 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                 _neg_tip
                                 + (_retry_tip.replace("后重试", "后仍不会自动重发，需人工下")
                                    if t.retry_at else ""))
+                        elif cur.finished_at and config.ANIME_FINISH_UNSUB:
+                            # 【要排在 retry / plan / covered 【全部】之前】这部番已判完结且开了停订 ⇒
+                            # 它整个掉出 subscribed_where，flush 一条都不会挑，所以：
+                            #  · 落进下面的 else 会被解释成"锁定源/版本过滤光了"——用户多半两样都没设过；
+                            #  · 落进上面的『重试中·第N次』会承诺"X 时之后自动重发"——那次重发【永不发生】，
+                            #    因为整部番不在候选里。这条假承诺比前一条更糟：它让人干等。
+                            # 判序与 core.anime.pending_breakdown 的『已完结』单列一档对齐（那边是对的）。
+                            ui.badge("已停订·不自动下").props("color=teal").tooltip(
+                                "这部番已判完结，且设置页开着『完结后停止自动下新集』，所以它的新集"
+                                "一律不自动下（含失败后的自动重发）。要这一集就点右边『下载』；"
+                                "若其实还没完结，点上方的『继续订阅』。")
                         elif t.retry_at:   # 暂时性失败排队中：它仍是待下，但要让人看见"为什么还没下"
                             ui.badge(f"重试中·第{t.retry_count}次").props("color=orange").tooltip(
                                 f"{t.fail_reason or '暂时性失败'} · "
@@ -357,8 +368,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 一样问一句要不要搬迁。剧场版侧的同名 _enrich 本来就是这么写的（pages/movies.py:213）；
         # 番剧详情页这条一直漏着，已下的集会被静默遗弃在旧目录、同一部番裂成两个文件夹。
         old_path = anime.anime_save_path(anime_id)
-        anime.reset_enrich_tries(anime_id)   # 手动重识别：清零后台重试计数，重新获得自动重试机会
-        ok = await anime.enrich_anime(anime_id)
+        ok = await anime.manual_enrich(anime_id)   # 含清零后台重试计数（三个入口同口径）
         _after()
         ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）",
                   type="positive" if ok else "warning")

@@ -9,3 +9,9 @@ opencc-python-reimplemented   # 繁转简；没装也能跑（自动降级为不
 pymysql>=1.1
 # 数据库版本管理：建表/升级一律走 Alembic（db/schema.py + alembic/），两种后端共用一条版本链
 alembic>=1.13
+
+# 测试（tests/ 已入库，见 docs/DECISIONS.md D-28）。运行：.venv/bin/python -m pytest
+# 【不是可选的】没有它，clone 下来的人跑不了那 470 多条回归——而那份回归网正是
+# 这个项目唯一能挡住"改一处、坏另一处"的东西。零网络、约 10 秒。
+pytest>=8.0
+pytest-asyncio>=0.23

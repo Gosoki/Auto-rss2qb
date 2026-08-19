@@ -58,8 +58,9 @@ systemctl restart autorss         # 重启
 | `config.py` | 配置：默认值硬编码，建库时写入数据库 `settings` 表；运行时读、设置页可改（`.env` 只留 WEB_PORT/DB_PATH 结构项） |
 | `db/` | 数据层：`__init__`(SQLite/WAL 引擎 + 会话 + 开发期加列自动迁移) / `models`(数据模型:`Setting`/`SourceGroup`;TV=`Anime`+`AnimeTorrent`+`AnimeAlias`;剧场版=`Movie`+`MovieTorrent`) |
 | `core/` | **核心逻辑**：`engine`(TV/剧场版共用底层:qB客户端+实时态同步+下载原语+bgm落库+路径季度) / `anime`(TV 番剧线) / `movies`(剧场版/OVA 线,对 anime 零依赖) / `worker`(后台三协程:采集/qB同步/剧场版扫描) |
+| `core/ssrf.py` | 出站请求的内网守卫：取种【每一跳都判】，其余出站【首跳与同主机跳转放行、其余跳判】（config.http_client_kwargs 默认装上） |
 | `services/` | 外部服务客户端：`enrich`(bgm 识别) / `qbittorrent`(qB 客户端) / `notify`(通知推送) |
-| `sources/` | 订阅源：`base`(源基类+`ParsedItem`) / `parse`(标题季度解析) / `nyaa` / `mikan`(Classic RSS 源 + 季度剧场版/OVA 发现) |
+| `sources/` | 订阅源：`base`(`ParsedItem` + `RssSource` —— 取回/校验/过滤/解析/构造【全部】共用逻辑) / `parse`(标题季度解析) / `nyaa`、`mikan`(各只剩 `site`/`TZ`/`_hash_of`/`_url_of` 四个覆写点) / `__init__` 的 `SOURCES` 表(站点→源类，加源只改这一处) |
 | `pages/` | NiceGUI 界面：`anime`(番剧主页 tab:仪表盘/番剧表/待确认/待识别/已忽略/订阅源) / `anime_detail`(番剧详情组件,渲染进悬浮框) / `movies`(剧场版 tab:仪表盘/列表/待识别/已忽略/订阅源) / `parse_test`(解析测试页 `/parse`) / `settings` / `sources` / `layout` |
 
 ## 文档
@@ -71,8 +72,31 @@ systemctl restart autorss         # 重启
 | [docs/audit-2026-08-r3.md](docs/audit-2026-08-r3.md) | 第 3 轮审计：性能/备份/取回层三块新东西的成色（**备份模块自己带着 2 条 critical 上线**）、测试套件自身的质量问题、**新增 9 个待拍板** |
 | [docs/audit-2026-08-r4.md](docs/audit-2026-08-r4.md) | 第 4 轮审计：ani-rss「三件套」落地 + 它引入的 3 条 P0（归纳成两条结构性根因）、完结判据的风险专节 |
 | [docs/audit-2026-08-r5.md](docs/audit-2026-08-r5.md) | 第 5 轮（收官）：交付状态、五轮修复的交叉验证、**这五轮的复盘**（为什么每轮的改动都要靠下一轮才发现 P0） |
-| **[docs/DECISIONS.md](docs/DECISIONS.md)** | **待你拍板的 24 条**（四份报告合并去重，按「影响 ÷ 决策成本」排序）——先看这份 |
+| [docs/audit-2026-08-r6.md](docs/audit-2026-08-r6.md) | 第 6 轮：**MySQL 四条缺陷在真库上修复并验证**、`sources/` 重复合并（前提更正：本项目无插件系统） |
+| [docs/audit-2026-08-r7.md](docs/audit-2026-08-r7.md) | 第 7 轮：第 6 轮那三块改动各自引入的回归（含**一条就写在自己警示注释下面 3 行**的）、**ani-rss 对标收官** |
+| [docs/GLOSSARY.md](docs/GLOSSARY.md) | **术语表**：两条线哪些用词分歧是有意的、哪些字段容易读反 |
+| [docs/audit-2026-08-r8.md](docs/audit-2026-08-r8.md) | 第 8 轮（收官）：**DECISIONS 24 条全部清空**、三条「比描述要大」的改动（SSRF 同主机放行 / 唯一约束差点变成每轮崩 / batch 迁移静默失效） |
+| [docs/audit-2026-08-r9.md](docs/audit-2026-08-r9.md) | 第 9 轮（回顾）：45 agent 对抗复查上一轮的 12 项改动——**没有一项做错，漏的全是覆盖面**；归纳出一种新病「约束的作用域比验证的作用域大」 |
+| **[docs/DECISIONS.md](docs/DECISIONS.md)** | 拍板清单（**24/24 已全部实施**）——保留每条的**为什么**，回退时要用 |
 | [docs/benchmark-ani-rss.md](docs/benchmark-ani-rss.md) | 与 [ani-rss](https://github.com/wushuo894/ani-rss) 的逐维度差距分析、值得借鉴的 Top 5、明确不做的 |
+
+## 加一个订阅源要做什么
+
+**本项目没有插件系统**——`sources/` 就是几个普通模块，共用一个 `RssSource` 基类。加一个站：
+
+1. 新建 `sources/<站>.py`，继承 `RssSource`，给出四样东西：
+   `site`（站点标识）、`TZ`（该站 pubDate 的时区基准）、`_hash_of(entry)`、`_url_of(entry)`。
+2. 在 `sources/__init__.py` 的 `SOURCES` 表里加一行；有搜索接口的再往 `SEARCH_URL` 加一行（可选，缺了只是不支持『补齐』）。
+
+就这两步。取回、bozo 告警、40hex 校验、合集过滤、标题关键词、番名解析、多括号回退、
+字幕组白名单、发布时间、季度推算、`ParsedItem` 构造、异常兜底 —— 全在基类里。
+（一个例外：`sources/mikan.fetch_bangumi_torrents` 是服务于剧场版的第三条解析路径，
+语义不同故未合并 —— 改基类的通用行为时记得看一眼那边。）
+UI 的类型下拉、`engine` 的时区查询、`anime` 的补齐分派都从 `SOURCES` 取，不必再改。
+
+> 这套结构是审计推着做的：合并之前那些逻辑在 nyaa 与 mikan 里各有一份逐字相同的拷贝，
+> 源层的改动**有 9 次是「同一件事改两遍」**，其中最近一次只改了一半（字幕组白名单的大小写），
+> 表现是那个源组每轮抓 0 条、日志里却看不出为什么。
 
 ## 设计要点
 

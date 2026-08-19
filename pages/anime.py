@@ -716,7 +716,10 @@ def anime_page(t: str = ""):
         def _refail(anime_id):
             async def h():
                 old_path = anime.anime_save_path(anime_id)   # 同 _bind：识别成功会改归档目录
-                ok = await anime.enrich_anime(anime_id)
+                # 【必须走 manual_enrich】这里曾直接调 enrich_anime，不清 enrich_tries：
+                # 试满 5 次的番点了这个按钮只当场试一次，此后仍然一次都不自动重试，
+                # 而详情页那个同名按钮是清的——同一个操作两个页面两种行为。
+                ok = await anime.manual_enrich(anime_id)
                 refresh_all()
                 ui.notify("识别成功 ✓" if ok else "还是没识别到（可手动粘贴 bgm 链接绑定）",
                           type="positive" if ok else "warning")
@@ -740,7 +743,7 @@ def anime_page(t: str = ""):
                 ui.notify("已有一轮同步在跑，稍等片刻再看", type="info")
                 return
             try:
-                n = await anime.sync_qb_status()
+                n = await anime.sync_qb_status(manual=True)
             except Exception as e:                       # qB 连不上/超时：别让异常掀翻页面，给个可读提示
                 ui.notify(f"同步失败：{e}", type="negative")
                 return
@@ -779,6 +782,17 @@ def anime_page(t: str = ""):
                     ui.badge("已忽略").props("color=grey").classes("inline-block align-middle mr-2")
                 elif not a.confirmed:
                     ui.badge("待确认").props("color=orange").classes("inline-block align-middle mr-2")
+                elif a.finished_at:
+                    # 【第三态】开了停订时这部番【不再自动下新集】，而在此之前它在列表里
+                    # 与正常追番中的番长得一模一样（没有任何徽标）——用户唯一能察觉的迹象
+                    # 是"它好久没更新了"，而那与源失效、字幕组断更的表现完全一致。
+                    _unsub = config.ANIME_FINISH_UNSUB
+                    ui.badge("🎊 已完结" + ("·已停订" if _unsub else "")).props(
+                        "color=teal").classes("inline-block align-middle mr-2").tooltip(
+                        f"1~{a.total_episodes or '?'} 集全部到手。"
+                        + ("已停止自动下新集（设置页『完结后停止自动下新集』）——"
+                           "若其实还没完（bgm 总集数少记了），进详情页点『继续订阅』。"
+                           if _unsub else "仍在继续自动下新集（只标记不停订）。"))
                 color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
                 ui.label(name_of(a)).classes(
                     f"text-lg inline align-middle cursor-pointer {color} hover:underline").on(

@@ -24,6 +24,17 @@ log = logging.getLogger("autorss")
 # 单次尝试的总时长上限（秒）。比 ENRICH_TIMEOUT（逐块超时，默认十几秒）宽松得多，
 # 只用来兜住"涓流响应把识别协程挂到天荒地老"这一种情形，正常请求碰不到它。
 _ATTEMPT_TIMEOUT = 90
+# resolve() 的【整体】预算（秒）与候选名上限。理由见 resolve 里的注释：
+# 它串在采集主链路上，单番拖久了会连累整轮采集与下载放行。
+# 120 秒对"搜 3 个名字 + 取一次详情 + 取一次声优"绰绰有余（正常一次 1~3 秒）。
+_RESOLVE_BUDGET = 120
+# 【截断前先按繁简去重】candidate_names 会为中文名额外产出一个 t2s 简体孪生，两者紧挨着排在
+# 最前面。直接切前 3 个的话，3 个槽位实际只装得下约 2 个【不同】的名字，日文原名必然被切掉。
+# 用真实标题实测过 2900 条：截断本身不改变最终 bangumi_id（bgm 的 name_cn 就是简体，
+# 繁体名单独搜也命中），但"3 个名字"这个说法是不准的——去重之后才是。
+_MAX_CANDIDATE_NAMES = 3
+# 声优抓取自己的上限：它是【可选】字段，不该占用整体预算，更不该让一次已成功的识别作废。
+_CAST_TIMEOUT = 20
 
 
 async def _retryable(make_request):
@@ -246,14 +257,40 @@ def _subject_to_info(bgm_id, meta: dict) -> dict:
 
 
 async def fetch_by_id(bgm_id: int) -> dict | None:
-    """按明确的 bgm subject id 直接取元数据（『富集失败』页手动绑定用）。取不到返回 None。"""
+    """按明确的 bgm subject id 直接取元数据（『富集失败』页手动绑定用）。取不到返回 None。
+
+    【同样要有整体预算】它串在【UI 同步等待】的路径上（详情页点『绑定 bgm』的 on_click，
+    外层没有任何 timeout），而内部是两次串行的 _retryable —— 最坏
+    2 × ENRICH_RETRY_TIMES × _ATTEMPT_TIMEOUT ≈ 9 分钟，期间按钮一直转圈。
+    剧场版扫描也在 per-movie 循环里调它，还被 _scan_lock 罩着。
+    """
+    try:
+        async with asyncio.timeout(_RESOLVE_BUDGET):
+            return await _fetch_by_id_inner(bgm_id)
+    except TimeoutError:
+        log.warning("按 id 取 bgm 超时（整体 %ds）：%s", _RESOLVE_BUDGET, bgm_id)
+        return None
+
+
+async def _fetch_by_id_inner(bgm_id: int) -> dict | None:
     try:
         async with httpx.AsyncClient(**config.http_client_kwargs(max(1, config.ENRICH_TIMEOUT))) as client:
             r = await _retryable(lambda: client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
             if r.status_code != 200:
                 return None
             j = r.json()
-            cast = await _fetch_cast(client, bgm_id)
+            # 【声优要自己的小超时，不能裸调】与 _resolve_inner 里那段【同一个理由】：
+            # 一个涓流的 /characters 会把 3 次重试各拖满 _ATTEMPT_TIMEOUT(90s)≈270s，
+            # 撑破外层 _RESOLVE_BUDGET(120s)，于是一次【已经拿到 subject 的成功取数】被整份丢掉。
+            # 那三行守卫加在 resolve 那条路径上时，这条漏了——而这条更糟：
+            # discover_movies 走的就是它，info=None → 新片以 bangumi_id 为空落库、归档进 unknown/，
+            # 而剧场版线没有 retry_unmatched 那样的后台重识别，只能人工再点。
+            try:
+                async with asyncio.timeout(_CAST_TIMEOUT):
+                    cast = await _fetch_cast(client, bgm_id)
+            except Exception as e:
+                log.info("声优信息取不到（不影响识别）：%s: %s", type(e).__name__, e)
+                cast = None
     except (httpx.HTTPError, ValueError) as e:
         log.warning("按 id 取 bgm 失败 %s: %s", bgm_id, e)
         return None
@@ -262,6 +299,18 @@ async def fetch_by_id(bgm_id: int) -> dict | None:
     info = _subject_to_info(bgm_id, j)
     info["cast"] = cast
     return info
+
+
+def _dedup_names(names: list) -> list:
+    """按"转简体后是否相同"去重，保序。见 _MAX_CANDIDATE_NAMES 的说明。"""
+    from sources.parse import t2s
+    out, seen = [], set()
+    for n in names:
+        k = t2s(n or "").strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(n)
+    return out
 
 
 async def resolve(names, release_time=None, episode=None, info_hash=None) -> dict | None:
@@ -287,6 +336,30 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
         else:
             est = date_ref = None    # 长番 / 绝对编号 / -1 特别篇 / -2 未识别
 
+    # 【整体时间预算】识别是【串在采集主链路上】的：process_item 在种子落库【之前】调它，
+    # 而 poll_once 又要等所有条目处理完才轮到 flush 放行下载。
+    # 没有这层封顶时，最坏情况是 候选名数 × 重试次数 × _ATTEMPT_TIMEOUT ——
+    # 实测单番可达 ~22 分钟，二十个新番就能把整轮采集与下载放行堵住数小时；
+    # 而 nyaa 的 RSS 是滑动窗口，被堵期间滚出去的条目【永远不会再被采到】。
+    # 超时就当"这次没识别成"，番留在『待识别』，由 run_reenrich_retry 按退避重来。
+    try:
+        async with asyncio.timeout(_RESOLVE_BUDGET):
+            return await _resolve_inner(_dedup_names(names)[:_MAX_CANDIDATE_NAMES],
+                                        est, date_ref, info_hash)
+    except TimeoutError:
+        # 【这里不能再自己记一次 bgm 失败】预算罩住的不只是 bgm，还有 Mikan 桥
+        # （_mikan_bridge）——而它自己的注释明写着"不记 bgm 的账：混在一起会让
+        # 'Mikan 打不开' 被判成 'bgm 整体不可达'，把退避阶梯无限退款"。
+        # 无条件记的话，Mikan 涓流就能让每一轮都退款：enrich_tries 永远回到 0、
+        # 每个检查节拍重打一遍 bgm，而 bgm 从头到尾都是 200。实测复现过。
+        # 内层已经在每个真实的 bgm 失败点各记了一笔，这里【什么都不做】才是准确的。
+        log.warning("富集超时（整体 %ds），按未识别处理：%s",
+                    _RESOLVE_BUDGET, (names[0] if names else info_hash or "")[:40])
+        return None
+
+
+async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
+    """resolve 的主体。拆出来只为让上面那层 asyncio.timeout 包得干净。"""
     try:
         async with httpx.AsyncClient(**config.http_client_kwargs(max(1, config.ENRICH_TIMEOUT))) as client:
             # ① 多名搜 bgm，统计投票（被几个名字命中）+ 记录日期贴合度
@@ -325,7 +398,17 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
                     meta = {}
                 except ValueError:
                     meta = {}          # JSON 坏了——问到了，只是对方给的东西不对
-                cast = await _fetch_cast(client, bgm_id)   # 声优另调 /characters（只抓主角）
+                # 【声优单独限时，且失败不影响识别】走到这里 bgm_id 与 meta 都已到手，
+                # 只差这一个【可选】字段（_fetch_cast 自己就返回 None 容错）。
+                # 把它罩在整体预算里的话，一个挂死的 /characters 会让一次【已经成功】的识别
+                # 整个作废、番退回『待识别』——而那正是本函数下面几行明写"只有【详情】取不到
+                # 才算识别失败"要排除的情形。给它自己的小超时，兜住就好。
+                try:
+                    async with asyncio.timeout(_CAST_TIMEOUT):
+                        cast = await _fetch_cast(client, bgm_id)
+                except (TimeoutError, Exception) as e:   # noqa: B014  （TimeoutError 只为可读性）
+                    log.info("声优信息取不到（不影响识别）：%s: %s", type(e).__name__, e)
+                    cast = None
 
         if bgm_id is not None and not meta:
             # 【搜到了 id、却没取到详情】(bgm 502/限流/超时，或 subject 被删) 不能算识别成功：

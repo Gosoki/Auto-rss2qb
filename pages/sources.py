@@ -6,9 +6,11 @@ render_sources() 抽出来复用：/sources 独立页 与 番剧列表『订阅�
 from nicegui import ui
 
 from core import anime
+from sources import SOURCES
 from .layout import frame, confirm
 
-SITE_OPTS = {"nyaa": "nyaa", "mikan": "mikan"}
+# 类型下拉直接取自 sources.SOURCES —— 加一个源时不必再回来改这里
+SITE_OPTS = {k: k for k in SOURCES}
 POLICY_OPTS = {"auto": "自动下载", "review": "人工审核"}
 
 

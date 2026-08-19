@@ -38,7 +38,8 @@ def _group_by_year_quarter(items):
     by_year: dict = defaultdict(lambda: defaultdict(list))
     for it in items:
         q = it.quarter or "未知"
-        year = q[:2] if (q != "未知" and len(q) >= 2 and q[:2].isdigit()) else "未知"
+        _y = engine.quarter_year(q)
+        year = f"{_y - 2000:02d}" if _y is not None else "未知"
         by_year[year][q].append(it)
     out = []
     for year in sorted(by_year, key=lambda y: (1, 0) if y == "未知" else (0, -int(y))):
@@ -167,6 +168,12 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         with ui.row().classes("items-center gap-3 flex-wrap"):
             ui.button("重新识别", icon="refresh", on_click=_enrich).props(
                 "flat dense size=sm").style("font-size:12px")
+            _rb = ui.button("刷新版本", icon="cloud_download", on_click=_refresh_versions).props(
+                "flat dense size=sm").style("font-size:12px")
+            _rb.set_enabled(bool(cur.mikan_id))
+            _rb.tooltip("去 Mikan 重新拉这一部的全部版本（BD 常在首映后半年到一年半才出，"
+                        "而发现是按整年扫的）" if cur.mikan_id
+                        else "这部片没有 Mikan 番组 id，无法刷新（重新扫描该年份可补上）")
             if cur.rejected:
                 ui.button("恢复订阅", icon="undo", on_click=_restore).props(
                     "dense size=sm color=primary unelevated").style("font-size:12px")
@@ -236,6 +243,16 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                   type="positive" if ok else "warning")
         if ok:
             await _maybe_relocate_movie(movie_id, old_path, _after)
+
+    async def _refresh_versions():
+        r = await mov.refresh_movie_torrents(movie_id)
+        if not r["ok"]:
+            ui.notify(r["msg"], type="warning")
+            return
+        _after()
+        ui.notify(f"站上 {r['seen']} 个版本，新增 {r['added']} 个"
+                  if r["added"] else f"站上 {r['seen']} 个版本，没有新的",
+                  type="positive" if r["added"] else "info")
 
     def _reject():
         mov.reject_movie(movie_id)
@@ -844,7 +861,7 @@ def movies_page(t: str = ""):
                 ui.notify("已有一轮同步在跑，稍等片刻再看", type="info")   # 理由同番剧页
                 return
             try:
-                n = await mov.sync_qb_status()
+                n = await mov.sync_qb_status(manual=True)
             except Exception as e:                       # qB 连不上/超时：给可读提示，别掀翻页面
                 ui.notify(f"同步失败：{e}", type="negative")
                 return

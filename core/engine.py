@@ -10,7 +10,6 @@ import ntpath
 import os
 import posixpath
 import re
-import socket
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -19,6 +18,7 @@ from sqlmodel import func, or_, select
 import config
 from db import get_meta_session, get_session
 from db.models import AnimeTorrent, MovieTorrent, Setting
+from core import ssrf
 from services import fetch
 from services.qbittorrent import QBittorrent
 from sources.parse import format_quarter
@@ -138,6 +138,17 @@ def quarter_label(quarter: str) -> str:
     return format_quarter(quarter, config.QUARTER_FMT_UI)
 
 
+def quarter_year(quarter: str) -> int | None:
+    """季度键(26C) → 四位年份(2026)；解析不出回 None。**"从季度取年份"只此一份**。
+
+    曾有两份各写各的：core/movies.py 的小结返回 `2000+int(q[:2])`（四位 int），
+    pages/movies.py 的分组返回 `q[:2]`（两位 str），而两者的"解析不出"判据也不同。
+    剧场版整条线都按年归档（MOVIE_QUARTER_FMT 默认 {yyyy}），这是它最常用的一个派生量。
+    """
+    q = quarter or ""
+    return 2000 + int(q[:2]) if len(q) >= 2 and q[:2].isdigit() else None
+
+
 def prev_quarter(q: str) -> str:
     """上一个季度键：26C→26B，26A→25D（A 是年内第一季）。解析不出回空串。"""
     m = _QUARTER_KEY_RE.fullmatch(q or "")
@@ -224,7 +235,12 @@ def build_save_path(quarter: str, folder_name: str, season: int | None = None,
 def apply_bgm_meta(obj, info: dict | None, keep_path: bool = False) -> None:
     """把 enrich 结果写进 obj（Anime 或 Movie，bgm 字段同名）——只覆盖非空值。
 
-    keep_path=True（已有已下文件时）冻结【所有决定归档路径的字段】：季度 + jp_name/display_name。
+    keep_path=True（已有已下文件时）冻结决定归档路径的字段（季度 + jp_name/display_name），
+    但**只冻结已经有值的那些**——空值照样会被填上。这是有意的：一律 `continue` 的话，
+    bgm 第一次没识别出来的片会带着空 quarter/jp_name 永久钉死在 `.../unknown/<种子原名>/`，
+    把"目录名不好看"换成"永远修不好"。代价是"空→有值"这一次仍会改路径，
+    带 UI 的那几条链路（绑定 / 详情页重新识别）本来就跟着 relocate 会把文件搬过去；
+    **无 UI 的后台链路要自己快照回写**（见 movies._upsert_movie）。
     路径由 (quarter, jp_name or display_name, season) 拼成（见 anime._anime_path_parts），
     这几个字段一变，新集就落到另一个目录、已下的分集留在旧目录，同一部番裂成两个文件夹，
     而 qB 那边没人去搬。此前只冻结了 quarter，名字是漏的——重识别走的是【全新 bgm 搜索】而非
@@ -247,111 +263,9 @@ def apply_bgm_meta(obj, info: dict | None, keep_path: bool = False) -> None:
 
 # ---------------- 下载原语（取种子 + 交 qB） ----------------
 
-def _ip_is_internal(ip) -> bool:
-    """ipaddress 对象是否属内网/环回/链路本地/保留等不可路由到公网的范围。
-    IPv4-mapped IPv6（::ffff:127.0.0.1）先归一到内嵌 IPv4 再判，防映射写法绕过。"""
-    mapped = getattr(ip, "ipv4_mapped", None)
-    if mapped is not None:
-        ip = mapped
-    return (ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
-
-
-async def _safe_ip_for(host: str) -> str | None:
-    """解析 host 并逐个校验，返回一个【已校验安全】的 IP；有任何一个地址落在内网/环回则返回 None。
-
-    返回 IP 而不是只回布尔，是为了让调用方把连接【钉】在这个地址上——见 _block_internal_request
-    里对 DNS 重绑定的说明。字面 IP 原样返回（校验通过的话），域名取第一个解析结果。
-    解析失败/无结果保守视作内网（反正也连不上）。
-    """
-    host = (host or "").strip("[]")            # 去 IPv6 字面量方括号
-    try:
-        return None if _ip_is_internal(ipaddress.ip_address(host)) else host
-    except ValueError:
-        pass
-    try:
-        infos = await asyncio.get_running_loop().getaddrinfo(
-            host, None, proto=socket.IPPROTO_TCP)
-    except (OSError, UnicodeError, ValueError):
-        return None
-    if not infos:
-        return None
-    first = None
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return None                        # 解析出无法识别的地址形态 → 保守拒
-        if _ip_is_internal(addr):
-            return None                        # 只要有一个内网地址就整体拒（别给轮询解析留缝）
-        if first is None:
-            first = info[4][0]
-    return first
-
-
-async def _host_is_internal(host: str) -> bool:
-    """host（字面 IP 或域名）会不会连到内网/环回地址。
-
-    字面 IP 直接判；其余（域名，以及十进制 2130706433 / 0x7f000001 / 0177.0.0.1 等非点分整数写法）
-    交给 getaddrinfo 实际解析、对每个解析地址逐一判——这些花式写法会被解析成真实内网 IP 从而被拦，
-    指向内网的域名同样被拦（弥补『只拦字面 IP』的绕过面）。解析失败/无结果保守视作内网并拒（反正也连不上）。
-    """
-    host = (host or "").strip("[]")            # 去 IPv6 字面量方括号
-    try:
-        return _ip_is_internal(ipaddress.ip_address(host))
-    except ValueError:
-        pass
-    try:
-        infos = await asyncio.get_running_loop().getaddrinfo(
-            host, None, proto=socket.IPPROTO_TCP)
-    except (OSError, UnicodeError, ValueError):
-        return True
-    if not infos:
-        return True
-    for info in infos:
-        try:
-            if _ip_is_internal(ipaddress.ip_address(info[4][0])):
-                return True
-        except ValueError:
-            return True                        # 解析出无法识别的地址形态 → 保守拒
-    return False
-
-
-async def _block_internal_request(request: httpx.Request) -> None:
-    """请求级钩子：种子下载不许打到内网/环回地址（含重定向后的每一跳）——挡住 RSS 里的 SSRF 载荷。
-
-    【校验完还要把连接钉在校验过的那个 IP 上】否则是典型的 TOCTOU：我们在这里解析一次判定安全，
-    httpx 建连接时会【再解析一次】，两次之间没有任何绑定。攻击者用 TTL=0 的 DNS 交替应答
-    （第一次回公网 IP 放行、第二次回 127.0.0.1）即可绕过——实测可取回本机服务的响应。
-    把 URL 主机改写成已校验的 IP、Host 头保留原域名、https 再带上 sni_hostname，
-    证书校验与虚拟主机都照常工作（实测 http/https 均 200）。
-    本钩子对每一跳重定向都会跑，所以每跳各自钉各自的，不必自己重写重定向循环。
-
-    已配代理时目标由代理侧解析、本地判定既无意义又会误伤，跳过。
-    """
-    if config.PROXY:
-        return
-    host = request.url.host or ""
-    ip = await _safe_ip_for(host)
-    if ip is None:
-        raise ValueError(f"拒绝下载到内网/环回地址（防 SSRF）：{host}")
-    # 【已知取舍】钉住单个地址 = 放弃 httpx/anyio 的 happy-eyeballs 多地址回退（RFC 6555）：
-    # 域名解析出多个地址时，原先连不通第一个会自动试下一个，现在只连我们选中的那个。
-    # 接受它的理由：多地址回退只在"第一个地址不通、其余通"时才有价值，而那对本工具的场景
-    # （固定几个种子站、走同一条家宽）很罕见；而不钉就等于把 DNS 重绑定的洞留着。
-    # 真要两者兼得，得在这条关键下载路径上加一层"逐个候选地址重试"的循环——
-    # 那条路径一旦写错就是【所有下载全挂】，代价不对等，故不做。
-    if ip != host:                     # 域名 → 钉到刚校验过的地址；字面 IP 无需改写
-        # 【Host 头要带端口】request.url.host 不含端口，直接拿它当 Host 会把
-        # 'example.com:8443' 写成 'example.com' —— 非默认端口的私站取种恒失败，
-        # 而浏览器/curl 一切正常，排查方向会被完全带偏。netloc 是"主机[:端口]"的原样。
-        # 改 host 之前先取 netloc（copy_with 之后 netloc 里的主机已经变成 IP 了）。
-        netloc = request.url.netloc.decode("ascii")
-        request.url = request.url.copy_with(host=ip)
-        request.headers["Host"] = netloc
-        if request.url.scheme == "https":
-            request.extensions["sni_hostname"] = host
-
+# SSRF 守卫已挪到 core/ssrf.py —— config.http_client_kwargs 要用它装默认钩子，
+# 而 config 是最底层，不能反过来 import 本模块。取种这条路径用【每一跳都判】的严格口径：
+# download_url 整个来自 RSS 正文，不存在"用户自填所以可信"。
 
 async def fetch_torrent_bytes(url: str) -> bytes:
     """流式下载 .torrent，封顶 32MB + 整体 180s 超时（download_url 源自 RSS 可被投毒 + 跟随重定向）。
@@ -363,7 +277,7 @@ async def fetch_torrent_bytes(url: str) -> bytes:
     if not (url or "").lower().startswith(("http://", "https://")):
         raise ValueError(f"拒绝非 http(s) 下载地址（防 SSRF）：{(url or '')[:80]}")
     kwargs = config.http_client_kwargs(60)
-    kwargs["event_hooks"] = {"request": [_block_internal_request]}
+    kwargs["event_hooks"] = {"request": [ssrf.block_internal_request]}
     async with httpx.AsyncClient(**kwargs) as client:
         # 复用 services.fetch 的封顶实现，别再手写一份：那份已经处理了"上限只作用在解压后"
         # 这个坑（一个几百 KB 的 gzip 压缩体能在单个块里解出几十 MB，等发现超限内存早就上去了）。
@@ -379,7 +293,14 @@ async def fetch_torrent_bytes(url: str) -> bytes:
 #   · mikan ：pubDate 不带时区（实为北京时间 UTC+8），feedparser 按 GMT 解释 → 存的是北京墙钟
 # 存量数据用的都是旧基准，所以【只在显示期换算、不改库】——改入库那头会让新旧数据混在同一列、更难看。
 # 用真实时区做 astimezone() 而不是写死小时差：本机换个时区（或夏令时地区）也照样对。
-_SITE_TZ = {"nyaa": timezone.utc, "mikan": timezone(timedelta(hours=8))}
+#
+# 【时区基准存在源自己身上，不在这里维护一张表】这里曾经是一张 {site: tz} 的字典，
+# 而它是全项目唯一一处"新增一个源时漏改了【不会报错】、只是发布时间整天错"的地方。
+# 现在每个源类自带 TZ 属性（见 sources/base.RssSource），这里按 site 去源里问。
+def _site_tz(site: str):
+    from sources import SOURCES
+    cls = SOURCES.get(site or "")
+    return getattr(cls, "TZ", None) if cls else None
 
 
 def torrent_time(t) -> str:
@@ -393,7 +314,7 @@ def torrent_time(t) -> str:
     注意 release_time 不进任何下载/门禁判定（开始使用日比的是 bgm air_date），这纯粹是显示层。
     """
     if t.release_time is not None:
-        tz = _SITE_TZ.get(getattr(t, "site", "") or "")
+        tz = _site_tz(getattr(t, "site", "") or "")
         if tz is not None:
             return str(t.release_time.replace(tzinfo=tz).astimezone().replace(tzinfo=None))[:16]
         return str(t.release_time)[:16]
@@ -533,7 +454,9 @@ def pick_order(torrents, pref=None, prefer_fresh: bool = False):
     否则会出现这样的死结：某集优先级最高的那一份种子是坏的（源下架/磁链失效），
     每次挑都还是它、每次都失败，而同集另一个源的健康 pending 兄弟永远轮不到——
     该集就此永久停滞，用户按仪表盘指引点『补下』永远返回 0，详情页还把『将下载』标在坏的那条上。
-    只给"会真的逐个去试"的路径用（补下/计划），后台 flush 只从 pending 里挑、不受影响。
+    【三条路径现在都用它】补下 / 计划 / 后台 flush 同口径（D-08）。这里曾写着"后台 flush
+    只从 pending 里挑、不受影响"——那句话在 D-08 之后就不成立了：flush 也开了 prefer_fresh，
+    因为 pending 里确实有失败过的（暂时性失败留在 pending 上排队重试）。
     """
     cands = torrents
     if pref:
@@ -967,18 +890,22 @@ def backfill_legacy_progress_once() -> None:
         log.info("一次性迁移：%d 条历史 sent 种子标记为已完成（qb_progress=1，脱离 in-flight）", n)
 
 
-async def sync_qb_status(model_cls) -> int:
+async def sync_qb_status(model_cls, manual: bool = False) -> int:
     """从 qB 拉某表『在下的』种子实时态并写回。返回更新数。整轮串行化，实现见 _sync_qb_status。
+
+    manual=True 是【页面上人点了『立刻刷新』】。差别只有一处：没有在下种子时，
+    后台轮次直接收工，而人工这一次仍会去补查『文件缺失』的行——理由见 _sync_qb_status 里
+    那段"只在已有在下种子时搭车"。
 
     锁在这一层而不是在调用方：调用方有四个（后台轮询两条线 + 两个页面按钮），任何一个漏加都会
     把下面那套"宽限一轮"的墙钟语义打回原形（理由见 _sync_locks）。页面想避开排队等待可以先问 sync_busy()。
     """
     lock = _sync_locks.setdefault(model_cls, asyncio.Lock())
     async with lock:
-        return await _sync_qb_status(model_cls)
+        return await _sync_qb_status(model_cls, manual)
 
 
-async def _sync_qb_status(model_cls) -> int:
+async def _sync_qb_status(model_cls, manual: bool = False) -> int:
     """从 qB 拉『在下的』种子实时态写回某表（AnimeTorrent/MovieTorrent，qb_* 字段同名）。返回更新数。
 
     一次 hashes= 拿全状态，客户端按 qB 态分桶：
@@ -1007,13 +934,16 @@ async def _sync_qb_status(model_cls) -> int:
         # 但排除得太干净就成了死胡同：用户在 qB 里把文件放回去、重新校验之后，
         # 我们再也不去看它一眼，UI 上那条醒目的『文件缺失』告警【永不消失】，该行也永不归档。
         # 所以额外查一遍它们、跟着本轮一起刷新：qB 侧一恢复，真实态就把记号覆写掉、告警自动消失。
-        # 【只在已有在下种子时搭车】没别的事时不为它单独唤醒 qB —— 恢复文件是人工动作，不急这一轮。
+        # 【后台轮次只在已有在下种子时搭车】没别的事时不为它单独唤醒 qB —— 恢复文件是人工动作，
+        # 不急这一轮。但【人工点『立刻刷新』时不搭车、单独查】：那一下正是"我刚把文件放回去了"
+        # 的时机，而搭车口径下它恰好不成立（都下完了才会去修文件，此时没有在下种子），
+        # 于是那条『文件缺失』告警要挂到下一次有新种子在下时才会消失——休播期可能是几周。
         recheck = [(t.id, t.info_hash, True)
                    for t in s.exec(select(model_cls).where(
                        model_cls.status.in_(TRACKED_STATUSES),
                        model_cls.qb_state == "missingFiles"))
-                   if t.info_hash] if rows else []
-    if not rows:
+                   if t.info_hash] if (rows or manual) else []
+    if not rows and not recheck:
         return 0
     # 【补查行必须与在下行分开】它们【不参与】下面那套"qB 查不到就在有限轮内落定"的判据：
     #  · 文件缺失的种子 qb_progress 常常正是 1.0（归档闸那段注释就是为此写的），一进 d is None

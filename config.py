@@ -70,7 +70,11 @@ _SPEC = {
     "QB_URL": (str, "http://127.0.0.1:8080"),
     "QB_USERNAME": (str, ""),
     "QB_PASSWORD": (str, ""),
-    "DOWN_PATH": (str, "/home"),            # 工作目录=下载根；番剧/剧场版留空时都直接落它下面
+    # 【默认空，不是 /home】空 = build_save_path 返回 None = 拒绝下载并报"未配置下载目录"。
+    # 曾默认 /home：那是系统目录，而首配链路上【没有任何一处会拦】——设置页的防呆判的是
+    # "两个根不能都为空"，预填的 /home 恒满足它，于是新用户装完直接点保存，番就下进了
+    # /home/26C/<番名>。默认值必须是"过不了自己那道校验"的值，防呆才真的存在。
+    "DOWN_PATH": (str, ""),                 # 工作目录=下载根；番剧/剧场版留空时都直接落它下面
     # 【留空 = 直接落工作目录，不额外分类】——不是 DOWN_PATH/番剧。实测落的是 /home/26C/<番名>。
     # 想要 DOWN_PATH/番剧/… 就把这两项填成【相对名】（如 番剧 / 剧场版），engine.build_save_path
     # 会把它拼在工作目录下面；填绝对路径则整个换根（可另一块盘）。
@@ -106,7 +110,7 @@ _SPEC = {
     # 想收哪些事件（键见 services/notify.EVENTS）。【留空 = 全关】，不是全开——
     # 这与本项目别处"留空=不限"（字幕组白名单、标题关键词）恰好相反，设置页上写明了。
     # 默认值含 delivered，所以老库升级后【行为一字不变】（load_from_db 只补缺键）。
-    "NOTIFY_EVENTS": (list, "delivered,failed,stalled,finished,idle,qb_down,db_down,backlog"),
+    "NOTIFY_EVENTS": (list, "delivered,movie,failed,stalled,finished,idle,qb_down,db_down,backlog"),
     "NOTIFY_MAX_PER_HOUR": (int, 20),       # 全事件合计的限流上限（0=不限）。被丢弃的条数会挂在下一条消息尾巴上
     "NOTIFY_BACKLOG_MIN": (int, 5),         # 『待识别』积压到几部才提醒
     # ---- 完结 / 断更巡检（见 core.anime.sweep_finished / sweep_idle）----
@@ -127,7 +131,6 @@ _SPEC = {
     "MIKAN_ENABLED": (bool, False),
     "MIKAN_RSS_URL": (str, "https://mikanani.me/RSS/Classic"),
     "MIKAN_BASE": (str, "https://mikanani.me"),
-    "MIKAN_SUBGROUPS": (list, ""),          # 逗号分隔 → list
     "BGM_API": (str, "https://api.bgm.tv"),
     # ---- 剧场版/OVA 自动扫描（来源固定为 Mikan 季度桶）----
     "MOVIE_SCAN_ENABLED": (bool, False),    # 自动扫描开关（关=只在 /movies 手动点扫描）
@@ -198,7 +201,14 @@ def http_client_kwargs(timeout: int = 30) -> dict:
     代理账号/密码任一非空时走带认证的 httpx.Proxy；socks5:// 需自行装 socksio——
     缺了它是在【建 AsyncClient 那一步】就抛 ImportError（不是发请求时），而且抛的不是 httpx.HTTPError，
     所以各处只接 HTTPError 的 except 都拦不住它。"""
-    kwargs = {"timeout": timeout, "follow_redirects": True}
+    # 【SSRF 守卫默认就装上】首跳放行（地址是用户在设置页自己填的，自建镜像/局域网 webhook 是正当用法），
+    # 重定向后的每一跳强制内网判定。装在这里而不是各调用点，是因为"新加一处抓取时忘了加"
+    # 恰好是本项目反复栽跟头的那种失效形状——而这一处忘了，代价是常驻协程周期性地
+    # 对同机 qB 发一个源站可控的 GET（审查实测收到过 torrents/delete?hashes=all）。
+    # 延迟导入：core.ssrf 要 import config，模块级会成环。
+    from core import ssrf
+    kwargs = {"timeout": timeout, "follow_redirects": True,
+              "event_hooks": {"request": [ssrf.guard_redirect_request]}}
     proxy = __getattr__("PROXY")
     if proxy:
         user, pw = _v["PROXY_USER"], _v["PROXY_PASS"]

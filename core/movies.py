@@ -88,11 +88,42 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         is_new = movie is None
         if movie is None:
             movie = Movie(title=title, mikan_id=mikan_id)
+        # 【先把这个 mikan_id 从别的行上摘下来】mikan_id 现在是唯一索引，而下一行是
+        # 【无条件】覆写：按 bgm_id 命中的那一行可能原本挂着另一个 mikan_id，
+        # 而这个 mikan_id 又可能正挂在一部"早期扫进来、当时没识别出 bgm"的旧行上。
+        # 不先摘就是 IntegrityError——加约束之前那只是多一行重复（观感问题），
+        # 加约束之后会变成"这部片每一轮扫描都失败"，而日志只有一行『处理剧场版失败』。
+        # 摘掉之后，若两行本就是同一部（同 bgm_id），下面的身份守卫会把它合并掉；
+        # 不是同一部则那行只是失去 Mikan 链接，数据仍在（重扫该年份会重新补上）。
+        for other in list(s.exec(select(Movie).where(Movie.mikan_id == mikan_id))):
+            if movie.id is None or other.id != movie.id:
+                # 注意不能写进 SQL 的 Movie.id != movie.id：新建时 movie.id 还是 None，
+                # `id != NULL` 在 SQL 里恒为 NULL，一行都选不出来。
+                other.mikan_id = None
+                s.add(other)
+        s.flush()      # 【先把"摘掉"落下去】否则 flush 顺序不保证，可能先发出本行的 UPDATE
+                       # 再发旧行的，中间那一瞬两行同值 —— 唯一索引照样 1062。
         movie.mikan_id = mikan_id
         movie.mikan_type = mikan_type   # Mikan 桶判定（剧场版/OVA），列表徽标用
+        keep_path = (not is_new and _has_handled_torrents(s, movie.id))
+        # 【快照要在任何写入之前拍】display_name 也决定目录（_movie_folder 取
+        # jp_name or display_name，两者皆空才回退种子原名），而下面那句"空就填成 Mikan 展示名"
+        # 正是把它从空变成有值的地方 —— 拍晚一格，冻的就是已经被改过的值。
+        # 第一版只冻了 quarter/jp_name，实测目录仍从 `.../[组] 早下的片` 变成 `.../早下的片`。
+        snap = ({k: getattr(movie, k) for k in ("quarter", "jp_name", "display_name")}
+                if keep_path else None)
         if not movie.display_name:
             movie.display_name = title  # 无 bgm 时先用 Mikan 展示名兜底
-        engine.apply_bgm_meta(movie, info, keep_path=(not is_new and _has_handled_torrents(s, movie.id)))
+        # 【连"原本为空"的也要冻】apply_bgm_meta 只冻已有值的字段（理由见那里）。可这条是
+        # **后台扫描**链路：它没有 UI、不会 relocate。一部在 bgm 还没识别出来时就下过的片，
+        # jp_name/quarter 都是空的、文件落在 `.../unknown/<种子原名>/`；下一轮扫描 bgm 识别成功
+        # 就把这两个字段填上，于是归档目录整个换了地方，而盘上的文件没人去搬——
+        # 页面显示的目录与实际落地从此分家，删除/重定位都会打空。
+        # 想把它挪到正确目录，走详情页的『重新识别』：那条路径带 relocate，会把文件一起搬过去。
+        engine.apply_bgm_meta(movie, info, keep_path=keep_path)
+        if snap is not None:
+            for k, v in snap.items():
+                setattr(movie, k, v)
         s.add(movie)
         s.commit()
         s.refresh(movie)
@@ -172,6 +203,41 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
     return {"movies": added_movies, "torrents": added_torrents, "seen": seen, "errors": errors}
 
 
+async def refresh_movie_torrents(movie_id: int) -> dict:
+    """按需重拉这一部剧场版的全部版本（Mikan `/RSS/Bangumi?bangumiId=<mikan_id>`）。
+
+    【为什么需要它】剧场版的 BD 普遍在首映后 6~18 个月才出。发现是按季度整年扫的，
+    而"每隔几个月人工把整年重扫一遍，只为看某一部有没有出新版本"实践中等于不会发生——
+    于是 `Movie.mikan_id` 那句"刷新种子 RSS 用"的注释从上线起就没有兑现过。
+    一次只发一个 RSS 请求，比整年重扫便宜三个数量级。
+
+    返回 {"ok": bool, "msg": str, "added": int, "seen": int}。
+    """
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None:
+            return {"ok": False, "msg": "这部片已不存在（可能刚被合并）", "added": 0, "seen": 0}
+        mid = (m.mikan_id or "").strip()
+    if not mid:
+        # 早期扫描入库的、或被合并时保留了另一侧的行，可能没有 mikan_id。
+        return {"ok": False, "msg": "这部片没有 Mikan 番组 id，无法刷新（重新扫描该年份可补上）",
+                "added": 0, "seen": 0}
+    try:
+        async with mikan.make_client() as client:
+            items = await mikan.fetch_bangumi_torrents(client, mid)
+    except Exception as e:
+        # 【必须接住，且不能只接 httpx.HTTPError】本函数 4 行之上的另一条失败支
+        # （没有 mikan_id）是老老实实按契约返回的，这条却直接抛——而 NiceGUI 的
+        # on_click 里逃出去的异常只进服务端日志，用户看到的是"按钮点了没反应"。
+        # 代理配错时抛的是 ImportError / ValueError，都不属 httpx 异常族。
+        log.warning("刷新剧场版版本失败 movie=%s mikan=%s: %s", movie_id, mid, e)
+        return {"ok": False, "msg": f"Mikan 取不到：{type(e).__name__}: {e}", "added": 0, "seen": 0}
+    # _store_movie_torrents 自带"入库前重取、悬空就放弃"的守卫（我们刚 await 过网络）
+    added = _store_movie_torrents(movie_id, items)
+    log.info("刷新剧场版版本 movie=%s mikan=%s：站上 %d 个，新增 %d", movie_id, mid, len(items), added)
+    return {"ok": True, "msg": "", "added": added, "seen": len(items)}
+
+
 async def scan_now(year: int, seasons: list[str] | None = None) -> dict:
     """扫描一次并记下扫描时间（手动『立即扫描』与后台自动扫描共用）。只碰剧场版，不涉 TV。"""
     res = await discover_movies(year, seasons)
@@ -246,8 +312,7 @@ def year_brief() -> list[dict]:
     剧场版按年归档（quarter 前两位=年份后两位），故按年而非季度小结。"""
     now_year = datetime.now().year
 
-    def yr_of(q):
-        return 2000 + int(q[:2]) if q and q[:2].isdigit() else None
+    yr_of = engine.quarter_year
 
     with get_session() as s:
         movies = list(s.exec(select(Movie.id, Movie.quarter, Movie.rejected, Movie.bangumi_id)))
@@ -614,7 +679,9 @@ async def download_movie_torrent(mt_id: int) -> bool:
                                        quarter_fmt=config.MOVIE_QUARTER_FMT)
     if save_path is None:
         log.error("拒绝越界保存路径 - movie torrent %s", mt_id)
-        _fail(reason="拒绝越界保存路径（检查下载目录设置）")
+        _fail(reason=("未配置下载目录，请到设置页填『工作目录』"
+                      if not (config.DOWN_PATH or config.MOVIE_DOWN_PATH)
+                      else "拒绝越界保存路径（检查下载目录设置）"))
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
@@ -650,7 +717,9 @@ async def download_movie_torrent(mt_id: int) -> bool:
     log.info("已加入qB（剧场版）- torrent=%s", mt_id)
     # 走事件层：否则设置页那句"留空＝一条都不发"对剧场版是假的，
     # 而且批量下 30 个版本 = 30 条不可关、不限流的推送。
-    await notify_event("delivered", f"{folder} 🎬")
+    # 事件键是 'movie' 而不是 'delivered'：见 services/notify.EVENTS 里的说明。
+    # 图标由事件表给（🎬），这里不再自己拼。
+    await notify_event("movie", folder)
     return True
 
 
@@ -684,9 +753,9 @@ async def delete_movie_torrent(mt_id: int) -> bool:
     return True
 
 
-async def sync_qb_status() -> int:
+async def sync_qb_status(manual: bool = False) -> int:
     """从 qB 同步剧场版种子实时态。"""
-    return await engine.sync_qb_status(MovieTorrent)
+    return await engine.sync_qb_status(MovieTorrent, manual=manual)
 
 
 def failed_rows() -> list[dict]:

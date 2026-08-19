@@ -61,6 +61,10 @@ _COL_LEN = {
     "movietorrent.fail_reason": 300,
 }
 
+# 【写入侧要用到的列长】把上面那张表暴露出去：番名对照的键必须在【查询与插入两侧】按同一长度截断，
+# 否则超长番名（畸形标题解析出来的）会走进一条静默的死路——见 core.anime.alias_key。
+ALIAS_TITLE_LEN = _COL_LEN["anime_alias.title"]
+
 
 def _keyed_columns(table) -> set:
     """该表里参与主键/索引/唯一约束的列名——MySQL 要求这些列的类型必须有确定长度。"""
