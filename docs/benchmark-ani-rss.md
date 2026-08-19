@@ -1,0 +1,119 @@
+# 对标 ani-rss：差距分析与借鉴清单
+
+> 基线：[wushuo894/ani-rss](https://github.com/wushuo894/ani-rss)（Java，3.5k star，多用户，JSON 存储）
+> 对照：本项目 autorss（Python/NiceGUI，单人自用，SQLModel 双引擎，约 11.4k 行）
+> 生成：2026-08-18 第 1 轮审计（39 agent 并行调研 + 逐条对抗验证）
+>
+> **读法**：✅ 标的是我们做得更好的地方，不要为了「对齐」把它们改掉。
+> 「必做/可选/不做」是建议，最终以 [audit-2026-08.md](audit-2026-08.md) §待你拍板 为准。
+
+## 一、逐维度差距表
+
+> 口径：ani-rss v3.2.11（3.5k star，多用户、无数据库、JSON 存储）；autorss（单人自用、SQLModel、约 11.4k 行）。**我们做得更好的用 ✅ 标出**。
+
+### 1 订阅源 / RSS
+
+| 能力 | ani-rss 怎么做 | 我们的现状 | 差距 | 建议 | 理由 |
+|---|---|---|---|---|---|
+| 源类型 | Mikan/AniBT/AnimeGarden/任意 RSS 四类，任意 RSS 是一等公民（但强制绑 bgmUrl） | nyaa + mikan 硬编码；`core/worker.py:38-43` 其它 site 静默 warning 跳过 | 中 | 可选 | 我们的 feed 字段已能吃任意 nyaa/mikan 变体 feed；真正的「通用 RSS」需要字段映射配置，成本远大于收益 |
+| RSS 方言兼容 | `enclosure`/`guid`/`nyaa:infoHash`/`<torrent><infohash>`/ed2k，且强校验 Content-Type | 各源写死取法（`nyaa.py:75` / `mikan.py:87`） | 小 | 不做 | 只接两站，方言固定 |
+| 备用 RSS + 自动洗版 | 每订阅多条备用源、各自 offset；主源到了就删备用任务**和本地文件** | `pref_source` 硬锁 + `priority` 择优 + `_revive_orphaned_skipped` 换源兜底 | 中 | 不做 | 我们是「同集只下一份、按优先级挑」；洗版=删已下文件，与本项目「不主动删用户文件」的一贯边界冲突 |
+| 过滤规则 | 订阅级 match/exclude 正则 + 全局 exclude + `{{字幕组}}:正则` 作用域语法 | `SourceGroup.subgroups`（白名单）+ `title_filter`（关键词 OR）+ `Anime.pref_keyword`（单番硬锁） | 中 | 可选 | 三层结构其实我们都有对应物，缺的是**正则**与**排除**（现在只有包含）。加 exclude 关键词成本低 |
+| 从历史标题自动生成规则 | `GroupRegexUtils` 扫该组历史标题，生成可点选的正则 chip（1080P/繁日/HEVC…） | 无 | **大** | **必做（Top 5）** | 我们的 `title_filter` 全靠用户手打「繁日」，这是纯 UX 增量，数据（`AnimeTorrent.raw_title`）本来就在库里 |
+| 轮询 | 单线程串行，每源 sleep 500ms，默认 15 分钟 | 串行 for，无 sleep，默认 1200s；`build_sources()` 每轮从 DB 重建（热生效） | ✅ 我们更简洁 | — | 但见 §3 的 `enrich-blocks-poll`：我们的串行链路里挂了无预算的 bgm 请求 |
+| 每源独立间隔 | 无（全局） | 无（全局） | 平 | 不做 | — |
+
+### 2 识别与元数据
+
+| 能力 | ani-rss | 我们 | 差距 | 建议 | 理由 |
+|---|---|---|---|---|---|
+| 元数据锚点 | bgm 为事实来源 + TMDB 做命名规范化/刮削素材 + AniList 兜底罗马音 | bgm 单源（`services/enrich.py`），Mikan-hash 桥兜底 | 中 | 不做 TMDB | 我们不做刮削（见 1.3），TMDB 的价值 90% 在刮削与集标题上 |
+| 名字匹配 | 靠 bgmUrl 手填 / URL query 自动提取 | 多候选名投票 + 放送日 ±35 天校验 + 繁转简（`enrich.py:261-277`） | ✅ **我们明显更强** | — | ani-rss 把这一步甩给用户手填 bgm 链接 |
+| 集号识别 | 一条主正则兜住 + 每订阅自定义正则 + 捕获组序号 | 5 套模式 + 中文数字 + v2 + 小数集 + 促销串剥离（`sources/parse.py`） | 平，各有洞 | 见 §3 | 我们缺 `[12END]`、`[1170]` 四位；ani-rss 缺我们的多语言段/繁转简 |
+| 集数偏移 | 每订阅 offset + **添加时自动推断** `-(min-1)` | 从 `- 16(88)` 双编号学 offset，只在取值域不相交时折算，学到后回折存量（`anime.py:289-381`） | ✅ **我们更严谨** | — | ani-rss 的 `min-1` 推断在「RSS 窗口恰好从中间开始」时会推错 |
+| 罗马数字季（Ⅱ/IV/∬） | `getSeasonByName` 解析 | **不识别**（实测 `Overlord IV`→season=1） | 小 | 可选 | `ANIME_SEASON_SUBFOLDER` 默认关，且目录名走 bgm 名，实际影响小 |
+| 别名管理 | 无（靠 bgmUrl） | `AnimeAlias` 自动登记，**但无任何 UI 可查看/编辑** | 小 | 可选 | 一旦别名错了（见 `mb-xinfan-fake-anime`）用户无从修 |
+
+### 3 命名与文件组织
+
+| 能力 | ani-rss | 我们 | 差距 | 建议 | 理由 |
+|---|---|---|---|---|---|
+| 保存路径模板 | 16 个变量（`${letter}` 拼音首字母、`${quarterName}`、`${tmdbid}`…），每订阅可覆盖 | 只有季度段可模板化（`QUARTER_FMT`，5 个占位符）；番名段是固定回退链 | 中 | 可选 | 我们的目录结构是「季度/番名/[Season N]」，够用；模板化番名段会让 `_PATH_FIELDS` 冻结逻辑复杂化 |
+| 文件重命名 | qB **下载前**改名（paused→renameFile→start），不断种、不触发 Emby 二次刮削 | 完全不改名（`services/qbittorrent.py` 无 renameFile 端点） | **大** | **不做** | 这是刻意的产品边界：不改名就不需要保证「改名后 qB 仍能做种」，也不需要处理多文件种子。要改就得连带做刮削，是另一个产品 |
+| 媒体库刮削（nfo/poster） | 完整 TMDB 刮削 | 无 | 大 | **不做** | 同上。用户可用 tinyMediaManager/Emby 自带刮削 |
+| 完结迁移 | 完结→改 qB savePath→搬文件→清空目录，做种不断 | `engine.relocate()` 已经能干这件事（setLocation + 移动），只缺「什么时候触发」 | 小 | 见 1.5 | **基础设施已就绪**，是最便宜的 Top 5 之一 |
+| 路径安全 | 文件名清洗 + 长度截断 | 非法字符替换 + `..` 穿越阻断 + **按 UTF-8 字节截断到 200 不切碎多字节** + realpath 越界校验（`engine.py:106-206`） | ✅ **我们更严** | — | — |
+| 跨平台路径 | 靠 Java File | 按 base 形态自动选 `ntpath`/`posixpath`，保证与 qB 回报逐字一致（`engine.py:141-158`） | ✅ 我们更细 | — | — |
+
+### 4 下载器
+
+| 能力 | ani-rss | 我们 | 差距 | 建议 | 理由 |
+|---|---|---|---|---|---|
+| 支持数 | qB/Transmission/Aria2/OpenList 四种 | 只有 qB，且 `engine.qb` 是模块级单例、`qb_*` 6 个列名写进 schema | 大 | **不做** | 抽象成本 = 改 12 个列名 + 跨方言迁移（本项目无 downgrade）+ 重做状态词表映射；Transmission 的态与 qB 不是 1:1 |
+| 分类/标签 | category + tags（字幕组/自定义标签）可配 | 写死 `AutoRSS-Anime`/`AutoRSS-Movie`/`AutoRSS-Manual`，标签=季度键 | 小 | **可选（低成本）** | 让用户能配 category 是 10 行改动，对「和自己其它任务隔离」有实际价值 |
+| 限速/做种限制/队列 | `ratioLimit`/`seedingTimeLimit`/`upLimit`/`dlLimit` 全可配 | 无（`autoTMM=false`、`paused=false` 硬编码） | 中 | 可选 | 用户可在 qB 全局设，不是刚需 |
+| 认证 | 已改 API Key（qB ≥5.2） | cookie 登录 + 1800s TTL + 403 重登 | 小 | 可选 | qB 5.2 的 API Key 更稳（不会被暴力破解封禁，见 `qb-login-no-cooldown`） |
+| 三态返回 | 无此概念 | `True=受理 / False=qB 明确拒 / None=连不上`，连不上不算失败（`qbittorrent.py:163-185`） | ✅ **我们的核心优势** | — | 这是整条交付链正确性的地基 |
+| 停滞检测 | 无 | 进度零推进 N 分钟→标 stalled、脱离轮询、不自动换源、留人工（`engine.py:995-1010`） | ✅ 我们独有 | — | — |
+| 归档（移除种子留文件） | `delete` + `awaitStalledUP` | `QB_ARCHIVE_AFTER_DAYS` + 200 条/轮上限 + 5 次熔断 | ✅ 相当，我们更防御 | — | — |
+| Trackers 自动更新 | 每天 01:00 写 qB `add_trackers` | 无 | 小 | 不做 | 用户在 qB 里自己配即可，不该由订阅器管 |
+
+### 5 自动化
+
+| 能力 | ani-rss | 我们 | 差距 | 建议 | 理由 |
+|---|---|---|---|---|---|
+| **完结检测→自动停订** | 已下集数 ≥ bgm 总集数 → `enable=false` + 🎊 通知 | `total_episodes` **已落库**但只用于集号折算与告警 | **大** | **必做（Top 5）** | 数据齐、判据现成（`HAVE_STATUSES` 计数 vs `total_episodes`），约 30 行 |
+| **遗漏检测** | 集号 min..max 找空洞，空洞 >10 视为误判，每集每天提醒一次 | 详情页有「缺集」标记，但**不主动提醒、不主动去搜** | **大** | **必做（Top 5）** | 我们的 `backfill_source` 已能按名搜种，缺的只是「按 1..total 找空洞并触发」 |
+| **摸鱼检测** | 最新 pubDate 距今 ≥14 天 → 🐟 | 无 | 中 | **必做（Top 5，最便宜）** | 一条 SQL + 一条通知，能提前发现「源失效/字幕组断更」 |
+| 只下最新集 | 全局+每订阅开关 | 无（全量补） | 小 | 不做 | 我们有 `ANIME_START_DATE` 老番过滤，语义更清晰 |
+| 单集黑名单 | `notDownload: List<Double>` | 单条种子「排除」 | 平 | — | — |
+| 缓冲窗口择优 | 无 | `ANIME_DOWNLOAD_GRACE_MIN`（默认 120 分）内攒候选再按优先级挑 | ✅ 我们独有 | — | 比 ani-rss 的「主/备 RSS 顺序」更通用 |
+| 失败重试 | `downloadRetry`（3 次）+ 疑似坏种通知 | 退避表 `(1,5,30,180,720,1440)` 分钟 + 只给可重试原因（`engine.py:81`） | ✅ 我们更细 | — | — |
+| cron | 3 个 `@Scheduled` | 全部固定间隔 sleep | 小 | 不做 | 单人自用，间隔够了 |
+| 批量操作 | 批量启停/刮削/删除/导入导出 | 批量重识别（按季度范围）、批量补下 | 小 | 可选 | 缺「批量导出订阅」 |
+
+### 6 通知
+
+| 能力 | ani-rss | 我们 | 差距 | 建议 | 理由 |
+|---|---|---|---|---|---|
+| 渠道数 | 10 种，且是**数组**（同渠道可多实例，各带事件订阅/模板/重试/排序） | 1 种：`f"{NOTIFY_URL}/💡{quote(msg)}"`（Bark/ntfy 路径式），40 行 | **大** | **必做（Top 5，只做事件维度）** | 渠道多元不重要（Bark 够用），**事件维度是刚需** |
+| 事件类型 | 6 种（开始/完成/缺集/错误/完结/摸鱼） | **1 种：只在交付成功时通知** | **大** | 必做 | 现在「失败、停滞、待确认、识别失败、qB 掉线、库停摆」一律静默，用户只能靠盯页面发现 |
+| 消息模板 | 20+ 变量 + Thymeleaf | 写死两条 f-string | 中 | 可选 | — |
+| 走代理 | `proxyList` 白名单（telegram.org 在内） | ~~全仓唯一绕过 `http_client_kwargs` 的出站请求~~ → **本轮已修**，改走 `config.http_client_kwargs()` | — | ✅ 已完成 | 修前：NOTIFY_URL 在墙外时通知永远发不出，日志只有一行「通知发送失败」 |
+
+### 7 Web UI / 部署 / 运维
+
+| 能力 | ani-rss | 我们 | 差距 | 建议 | 理由 |
+|---|---|---|---|---|---|
+| 鉴权 | 4 种（Header/Form/API Key/IP 白名单）+ 暴力破解封禁 + 可信反代列表 | **无鉴权**，只有 CIDR 白名单中间件；且 `deploy.sh` 强制写 `WEB_HOST=0.0.0.0` + root 运行 | **大** | **可选（但部署层必做）** | 单人内网自用可以不做登录；但 deploy.sh 的默认值必须收（见 §3 P1） |
+| Docker | 3 个镜像 tag + 完整环境变量 | 无 Dockerfile | 中 | 可选 | 有 deploy.sh + systemd，对单人够用；但 Docker 能顺带解决 root/权限问题 |
+| 备份 / 导入导出 | 每天 00:00 zip 备份，保留 7 天；设置与订阅可导入导出 | **完全没有**（只有 SQLite↔MySQL 迁移，不是备份） | 中 | **可选（推荐做备份）** | SQLite 单文件，`shutil.copy2` + 保留 N 份 = 20 行，性价比极高 |
+| 配置演进 | `@SerializedName(alternate=)` + 加载时用默认对象补齐 + Alist→OpenList 自动改写 | Alembic 双 role，**明确不做 downgrade** | 平 | — | 各有取舍 |
+| 数据库 | 无（JSON 全量常驻内存） | 双引擎（配置恒本地 SQLite / 业务可切 MySQL）+ 停摆语义 + 健康看守 | ✅ **我们明显更强** | — | ani-rss 订阅量大时无分页无索引 |
+| 主题切换 | 亮/暗/跟随系统 + 强调色 + 自定义 CSS/JS | `ui.dark_mode(True)` 硬编码，配色写死 | 小 | 不做 | 单人自用 |
+| 搜索/筛选 | 主页搜索 + 月份筛选 + 三种排序 | **番剧表无搜索框**，只有季度折叠 + 分页 | 中 | 可选 | 番剧上百部后会难受 |
+| MCP / 日历 / Emby Webhook | 全有 | 无 | — | **不做** | 明确超出本项目定位 |
+| 测试 | 0 | 0（`.gitignore` 里 `tests/` 有意不入库） | 平 | — | 但见 §9：无测试是所有重构方案的风险放大器 |
+
+### 8 值得借鉴的 Top 5（按性价比）
+
+1. **完结检测 → 自动停订**（`total_episodes` 已在库，判据用现成的 `HAVE_STATUSES` 计数；顺带解锁「完结迁移」，因为 `engine.relocate()` 已经能搬）。
+2. **摸鱼检测**（该番最新 `release_time` 距今 > N 天 → 通知）：一条 SQL + 一条通知，是发现「源失效」的唯一自动手段。
+3. **通知升级为「事件维度」**：至少加 `失败/停滞/待识别积压/qB 连不上/库停摆` 五个事件，配一个 `NOTIFY_EVENTS` 多选。渠道仍只保留现有的 URL 式（顺手修掉不走代理）。
+4. **遗漏检测 + 按空洞补抓**：现在 `backfill_source` 是「按源名搜」，改成「按缺的集号搜」精度更高。
+5. **从历史 `raw_title` 自动生成过滤 chip**：扫该源组已有种子标题，提取 `1080p/繁日/简日/HEVC/内嵌…`，在源组编辑框下给一排可点 chip 直接填进 `title_filter`。零后端成本。
+
+### 9 明确不做的
+
+| 项 | 理由 |
+|---|---|
+| TMDB / 媒体库刮削（nfo/poster/集标题） | 需要连带做文件重命名；用户已有 Emby/tMM 承担这件事 |
+| 文件重命名（含 `SxxEyy` 规范化、下载前 rename） | 本项目定位是「把正确的种子送进 qB」，改名后要保证做种/多文件/字幕关联，是另一个产品 |
+| 下载器抽象（Transmission/Aria2/OpenList） | 6 个 DB 列名叫 `qb_*`、状态词表是 qB 原生态、104 处引用；抽象需跨方言迁移且本项目无 downgrade |
+| 备用 RSS 洗版（自动删旧文件） | 与「不主动删用户已下文件」的产品边界冲突 |
+| MCP Server / ICS 日历 / Emby Webhook 回写 bgm | 超出定位 |
+| 代理域名白名单 | **我们天然不需要**：qB 客户端不走 `http_client_kwargs`（qB 恒在内网），其余出站（nyaa/mikan/bgm/取种/通知）本就全是外网，全部走代理即可，无需逐域名开关 |
+| 多用户 / 权限分级 | 单人自用 |
+
+---
+

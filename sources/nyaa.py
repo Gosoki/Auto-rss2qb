@@ -15,7 +15,7 @@ import config
 from services import fetch
 from sources.base import ParsedItem, Source
 from sources.parse import (candidate_names, clip_title, estimate_premiere, extract_episode_abs,
-                           quarter_of, is_batch, parse_multibracket, parse_title)
+                           kw_match, quarter_of, is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
 
@@ -31,6 +31,11 @@ def nyaa_feed_url(feed: str) -> str:
     feed = (feed or "").strip()
     if feed.startswith(("http://", "https://")):
         return feed
+    if not feed:
+        # 【空用户名 = 全站 firehose】拼出来的是不带 u= 的整站 RSS：几十条/分钟、什么都有。
+        # 而源组的默认策略是 auto（自动建番、自动确认、自动下载）——一个不小心存进去的空 feed
+        # 就能让 qB 开始下载整个 nyaa。宁可这一轮抓不到，也不能让它变成"订阅全站"。
+        raise ValueError("nyaa 源的 feed 不能为空（填用户名或完整 RSS URL）")
     return f"https://nyaa.si/?page=rss&u={feed}&c=1_0"
 
 
@@ -77,7 +82,7 @@ class NyaaSource(Source):
                 return None  # 必须是 40 位 hex：既能跨源去重，也防脏 hash 注入 qB 的 '|' 分隔符
             if is_batch(raw_title):
                 return None  # 合集/BDRip/连续集范围 整理帖
-            if self.title_filter and not any(k in raw_title for k in self.title_filter):
+            if self.title_filter and not any(kw_match(k, raw_title) for k in self.title_filter):
                 return None  # 标题不含所需关键词（如按语言 繁日/简日 过滤）
 
             group, anime_title, season, episode = parse_title(raw_title)
@@ -88,7 +93,10 @@ class NyaaSource(Source):
                     anime_title, search_names = mb
             if not anime_title:
                 return None  # 番名解析为空（如纯多括号格式）→ 无法定位/去重，跳过免撞库
-            if self.subgroups and not any(g in group for g in self.subgroups):
+            # 【与标题关键词同口径：大小写不敏感】紧邻下面那行的 title_filter 早已改成 kw_match，
+            # 唯独这里还是裸 in —— 用户填 lolihouse 而站上写 LoliHouse，该源组每轮全灭，
+            # 日志只有一行"0 条"，没有任何指向。与 R2 判为 P1 的那条是逐字相同的失效模式。
+            if self.subgroups and not any(kw_match(g, group) for g in self.subgroups):
                 return None  # 不在白名单的字幕组
             release_time = None
             # 用 feedparser 已解析的 published_parsed（C 层解析、与进程 LC_TIME 无关），与 mikan 一致。

@@ -8,7 +8,9 @@
 POST 无法这样触发。qB 的 run-external-program 支持 curl -X POST，故合法回调不受影响。
 
 不配也行——只是慢速下完后被 qB 删（remove-on-complete）的种子会被标 error（详见设置页说明）。
-接口只认我们自己表里已交付的 hash、校验 40hex，绑在 127.0.0.1，风险低。
+接口只认我们自己表里已交付的 hash、校验 40hex。**但不设 token 时的免鉴权分支靠的是三条"这不是浏览器/
+不是反代"的判据（见下），只是纵深防御，不等于鉴权**——qB 与本程序不同机、或本机跑着不受信的浏览器时，
+请到设置页设一个 token（页面上那条 curl 会自动带 &t=）。
 """
 import hmac
 
@@ -40,6 +42,17 @@ def qb_done(request: Request, hash: str = "", t: str = "") -> dict:
         # 而真·本机 curl 本来就不会带。带了就说明这不是本机直连，必须要 token。
         if request.headers.get("x-forwarded-for") or request.headers.get("forwarded"):
             return {"ok": False, "error": "callback token required behind a reverse proxy"}
+        # 【上面两条都是"否定式"判据，各有一个默认配置就能踩穿的缺口】：
+        #   · 对端判据：WEB_HOST 默认就是 127.0.0.1，此时能访问到本接口的浏览器【本来就在本机】，
+        #     对端恒等于 127.0.0.1 —— 于是本机浏览器里任意一个网页都能 no-cors POST 打进来。
+        #   · 转发头判据：nginx/caddy 的最小反代配置【不会】主动加 X-Forwarded-For（要写 proxy_set_header
+        #     才有），于是"带了转发头才算反代"在最常见的那份配置下恒为假。
+        # 补一条【肯定式】判据收口：浏览器发起的跨源请求必带 Origin，同源与跨源都必带 Sec-Fetch-Site
+        # （Chrome/Firefox/Safari 现行版本均有），而 qB 的 `curl -X POST` 三个头一个都不带。
+        # 于是"是不是浏览器发来的"变成了正向可判定的事实，不再依赖对方没做什么。
+        if (request.headers.get("origin") or request.headers.get("referer")
+                or request.headers.get("sec-fetch-site") or request.headers.get("sec-fetch-mode")):
+            return {"ok": False, "error": "callback token required for browser-originated requests"}
     # 两侧编码成 bytes 再常量时间比较：str 版 compare_digest 遇非 ASCII 的 t（外部可控 query 参数）会抛
     # TypeError→500 刷栈；bytes 版无此限制。仍是常量时间，堵计时侧信道（绑 0.0.0.0 时才有意义）。
     elif not hmac.compare_digest(t.encode("utf-8"), tok.encode("utf-8")):

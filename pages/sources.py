@@ -12,6 +12,16 @@ SITE_OPTS = {"nyaa": "nyaa", "mikan": "mikan"}
 POLICY_OPTS = {"auto": "自动下载", "review": "人工审核"}
 
 
+def _opts_with(opts: dict, value: str) -> dict:
+    """下拉选项，确保库里那个值一定在里面（不在就临时加一项并标注）。
+
+    典型场景：先建了某个源组、又回滚到不支持该 site 的版本。
+    """
+    if value in opts:
+        return opts
+    return {**opts, value: f"{value}（本版本不支持）"}
+
+
 def _bad_priority(priority) -> bool:
     """优先级输入框为空/非数字时拦下保存并提示。True=有问题，调用方直接 return。
 
@@ -48,8 +58,14 @@ def render_sources() -> None:
             with ui.card().classes("w-full"):
                 with ui.row().classes("items-center gap-2 w-full flex-wrap"):
                     name = ui.input("名字", value=g.name).props("dense outlined").classes("w-32")
-                    site = ui.select(SITE_OPTS, value=g.site, label="类型").props("dense outlined").classes("w-32")
-                    policy = ui.select(POLICY_OPTS, value=g.policy, label="策略").props("dense outlined").classes("w-32")
+                    # 【库里的值不在选项里也要能渲染】ui.select 拿到不在 options 里的 value 会抛，
+                    # 而这一页正是删除源组的【唯一入口】——一旦崩掉，用户连把那个坏组删掉都做不到。
+                    # 后台对同样的数据只是 log.warning 跳过（见 core/worker.py 的 build_sources），
+                    # 没有理由 UI 这边反而硬崩。
+                    site = ui.select(_opts_with(SITE_OPTS, g.site), value=g.site,
+                                     label="类型").props("dense outlined").classes("w-32")
+                    policy = ui.select(_opts_with(POLICY_OPTS, g.policy), value=g.policy,
+                                       label="策略").props("dense outlined").classes("w-32")
                     priority = ui.number("优先级", value=g.priority, format="%d").props("dense outlined").classes("w-32")
                     enabled = ui.switch("启用", value=g.enabled).props("dense")
                 feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).props("dense outlined").classes("w-full")
@@ -81,8 +97,11 @@ def render_sources() -> None:
 
     def _save(gid, name, site, policy, priority, enabled, feed, subgroups, tfilter):
         def h():
-            if not name.value or not feed.value:
-                ui.notify("名字和 feed 不能为空", type="warning")
+            if not (name.value or "").strip() or not (feed.value or "").strip():
+                # 【必须 strip 再判空】纯空格是 truthy，会一路放行到下面的 .strip() 落成空串——
+                # 而空 feed 在 nyaa 那边拼出来的是【不带用户名的全站 RSS】，
+                # 首启种入的 ANi 组又恰好是 policy='auto'：自动建番、自动确认、自动下载整站。
+                ui.notify("名字和 feed 不能为空（也不能只填空格）", type="warning")
                 return
             if _bad_priority(priority):
                 return
@@ -96,7 +115,7 @@ def render_sources() -> None:
                           "也可能是某个字段太长写不进库——具体原因看 /logs", type="warning")
                 return
             group_list.refresh()
-            ui.notify("已保存（下一轮生效）")
+            ui.notify("已保存（下一轮生效）", type="positive")
         return h
 
     def _delete(gid):
@@ -109,13 +128,13 @@ def render_sources() -> None:
                 return
             anime.delete_source_group(gid)
             group_list.refresh()
-            ui.notify("已删除")
+            ui.notify("已删除", type="positive")
         return h
 
     def _add(name, site, policy, priority, feed, subgroups, tfilter):
         def h():
-            if not name.value or not feed.value:
-                ui.notify("名字和 feed 不能为空", type="warning")
+            if not (name.value or "").strip() or not (feed.value or "").strip():
+                ui.notify("名字和 feed 不能为空（也不能只填空格）", type="warning")   # 理由同『保存』
                 return
             if _bad_priority(priority):
                 return
@@ -129,7 +148,7 @@ def render_sources() -> None:
                           "也可能是某个字段太长写不进库——具体原因看 /logs", type="warning")
                 return
             group_list.refresh()
-            ui.notify("已添加（下一轮生效）")
+            ui.notify("已添加（下一轮生效）", type="positive")
         return h
 
     group_list()

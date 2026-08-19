@@ -69,7 +69,15 @@ _EP_PATTERNS = [
     re.compile(r"(?<!\d)[-–—]\s*(\d{1,4}(?:\.\d+)?)(?:\s*[vV]\d+)?" + _FINALE + _EP_END, re.I),
     re.compile(r"[Ss]\d{1,2}[Ee](\d{1,3})"),
     re.compile(r"第\s*([一二三四五六七八九十]+|\d+(?:\.\d+)?)\s*[话話集]"),
-    re.compile(r"[\[【](\d{1,3}(?:\.\d+)?)(?:[vV]\d+)?[\]】]"),
+    # 括号写法 [07]/[07v2]/[28END]/[24 END]/[12完]/[1170]。两处历史坑都在这一条上：
+    # ① 少了 _FINALE：桜都/北宇治等组把最终话写成 [28END]，整条落 -2（未知集）→ 每部番都差最后一集。
+    # ② 位数卡死 3 位：海贼王/柯南 的 [1170] 抽不出集号，整部千集长番进"待识别"。
+    # 放宽到 4 位就必须排掉两类同形的东西——负向前瞻只看【整块】，所以 [1080P] 这种带字母尾巴的
+    # 本来就匹配不上，需要排的只有裸写的年份与分辨率：
+    #   [2023]/[1999] → 发行年（GM-Team 惯例 [国漫][番名][2023][172]，年份在集号前面，先撞上）
+    #   [1080]/[1440]/[2160] → 裸写的分辨率（720/480 这些 3 位的旧代码本来就在收，沿用现状不动）
+    re.compile(r"[\[【](?!(?:19|20)\d{2}[\]】]|(?:1080|1440|2160)[\]】])"
+               r"(\d{1,4}(?:\.\d+)?)(?:\s*[vV]\d+)?" + _FINALE + r"\s*[\]】]", re.I),
     # EP07 / Episode 7 / [EP07]：放最后当兜底（上面四条都认不出才轮到它）。
     # 前面禁字母数字，免得吃到 'Deep 3' 的 ep、'S02EP07' 由第 2 条先管。
     re.compile(r"(?<![A-Za-z0-9])(?:EP|Episode)\s*\.?\s*(\d{1,3})(?!\d)", re.I),
@@ -271,6 +279,17 @@ def format_quarter(quarter: str, fmt: str) -> str:
     return out[:60] if len(out) > 60 else out
 
 
+def kw_match(kw: str, raw: str) -> bool:
+    """版本/标题关键词是否命中种子原名？**大小写不敏感**子串（繁日/简日/1080p 等）。
+
+    【五处共用这一个判据】源组的 title_filter 与 subgroups（nyaa/mikan 的 _parse 各两处）
+    与单番的 pref_keyword（core.anime）。此前源组那两处用的是裸 `in`（大小写敏感）：用户在源管理页填 `1080p`
+    而该组标题写的是 `1080P`，那个源组每一轮都会被整体过滤成 0 条，日志里只有一行"0 条"，
+    而设置页对 pref_keyword 的示例文案用的恰恰是小写的 `1080p`——两处口径相反最容易踩。
+    """
+    return (kw or "").lower() in (raw or "").lower()
+
+
 def _is_chinese(s: str) -> bool:
     """判『中文段』：有汉字、无假名——用于多语言标题优先取中文番名。
     ANi 是 罗马音/中文（中文在后），但别的字幕组常把中文放前面，故按内容挑而非按位置。"""
@@ -298,7 +317,11 @@ def parse_title(raw_title: str):
     else:
         name_part = body
 
-    season = extract_season(raw_title)
+    # 【与集数同口径：都从 body 抽，不从 raw_title】raw_title 带着开头那个 [组] 块，
+    # 组名里恰好有 'S2'/'Ⅱ' 之类字样时（如 '[Sakurato-S2] 某番'）会被读成第 2 季，
+    # 于是该组收的每一部番都被整体挪进第 2 季：季度目录错、跨源集号也对不上。
+    # body 已由 _group_and_body 去掉组块，而 '[某组][S2] 某番' 这种真把季号单独成块的写法仍在 body 里。
+    season = extract_season(body)
     episode = extract_episode(body)                  # 集数从整体正文抽：中文段在前时也不丢 '- EE'
     anime_title = strip_season(t2s(_clean_name(name_part)))
     return group, anime_title, season, episode
@@ -356,7 +379,12 @@ _CJK = re.compile(r"[一-鿿぀-ヿ]")
 _INNER_BLK = re.compile(r"[\[【]([^\]】]+)[\]】]")
 # 明显不是番名的块：分类 / 年份 / 画质 / 编码 / 来源 / 语言 / 纯集号——回退挑名字时跳过它们
 _NAME_BLOCK_SKIP = re.compile(
-    r"^(?:国漫|国番|日漫|港漫|美漫|新番|完结|補番|补番|\d{4}|\d{1,4}(?:\.\d+)?|"
+    # '4月新番'/'10月新番'/'四月新番' 是【季度栏目名】不是番名。漏了它的后果比看起来重：
+    # 天使动漫等论坛的每条标题都带这个块，且它排在真番名【前面】，于是同一论坛当季所有番会
+    # 共用别名 ('4月新番', 1) 被并成同一部假番——落进同一个目录，集号还会互相撞成 skipped。
+    r"^(?:(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*月新?番|"
+    r"招募\w*|招聘\w*|合集|全集|完結|"
+    r"国漫|国番|日漫|港漫|美漫|新番|完结|補番|补番|\d{4}|\d{1,4}(?:\.\d+)?|"
     r"\d+P|\d+x\d+|4K|\d{1,2}\s*bits?|x26[45]|H\.?26[45]|HEVC|AVC|AAC|FLAC|OPUS|DDP|"
     r"GB|BIG5|CHT|CHS|BDRIP|BD|WEB-?RIP|WEB-?DL|Baha|B-?Global|CR|Crunchyroll|"
     r"Bilibili|IQIYI|Netflix|ViuTV|NTV|MKV|MP4|TS|SRT|ASS|"
@@ -377,20 +405,27 @@ def parse_multibracket(raw_title: str):
     """全括号命名 [组][番名块][集号][画质…] 的番名回退：挑出番名块 → 拆多语言 → 候选名。
 
     仅当 parse_title 得空名、且开了 ANIME_MULTIBRACKET_PARSE 时兜底调用（见 nyaa/mikan 源）。
-    挑名策略：① 优先含 '/' 的块（中文/罗马音/日文，最明确）；② 退而取第一个『含 CJK 且非标签』的块。
+    挑名策略：① 优先【真·多语言并列】的块（一侧含 CJK、一侧不含，判据同 _split_langs）；
+    ② 退而取第一个『含 CJK 且非标签』的块；③ 再退取第一个非标签块（纯拉丁名的番靠这一档）。
     带信心闸：洗完拿不到 ≥2 字符的合理候选就返回 None——宁可不猜、落『待识别』，也不建垃圾番。
     返回 (anime_title, candidate_names) 或 None。
     """
     m = _GROUP_RE.match(raw_title)
     body = raw_title[m.end():] if m else raw_title
     blocks = _INNER_BLK.findall(body)
-    nameblk = next((b for b in blocks if "/" in b), None) or \
-        next((b for b in blocks if _CJK.search(b) and not _is_skip_block(b)), None)
+    # ① 优先含 '/' 的块，但【必须是真的多语言并列】——判据复用 _split_langs（一侧含 CJK、一侧不含）。
+    #    无条件认 '/' 会把 [Fate/Zero] 拆成 'Fate'，整个 Fate 系列并成一部番；
+    #    也会让 [招募/翻译] 这类块挤掉后面真正的番名块。
+    nameblk = next((b for b in blocks if len(_split_langs(b)) > 1 and not _is_skip_block(b)), None) or \
+        next((b for b in blocks if _CJK.search(b) and not _is_skip_block(b)), None) or \
+        next((b for b in blocks if not _is_skip_block(b) and len(b.strip()) >= 2), None)
     if not nameblk:
         return None
 
     names: list[str] = []
-    for p in re.split(r"\s*/\s*|_", nameblk):        # 中文/罗马音/日文 多用 / 或 _ 分隔
+    # 块内再拆多语言：'_' 恒拆（只当分隔符用），'/' 走 _split_langs 的同一判据——
+    # 否则挑对了 [Fate/Zero] 这个块，也会在这里被拆回 'Fate'，等于没修。
+    for p in [q for seg in nameblk.split("_") for q in _split_langs(seg)]:
         c = strip_season(_EXT_RE.sub("", _TAG_BLK_RE.sub("", p))).strip()
         if len(c.replace(" ", "")) < 2 or _is_skip_block(c):
             continue

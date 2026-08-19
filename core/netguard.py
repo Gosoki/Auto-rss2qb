@@ -65,6 +65,7 @@ class SubnetGuard:
     """ASGI 中间件：WEB_ALLOW_CIDRS 非空时，非白名单网段的 HTTP/WS 一律拒；空=放行一切。
 
     白名单配了但全解析失败 → nets 为空 → 只有回环能过（fail-closed，但本机仍能进去改回来）。
+    配置整个没从库里读出来（建表/迁移失败）→ 同样只放行回环，理由见 __call__ 里的注释。
     """
 
     def __init__(self, app):
@@ -72,23 +73,46 @@ class SubnetGuard:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
-            raw = (config.WEB_ALLOW_CIDRS or "").strip()
-            if raw:
+            if not config.loaded_from_db:
+                # 【配置根本没从库里读出来】——建表/迁移失败时 main.py 会走停摆分支，
+                # 而 load_from_db 恰好在同一个 try 里，一起没跑成。此时内存里是硬编码默认值，
+                # WEB_ALLOW_CIDRS 的默认值是空串 = "不限制"，白名单就这么静默失效了：
+                # 一个无鉴权、存着 qB 明文密码、能让 qB 往任意目录下载的面板对整个局域网敞开，
+                # 而页面上只说"数据库停摆"，一个字不提白名单已经不作数。
+                # 本模块 docstring 声明的是 fail-closed，这里把它兑现：读不到配置就只放行回环
+                # （本机仍进得去，能到设置页把库修好，锁不死自己）。
                 client = scope.get("client")
-                if not _allowed(client[0] if client else None, _parse(raw)):
-                    await self._reject(scope, send)
+                if not _allowed(client[0] if client else None, ()):
+                    # 【文案必须分开】这一支拒绝的原因是"数据库还没初始化好"，与网段白名单无关。
+                    # 用默认那句"你的网段不在允许访问列表内"会把用户支去查路由和防火墙——
+                    # 而他可能根本没配过白名单，方向完全错。
+                    await self._reject(scope, send, not_ready=True)
                     return
+            else:
+                raw = (config.WEB_ALLOW_CIDRS or "").strip()
+                if raw:
+                    client = scope.get("client")
+                    if not _allowed(client[0] if client else None, _parse(raw)):
+                        await self._reject(scope, send)
+                        return
         await self.app(scope, receive, send)
 
     @staticmethod
-    async def _reject(scope, send) -> None:
+    async def _reject(scope, send, not_ready: bool = False) -> None:
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008})
             return
-        await send({"type": "http.response.start", "status": 403,
+        if not_ready:
+            status, body = 503, (
+                "503 服务未就绪：数据库初始化失败，安全起见暂时只允许本机访问。\n"
+                "这【不是】网段白名单的问题——配置根本没能从数据库读出来，"
+                "而白名单的默认值是『不限制』，照原样跑等于把无鉴权面板对整个局域网敞开。\n"
+                "排查：journalctl -u autorss -n 50")
+        else:
+            status, body = 403, "403 Forbidden：你的网段不在允许访问列表内"
+        await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"text/plain; charset=utf-8")]})
-        await send({"type": "http.response.body",
-                    "body": "403 Forbidden：你的网段不在允许访问列表内".encode()})
+        await send({"type": "http.response.body", "body": body.encode()})
 
 
 def install(app) -> None:

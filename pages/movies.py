@@ -8,6 +8,7 @@ from datetime import datetime
 from nicegui import ui
 
 import config
+import db
 from db.models import MovieTorrent
 from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN
@@ -111,7 +112,7 @@ async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
     _extra = f"；另有 {len(arch)} 个版本已归档、无法代为移动（文件留在旧目录）" if arch else ""
     if not await confirm("归档目录变了，移动已下文件？",
                          f"{len(dl)} 个版本已下，移到新目录：{new_path}{_extra}",
-                         ok_label="移动文件", ok_icon="drive_file_move"):
+                         ok_label="移动文件", ok_icon="drive_file_move", ok_color="primary"):
         ui.notify("已更新记录，未移动文件（新版本将下到新目录，旧文件留在原处）", type="warning")
         return
     rep = await mov.relocate_movie(movie_id, old_path)
@@ -193,8 +194,13 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                         # 的论证正是"失败时人就在跟前，给个能看的 fail_reason 比排队重发有用"）——
                         # 而这个字段原本任何页面都不显示，那句论证在 UI 上是落空的：qB 连不上时状态还会
                         # 落回 pending，列表只显示『待下』，用户完全看不出点过一次且失败了。
-                        _b = ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
-                            "color=blue-grey")
+                        # 走 _mov_live_status 同款改写：剧场版侧 pending 一律叫『可下载』。
+                        # 此前这里直接用 torrent_status_cn 显示『待下』，同一页同一状态两个名字。
+                        _st = torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)
+                        # 颜色也要跟同页一致：pending 在本页别处是 blue（见 _mov_live_status），
+                        # 只有这里写死了 blue-grey —— 文案统一了颜色没统一，反而更像两个状态。
+                        _b = ui.badge("可下载" if _st == "待下" else _st).props(
+                            "color=blue" if _st == "待下" else "color=blue-grey")
                         if t.fail_reason:
                             _b.props("color=orange").tooltip(
                                 f"上次失败：{t.fail_reason}（剧场版不自动重发，要重试就点右边『下载』）")
@@ -226,19 +232,20 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         old_path = mov.movie_save_path(movie_id)
         ok = await mov.enrich_movie(movie_id)
         _after()
-        ui.notify("识别成功" if ok else "未识别到（可粘贴 bgm 链接绑定）")
+        ui.notify("识别成功" if ok else "未识别到（可粘贴 bgm 链接绑定）",
+                  type="positive" if ok else "warning")
         if ok:
             await _maybe_relocate_movie(movie_id, old_path, _after)
 
     def _reject():
         mov.reject_movie(movie_id)
         _after()
-        ui.notify("已忽略")
+        ui.notify("已忽略", type="positive")
 
     def _restore():
         mov.restore_movie(movie_id)
         _after()
-        ui.notify("已恢复")
+        ui.notify("已恢复", type="positive")
 
     def _force(mt_id):
         async def h():
@@ -279,7 +286,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         async def h():
             if not await confirm("排除这一版本？",
                                  "从可下里排除：不再显示为可下、RSS 再遇到同种子也不重收；可随时点『恢复』放回。",
-                                 ok_label="排除", ok_icon="block"):
+                                 ok_label="排除", ok_icon="block", ok_color="primary"):
                 return
             ok = mov.exclude_torrent(mt_id)
             _after()
@@ -291,7 +298,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         def h():
             mov.unexclude_torrent(mt_id)
             _after()
-            ui.notify("已恢复到可下")
+            ui.notify("已恢复到可下", type="positive")
         return h
 
     async def _bind():
@@ -301,7 +308,8 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label("自动认错了就把正确的 bgm 链接或 ID 填这——直接取权威元数据覆盖。").classes(
                 "text-xs text-gray-400")
             inp = ui.input(placeholder="bgm.tv/subject/464376 或 464376").props(
-                "dense outlined autofocus").classes("min-w-80")
+                "dense outlined autofocus").classes("w-80 min-w-0 max-sm:w-full")
+            inp.on("keydown.enter", lambda: dlg.submit(inp.value))   # 同番剧页：autofocus 就该能回车提交
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("绑定", icon="link",
@@ -371,7 +379,7 @@ def movies_page(t: str = ""):
             if not letters:
                 ui.notify("至少选一个季度", type="warning")
                 return
-            ui.notify(f"扫描 {yr} 年 {len(letters)} 个季度的剧场版/OVA…（走 Mikan+bgm，请稍候）")
+            ui.notify(f"扫描 {yr} 年 {len(letters)} 个季度的剧场版/OVA…（走 Mikan+bgm，请稍候）", type="info")
             # 走 worker 那把 _scan_lock 而不是页面自己的标志：一次全年扫描是几分钟的 Mikan+bgm 串行请求，
             # 而页面级防抖只在【本浏览器标签】里有效——挡不住后台自动扫描那一轮，也挡不住第二个标签页。
             # 并发跑两轮不只是请求翻倍：_upsert_movie 是"先查后插"、mikan_id 上没有唯一约束，
@@ -390,14 +398,14 @@ def movies_page(t: str = ""):
             def h():
                 mov.reject_movie(movie_id)
                 refresh_all()
-                ui.notify("已忽略（『已忽略』tab 可恢复）")
+                ui.notify("已忽略（『已忽略』tab 可恢复）", type="positive")
             return h
 
         def _restore(movie_id):
             def h():
                 mov.restore_movie(movie_id)
                 refresh_all()
-                ui.notify("已恢复")
+                ui.notify("已恢复", type="positive")
             return h
 
         def _redownload(mt_id):
@@ -412,7 +420,7 @@ def movies_page(t: str = ""):
             def h():   # 取消排除：把 excluded 放回可下
                 mov.unexclude_torrent(mt_id)
                 refresh_all()
-                ui.notify("已恢复到可下")
+                ui.notify("已恢复到可下", type="positive")
             return h
 
         def _bind_from_input(movie_id, inp):
@@ -492,7 +500,7 @@ def movies_page(t: str = ""):
             ov = mov.overview()
             k = ov["kpi"]
             # 影片维度四卡（粉字）与种子维度三卡（绿字）分组；数字保持语义色；待识别/已忽略点击跳 tab
-            kpi_cards([("电影", k["total"], "", None),
+            kpi_cards([("剧场版", k["total"], "", None),
                        ("已识别", k["matched"], "", None),
                        ("待识别", k["unmatched"], "red", lambda: tabs.set_value("fail")),
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
@@ -501,13 +509,15 @@ def movies_page(t: str = ""):
                        # 与同组其它三张不同量纲，同页还有另外两个口径不同的『已下』）
                        ("已交付", ov["status"]["sent"], "green", None),
                        ("可下载", ov["status"]["pending"], "blue", None),
-                       ("失败", ov["status"]["error"], "red", _open_failed),
+                       # 与番剧页同口径（pages/anime.py）：点开的 failed_rows() 查的是 error+stalled，
+                       # 卡上只数 error 就会出现"卡上写 0、点开列出 N 条"。名字也一并对齐成『失败/异常』。
+                       ("失败/异常", ov["status"]["error"] + ov["status"]["stalled"], "red", _open_failed),
                        ("版本", k["versions"], "", None)])
             if not ov["config"]["qb"]:
                 warn_banner("qB 未启用：剧场版也只采集不下载（设置页开 QB_ENABLED 后生效）")
 
-            # ── 各季度（电影数）──
-            ui.label(f"各季度（电影数）· {len(ov['by_quarter'])}").classes("text-sm font-bold mt-3 pl-1")
+            # ── 各季度（剧场版数）──
+            ui.label(f"各季度（剧场版数）· {len(ov['by_quarter'])}").classes("text-sm font-bold mt-3 pl-1")
             with ui.column().classes("w-full gap-0 pl-1"):
                 maxv = max((tot for _, tot, _ in ov["by_quarter"]), default=1) or 1
                 if not ov["by_quarter"]:
@@ -651,7 +661,7 @@ def movies_page(t: str = ""):
 
             items = mov.list_movies()
             if not items:
-                ui.label("还没有剧场版/OVA。去『订阅源』tab 点『扫描』从 Mikan 拉取。").classes(
+                ui.label("还没有剧场版/OVA。去『订阅源』tab 点『立即扫描』从 Mikan 拉取。").classes(
                     "text-gray-400 p-4")
                 return
             yrs = max(1, config.MOVIE_PAGE_YEARS)  # 防 0（每页 0 年会除零）
@@ -711,7 +721,10 @@ def movies_page(t: str = ""):
                         ui.label("来源: " + (" · ".join(_smap.get(m.id, [])) or "—")).classes(
                             "text-xs text-gray-400")
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
-                        inp = ui.input(placeholder="bgm 链接或 ID").props("dense outlined").classes("min-w-96")
+                        # 与番剧页 pages/anime.py 的同款输入框对齐：min-w-* 是【硬地板】，
+                        # 窄屏收不下去、必定横向撑破卡片。改成 w-96 + min-w-0（让 q-input 真能收缩）
+                        # + max-sm:w-full。剧场版『待识别』恰恰是最常在手机上处理的一页。
+                        inp = ui.input(placeholder="bgm 链接或 ID").classes("w-96 min-w-0 max-sm:w-full")
                         ui.button("绑定", icon="link", on_click=_bind_from_input(m.id, inp)).props("color=primary unelevated")
                         ui.button("重试识别", icon="refresh", on_click=_refail(m.id)).props("flat color=grey")
                         ui.button("忽略", on_click=_reject(m.id)).props("flat color=grey")
@@ -827,6 +840,9 @@ def movies_page(t: str = ""):
             if not config.QB_ENABLED:
                 ui.notify("qB 未启用（去设置页开启『发送种子到 qB』）", type="warning")
                 return
+            if engine.sync_busy(MovieTorrent):
+                ui.notify("已有一轮同步在跑，稍等片刻再看", type="info")   # 理由同番剧页
+                return
             try:
                 n = await mov.sync_qb_status()
             except Exception as e:                       # qB 连不上/超时：给可读提示，别掀翻页面
@@ -867,3 +883,24 @@ def movies_page(t: str = ""):
             _build_tab(e.value)
         tabs.on_value_change(_on_tab)
         _build_tab(start)   # 构建首屏 tab
+
+        def _refresh_live():
+            """30s 定时器：只刷【当前可见 tab】里会随 qB 实时态变化的那几块。
+
+            此前本页【完全没有定时器】，于是仪表盘上的"qB 实时下载进度"永远静止，
+            而那段文案与番剧页逐字相同——用户无从知道其中一个是死的。
+
+            【只刷 overview 这一个 tab】其余 tab 各有理由不能被定时器碰：
+              · sources 是表单（订阅源开关/年份/季度），刷一下用户没保存的编辑就没了；
+              · list/fail/reject 有分页与展开状态，刷一下会跳回第一页。
+            番剧页的同名函数也是这个口径（见 pages/anime.py 的 refresh_timer）。
+            """
+            if tabs.value != "overview" or "overview" not in _built:
+                return
+            if db.is_data_down():     # 停摆时别每 30s 白撞一次库（每次都要等连接超时）
+                return
+            overview_panel.refresh()
+            inflight_panel.refresh()
+            recent_panel.refresh()   # overview tab 的第三块，进度数字同样会变（与番剧页同口径）
+
+        ui.timer(30.0, _refresh_live)

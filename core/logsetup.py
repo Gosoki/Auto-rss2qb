@@ -80,6 +80,14 @@ def setup_logging() -> None:
         h.addFilter(filt)
         root.addHandler(h)
 
+    # 【httpx 的 INFO 访问日志压到 WARNING】它对每个请求记一行完整 URL，而 qB 的
+    # torrents/info 是把几十上百个 hash 拼进 query 的——单条就 4KB 以上，每 QB_SYNC_INTERVAL
+    # 一次，一天能写十几 MB，远超本文件总共 12MB 的保留量：真正想看的采集/下载日志会被
+    # 挤出滚动窗口，而下载下来的日志 99% 是 URL。warning 及以上照常保留。
+    # （同款处理见 db/schema.py 对 alembic 的静音。）
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     ring.setFormatter(_FMT)
     logging.getLogger("autorss").addHandler(ring)  # 只收本应用日志（各模块都用这个 logger 名）
     _configured = True

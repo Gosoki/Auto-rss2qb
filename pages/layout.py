@@ -28,7 +28,19 @@ from core import engine
 _ui_notify = ui.notify
 
 
+# 有彩色底的通知类型：这几种的底色都是浅色档（positive #21BA45 / warning #F2C037 /
+# info #31CCEC / negative 被 ui.colors 定成了 red-400），Quasar 却一律配白字 → 1.9~2.9:1。
+# 【不带 type 的通知【不能】改】那时底色是 Quasar 默认的 #323232 深灰，深色前景只有 1.64:1。
+_LIGHT_NOTIFY_TYPES = ("positive", "negative", "warning", "info")
+
+
 def _slot_safe_notify(message, **kwargs) -> None:
+    # 【必须写 textColor 这个驼峰名】NiceGUI 的 notify 只把 close_button/multi_line 两个参数
+    # 转成驼峰（见 nicegui.functions.notify 的 ARG_MAP），其余【原样】下发给 Quasar。
+    # 而 Quasar 认的是 textColor —— 写 text_color 会被它当成不认识的选项直接忽略，
+    # 也就是说这一行如果写成蛇形，看起来改了、实际什么都没发生（本项目就这么错过一次）。
+    if kwargs.get("type") in _LIGHT_NOTIFY_TYPES or kwargs.get("color"):
+        kwargs.setdefault("textColor", "dark")
     try:
         _ui_notify(message, **kwargs)
     except RuntimeError:
@@ -45,9 +57,25 @@ ui.notify = _slot_safe_notify
 # `platform.is.mobile !== true && behavior !== "dialog" ? false : behavior !== "menu" && …`——
 # 即手机/平板上默认翻成顶部弹出的全宽 dialog（带一个没用的只读输入框），跟桌面端两副样子。
 # 定死 menu，所有 ui.select（含以后新加的）在任何设备上都是同一个下拉。
-ui.select.default_props("behavior=menu")
+ui.select.default_props("behavior=menu dense outlined")
+# 输入类控件的统一形态定在这里，而不是每个调用点各写一遍 `.props("dense outlined")`。
+# 此前是后者：38 处逐字重复，于是漏一处就多一种样子（movies 的『扫描间隔』输入框就是全站唯一
+# 一个下划线样式的框）。定成默认值之后，以后新加的控件默认就是对的，也不会再有"漏写"这件事。
+ui.input.default_props("dense outlined")
+ui.number.default_props("dense outlined")
+ui.textarea.default_props("dense outlined")
+ui.switch.default_props("dense")
+# 按钮：no-caps 让拉丁文标签不被 Quasar 强制大写（中文看不出差别，混排时才显形，
+# 全站只有一处显式写了它 —— 属于"碰巧没人注意到"而不是"有意统一"）。
+ui.button.default_props("no-caps")
 
-NAV = [("manage", "动漫番剧", "/"), ("movies", "OVA・剧场版", "/movies"),
+# ---- 全站术语表：改文案前先看这里，UI 上同一个东西只能有一个叫法 ----
+#   TV 周更 → 「番剧」        （不用"动漫/动画/anime"）
+#   剧场版/OVA → 「剧场版」    （不用"电影/影片/OVA・剧场版"）
+#   一条可下载的种子 → 「种子」（剧场版侧历史上叫"版本"，见 docs 里待裁决项 Q9）
+#   status=pending → 「待下」  （剧场版侧显示成"可下载"，同上）
+#   review 策略 → 「人工审核」  rejected → 「已忽略」  未匹配 bgm → 「未识别」
+NAV = [("manage", "番剧", "/"), ("movies", "剧场版", "/movies"),
        ("parse", "解析测试", "/parse"), ("manual", "手动下载", "/manual"),
        ("logs", "运行日志", "/logs"), ("settings", "全局设置", "/settings")]
 
@@ -192,6 +220,13 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
         ],
         rows=rows, row_key="id",
     ).classes("w-full")
+    # Quasar 的默认空态是英文 "No data available" 配一个警告三角——全站唯一一处英文，
+    # 而新库第一次打开首页就会看到它。用中文插槽换掉（模板里不能出现半角引号）。
+    tbl.add_slot("no-data", """
+        <div class="full-width row flex-center q-py-md text-gray-400" style="font-size:14px">
+            还没有记录
+        </div>
+    """)
     # 番名：可点则染蓝加手型、点击 $emit 回传整行给 Python；不可点则纯文本。原始名恒为灰色小字。
     name_top = ('<div class="cursor-pointer text-blue-400" '
                 "@click=\"() => $parent.$emit('opendetail', props.row)\">{{ props.row.name }}</div>"
@@ -457,12 +492,26 @@ _HEAD_BASE_CSS = (
     "transform:translate(-50%,-50%);margin:0!important}}"
     # 顶栏『跳转到』悬浮下拉：自写 :hover 规则（不依赖 Tailwind 的 group-hover——它在本环境的 Tailwind 构建里不生成）。
     # 菜单本体/条目也全用自写 CSS：block 条目撑满菜单宽，hover 高亮整行铺满（不再是浮在中间的圆角小块）。
-    ".jumpdd .jumpmenu{display:none}.jumpdd:hover .jumpmenu{display:block}"
+    # focus-within 与 hover 并列：display:none 的子树不进 tab 序，只有 :hover 的话
+    # 键盘用户永远打不开这个菜单（≥1024px 时汉堡是隐藏的，没有第二条路）。
+    ".jumpdd .jumpmenu{display:none}"
+    ".jumpdd:hover .jumpmenu,.jumpdd:focus-within .jumpmenu{display:block}"
     ".jumplist{background:#1b1e24;border:1px solid rgba(255,255,255,.14);border-radius:8px;"
     "overflow:hidden;padding:4px 0;box-shadow:0 8px 24px rgba(0,0,0,.45)}"
     ".jumplist .jitem{display:block;padding:6px 18px;font-size:14px;line-height:1.5;"
     "color:#d1d5dc;white-space:nowrap;cursor:pointer;transition:background .12s}"
     ".jumplist .jitem:hover{background:rgba(255,255,255,.08)}"
+    ".jumplist .jitem{text-decoration:none}"
+    # 顶栏导航：用真链接（<a>）而不是可点的 <div>——键盘 Tab 到得了、能中键/新标签打开、
+    # 屏幕阅读器也认得。样式全在这里定，免得 Tailwind 的 underline 类与链接默认下划线互相盖。
+    ".navlink{text-decoration:none}"
+    ".navlink.is-active{text-decoration:underline;text-underline-offset:8px;text-decoration-thickness:2px}"
+    # 焦点可见：本站是纯深色背景，浏览器默认的黑色焦点框基本看不见。
+    # 【不要在这里写 border-radius】本段在裸 <style> 里、不属任何 @layer，会压过 Quasar 的
+    # .q-btn--round{border-radius:50%}，把所有圆形图标按钮压成圆角方块。outline 自己会跟随
+    # 元素既有的圆角，不需要我们指定。
+    "a:focus-visible,.q-btn:focus-visible,.jitem:focus-visible{outline:2px solid "
+    "oklch(70.7% 0.165 254.624);outline-offset:2px}"
     "</style>")
 # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。放 @layer overrides 才能压过 Quasar 的 .bg-* !important。
 _HEAD_BADGE_CSS = (
@@ -478,7 +527,27 @@ _HEAD_BADGE_CSS = (
     ".q-badge.bg-deep-purple{background:oklch(70.2% 0.183 293.541)!important}"         # violet-400
     ".q-badge.bg-amber{background:oklch(82.8% 0.189 84.429)!important}"                # amber-400
     ".q-badge.bg-pink{background:oklch(71.8% 0.202 349.761)!important}"                # pink-400
+    # deep-orange（停滞态专用）此前【不在】映射表里，是全站唯一一个走 Quasar 原色的徽标——
+    # 偏偏它标的是最需要被看见的状态。补进来，取 orange-500：比 orange-400 更红更沉，
+    # 与相邻的 orange（需人工但可挽回）一眼能分开，又仍在同一套色板里。
+    ".q-badge.bg-deep-orange{background:oklch(70.5% 0.213 47.604)!important}"          # orange-500
     ".q-btn.text-grey{color:oklch(70.7% 0.022 261.325)!important}"                     # 次级灰按钮→gray-400(灰2)
+    # ---- 前景色与字号：与上面的背景是【同一个决定的两半】，必须放在一起改 ----
+    # 上面把徽标背景整体换成了 Tailwind 的 -400/-500 档（亮度 67%~83%），而 Quasar 的
+    # `.q-badge{color:#fff}` 是写死的白字：amber 上只有 1.7:1、green 2.2:1、orange 2.4:1，
+    # 全线低于可读下限。全站的状态语义【只】靠徽标传达，这是最不该看不清的一处。
+    # 浅底一律配深色前景 → 同样这批颜色能到 6.6:1~12:1。
+    ".q-badge.bg-green,.q-badge.bg-red,.q-badge.bg-blue,.q-badge.bg-primary,"
+    ".q-badge.bg-blue-grey,.q-badge.bg-grey,.q-badge.bg-orange,.q-badge.bg-deep-orange,"
+    ".q-badge.bg-purple,.q-badge.bg-teal,.q-badge.bg-indigo,.q-badge.bg-deep-purple,"
+    ".q-badge.bg-amber,.q-badge.bg-pink,.q-badge.bg-negative,.q-badge.bg-positive"
+    "{color:#0b0d10!important}"
+    # 实心按钮同病：ui.colors 把 primary/negative 定成了同一档 blue-400/red-400，白字 2.6:1。
+    # 只影响实心（bg-*）；flat/outline 用的是 text-*，不在此列。
+    ".q-btn.bg-primary,.q-btn.bg-negative{color:#0b0d10!important}"
+    # 徽标字号统一 14px：此前列表/详情里的徽标是 12px、仪表盘的带 text-sm 是 14px，
+    # 同一个『待确认』在同一屏出现三种大小。字号不该由调用点各写各的。
+    ".q-badge{font-size:14px}"
     "}</style>")
 
 
@@ -571,10 +640,12 @@ def frame(active: str = ""):
             with ui.row().classes("items-center gap-2 flex-nowrap whitespace-nowrap w-max max-lg:hidden "
                                   "absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"):
                 for key, label, path in NAV:
-                    cls = "cursor-pointer text-sm px-2 transition-colors "
-                    cls += ("text-blue-400 font-semibold underline underline-offset-8 decoration-2"
+                    # 【必须是 ui.link 而不是可点的 ui.label】≥1024px 时汉堡（唯一可聚焦的导航）被隐藏，
+                    # 接管的却是一串 <div>：键盘用户在桌面宽度下【完全够不着导航】，也没法中键开新标签。
+                    cls = "navlink text-sm px-2 transition-colors "
+                    cls += ("is-active text-blue-400 font-semibold"
                             if key == active else "text-gray-400 hover:text-gray-300")
-                    ui.label(label).classes(cls).on("click", lambda p=path: ui.navigate.to(p))
+                    ui.link(label, path).classes(cls)
                 # 跳转到：外链下拉（qB后台/Nyaa/Mikan/Bangumi）。自写 CSS『.jumpdd:hover .jumpmenu』控制显隐——
                 # 【鼠标悬浮即显示、移开即收起】，不用点击。不再单独设断点——整条内联导航已是 ≥1024 才出现，
                 # 窄屏时它和导航一起收进汉堡（汉堡菜单里已列了同样的外链），不会出现两边都够不着的空档。
@@ -588,8 +659,10 @@ def frame(active: str = ""):
                     with ui.element("div").classes("jumpmenu absolute left-0 top-full z-50 pt-1"):
                         with ui.element("div").classes("jumplist min-w-max"):
                             for _name, _url in _jump_targets():
-                                ui.label(_name).classes("jitem").on(
-                                    "click", lambda u=_url: ui.navigate.to(u, new_tab=True))
+                                # 同上：链接而非可点 div。附带修好另一件事——ui.navigate.to(new_tab=True)
+                                # 走的是 window.open，会被浏览器的弹窗拦截器当成非用户手势拦下；
+                                # <a target="_blank"> 不会（NiceGUI 自己的文档也建议这么换）。
+                                ui.link(_name, _url, new_tab=True).classes("jitem")
 
             ui.space()
             header_right = ui.row().classes("items-center gap-1")  # 页面自定义动作位

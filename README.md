@@ -31,9 +31,9 @@ bash deploy.sh            # root 运行
 ```
 
 `deploy.sh` 自动完成：装 [uv](https://docs.astral.sh/uv/)（自带独立 Python，**不依赖系统 python**，
-Debian 11 的 3.9 也无所谓）→ 建 `.venv` 装依赖 → 写 `.env`（`WEB_HOST=0.0.0.0`）+ 关掉开发用热重载
+Debian 11 的 3.9 也无所谓）→ 建 `.venv` 装依赖 → 写 `.env`（`WEB_HOST=0.0.0.0`）
 → 生成 systemd 服务并启动。路径由脚本自身位置推导，仓库克隆到哪都行；每步失败即停并报错，
-**幂等可重复跑**，升级也是 `git pull && bash deploy.sh`。
+**幂等可重复跑**（已有可用 `.venv` 就复用，版本不符才停服务重建），升级也是 `git pull && bash deploy.sh`。
 
 ```bash
 journalctl -u autorss -f          # 看日志
@@ -61,6 +61,18 @@ systemctl restart autorss         # 重启
 | `services/` | 外部服务客户端：`enrich`(bgm 识别) / `qbittorrent`(qB 客户端) / `notify`(通知推送) |
 | `sources/` | 订阅源：`base`(源基类+`ParsedItem`) / `parse`(标题季度解析) / `nyaa` / `mikan`(Classic RSS 源 + 季度剧场版/OVA 发现) |
 | `pages/` | NiceGUI 界面：`anime`(番剧主页 tab:仪表盘/番剧表/待确认/待识别/已忽略/订阅源) / `anime_detail`(番剧详情组件,渲染进悬浮框) / `movies`(剧场版 tab:仪表盘/列表/待识别/已忽略/订阅源) / `parse_test`(解析测试页 `/parse`) / `settings` / `sources` / `layout` |
+
+## 文档
+
+| 文件 | 内容 |
+| --- | --- |
+| [docs/audit-2026-08.md](docs/audit-2026-08.md) | 第 1 轮审计：已修缺陷、未修清单、插件架构裁决、命名待判项、**需要拍板的 9 个问题** |
+| [docs/audit-2026-08-r2.md](docs/audit-2026-08-r2.md) | 第 2 轮审计：**第 1 轮引入的 2 个 P0 回归**及修法、上轮盲区（手动线/白名单/Alembic/qB 客户端/取回层）、**新增 8 个待拍板** |
+| [docs/audit-2026-08-r3.md](docs/audit-2026-08-r3.md) | 第 3 轮审计：性能/备份/取回层三块新东西的成色（**备份模块自己带着 2 条 critical 上线**）、测试套件自身的质量问题、**新增 9 个待拍板** |
+| [docs/audit-2026-08-r4.md](docs/audit-2026-08-r4.md) | 第 4 轮审计：ani-rss「三件套」落地 + 它引入的 3 条 P0（归纳成两条结构性根因）、完结判据的风险专节 |
+| [docs/audit-2026-08-r5.md](docs/audit-2026-08-r5.md) | 第 5 轮（收官）：交付状态、五轮修复的交叉验证、**这五轮的复盘**（为什么每轮的改动都要靠下一轮才发现 P0） |
+| **[docs/DECISIONS.md](docs/DECISIONS.md)** | **待你拍板的 24 条**（四份报告合并去重，按「影响 ÷ 决策成本」排序）——先看这份 |
+| [docs/benchmark-ani-rss.md](docs/benchmark-ani-rss.md) | 与 [ani-rss](https://github.com/wushuo894/ani-rss) 的逐维度差距分析、值得借鉴的 Top 5、明确不做的 |
 
 ## 设计要点
 

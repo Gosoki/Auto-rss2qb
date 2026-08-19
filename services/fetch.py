@@ -9,29 +9,139 @@
 （32MB 上限 + asyncio.timeout(180) 流式读），这里把同一套范式抽出来给 feed/HTML 复用。
 """
 import asyncio
+import zlib
 
 import httpx
 
 FEED_CAP = 16 * 1024 * 1024     # 单个 feed / HTML 页的上限。实际 RSS 通常几十 KB，16MB 已极宽松
 TOTAL_TIMEOUT = 120             # 整个传输的总时长上限（秒），与 httpx 的逐块超时是两回事
 
+# 【为什么要自己管解压】httpx 的 aiter_bytes() 吐的是【解压后】的数据，而上限只能在拿到数据之后判——
+# 一个 400KB 的 gzip 压缩体可以在【单个块】里解出几十 MB，等我们发现超限时内存峰值早就上去了
+# （实测：声称 16MB 上限，tracemalloc 峰值 141.8MB）。
+# 两道闸：① 请求时要求 identity（大多数服务端会照做，那就根本没有解压这回事）；
+#        ② 仍然收到压缩响应时，走 aiter_raw() 按【线上原始字节】封顶，并用 decompressobj 的
+#           max_length 限制每次解出的量——这样压缩比再高也撑不爆内存。
+_IDENTITY = {"Accept-Encoding": "identity"}
+# zlib 能增量解的两种（增量 = 能在解出 cap 字节时立刻停手，压缩炸弹撑不爆内存）。
+_ZLIB_WBITS = {"gzip": 16 + zlib.MAX_WBITS, "deflate": zlib.MAX_WBITS, "x-gzip": 16 + zlib.MAX_WBITS}
+
+
+def _httpx_decoders() -> frozenset:
+    """httpx 这套安装里【真正解得开】的编码名。
+
+    httpx 对装不上解码器的编码（br 需要 brotli、zstd 需要 zstandard，两者都不是本项目的依赖）
+    是【静默放行】的：它把压缩字节原样交出来，不报任何错。所以不能假设"交回 httpx 就一定能解"。
+    """
+    try:
+        from httpx import _decoders
+        return frozenset(_decoders.SUPPORTED_DECODERS)
+    except Exception:      # httpx 内部结构变了就退回最保守的一组（这三个是 HTTP 规范里的常备项）
+        return frozenset({"identity", "gzip", "deflate"})
+
+
+_HTTPX_DECODERS = _httpx_decoders()
+
+
+def _with_identity(kw: dict) -> None:
+    """就地把 Accept-Encoding: identity 塞进 kw['headers']，调用方已给的同名头优先。
+
+    走 httpx.Headers 而不是 dict 合并：httpx 允许 headers 是 dict / 二元组列表 / Headers，
+    直接 `{**kw["headers"]}` 遇到列表就 TypeError，遇到小写键还会发出两条 Accept-Encoding。
+    """
+    hdrs = httpx.Headers(kw.get("headers") or {})
+    if "accept-encoding" not in hdrs:
+        hdrs["Accept-Encoding"] = "identity"
+    kw["headers"] = hdrs
+
 
 class TooLarge(Exception):
     """响应体超过上限。单列一个类型，方便调用方在日志里区分"太大"与"网络错误"。"""
 
 
+async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
+    """把响应体读进内存并封顶。压缩响应走增量解压，原始字节与解压后字节【各自】封顶。"""
+    # 【必须按 token 解析，不能拿整条头去查表】Content-Encoding 是个列表：
+    # 'gzip, identity'、两个独立的 Content-Encoding 头、大小写混写 —— 都合法。
+    # 早先这里拿整条字符串精确匹配，于是 'gzip, identity' 查不到表就落进"交回 httpx"的回退路径，
+    # 而那条路径【没有原始字节闸】，压缩炸弹的内存峰值原样回到 148MB —— 等于整个封顶被一个逗号绕开。
+    codings = [c.strip().lower()
+               for raw in resp.headers.get_list("content-encoding")
+               for c in raw.split(",")]
+    codings = [c for c in codings if c and c != "identity"]
+    if not codings:
+        buf = bytearray()
+        async for chunk in resp.aiter_raw():
+            buf += chunk
+            if len(buf) > cap:
+                raise TooLarge(f"响应体超过 {cap} 字节上限：{url}")
+        return bytes(buf)
+    if len(codings) > 1:
+        # 【分层压缩直接拒收】httpx 会把 'gzip, gzip' 逐层解开，而我们的回退路径只能看到
+        # 最外层的原始字节数——实测 1831 字节的双层炸弹能把进程 RSS 顶到 2076MB（上限声称 16MB）。
+        # 真实的 feed 服务端不会分层压缩；会这么发的只有想撑爆你的那一方。
+        raise httpx.DecodingError(
+            f"响应用了多重压缩编码 {'+'.join(codings)}（正常服务端不会这么发）：{url}")
+    wbits = _ZLIB_WBITS.get(codings[0])
+    if wbits is None:
+        # 多重编码 / 我们不认识的单一编码：交回 httpx 解，但先确认它【真的解得开】。
+        # 【httpx 对装不上解码器的编码是静默放行的】——SUPPORTED_DECODERS 里没有 br/zstd 时
+        # （brotli/zstandard 不是本项目的依赖），它会原样把【压缩字节】交给我们，
+        # 于是 feedparser 拿到一堆二进制垃圾，抛出一个与编码毫无关系的解析错误。
+        # 那是最难查的失败形态：日志里既没有"编码不支持"也没有"下载失败"。宁可在这里明确报错。
+        if any(c not in _HTTPX_DECODERS for c in codings):
+            bad = [c for c in codings if c not in _HTTPX_DECODERS]
+            raise httpx.DecodingError(
+                f"响应用了本程序解不开的压缩编码 {'+'.join(bad)}（已请求 identity 但服务端未照做）：{url}")
+        # 回退路径也【必须有原始字节闸】——不该是一个没有防护的洞。
+        # num_bytes_downloaded 是 httpx 自己记的线上字节数。
+        buf = bytearray()
+        async for chunk in resp.aiter_bytes():
+            buf += chunk
+            if len(buf) > cap or resp.num_bytes_downloaded > cap:
+                raise TooLarge(f"响应体超过 {cap} 字节上限（编码 {'+'.join(codings)}）：{url}")
+        return bytes(buf)
+    dec = zlib.decompressobj(wbits)
+    raw_seen, out = 0, bytearray()
+    async for chunk in resp.aiter_raw():
+        raw_seen += len(chunk)
+        if raw_seen > cap:                  # 线上原始字节也封顶：压缩体本身就不该有这么大
+            raise TooLarge(f"压缩响应超过 {cap} 字节上限：{url}")
+        # max_length 让每次最多解出"还能再收多少"，多出来的留在 unconsumed_tail 里不占额外内存
+        try:
+            piece = dec.decompress(chunk, max_length=cap - len(out) + 1)
+        except zlib.error as e:
+            # 裸 deflate（RFC1951，无 zlib 头）：实测某些站在 Accept-Encoding: deflate 下就这么发。
+            # 只在【第一块】上重试一次，用负 wbits 重新解；再不行就归一成 httpx 的异常族——
+            # zlib.error 不属那一族，会从各调用点的 except 里漏出去。
+            if raw_seen == len(chunk) and wbits == zlib.MAX_WBITS:
+                dec = zlib.decompressobj(-zlib.MAX_WBITS)
+                try:
+                    piece = dec.decompress(chunk, max_length=cap + 1)
+                except zlib.error as e2:
+                    raise httpx.DecodingError(f"解压失败：{e2}") from e2
+            else:
+                raise httpx.DecodingError(f"解压失败：{e}") from e
+        out += piece
+        if len(out) > cap:
+            raise TooLarge(f"解压后超过 {cap} 字节上限（疑似压缩炸弹）：{url}")
+    try:
+        out += dec.flush()
+    except zlib.error as e:
+        raise httpx.DecodingError(f"解压收尾失败：{e}") from e
+    if len(out) > cap:
+        raise TooLarge(f"解压后超过 {cap} 字节上限（疑似压缩炸弹）：{url}")
+    return bytes(out)
+
+
 async def get_bytes(client: httpx.AsyncClient, url: str, *,
                     cap: int = FEED_CAP, timeout: int = TOTAL_TIMEOUT, **kw) -> bytes:
     """流式取回并封顶。超限抛 TooLarge，超时抛 TimeoutError，HTTP 错误照常抛。"""
+    _with_identity(kw)
     async with asyncio.timeout(timeout):
         async with client.stream("GET", url, **kw) as resp:
             resp.raise_for_status()
-            buf = bytearray()
-            async for chunk in resp.aiter_bytes():
-                buf += chunk
-                if len(buf) > cap:
-                    raise TooLarge(f"响应体超过 {cap} 字节上限：{url}")
-            return bytes(buf)
+            return await _read_capped(resp, cap, url)
 
 
 async def get_text(client: httpx.AsyncClient, url: str, *,
@@ -41,19 +151,16 @@ async def get_text(client: httpx.AsyncClient, url: str, *,
     用 charset_encoding（响应头里的）而不是 httpx 的 resp.encoding：后者在流式模式下
     可能要读完整个 body 做字符集嗅探，正好绕开我们要设的上限。
     """
+    _with_identity(kw)
     async with asyncio.timeout(timeout):
         async with client.stream("GET", url, **kw) as resp:
             resp.raise_for_status()
             enc = resp.charset_encoding or "utf-8"
-            buf = bytearray()
-            async for chunk in resp.aiter_bytes():
-                buf += chunk
-                if len(buf) > cap:
-                    raise TooLarge(f"响应体超过 {cap} 字节上限：{url}")
+            data = await _read_capped(resp, cap, url)
             try:
-                return bytes(buf).decode(enc, "replace")
+                return data.decode(enc, "replace")
             except LookupError:
                 # 字符集名来自第三方响应头（Content-Type: charset=xxx），是不可信输入：
                 # 编造一个不存在的编码名就能让 decode 抛 LookupError——它不属 httpx 异常族，
                 # 会从各调用点的 except httpx.HTTPError 里漏出去打断整轮采集。回落 utf-8 照常解。
-                return bytes(buf).decode("utf-8", "replace")
+                return data.decode("utf-8", "replace")

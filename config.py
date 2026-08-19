@@ -5,11 +5,14 @@
 例外：DB_PATH（开库前提）、WEB_PORT（绑端口）本质上就得重启，走 .env/硬编码默认，不进 settings 表。
 """
 import ipaddress
+import logging
 import os
 import re
 import tempfile
 import threading
 from pathlib import Path
+
+log = logging.getLogger("autorss")
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -23,6 +26,13 @@ except Exception:
 
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+try:
+    # 0700：库里存着 qB 明文密码与 bgm token，默认的 0755/0644 意味着同机任何账号都能读走。
+    # 每次启动都收一遍（不只是新建时），好让老库也能被一次升级修好。失败不致命——
+    # 挂载点是 NTFS/exFAT 或跑在非 owner 身份下时 chmod 会抛，那种环境本来也谈不上文件权限。
+    DATA_DIR.chmod(0o700)
+except OSError:
+    pass
 
 # ---- 结构性/绑定项：走 .env，改了需重启（DB_PATH 是启动 DB 的前提，WEB_HOST/WEB_PORT 绑监听）----
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "autorss.db"))
@@ -60,9 +70,14 @@ _SPEC = {
     "QB_URL": (str, "http://127.0.0.1:8080"),
     "QB_USERNAME": (str, ""),
     "QB_PASSWORD": (str, ""),
-    "DOWN_PATH": (str, "/home"),            # 工作目录=下载根；动漫/电影留空时都落它下面
-    "ANIME_DOWN_PATH": (str, ""),           # 动漫独立下载根（空=用工作目录 DOWN_PATH/番剧；填了=放这个独立目录，可另一块盘）
-    "MOVIE_DOWN_PATH": (str, ""),            # 电影独立下载根（空=用工作目录 DOWN_PATH/剧场版；填了=放这个独立目录，可另一块盘）
+    "DOWN_PATH": (str, "/home"),            # 工作目录=下载根；番剧/剧场版留空时都直接落它下面
+    # 【留空 = 直接落工作目录，不额外分类】——不是 DOWN_PATH/番剧。实测落的是 /home/26C/<番名>。
+    # 想要 DOWN_PATH/番剧/… 就把这两项填成【相对名】（如 番剧 / 剧场版），engine.build_save_path
+    # 会把它拼在工作目录下面；填绝对路径则整个换根（可另一块盘）。
+    # 早先这两行注释写的是"空=用工作目录 DOWN_PATH/番剧"，与实现不符——engine.py 与 settings.py
+    # 两处的说明都是对的，只有这里错，而这里恰恰是读代码的人最先看到的地方。
+    "ANIME_DOWN_PATH": (str, ""),           # 番剧独立下载根（空=直接落工作目录；相对名=拼在其下；绝对路径=换根）
+    "MOVIE_DOWN_PATH": (str, ""),           # 剧场版独立下载根（同上）
     "ANIME_SEASON_SUBFOLDER": (bool, False),
     "QUARTER_FMT": (str, "{yy}{q}"),   # 番剧下载文件夹的季度目录名
     "MOVIE_QUARTER_FMT": (str, "{yyyy}"),   # 电影下载文件夹命名（默认年份 2026）；番剧走 QUARTER_FMT
@@ -88,6 +103,20 @@ _SPEC = {
     "PROXY_PASS": (str, ""),                 # 代理密码（同上）
     "WEB_ALLOW_CIDRS": (str, ""),   # Web 访问网段白名单(CIDR,逗号分隔;空=不限)——绑 0.0.0.0 时限定可信内网,本机恒放行,即时生效
     "NOTIFY_URL": (str, ""),
+    # 想收哪些事件（键见 services/notify.EVENTS）。【留空 = 全关】，不是全开——
+    # 这与本项目别处"留空=不限"（字幕组白名单、标题关键词）恰好相反，设置页上写明了。
+    # 默认值含 delivered，所以老库升级后【行为一字不变】（load_from_db 只补缺键）。
+    "NOTIFY_EVENTS": (list, "delivered,failed,stalled,finished,idle,qb_down,db_down,backlog"),
+    "NOTIFY_MAX_PER_HOUR": (int, 20),       # 全事件合计的限流上限（0=不限）。被丢弃的条数会挂在下一条消息尾巴上
+    "NOTIFY_BACKLOG_MIN": (int, 5),         # 『待识别』积压到几部才提醒
+    # ---- 完结 / 断更巡检（见 core.anime.sweep_finished / sweep_idle）----
+    "ANIME_FINISH_ENABLED": (bool, True),   # 判定完结（只打标记 + 发通知，不改下载行为）
+    # 【默认关】判定完结后是否【真的停止自动下新集】。判据已经很保守（要 bgm 给出总集数、
+    # 无集号歧义段、1..T 每一集都在手），但 bgm 的总集数少记一集是真实存在的——那会让最后一集
+    # 永远下不下来。开之前请先让它跑一阵、看『已完结』的标记打得对不对。
+    "ANIME_FINISH_UNSUB": (bool, False),
+    "ANIME_IDLE_DAYS": (int, 14),           # 一部追番中的番多少天没有新种子就提醒（0=关）
+    "SWEEP_INTERVAL_MIN": (int, 180),       # 完结/断更巡检的间隔（分钟）
     "NOTIFY_TIMEOUT": (int, 10),
     "ENRICH_TIMEOUT": (int, 15),
     "ENRICH_RETRY_TIMES": (int, 3),          # bgm 请求瞬时失败(超时/连接)的即时重试次数
@@ -105,6 +134,13 @@ _SPEC = {
     "MOVIE_SCAN_INTERVAL": (int, 604800),   # 每隔多少秒自动扫一次剧场版（默认 7 天）——
                                             # 剧场版桶更新很慢，扫太勤没意义、只是白打 Mikan
     "MOVIE_SCAN_LAST": (str, ""),           # 上次扫描时间（ISO，运行时更新；非用户填）
+    # ---- 自动备份（整库快照，走 VACUUM INTO；见 db/backup.py）----
+    # 这是全项目唯一"出事就没救"的空白的补丁：我们有迁移、有 Alembic、有停摆自愈，
+    # 但在此之前【没有任何一份可回滚的数据副本】。默认开——备份的价值全在"没想起来时它已经在做了"。
+    "BACKUP_ENABLED": (bool, True),
+    "BACKUP_INTERVAL_HOURS": (int, 24),     # 每隔多少小时自动备一次（跨重启不会误重备，判据同剧场版扫描）
+    "BACKUP_KEEP": (int, 7),                # 保留最近几份（0=不自动清理）
+    "BACKUP_LAST": (str, ""),               # 上次备份时间（ISO，运行时更新；非用户填）
     # ---- 业务数据库（这几项本身恒存在【本地 SQLite】的 setting 表里，见 db.__init__ 的双引擎说明）----
     "DB_BACKEND": (str, "sqlite"),          # 业务表落在哪：'sqlite'(本地文件) | 'mysql'
     "DB_MYSQL_HOST": (str, ""),
@@ -159,7 +195,9 @@ def __getattr__(name):
 
 def http_client_kwargs(timeout: int = 30) -> dict:
     """httpx.AsyncClient 的公共 kwargs：超时 + 跟随重定向 +（启用时）代理。各处抓取统一走它。
-    代理账号/密码任一非空时走带认证的 httpx.Proxy；socks5:// 需自行装 socksio，否则请求时报错。"""
+    代理账号/密码任一非空时走带认证的 httpx.Proxy；socks5:// 需自行装 socksio——
+    缺了它是在【建 AsyncClient 那一步】就抛 ImportError（不是发请求时），而且抛的不是 httpx.HTTPError，
+    所以各处只接 HTTPError 的 except 都拦不住它。"""
     kwargs = {"timeout": timeout, "follow_redirects": True}
     proxy = __getattr__("PROXY")
     if proxy:
@@ -172,11 +210,21 @@ def http_client_kwargs(timeout: int = 30) -> dict:
     return kwargs
 
 
+# 【配置是否真的从数据库读出来过】False = 内存里全是硬编码默认值。
+# 这不只是"少了几个用户偏好"：WEB_ALLOW_CIDRS 的默认值是空串，而空串在 netguard 里的含义是
+# 【不限制、放行一切】。于是"建表/迁移失败"这条本该更安全的失败路径，反而把一个无鉴权的、
+# 存着 qB 明文密码的面板对整个局域网敞开——典型的 fail-open。
+# netguard 据此在配置没读出来时退回"只放行回环"（fail-closed），见 core/netguard.py。
+loaded_from_db = False
+
+
 def load_from_db() -> None:
     """启动时（init_db 之后）加载配置，并把 settings 表缺的键补齐写入。
 
     新库 = 写入全部默认值；以后往 _SPEC 新加的设置项，下次启动也会补上缺的键。
+    成功后置 loaded_from_db=True（网段白名单据此判断自己该不该 fail-closed）。
     """
+    global loaded_from_db
     from sqlmodel import select
 
     from db import get_meta_session
@@ -196,6 +244,78 @@ def load_from_db() -> None:
         s.commit()
     for k in _SPEC:
         _v[k] = _coerce(_SPEC[k][0], have[k])
+    loaded_from_db = True
+    # 【必须排在 loaded_from_db 之后、且整段兜住】走到这里配置已经全部读进 _v 了，
+    # 并入新事件只是一个锦上添花的升级步骤——它的成败与"配置读没读出来"毫无关系，
+    # 却曾经能决定后者：这个函数会写库（INSERT/UPDATE + commit），而它抛出的任何异常都会穿透
+    # load_from_db → main.py 的启动 try → db.mark_data_fatal，而 fatal 的解除方式【只有人工介入】
+    # （探测探通了也不解除）。连带后果是 netguard 只放行回环、设置页拒绝保存——
+    # 一次并发启动撞上的 UNIQUE 约束，就能让整台机器停在那里。
+    # 实测触发窗口恰好是"升级后第一次启动"：service 还跑着又手动试跑一次（README 就是这么教的）、
+    # deploy.sh 重启期间新旧进程重叠、备份的 VACUUM INTO 把 meta 库锁过 busy_timeout、磁盘满。
+    try:
+        _merge_new_notify_events(have)
+    except Exception as e:
+        log.warning("并入新增通知事件失败（不影响启动，下次再试）：%s: %s", type(e).__name__, e)
+
+
+_KNOWN_EVENTS_KEY = "_KNOWN_NOTIFY_EVENTS"    # 内部键，不进 _SPEC（不该出现在设置页）
+
+
+def _merge_new_notify_events(have: dict) -> None:
+    """把【本版本新增的】通知事件并进用户已有的 NOTIFY_EVENTS。
+
+    【为什么必须有这一步】load_from_db 只补【缺失的键】。NOTIFY_EVENTS 一旦存过一次，
+    以后往 services.notify.EVENTS 里加的任何新事件，对所有老库都是【静默默认关】——
+    用户升级后得自己想到去设置页勾一下，而他根本不知道多了这么个事件。
+    那会挡住后续所有"加一类提醒"的改进。
+
+    只并【本版本新出现】的键：用一份"上次见过哪些事件"的快照做差集，
+    所以用户【显式取消过】的事件不会被重新打开（那些键早就在快照里了）。
+    """
+    from sqlmodel import select
+
+    from db import get_meta_session
+    from db.models import Setting
+    try:
+        from services.notify import EVENTS
+    except Exception:                    # 循环导入等极端情况：宁可不并，也别拖垮启动
+        return
+    all_keys = set(EVENTS)
+    with get_meta_session() as s:
+        row = s.exec(select(Setting).where(Setting.key == _KNOWN_EVENTS_KEY)).first()
+        known = {k for k in (row.value if row else "").split(",") if k} if row else None
+        if known is None:
+            # 第一次见（老库或新库）：只记快照，不动用户的选择。
+            # 幂等写法：并发启动时两个进程可能同时走到这里，裸 INSERT 会撞 UNIQUE。
+            exist = s.get(Setting, _KNOWN_EVENTS_KEY)
+            if exist is None:
+                s.add(Setting(key=_KNOWN_EVENTS_KEY, value=",".join(sorted(all_keys))))
+                s.commit()
+            return
+        fresh = all_keys - known
+        if not fresh:
+            return
+        cur = set(_v.get("NOTIFY_EVENTS") or [])
+        if not cur:
+            # 【用户把通知全关了 —— 那是一个明确的意思表示，不该被下个版本推翻】
+            # 空集与新键取并集就是新键，等于"关全部"在每次升级时自动变回"开几个"。
+            # 快照仍要更新：否则下次升级又会把这些键当成"新增"再并一次。
+            row.value = ",".join(sorted(all_keys))
+            s.add(row)
+            s.commit()
+            return
+        merged = sorted(cur | fresh)
+        # 【先落库成功，再改内存】与同文件 set_many 的规矩一致：写库失败时内存不该单方面前进，
+        # 否则本进程用着一份库里并不存在的配置，重启即回退，而没有任何迹象。
+        row.value = ",".join(sorted(all_keys))
+        setting = s.exec(select(Setting).where(Setting.key == "NOTIFY_EVENTS")).first()
+        if setting is not None:
+            setting.value = ",".join(merged)
+            s.add(setting)
+        s.add(row)
+        s.commit()
+        _v["NOTIFY_EVENTS"] = merged
 
 
 def set_many(updates: dict) -> None:

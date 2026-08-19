@@ -23,8 +23,8 @@ from config import WEB_HOST, WEB_PORT
 from core.logsetup import setup_logging
 from core.netguard import install as install_netguard
 from core import worker as worker_mod
-from core.worker import (init_business_state, run_db_watch, run_movie_scan, run_qb_sync,
-                         run_reenrich_retry, run_worker)
+from core.worker import (init_business_state, run_backup, run_db_watch, run_movie_scan,
+                         run_qb_sync, run_reenrich_retry, run_sweep, run_worker)
 import db
 from db import apply_configured_backend, init_db
 
@@ -36,7 +36,7 @@ log = logging.getLogger("autorss")
 
 @app.on_startup
 async def _startup():
-    # 【这三步必须整体兜住】它们裸调时，任一抛异常都会让下面五个 create_task 一个都建不起来，
+    # 【这三步必须整体兜住】它们裸调时，任一抛异常都会让下面七个 create_task 一个都建不起来，
     # 而 NiceGUI 只是把异常记一行、Web 服务照常起：页面能开、看着一切正常，实则采集/下载/
     # qB 同步/重识别【全部没在跑】，用户只会觉得"好几天没更新了"。宁可明确停摆也不要假装正常。
     try:
@@ -69,6 +69,8 @@ async def _startup():
     asyncio.create_task(run_qb_sync())    # qB 种子实时态同步（独立频率）
     asyncio.create_task(run_movie_scan())  # 剧场版/OVA 自动扫描（独立频率）
     asyncio.create_task(run_reenrich_retry())  # 『待识别』番后台重试 bgm（独立频率，不阻塞采集）
+    asyncio.create_task(run_backup())      # 整库自动备份（独立频率；采集暂停/qB 掉线都不影响它）
+    asyncio.create_task(run_sweep())       # 完结判定 + 断更提醒（回答"有没有【没发生】的事"）
 
 
 if __name__ in {"__main__", "__mp_main__"}:

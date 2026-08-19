@@ -10,7 +10,8 @@ from core import anime
 import config
 from core import engine, movies
 import db
-from core.anime import flush_ready_downloads, list_source_groups, process_item
+from core.anime import existing_hashes, flush_ready_downloads, list_source_groups, process_item
+from services.notify import state as notify_state
 from sources.mikan import MikanSource
 from sources.nyaa import NyaaSource, nyaa_feed_url
 
@@ -51,13 +52,25 @@ async def poll_once() -> None:
         except Exception as e:
             log.error("抓取失败 %s: %s", source.name, e)
             continue
+        # 【本源这一批的 hash 一次查完】RSS 一轮的条目绝大多数是上一轮就见过的，
+        # 逐条各开一个 session 去查等于把 100 次数据库往返摊在采集主链路上
+        # （本地 SQLite 约 42ms/100 条；远程 MySQL 是每轮 0.4~2 秒的裸阻塞）。
+        # 预取是在【本源开抓之前】做的，所以本轮里前一个源刚入库的 hash 已经在里面了
+        # （每个源各预取一次）。缺口只有一个：同一个 feed 里出现【重复条目】——
+        # 那条 hash 预取时不存在、第一次处理后才存在，不补进集合的话第二条会再走一遍
+        # 识别与入库（唯一约束会挡下写入，但 bgm 请求已经白打出去了）。
+        # 所以处理完就补进集合：无论它是被入库还是被过滤掉，同一轮里再见到都该是同样的结局。
+        known = existing_hashes([getattr(i, "info_hash", "") for i in items])
         new = 0
         for item in items:
             try:
-                if await process_item(item):
+                if await process_item(item, known_hashes=known):
                     new += 1
             except Exception as e:
                 log.error("处理失败 %s: %s", getattr(item, "anime_title", "?"), e)
+            finally:
+                if getattr(item, "info_hash", ""):
+                    known.add(item.info_hash)   # 同一 feed 内的重复条目不再重复识别（理由见上）
         log.info("源 %s：%d 条，新增 %d", source.name, len(items), new)
 
     try:
@@ -107,6 +120,22 @@ async def run_db_watch() -> None:
             # TCP 连接要挂到超时才返回（已用 db.MYSQL_CONNECT_TIMEOUT 压到 5 秒，但仍是 5 秒），
             # 直接 await 不了的同步调用会把整个事件循环卡死——页面、下载、qB 同步一起停。
             now_down = bool(await asyncio.to_thread(db.probe_data_engine))
+            # 【状态型通知挂在这里】看守协程是全项目唯一知道"停摆↔恢复"何时翻转的地方；
+            # 挂进 db.mark_data_down 反而不对——那是同步函数，且页面撞上异常时也会调它。
+            await notify_state("db_down", now_down,
+                               f"数据库停摆，采集/下载/同步已暂停：{db.data_down_reason()}",
+                               "数据库恢复，后台已自动接上")
+            # 【补读配置放在边沿【之外】】它曾被写在下面 `was_down and not now_down` 的边沿里，
+            # 而那个分支在它最该起作用的场景下【不可达】：建表/迁移失败走的是 mark_data_fatal，
+            # 此后 probe_data_engine 恒返回 fatal，边沿永不成立 —— 于是"进程到死都用着默认配置"
+            # 这件它本来要防的事照旧发生。
+            # 配置库恒是本地 SQLite（见 db 的双引擎说明），本就不必等业务库回来，每轮试一次即可。
+            if not config.loaded_from_db:
+                try:
+                    config.load_from_db()
+                    log.info("已补读数据库里的配置（启动时那次没跑成）")
+                except Exception as e:
+                    log.error("补读配置失败（下次探测再试）: %s", e)
             if was_down and not now_down:
                 # 补跑停摆期间漏掉的初始化。是否复位遗留的 downloading 看本进程欠不欠那一次：
                 # 【启动时就停摆】→ 欠（main.py 跳过了初始化，且此刻不可能有交付协程在跑）；
@@ -149,6 +178,60 @@ async def run_reenrich_retry() -> None:
             await anime.retry_unmatched()
         except Exception as e:
             log.error("延迟重识别异常: %s", e)
+
+
+async def run_backup() -> None:
+    """独立协程：按 BACKUP_INTERVAL_HOURS 自动备份整库（开关在设置页）。
+
+    刻意独立而不是挂在别的循环上：备份要在【采集/下载都可能正忙】的时候照做，
+    而且它不该被采集暂停或 qB 掉线连累——那两种情形恰恰是最需要有备份的时候。
+    数据库停摆时跳过（备的是本地配置库，但此时业务库连接本身就不可信，等它回来再说）。
+    每 10 分钟心跳一次，是否真备由 backup.auto_tick 按"距上次多久"判（跨重启不会误重备）。
+    """
+    from db import backup
+    log.info("自动备份协程启动（%s，每 %d 小时，保留 %d 份）",
+             "开" if config.BACKUP_ENABLED else "关·在设置页开启",
+             config.BACKUP_INTERVAL_HOURS, config.BACKUP_KEEP)
+    while True:
+        await asyncio.sleep(600)          # 先睡后做：启动瞬间不抢资源，且刚起来备一份意义不大
+        try:
+            if not db.is_data_down():
+                await asyncio.to_thread(backup.auto_tick)   # VACUUM INTO 是同步 IO，别卡事件循环
+        except Exception as e:
+            log.error("自动备份异常: %s", e)
+
+
+async def run_sweep() -> None:
+    """独立协程：定期巡检『完结』与『断更』（开关在设置页）。
+
+    刻意独立于采集轮询：这两件事回答的是"有没有【没发生】的事"，而采集循环只在有东西可抓时才动。
+    尤其是断更检测——源失效/字幕组停更时采集轮看起来一切正常（抓到 0 条不是错误），
+    只有这条巡检会说话。数据库停摆时跳过。
+    """
+    log.info("完结/断更巡检协程启动（%s，每 %d 分钟；断更阈值 %d 天）",
+             "完结判定开" if config.ANIME_FINISH_ENABLED else "完结判定关",
+             config.SWEEP_INTERVAL_MIN, config.ANIME_IDLE_DAYS)
+    # 先睡后做：启动瞬间不抢资源，也避免"每次重启都立刻重判一遍"。
+    await asyncio.sleep(max(60, config.SWEEP_INTERVAL_MIN * 60))
+    while True:
+        if db.is_data_down():
+            # 【短睡重试，而不是睡满一整个巡检周期】巡检间隔默认 3 小时，库恢复后再等 3 小时
+            # 才做第一次巡检，那段时间里完结/断更/积压全是瞎的。
+            # 【长睡必须移出循环体】早先它是 while 的第一条语句，于是这里的 continue 回到的
+            # 正是那个 3 小时长睡——"短睡重试"是个彻头彻尾的空操作，实测 sleep 序列
+            # [10800, 30, 10800, 10800]：库在 3 小时时恢复，第一次巡检落在 6 小时。
+            await asyncio.sleep(30)
+            continue
+        # 【三段各自 try】它们互不相干：sweep_finished 抛一次异常不该让断更提醒与
+        # 失败/停滞/积压告警整轮不跑——而后两者恰恰是"出事了要有人知道"的那一类。
+        for name, fn in (("完结判定", anime.sweep_finished),
+                         ("断更提醒", anime.sweep_idle),
+                         ("积压告警", anime.sweep_alerts)):
+            try:
+                await fn()
+            except Exception as e:
+                log.error("巡检·%s 异常: %s", name, e, exc_info=True)
+        await asyncio.sleep(max(300, config.SWEEP_INTERVAL_MIN * 60))   # 做完再睡到下一轮
 
 
 async def run_movie_scan() -> None:
@@ -199,6 +282,22 @@ async def run_qb_sync() -> None:
         except asyncio.TimeoutError:
             pass                       # 到点：没人 kick 也醒来自查一遍
         engine.qb_kick.clear()
+        # 【停摆闸放在这里，不能放在上面 wait_for 之前】本循环里其余每一处都按 is_data_down() 把门，
+        # 唯独【醒来之后】的 archive_old_completed() 与内层循环是裸的同步库调用。而这一觉最长睡
+        # QB_SYNC_BACKSTOP_MIN（默认 120 分钟）——放在睡前判等于用两小时前的结论决定现在做不做，
+        # 库正是在这段睡眠里挂掉的话照样会冻住事件循环（MYSQL_CONNECT_TIMEOUT，5 秒）。
+        if db.is_data_down():
+            await asyncio.sleep(30)
+            continue
+        if config.QB_ENABLED and config.QB_SYNC_STATUS:
+            # 【qB 掉线的告警不该只挂在采集轮上】那条预检在 flush 里，而采集可以被用户关掉
+            # （全新库默认就是关的），于是"开箱即用"的配置下 qb_down 事件恒不触发。
+            # 这个循环是唯一一条与采集开关无关、又必然要碰 qB 的路径。
+            try:
+                await notify_state("qb_down", not await engine.qb.reachable(),
+                                   "qB 连不上，下载状态无法同步", "qB 恢复，继续同步")
+            except Exception as e:
+                log.error("qB 可达性探测异常（忽略）: %s", e)
         try:
             await engine.archive_old_completed()   # 顺手做完成归档（完成超 N 天→从 qB 移除留文件、标已归档；关则空转）
         except Exception as e:

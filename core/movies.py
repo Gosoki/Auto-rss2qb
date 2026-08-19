@@ -22,7 +22,7 @@ from core import engine
 from db import get_session
 from db.models import AnimeTorrent, Movie, MovieTorrent
 from services import enrich
-from services.notify import notify
+from services.notify import event as notify_event
 from sources import mikan
 from sources.parse import format_quarter
 
@@ -48,6 +48,16 @@ def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
         return
     keeper = s.get(Movie, keeper_id)
     loser = s.get(Movie, loser_id)
+    # 【双方都已下过东西 → 拒绝静默合并】合并会【删行】且不可逆，而触发它的是一次可能出错的
+    # 自动识别（bgm 的日期/名字匹配）。同系列的续作、重制版、总集编彼此极像，认错一次的代价
+    # 就是把一部【已经下完】的片连同它的版本记录一起删掉，而用户看到的只是一句"识别成功 ✓"。
+    # 两边都空着的时候合并是安全的（本来就是同一部片裂成了两行）；两边都有东西时几乎必然是认错了，
+    # 那就宁可留下两行让人看见、也不要安静地删掉一行。
+    if (keeper is not None and loser is not None
+            and _has_handled_torrents(s, keeper_id) and _has_handled_torrents(s, loser_id)):
+        log.warning("拒绝合并剧场版 %s → %s：两边都已下过文件，多半是识别认错了片。"
+                    "两行都保留，请到 /movies 人工核对（合并会删行且不可逆）", loser_id, keeper_id)
+        return
     if keeper is not None and loser is not None:
         keeper.rejected = keeper.rejected or loser.rejected
         s.add(keeper)
@@ -94,9 +104,21 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
 
 
 def _store_movie_torrents(movie_id: int, items: list) -> int:
-    """把某剧场版番组抓来的种子入库（按 hash 去重、逐条提交），全部 pending。返回新增数。"""
+    """把某剧场版番组抓来的种子入库（按 hash 去重、逐条提交），全部 pending。返回新增数。
+
+    【入库前先确认这部 Movie 还在】movie_id 是本轮扫描早些时候 _upsert_movie 拿到的，
+    而拿到它之后我们又 await 了两次网络（fetch_detail / fetch_bangumi_torrents，各可能几秒）。
+    这期间用户完全可能在页面上把这部片绑到别的 bgm 上、于是它被合并掉了——
+    此时挂上去的种子会变成孤儿：它占住了 info_hash（本函数按 hash 全局去重），
+    而真正那部 Movie 从此【永远收不到这几个版本】，页面上也看不到它们。
+    TV 侧早就有同款守卫（core/anime.py 的 backfill：await 之后重取，悬空就放弃本轮）。
+    """
     n = 0
     with get_session() as s:
+        if s.get(Movie, movie_id) is None:
+            log.info("剧场版 %s 在抓种期间已被合并/删除，本轮的 %d 个版本不入库（下轮扫描会重新归位）",
+                     movie_id, len(items))
+            return 0
         for item in items:
             if s.exec(select(MovieTorrent).where(MovieTorrent.info_hash == item.info_hash)).first():
                 continue
@@ -156,7 +178,12 @@ async def scan_now(year: int, seasons: list[str] | None = None) -> dict:
     # 只有覆盖当年四季的完整扫描才刷新自动扫描时间基准；手动只扫单季(回填历史)不该顶掉它、推迟自动全年扫。
     # 整轮网络故障（一部没命中且有报错）不刷新基准——否则一次抓取失败就要等满一个间隔才重试；留给 5 分钟心跳重扫。
     total_fail = res["seen"] == 0 and res["errors"] > 0
-    if (seasons is None or set(seasons) >= {"A", "B", "C", "D"}) and not total_fail:
+    # 【还必须是"当年"】MOVIE_SCAN_LAST 是自动扫描的节拍基准，而自动扫描扫的恒是【当年】四季
+    # （见 auto_scan_tick）。手动去补抓 2023 年的老片同样是"四季全选"，不加年份判断就会把基准
+    # 顶到现在 —— 当年的新片最长 MOVIE_SCAN_INTERVAL（默认 7 天）不再被自动抓，
+    # 而 /movies 上"上次扫描 刚刚"看起来一切正常，没有任何迹象说明漏了。
+    if (year == datetime.now().year
+            and (seasons is None or set(seasons) >= {"A", "B", "C", "D"}) and not total_fail):
         config.set_many({"MOVIE_SCAN_LAST": datetime.now().isoformat(timespec="seconds")})
     return res
 
@@ -437,8 +464,13 @@ async def enrich_movie(movie_id: int) -> bool:
                    .order_by(MovieTorrent.created_at.desc())).first()
         names = [n for n in (m.display_name, m.jp_name, m.title) if n]
         info_hash = t.info_hash if t else None
-        release_time = t.release_time if t else None
-    info = await enrich.resolve(names, release_time, None, info_hash)
+    # 【不传 release_time】那是【种子上架日】，不是【首映日】。剧场版的 BD/WEB 版普遍在首映后
+    # 6~18 个月才发，把上架日当首映日去做日期校验，会把正确的 subject 判成"日期对不上"而排除，
+    # 转而命中同系列的【另一部】（续作/重制版往往就在那个年份）。而下面紧接着就是
+    # `Movie.bangumi_id == m.bangumi_id → _merge_movie` —— 认错的直接后果是把【正主那一行】
+    # 连同它已下好的版本一起删掉，UI 上还弹一句绿色的"识别成功 ✓"。
+    # TV 侧 services/enrich.py 早有同一条规矩："基准不可靠就【不设】基准"，这里把它用上。
+    info = await enrich.resolve(names, None, None, info_hash)
     with get_session() as s:
         m = s.get(Movie, movie_id)
         if m is None:
@@ -470,6 +502,16 @@ async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
         for other in list(s.exec(select(Movie).where(
                 Movie.bangumi_id == bgm_id, Movie.id != m.id))):
             _merge_movie(s, other.id, m.id)
+        # 【合并会把"已忽略"传染过来，手动绑定要撤销它】_merge_movie 的规则是"两方任一被忽略则仍忽略"
+        # ——那对后台的身份归并是对的（用户忽略过的片不该因为被合并而复活）。
+        # 但【手动点绑定】是一个明确的"我要这部片"的动作：继承过来之后，UI 上弹一句绿色的
+        # "已绑定并识别 ✓"，片却从『列表』和『待识别』同时消失，只能去『已忽略』tab 找。
+        # TV 侧同款操作早就在合并后重读 keeper 并复位（见 core/anime.py 的 bind_anime_bgm）。
+        m2 = s.get(Movie, movie_id)
+        if m2 is not None and m2.rejected:
+            m2.rejected = False
+            s.add(m2)
+            s.commit()
     return True
 
 
@@ -606,7 +648,9 @@ async def download_movie_torrent(mt_id: int) -> bool:
     else:
         engine.settle_sent(MovieTorrent, mt_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
     log.info("已加入qB（剧场版）- torrent=%s", mt_id)
-    await notify(f"{folder} 🎬📥")
+    # 走事件层：否则设置页那句"留空＝一条都不发"对剧场版是假的，
+    # 而且批量下 30 个版本 = 30 条不可关、不限流的推送。
+    await notify_event("delivered", f"{folder} 🎬")
     return True
 
 

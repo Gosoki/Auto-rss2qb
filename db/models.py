@@ -75,6 +75,22 @@ class Anime(SQLModel, table=True):
     # 推不出就留 None，此时详情页会标出『疑似同集不同编号』交给人工，绝不瞎猜。
     ep_offset: int | None = Field(default=None)
     last_enrich_at: datetime | None = Field(default=None)  # 上次后台重试 bgm 的时刻（指数退避调度：下次到点=此刻+BASE*2^tries，封顶 MAX）
+    # ---- 完结 / 断更（见 core.anime.sweep_finished / sweep_idle）----
+    # finished_at：判定"1..total_episodes 全部到手"的时刻。**它本身只是个标记**——
+    # 是否据此停止自动下新集由 config.ANIME_FINISH_UNSUB 决定（默认关，只提示不停订）。
+    # 【为什么不复用 confirmed/rejected】上面那两个字段已经编码了三种语义（含"超期忽略"的
+    # (rejected=True, confirmed=False) 组合），塞第四种会与 apply_start_date_filter 的可逆重算打架；
+    # 而且 rejected 会把番挪进『已忽略』——完结的番仍然是订阅中的番，只是不再有新集。
+    # 【为什么不做纯派生】派生算得出"现在完不完整"，算不出"什么时候完的"（UI 要显示、通知要去重）。
+    finished_at: datetime | None = Field(default=None)
+    # 用户点过详情页的『继续订阅』：此后本番不再被自动判完结。
+    # 【必需，不是可选】完结判据是【状态式】的（集齐了就恒为真），用户手动清掉 finished_at 后
+    # 下一轮巡检会立刻再判一次 —— 没有这一位，那个按钮就是"点了没用"。
+    finish_optout: bool = Field(default=False)
+    # 上次因『长期没有新种子』提醒过的时刻。不落库的话，每个巡检周期都会为同一部番重发一条通知。
+    # 【不需要在新种子入库时清它】sweep_idle 的候选闸本身就要求"最近一条种子早于 cutoff"，
+    # 收到新种子的番根本进不了候选；这一列只用来在【同一段静默期内】去重。
+    idle_notified_at: datetime | None = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.now)
 
 

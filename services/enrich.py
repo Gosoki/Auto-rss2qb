@@ -53,6 +53,28 @@ async def _retryable(make_request):
                 raise
             await asyncio.sleep(0.5 * (2 ** i))   # 0.5s → 1s → 2s …
 
+# 【"没问成" vs "问了但搜不到"】两者的返回值都是 None，而上层必须能区分：
+# retry_unmatched 的退避阶梯一共只有 REENRICH_MAX_TRIES 次、总跨度约 15 小时，正好能被
+# bgm 的一次限流窗口或机房故障吃光——而"根本没问成"不该消耗那几次机会。
+#
+# 【只统计 bgm 这一个对端】计数器的唯一消费者是 retry_unmatched，它问的是"bgm 到底可不可达"。
+# 早先这里把 Mikan 桥的失败也记进同一个数：于是"bgm 一切正常、只是 Mikan 打不开"会被
+# 判成"bgm 整体不可达"，退避阶梯被无限退款、每个节拍重打一遍 bgm（实测 bgm 恒 200 也照样如此）。
+# 同理，纯本地的解析异常（JSON 坏了、字段类型不对）也不算"没问成"——问是问到了。
+_bgm_fail = 0
+
+
+def _note_bgm_fail() -> None:
+    """记一次【bgm 没问成】。只在"请求没能拿到一个可信答复"时调：连接层失败、429、5xx。"""
+    global _bgm_fail
+    _bgm_fail += 1
+
+
+def net_failures() -> int:
+    """本进程累计的【bgm 没问成】次数。上层取调用前后的差值，判断这一次到底问成没有。"""
+    return _bgm_fail
+
+
 _MIKAN_BANGUMI_RE = re.compile(r"/Home/Bangumi/(\d+)")
 _BGM_SUBJECT_RE = re.compile(r"bgm\.tv/subject/(\d+)")
 _CJK_RE = re.compile(r"[一-鿿぀-ヿ]")
@@ -99,13 +121,20 @@ async def _search_one(client, name, est, release):
             json={"keyword": name, "filter": {"type": [2]}},
         ))
         if r.status_code != 200:
+            # 429（限流）与 5xx 同样是【没问成】——而它们恰恰是最可能整批发生、
+            # 最该退款的一类。4xx 里除 429 之外算"问到了但对方说不行"，不计。
+            if r.status_code == 429 or r.status_code >= 500:
+                _note_bgm_fail()
             return None
         body = r.json()
         # bgm 正常返回 {"data": [...]}；防它返回数组/非对象/data 非列表导致 AttributeError 逃逸
         data = body.get("data") if isinstance(body, dict) else None
         results = data if isinstance(data, list) else []
-    except (httpx.HTTPError, ValueError, TypeError):
+    except httpx.HTTPError:
+        _note_bgm_fail()     # 连接层失败：这次【没问成】，与"问了但搜不到"要分开
         return None
+    except (ValueError, TypeError):
+        return None          # 对端回了东西但格式不对——问是问到了
     for d in results:
         if not isinstance(d, dict):
             continue
@@ -134,6 +163,8 @@ async def _mikan_bridge(client, info_hash):
         sm = _BGM_SUBJECT_RE.search(bg.text)
         return int(sm.group(1)) if sm else None
     except httpx.HTTPError:
+        # 【不记 bgm 的账】这是 Mikan，不是 bgm。混在一起会让"Mikan 打不开"被判成
+        # "bgm 整体不可达"，把退避阶梯无限退款。
         return None
 
 
@@ -289,8 +320,11 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
                     if r.status_code == 200:
                         j = r.json()
                         meta = j if isinstance(j, dict) else {}  # 防 bgm 返回数组/非对象
-                except (httpx.HTTPError, ValueError):
+                except httpx.HTTPError:
+                    _note_bgm_fail()   # 详情取不到（502/限流/超时）同样是【没问成 bgm】
                     meta = {}
+                except ValueError:
+                    meta = {}          # JSON 坏了——问到了，只是对方给的东西不对
                 cast = await _fetch_cast(client, bgm_id)   # 声优另调 /characters（只抓主角）
 
         if bgm_id is not None and not meta:
@@ -303,9 +337,24 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
             return None
         if bgm_id is None and _parse_date(meta.get("date")) is None:   # bgm_id 命中即短路，跳过多余解析
             return None
-        info = _subject_to_info(bgm_id, meta)
-        info["cast"] = cast
+        try:
+            # 【纯本地转换单独兜住】到这里网络部分已经全部结束。把它留在下面那个 catch-all 里，
+            # bgm 改一次响应形状（字段换类型）就会被记成"没问成 bgm"，进而每轮退款、
+            # 每个节拍重打一遍 bgm——而三个端点其实全是 200。
+            info = _subject_to_info(bgm_id, meta)
+            info["cast"] = cast
+        except Exception as e:
+            log.warning("bgm 元数据解析失败（问到了，但对方给的形状不对）%s: %s", bgm_id, e)
+            return None
         return info
-    except httpx.HTTPError as e:
-        log.warning("富集失败 %s: %s", (names[0] if names else info_hash or "")[:16], e)
+    except Exception as e:
+        # 走到这里的都是【请求机制本身】出了问题：建 client 失败（代理配错/缺 socksio）、
+        # 传输层错误。纯本地的解析异常已经被上面那个 try 拦住，不会落进这里。
+        _note_bgm_fail()
+        # 【不能只接 httpx.HTTPError】代理配错时抛的不是它：socks5:// 少装 socksio 抛 ImportError、
+        # 代理 URL 少写 scheme 抛 ValueError，两者都发生在【建 client】那一步、不继承 HTTPError。
+        # 从这里逃出去只会被上游 worker 的 per-item except 收成一行"处理失败"，看不出是代理的问题。
+        # 口径与 services/qbittorrent._request 对齐：识别失败就是识别失败，不该有掀翻调用方的权力。
+        log.warning("富集失败 %s: %s: %s", (names[0] if names else info_hash or "")[:16],
+                    type(e).__name__, e)
         return None

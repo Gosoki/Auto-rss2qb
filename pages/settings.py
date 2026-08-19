@@ -10,11 +10,15 @@ from nicegui import context, run, ui
 
 from core import anime, engine, netguard, worker
 import config
+from db import backup
+from services import notify
 from db.dialect import BINARY_COLLATION
 from sources.parse import format_quarter
 from .layout import confirm, frame, warn_banner
 
-_NUMERIC = {"ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
+_NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
+            "NOTIFY_MAX_PER_HOUR", "NOTIFY_BACKLOG_MIN", "ANIME_IDLE_DAYS", "SWEEP_INTERVAL_MIN",
+            "ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
             "QB_IDLE_RECHECK_MIN", "QB_STALL_TIMEOUT_MIN", "QB_ARCHIVE_AFTER_DAYS",
             "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
@@ -132,6 +136,64 @@ def _pw_into(f: dict, key: str, label: str) -> None:
     f[key] = ui.input(label, value="", password=True).props("dense outlined").classes("w-full")
 
 
+def _backup_panel(f: dict) -> None:
+    """『备份』分栏：开关/间隔/保留份数 + 立刻备份 + 现有备份列表。
+
+    这是全项目唯一"出事就没救"的空白的补丁。刻意做得朴素：只做【备份】不做【恢复】——
+    恢复是一次性、要停服、要看清楚的操作，做成一个网页按钮反而危险（点错了就把现在的库盖了）。
+    页面上直接给出恢复用的命令，人照着敲一次即可。
+    """
+    _section("自动备份", "整库快照（VACUUM INTO，不是拷文件——本项目的 SQLite 开着 WAL，"
+                         "直接拷主文件会拿到一份看着正常、其实缺最近写入的库）。"
+                         "业务库切到 MySQL 时这里只备得到配置，页面会明确标出来。")
+    with ui.element("div").classes("field-grid w-full"):
+        f["BACKUP_ENABLED"] = ui.switch("开启自动备份", value=config.BACKUP_ENABLED).props("dense")
+        _num_into(f, "BACKUP_INTERVAL_HOURS", "间隔（小时）", config.BACKUP_INTERVAL_HOURS)
+        _num_into(f, "BACKUP_KEEP", "保留份数（0=不清理）", config.BACKUP_KEEP)
+
+    @ui.refreshable
+    def _list():
+        items = backup.list_backups()
+        if not items:
+            ui.label("还没有备份。点右边『立刻备份』或等自动备份到点。").classes(
+                "text-xs text-gray-400")
+            return
+        ui.label(f"共 {len(items)} 份 · 目录 {backup.BACKUP_DIR}").classes("text-xs text-gray-400")
+        for d in items[:10]:
+            with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                ui.badge("配置+业务" if d["scope"] == "full" else "仅配置").props(
+                    "color=green" if d["scope"] == "full" else "color=orange")
+                ui.label(d["name"]).classes("text-xs text-gray-400 grow break-all min-w-0")
+                ui.label(f"{d['bytes'] / 1024:.0f} KB").classes("text-xs text-gray-500")
+
+    async def _now():
+        btn.props("loading")
+        try:
+            res = await run.io_bound(backup.backup_now, config.BACKUP_KEEP)
+            ok, why = backup.verify(res["path"])
+            _list.refresh()
+            ui.notify(f"已备份 {res['bytes'] / 1024:.0f} KB —— {res['note']}"
+                      if ok else f"备份文件自检未通过：{why}",
+                      type="positive" if ok else "negative")
+        except Exception as e:
+            ui.notify(f"备份失败：{type(e).__name__}: {str(e)[:160]}", type="negative")
+        finally:
+            btn.props(remove="loading")
+
+    with ui.row().classes("gap-2 items-center mt-2"):
+        btn = ui.button("立刻备份", icon="backup", on_click=_now).props("color=primary unelevated")
+        _help("恢复步骤（顺序不能乱）：\n"
+              "1. systemctl stop autorss\n"
+              "2. 【必须】删掉 data/autorss.db-wal 与 data/autorss.db-shm\n"
+              "3. cp data/backups/<选中的那份> data/autorss.db\n"
+              "4. systemctl start autorss\n\n"
+              "第 2 步不能省：本库开着 WAL，最近的写入躺在 -wal 文件里。只覆盖主文件的话，"
+              "SQLite 启动时会把【事故现场那份 -wal】重放到你刚恢复的库上——你拿回的是出事后的数据，"
+              "而 `pragma quick_check` 照样返回 ok，每一步验证都是绿的，根本看不出来。\n\n"
+              "恢复前建议先 `sqlite3 <备份文件> \'pragma quick_check\'` 确认那份能打开。")
+    _list()
+
+
 def _db_panel(f: dict) -> None:
     """『数据库』分栏：MySQL 连接参数 + 两个互不相同的动作（切换 / 迁移）。
 
@@ -205,7 +267,7 @@ def _db_panel(f: dict) -> None:
         name = (config.DB_MYSQL_NAME or "").strip()
         host = (config.DB_MYSQL_HOST or "").strip()
         if not host or not name:
-            ui.notify("MySQL 地址与库名都要填，并先点『保存设置』", type="warning")
+            ui.notify("MySQL 地址与库名都要填，并先点页面底部的『保存』", type="warning")
             return
         if not await confirm(
                 f"在 {host} 上创建数据库 `{name}`？",
@@ -238,7 +300,7 @@ def _db_panel(f: dict) -> None:
         """只切连接、不动数据。"""
         url = db.configured_mysql_url() if to_mysql else None
         if to_mysql and url is None:
-            ui.notify("MySQL 地址与库名都要填，并先点『保存设置』", type="warning")
+            ui.notify("MySQL 地址与库名都要填，并先点页面底部的『保存』", type="warning")
             return
         target = "MySQL" if to_mysql else "本地 SQLite"
         if not await confirm(
@@ -279,7 +341,7 @@ def _db_panel(f: dict) -> None:
         """复制数据；连接不变。"""
         url = db.configured_mysql_url()
         if url is None:
-            ui.notify("MySQL 地址与库名都要填，并先点『保存设置』", type="warning")
+            ui.notify("MySQL 地址与库名都要填，并先点页面底部的『保存』", type="warning")
             return
         try:
             other = db.make_mysql_engine(url)
@@ -304,13 +366,25 @@ def _db_panel(f: dict) -> None:
         over = any(d_cnt.values())
         if over:
             note += "⚠️ 目标库【非空】，继续会先清空它的业务表再写入——那些数据将不可恢复。\n"
+        # 【目标正是当前在用的业务库】这是最危险的一种：清空+逐批写入是在【线程】里跑的，
+        # 而后台采集/同步/页面还在读同一个库，中间态（anime 全在、animetorrent 还空）是可见的，
+        # 集去重的 have_eps 会漏判，于是同一集被重下一份。下面用两把轮次锁把采集与扫描挡住，
+        # 但页面读取挡不住，所以这里必须把话说清楚。
+        live_target = transfer.same_database(dst, db.engine)
+        if live_target:
+            note += ("⚠️ 目标就是【当前正在使用】的业务库。迁移期间采集与剧场版扫描会被暂停，"
+                     "但页面上看到的数据会在清空→写入之间短暂不完整；请迁完再操作。\n")
         note += "迁移完成后连接【仍在原库】，想改用新库请再点『切换』。"
         if not await confirm("开始迁移数据？", note,
                              ok_label="清空目标库并迁移" if over else "开始迁移",
                              ok_icon="content_copy", ok_color="negative" if over else "primary"):
             return
         try:
-            res = await run.io_bound(transfer.migrate_data, src, dst, overwrite=over)
+            # 【拿住两把轮次锁】迁移是"清空目标 → 逐批写入"，而后台采集正在往同一个库写：
+            # 复制出的会是撕裂快照（可产生 anime_id 指向不存在父行的孤儿种子，或静默丢行）。
+            # 两把锁正是 worker 用来串行化采集轮与剧场版扫描轮的那两把，这里借用它们把两条线挡在门外。
+            async with worker._poll_lock, worker._scan_lock:
+                res = await run.io_bound(transfer.migrate_data, src, dst, overwrite=over)
             moved = res["moved"]
             # 用【迁前】的源快照校验：现查源库有个自证陷阱——万一两端其实是同一个库，
             # 清空之后现查两边都是 0，反而"校验通过"。
@@ -366,8 +440,11 @@ def settings():
     with frame("settings") as header_right:
         with header_right:   # 顶栏右侧快捷保存：功能同页面底部『保存』（_save 在下方定义，lambda 延迟到点击时解析）
             ui.button(icon="save", on_click=lambda: _save()).props(
-                "flat round dense color=white").tooltip("保存设置（同页面底部『保存』）")
+                "flat round dense color=white").tooltip("保存设置（同页面底部的『保存』按钮）")
         ui.label("全局设置").classes("text-2xl font-bold")
+        if not config.loaded_from_db:
+            warn_banner("配置没能从数据库读出来，下面显示的全部是【硬编码默认值】，不是你设过的。"
+                        "此时保存会被拦下（否则会把原有设置整体覆盖掉）。先修好数据库再来。")
         ui.label("保存即时生效、页面刷新可见；仅 Web 绑定地址/端口改动需重启。").classes(
             "text-xs text-gray-400 mb-2")
 
@@ -481,12 +558,12 @@ def settings():
 
             ui.separator()
             _section("保存 & 命名",
-                     "有工作目录时，动漫/电影目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
-                     "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，动漫/电影须各填【绝对】路径（可不同盘）。"
+                     "有工作目录时，番剧/剧场版目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
+                     "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，番剧/剧场版须各填【绝对】路径（可不同盘）。"
                      "两侧都空又无工作目录=无处下载、保存拦下。")
             _text("DOWN_PATH", "工作目录（下载根）", config.DOWN_PATH)
-            _text("ANIME_DOWN_PATH", "动漫下载目录", config.ANIME_DOWN_PATH, _sub_ph)
-            _text("MOVIE_DOWN_PATH", "电影下载目录", config.MOVIE_DOWN_PATH, _sub_ph)
+            _text("ANIME_DOWN_PATH", "番剧下载目录", config.ANIME_DOWN_PATH, _sub_ph)
+            _text("MOVIE_DOWN_PATH", "剧场版下载目录", config.MOVIE_DOWN_PATH, _sub_ph)
             if config.QB_ENABLED and not engine.qb_is_local():
                 warn_banner("qB 在远程主机（非 127.0.0.1）：以上路径是【qB 主机上】的绝对路径，不是本机路径。"
                             "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。")
@@ -505,6 +582,36 @@ def settings():
                 _text("PROXY_USER", "代理账号", config.PROXY_USER, "留空=不认证")
                 _password("PROXY_PASS", "代理密码（留空=不改）")
             _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL)
+            _section("通知事件",
+                     "勾了哪些就只收哪些。【留空＝一条都不发】——注意这与『订阅源』页上"
+                     "『留空＝不限』（字幕组白名单、标题关键词）的含义相反。\n"
+                     "『qB 连不上』『数据库停摆』『待识别积压』是状态型：只在状态【翻转】的那一刻"
+                     "各发一条（进一条、出一条），不会每轮重复轰炸。\n"
+                     "『下载失败』『停滞异常』由后台巡检合并上报，同样的条数 6 小时内只说一次。")
+            f["NOTIFY_EVENTS"] = ui.select(
+                {k: f"{icon} {cn}" for k, (cn, icon) in notify.EVENTS.items()},
+                value=list(config.NOTIFY_EVENTS or []), multiple=True,
+                label="推送这些事件").props("dense outlined use-chips").classes("w-full")
+            with ui.element("div").classes("field-grid w-full"):
+                _num("NOTIFY_MAX_PER_HOUR", "每小时最多几条（0=不限）", config.NOTIFY_MAX_PER_HOUR)
+                _num("NOTIFY_BACKLOG_MIN", "待识别积压到几部才提醒", config.NOTIFY_BACKLOG_MIN)
+
+            ui.separator()
+            _section("完结 / 断更巡检",
+                     "完结判定：bgm 给出总集数、且 1~总集数【每一集都在手】才算完结（有集号歧义段的番一律不判）。\n"
+                     "『判完结后停止自动下新集』默认关——判据虽保守，但 bgm 的总集数少记一集是真实存在的，"
+                     "那会让最后一集永远下不下来。建议先让它跑一阵、看『已完结』标得对不对再开。\n"
+                     "断更提醒：一部追番中的番多少天没有新种子就说一声——那是发现『源失效/字幕组停更』的"
+                     "唯一自动手段（那类故障不报错，表现只是『好几天没更新了』）。")
+            with ui.element("div").classes("field-grid w-full"):
+                f["ANIME_FINISH_ENABLED"] = ui.switch(
+                    "判定完结（只标记+通知）", value=config.ANIME_FINISH_ENABLED).props("dense")
+                f["ANIME_FINISH_UNSUB"] = ui.switch(
+                    "判完结后停止自动下新集", value=config.ANIME_FINISH_UNSUB).props("dense")
+                _num("ANIME_IDLE_DAYS", "断更提醒阈值（天，0=关）", config.ANIME_IDLE_DAYS)
+                # 【给下限】这一项没有"0=关"的语义（关完结/断更各有自己的开关），
+                # 而 run_sweep 里是 max(60, ...) 秒——填 0 会变成每 60 秒来一次全表扫描。
+                _num("SWEEP_INTERVAL_MIN", "巡检间隔（分钟，最少 5）", config.SWEEP_INTERVAL_MIN, 5, 1440)
 
             ui.separator()
             _section("Web 访问",
@@ -559,7 +666,7 @@ def settings():
         with ui.card().classes("w-full"), ui.expansion(
                 "番剧", icon="movie", value=True).classes("w-full").props("dense"):
             _section("采集",
-                     "Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在『源管理』页配置。")
+                     "Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在『订阅源』tab 配置。")
             _switch_field("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
                     config.ANIME_POLL_ENABLED)
             with ui.element("div").classes("field-grid w-full"):
@@ -643,7 +750,7 @@ def settings():
                 _select("MOVIE_DEFAULT_TAB", "默认标签页", MOVIE_TAB_LABELS, config.MOVIE_DEFAULT_TAB)
                 _num("MOVIE_PAGE_YEARS", "分页 · 每页年数", config.MOVIE_PAGE_YEARS, 1, 5)
             _quarter_setting(f, "MOVIE_QUARTER_FMT", "下载文件夹命名（默认按年份）",
-                             "电影按此建下载文件夹（默认年份，如 2026；同年归一个文件夹）；留空＝不分类、直接放片名。",
+                             "剧场版按此建下载文件夹（默认年份，如 2026；同年归一个文件夹）；留空＝不分类、直接放片名。",
                              config.MOVIE_QUARTER_FMT, empty_hint="留空＝不建年份目录，直接 …/片名/")
 
         # ========== 折叠 ④ 数据库 ==========
@@ -651,7 +758,21 @@ def settings():
                 "数据库", icon="storage", value=False).classes("w-full").props("dense"):
             _db_panel(f)
 
+        # ========== 折叠 ⑤ 备份 ==========
+        with ui.card().classes("w-full"), ui.expansion(
+                "备份", icon="backup", value=False).classes("w-full").props("dense"):
+            _backup_panel(f)
+
         async def _save():
+            if not config.loaded_from_db:
+                # 【配置根本没从库里读出来时，绝不能保存】此刻表单上显示的每一个值都是【硬编码默认值】，
+                # 不是用户设过的。一按保存就会把库里全部已有配置改写成默认——其中
+                # WEB_ALLOW_CIDRS 会被清空，而空串在 netguard 里的含义是【放行一切】：
+                # 一个无鉴权、存着 qB 密码的面板重新对整个局域网敞开，NOTIFY_URL 的推送密钥也被抹掉，
+                # 而全程零报错、还弹一句绿色的"已保存"。
+                ui.notify("数据库没读出来，当前显示的是默认值——现在保存会覆盖掉你原有的全部设置，已拦下。"
+                          "请先修好数据库（journalctl -u autorss -n 50）", type="negative")
+                return
             updates = {}
             for key, ctrl in f.items():
                 v = ctrl.value
@@ -661,6 +782,11 @@ def settings():
                     updates[key] = str(v).strip()
                 elif isinstance(v, bool):
                     updates[key] = "true" if v else "false"
+                elif isinstance(v, (list, tuple, set)):
+                    # 【list 型配置】config 那边用逗号分隔的字符串存（见 config._to_raw），
+                    # NOTIFY_EVENTS 是第一个走这条路的表单项。不加这一支的话，
+                    # str(v) 会把整个 Python 列表字面量（含中括号和引号）原样写进库。
+                    updates[key] = ",".join(str(x).strip() for x in v if str(x).strip())
                 elif key in _NUMERIC:
                     try:
                         updates[key] = str(int(v))
@@ -699,7 +825,7 @@ def settings():
                     return
             # 路径防呆：每侧有效根 =(该侧目录 or 工作目录)不能为空，否则无处下载
             work = updates.get("DOWN_PATH", "")
-            for side, key in (("动漫", "ANIME_DOWN_PATH"), ("电影", "MOVIE_DOWN_PATH")):
+            for side, key in (("番剧", "ANIME_DOWN_PATH"), ("剧场版", "MOVIE_DOWN_PATH")):
                 if not (updates.get(key, "") or work):
                     ui.notify(f"{side}下载目录与工作目录都为空——无处下载。请填工作目录，或填这一侧的绝对路径。",
                               type="negative")
@@ -714,10 +840,17 @@ def settings():
                 sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
                 qb_was_on = config.QB_ENABLED
                 config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
+                # 通知的冷却/状态记忆是【进程内】的：不清的话，用户刚把某个事件勾上，
+                # 还要等冷却过期或状态再翻转一次才看得到效果——那看起来就像"设置没生效"。
+                notify.reset_state()
                 # 注：改开始使用日【不】自动重算已有番——由用户在设置里点『应用』按钮显式触发（更可控）
                 # qB 发送开着 → 保存后测一次连接：连不上就自动关掉开关（免得停在『开着却下不了』的迷惑态）
                 probe_failed = False
                 if config.QB_ENABLED:
+                    # 【先解除登录冷却】用户刚改完账号密码，不该还被自己上一次失败的负缓存挡着——
+                    # 那会让"密码明明改对了"的这次保存照样报连不上，然后把开关自动关掉。
+                    # 冷却是为了别把 qB 的失败登录封禁计数撞满，不是惩罚用户的显式操作。
+                    await engine.qb.reset_cooldown()
                     client = await engine.qb._login()
                     if client is None:
                         probe_failed = True
@@ -755,7 +888,8 @@ def settings():
                 return                       # 防抖：跑着时连点直接忽略，别叠多轮并发抓源
             if not await confirm("重新激活全部任务？",
                                  "立刻抓一遍所有源、把到点的下载发往 qB、按需扫剧场版，并唤醒 qB 状态检查"
-                                 "（约等于重启一次服务，但不重启进程）。源多时要一会儿。"):
+                                 "（约等于重启一次服务，但不重启进程）。源多时要一会儿。",
+                                 ok_color="primary"):
                 return
             _reactivate_busy["v"] = True
             reactivate_btn.props("loading")

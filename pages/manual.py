@@ -6,6 +6,9 @@ import config
 from core import manual
 from .layout import frame
 
+# .torrent 通常 < 1MB；给足余量后封顶，免得整块读进内存（与 core/engine.py 的取种上限同量级）。
+_UPLOAD_CAP = 32 * 1024 * 1024
+
 
 @ui.page("/manual")
 def manual_page():
@@ -40,9 +43,20 @@ def manual_page():
 
             @ui.refreshable
             def upbox():
-                def _on_upload(e):
-                    up["bytes"] = e.content.read(); up["name"] = e.name
-                    upbox.refresh(); ui.notify(f"已选文件：{e.name}", type="positive")
+                async def _on_upload(e):
+                    # 【NiceGUI 3.16 的事件对象是 slots dataclass，只有 sender/client/file】
+                    # 早先这里写的是 e.content.read() / e.name（旧版 API），在当前依赖上必抛
+                    # AttributeError——整条"上传 .torrent 文件"的入口是坏的：点了没反应，
+                    # 只有日志里一行异常。新 API 是 e.file.name / await e.file.read() / e.file.size()。
+                    f = e.file
+                    if f.size() > _UPLOAD_CAP:
+                        ui.notify(f"文件太大（{f.size() // 1024 // 1024}MB）："
+                                  f".torrent 通常不到 1MB，请确认选对了文件", type="warning")
+                        return
+                    up["bytes"] = await f.read()
+                    up["name"] = f.name
+                    upbox.refresh()
+                    ui.notify(f"已选文件：{f.name}", type="positive")
                 if up["name"]:
                     with ui.row().classes("items-center gap-2 w-full p-2 rounded").style(
                             "background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.3)"):

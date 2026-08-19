@@ -63,7 +63,7 @@ async def maybe_relocate_anime(anime_id: int, old_path, after=None):
     _extra = f"；另有 {len(arch)} 集已归档、无法代为移动（文件留在旧目录）" if arch else ""
     if not await confirm("归档目录变了，移动已下文件？",
                          f"{len(dl)} 集已下，移到新目录：{new_path}{_extra}",
-                         ok_label="移动文件", ok_icon="drive_file_move"):
+                         ok_label="移动文件", ok_icon="drive_file_move", ok_color="primary"):
         ui.notify("已更新记录，未移动文件（新集将下到新目录，旧文件留在原处）", type="warning")
         return
     rep = await anime.relocate_anime(anime_id, old_path)
@@ -102,6 +102,15 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 else:
                     ui.badge("✓ 已确认" if cur.confirmed else "⏳ 待确认").props(
                         f"color={'green' if cur.confirmed else 'orange'}")
+                if cur.finished_at:
+                    # 停订与否由全局开关决定，所以徽标的 tooltip 必须说清【当前这台机器上】它意味着什么，
+                    # 否则用户看到"已完结"无从判断后台还会不会继续下。
+                    ui.badge("🎊 已完结").props("color=teal").tooltip(
+                        f"1~{cur.total_episodes} 集全部到手（判定于 "
+                        f"{cur.finished_at.strftime('%Y-%m-%d %H:%M')}）。"
+                        + ("已停止自动下新集——若这部番其实还没完（bgm 的总集数少记了），"
+                           "点右边的『继续订阅』。" if config.ANIME_FINISH_UNSUB
+                           else "仅作标记，后台仍会继续下新集（『判完结后停止自动下新集』开关在设置页）。"))
             if on_close:
                 ui.button(icon="close", on_click=on_close).props("flat round dense").classes(
                     "shrink-0")
@@ -117,6 +126,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.button("恢复订阅", icon="undo", on_click=_restore).props(
                     "dense size=sm color=primary unelevated").style("font-size:12px")
             else:
+                if cur.finished_at:
+                    ui.button("继续订阅", icon="autorenew", on_click=_resubscribe).props(
+                        "dense size=sm color=primary unelevated").style("font-size:12px").tooltip(
+                        "清掉完结标记并【不再自动判它完结】。bgm 的总集数少记一集时用这个——"
+                        "否则下一轮巡检立刻又会把它判回完结。")
                 ui.button("忽略本番", icon="block", on_click=_reject).props(
                     "flat dense size=sm color=grey").style("font-size:12px")
 
@@ -282,7 +296,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _tried = f"（已自动重试 {t.retry_count} 次仍不行）" if t.retry_count else ""
                         ui.badge("失败·可补下" if _bf else "失败").props(
                             f"color={'orange' if _bf else 'red'}").tooltip(
-                            _why + (f"点右边『下载』或『补下本番』手动重试{_tried}"
+                            _why + (f"点右边『下载』或『下载该源』手动重试{_tried}"
                                     if _bf else f"下载失败过{_tried}"))
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删/已排除)按状态
                         ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
@@ -346,7 +360,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         anime.reset_enrich_tries(anime_id)   # 手动重识别：清零后台重试计数，重新获得自动重试机会
         ok = await anime.enrich_anime(anime_id)
         _after()
-        ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）")
+        ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）",
+                  type="positive" if ok else "warning")
         if ok:
             await maybe_relocate_anime(anime_id, old_path, _after)
 
@@ -357,7 +372,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label("自动认错了就把正确的 bgm 链接或 ID 填这——直接取权威元数据覆盖。").classes(
                 "text-xs text-gray-400")
             inp = ui.input(placeholder="bgm.tv/subject/464376 或 464376").props(
-                "dense outlined autofocus").classes("min-w-80")
+                "dense outlined autofocus").classes("w-80 min-w-0 max-sm:w-full")
+            inp.on("keydown.enter", lambda: dlg.submit(inp.value))   # 有 autofocus 就该能回车提交
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("绑定", icon="link",
@@ -385,7 +401,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label("内部键 = 两位年 + 季母（A冬 B春 C夏 D秋），如 26A=2026年冬。"
                      "改后可把已下文件移到新目录。").classes("text-xs text-gray-400")
             inp = ui.input("季度键", value=(cur.quarter if cur else "")).props(
-                "dense outlined autofocus").classes("min-w-60")
+                "dense outlined autofocus").classes("w-60 min-w-0 max-sm:w-full")
             prev = ui.label().classes("text-sm text-blue-400")
 
             def _pv():
@@ -415,23 +431,31 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         anime.confirm_anime(anime_id)
         n = await anime.download_pending_for_anime(anime_id)
         _after()
-        ui.notify(f"已确认，补下 {n} 集")
+        ui.notify(f"已确认，补下 {n} 集", type="positive")
 
     def _reject():
         anime.reject_anime(anime_id)
         _after()
-        ui.notify("已忽略，移到『已忽略』页")
+        ui.notify("已忽略，移到『已忽略』页", type="positive")
 
     async def _restore():
         anime.restore_anime(anime_id)
         n = await anime.download_pending_for_anime(anime_id)
         _after()
-        ui.notify(f"已恢复到『订阅中』，补下 {n} 集")
+        ui.notify(f"已恢复到『订阅中』，补下 {n} 集", type="positive")
+
+    async def _resubscribe():
+        """继续订阅：清完结标记 + 记下别再自动判它完结，顺手把攒下的待下补一遍。"""
+        anime.resubscribe(anime_id)
+        n = await anime.download_pending_for_anime(anime_id)
+        _after()
+        ui.notify(f"已继续订阅，补下 {n} 集（此后不再自动判它完结）" if n
+                  else "已继续订阅（此后不再自动判它完结）", type="positive")
 
     async def _download():
         n = await anime.download_pending_for_anime(anime_id)
         _after()
-        ui.notify(f"已触发下载 {n} 集")
+        ui.notify(f"已触发下载 {n} 集", type="positive")
 
     async def _run_backfill(name_filter):
         # 防抖挂在【番 id】上而不是弹窗闭包里：闭包随详情弹窗重建而重置，关掉再打开就绕过去了，
@@ -458,7 +482,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     "后台将暂停自动下新集，直到你去『待确认』页重新点确认。继续？",
                     ok_label="继续补齐", ok_icon="playlist_add", ok_color="primary"):
                 return
-        ui.notify("正在搜索补齐…（去 nyaa/Mikan 按名搜，请稍候）")
+        ui.notify("正在搜索补齐…（去 nyaa/Mikan 按名搜，请稍候）", type="info")
         try:
             res = await anime.backfill_source(anime_id, name_filter)
         except Exception as e:            # 兜住 fetch 之外的意外，别逃逸崩掉处理器
@@ -536,6 +560,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                          "支持 .5（如 12.5）。").classes("text-xs text-gray-400")
                 num = ui.number("集号", value=1, min=0, step=1, format="%g").props(
                     "dense outlined autofocus")
+                num.on("keydown.enter", lambda: dlg.submit(num.value))
                 with ui.row().classes("gap-2 justify-end w-full"):
                     ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                     ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("color=primary unelevated")
@@ -556,7 +581,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             if not await confirm("排除这一条？",
                                  "从待下里排除：不再自动下、不再挂在未知集，RSS 再遇到同种子也不重收；"
                                  "排除后可随时点『恢复』放回待下。",
-                                 ok_label="排除", ok_icon="block"):
+                                 ok_label="排除", ok_icon="block", ok_color="primary"):
                 return
             ok = anime.exclude_torrent(torrent_id)
             _after()

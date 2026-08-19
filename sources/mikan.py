@@ -21,7 +21,7 @@ import config
 from services import fetch
 from sources.base import ParsedItem, Source
 from sources.parse import (SEASON_CN, candidate_names, clip_title, estimate_premiere,
-                           extract_episode_abs, quarter_of,
+                           extract_episode_abs, kw_match, quarter_of,
                            is_batch, parse_multibracket, parse_title)
 
 log = logging.getLogger("autorss")
@@ -90,7 +90,7 @@ class MikanSource(Source):
 
             if is_batch(raw_title):
                 return None  # 批量/合集帖
-            if self.title_filter and not any(k in raw_title for k in self.title_filter):
+            if self.title_filter and not any(kw_match(k, raw_title) for k in self.title_filter):
                 return None  # 标题不含所需关键词（如按语言 繁日/简日 过滤）
 
             group, anime_title, season, episode = parse_title(raw_title)
@@ -100,7 +100,10 @@ class MikanSource(Source):
                 if mb:
                     anime_title, search_names = mb
             # 白名单：子串匹配，兼顾联合发布（如 "喵萌奶茶屋&LoliHouse"）
-            if self.subgroups and not any(g in group for g in self.subgroups):
+            # 【与标题关键词同口径：大小写不敏感】紧邻下面那行的 title_filter 早已改成 kw_match，
+            # 唯独这里还是裸 in —— 用户填 lolihouse 而站上写 LoliHouse，该源组每轮全灭，
+            # 日志只有一行"0 条"，没有任何指向。与 R2 判为 P1 的那条是逐字相同的失效模式。
+            if self.subgroups and not any(kw_match(g, group) for g in self.subgroups):
                 return None
             if not anime_title:
                 return None

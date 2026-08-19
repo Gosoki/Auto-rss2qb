@@ -21,6 +21,14 @@ _INFO_BATCH = 100
 
 _SESSION_TTL = 1800   # 复用已登录 client 的秒数；取小于 qB 默认 cookie 寿命(约 1h)，到点主动重登
 
+# 【登录失败的负缓存】qB 自带失败登录封禁（默认 5 次失败 → 封该 IP 3600 秒）。
+# 而本程序的两条后台线（anime + movies 的状态同步）每 QB_SYNC_INTERVAL（默认 30s）各要一次会话，
+# 用户改了密码或 qB 重启后，约 75 秒就能凑够 5 次失败把自己封进去——之后即使把密码改对，
+# 设置页的连接探测也会失败，还会顺手把『发送到 qB』开关自动关掉，看起来像"密码明明是对的却连不上"。
+# 凭据类失败退避得久（改密码是人工动作，不必抢），网络类失败退避得短（qB 重启很快回来）。
+_LOGIN_COOLDOWN_AUTH = 300    # 200 'Fails.'（账号密码错）/ 403（已被封）
+_LOGIN_COOLDOWN_NET = 30      # 连不上/超时
+
 
 def _add_accepted(resp: httpx.Response) -> bool:
     """/torrents/add 是否被受理。两代 qB 的回法完全不同，都要认。
@@ -55,6 +63,7 @@ class QBittorrent:
         self._auth = None                 # 缓存时的 (url, user, pass)；变了即重登
         self._logged_at = 0.0
         self._lock = asyncio.Lock()       # 串行化登录，防并发重复登录
+        self._fail_until = 0.0            # 负缓存：在这个时刻之前不再尝试登录（见 _LOGIN_COOLDOWN_*）
 
     async def _login(self) -> httpx.AsyncClient | None:
         """新建并登录一个 AsyncClient；成功返回它（不 aclose，交缓存复用），失败返回 None 并清理。"""
@@ -81,12 +90,17 @@ class QBittorrent:
                                            and resp.text.strip().lower().startswith("ok")):
                 ok = True
                 return client
-            log.error("qBittorrent 登录失败: %s %s", resp.status_code, resp.text[:80])
+            # 凭据错 / 已被封 → 长冷却。再撞下去只会把封禁时间续上，且用户改对密码后仍连不上。
+            self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_AUTH
+            log.error("qBittorrent 登录失败: %s %s（%d 秒内不再重试；改完账号密码点『保存』可立即重试）",
+                      resp.status_code, resp.text[:80], _LOGIN_COOLDOWN_AUTH)
             return None
         except httpx.HTTPError as e:
+            self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_NET   # 网络类：短冷却，qB 重启很快回来
             log.error("qBittorrent 登录请求失败: %s", e)
             return None
         except Exception as e:                 # 非 HTTP 类异常(socket/URL 等)也别逃逸；CancelledError 是
+            self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_NET
             log.error("qBittorrent 登录异常: %s", e)   # BaseException 不被此捕获，仍正常向上传播
             return None
         finally:
@@ -109,13 +123,23 @@ class QBittorrent:
                     and time.monotonic() - self._logged_at < _SESSION_TTL):
                 return self._client
             await self._close()
+            if time.monotonic() < self._fail_until:
+                return None            # 冷却中：直接当"连不上"，调用方本就按三态处理（None=留待下轮）
             client = await self._login()
             if client is not None:
                 self._client, self._auth, self._logged_at = client, auth, time.monotonic()
+                self._fail_until = 0.0                      # 登录成功即解除冷却
             return client
 
     async def _invalidate(self) -> None:
         async with self._lock:
+            await self._close()
+
+    async def reset_cooldown(self) -> None:
+        """解除登录失败的负缓存。设置页保存 qB 配置后调它——用户刚改完账号密码，
+        不该还被自己上一次的失败冷却挡着（冷却是为了别把 qB 的封禁计数撞满，不是惩罚用户）。"""
+        async with self._lock:
+            self._fail_until = 0.0
             await self._close()
 
     async def _request(self, method: str, path: str, **kw) -> httpx.Response | None:
@@ -169,7 +193,12 @@ class QBittorrent:
         重试多少次都一样。两者都揉成 False，就会在 qB 掉线时把整批种子打成 error 要人工补下。
         """
         files = {"torrents": ("t.torrent", torrent_bytes, "application/x-bittorrent")}
-        data = {"savepath": save_path, "autoTMM": "false", "paused": "false",
+        # 【paused 与 stopped 都发】qB 5.0 把这个参数改名成 stopped 且【没有保留别名】。
+        # 只发 paused 的话，用户在 qB 里开了 AddTorrentStopped 时种子会以 stoppedDL 入库——
+        # 那是 W 档（不计停滞），于是该行永久 in-flight、永不下完也永不报错。
+        # 两个都带是安全的：老版忽略未知的 stopped，新版忽略未知的 paused。
+        data = {"savepath": save_path, "autoTMM": "false",
+                "paused": "false", "stopped": "false",
                 "category": category, "tags": tags}
         resp = await self._request("POST", "/api/v2/torrents/add", data=data, files=files)
         if resp is None:
@@ -180,7 +209,10 @@ class QBittorrent:
         # engine.add_to_qb 会据 info_hash 兜底判为已交付——故 200 按 warning 记，别当 error 惊扰。
         # 响应体留 200 字：新版失败时的 failure_reasons 才不会被截掉（那是唯一的失败原因线索）。
         # 附上 save_path：远程 qB 若因路径不可写而拒，这行是另一条线索。
-        (log.warning if resp.status_code == 200 else log.error)(
+        # 200('Fails.') 与 409(Conflict) 都是"该 hash 已在 qB"的正常表达（新旧版本各一种），
+        # 调用方 engine.add_to_qb 会据 info_hash 兜底判为已交付——按 warning 记，别让"仅错误"
+        # 日志档里出现一堆正常事件。
+        (log.warning if resp.status_code in (200, 409) else log.error)(
             "添加下载任务未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:200], save_path)
         return False
 
@@ -188,14 +220,15 @@ class QBittorrent:
         """把 magnet 链接（或 http .torrent 链接）交给 qB 自己抓取下载（urls= 参数）。
         三态与 add_torrent 完全一致：True=已受理 / False=qB 明确拒了 / None=根本没连上
         （理由见 add_torrent 的说明；两者揉成 False 会让调用方把『qB 掉线』误诊成『种子有问题』）。"""
-        data = {"urls": url, "savepath": save_path, "autoTMM": "false", "paused": "false",
+        data = {"urls": url, "savepath": save_path, "autoTMM": "false",
+                "paused": "false", "stopped": "false",   # 理由同 add_torrent
                 "category": category, "tags": tags}
         resp = await self._request("POST", "/api/v2/torrents/add", data=data)
         if resp is None:
             return None
         if _add_accepted(resp):
             return True
-        (log.warning if resp.status_code == 200 else log.error)(
+        (log.warning if resp.status_code in (200, 409) else log.error)(
             "添加下载任务(url)未接受 %s: %s（save_path=%s）", resp.status_code, resp.text[:200], save_path)
         return False
 
@@ -222,7 +255,12 @@ class QBittorrent:
                 resp.raise_for_status()
                 data = resp.json()
             except (httpx.HTTPError, ValueError) as e:
-                log.error("查询种子状态失败: %s", e)
+                # 【只记异常类型与状态码】httpx 的异常串里带完整 URL，而本端点的 query 是把
+                # 几十上百个 hash 用 | 拼起来的——原样记下去单条日志就能上 4KB，一天十几 MB，
+                # 把真正想看的采集/下载日志挤出滚动窗口。
+                code = getattr(getattr(e, "response", None), "status_code", "—")
+                log.error("查询种子状态失败：%s（HTTP %s，%d 个 hash）",
+                          type(e).__name__, code, len(hashes[i:i + _INFO_BATCH]))
                 return None
             if not isinstance(data, list):
                 # 正常 qB 该端点恒返回数组。非列表(反代/网关在 200 下塞的错误 JSON/维护页等)按『连不上』处理、

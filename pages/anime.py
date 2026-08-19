@@ -207,6 +207,10 @@ def anime_page(t: str = ""):
                 ("将下载", ps["will"], "blue", "已确认番·本集首选，会自动下（特别篇/未知集不在其列，需手动下）"),
                 ("备用项", ps["backup"], "blue-grey", "同集已有『将下载/已下』的更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
+                *([("已完结", ps["finished"], "teal",
+                    "番已判定完结、且设置里开了『判完结后停止自动下新集』，所以这些不会自动下。"
+                    "若那部番其实还没完（bgm 的总集数少记了），去详情页点『继续订阅』")]
+                  if ps.get("finished") else []),
                 ("特别篇/未知集", ps["unknown"], "purple",
                  "特别篇·OVA 与批量/未知集：后台一律不自动下，需在详情页对准那一条点『下载』"),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
@@ -447,10 +451,10 @@ def anime_page(t: str = ""):
             pend_aids = {r["anime_id"] for r in raw
                          if r["status"] in engine.DOWNLOADABLE_STATUSES and r["anime_id"]}
             confirmed = anime.confirmed_anime_ids(pend_aids)
-            # 两种口径各算一次（都是批量，避免 N+1）：pending 行看『自动会下吗』，
-            # error 行看『补下会挑吗』——后台自动下从不重试 error，用同一个集合会标反。
-            plan_ids = anime.download_plan_for_ids(confirmed)
-            backfill_ids = anime.download_plan_for_ids(confirmed, for_backfill=True)
+            # 两种口径【一次算出】：pending 行看『自动会下吗』，error 行看『补下会挑吗』
+            # ——后台自动下从不重试 error，用同一个集合会标反。
+            # 两者只差"候选含不含 error"，分开调会把番元数据、种子行、"已有一份"的键全部重算一遍。
+            plan_ids, backfill_ids = anime.download_plans_for_ids(confirmed)
             rows = []
             for r in raw:
                 if r["status"] in engine.DOWNLOADABLE_STATUSES:
@@ -634,7 +638,7 @@ def anime_page(t: str = ""):
         def _open_failed():
             _open_torrent_list(
                 "失败 / 异常",
-                "下载失败过（取种/发送失败）或长期停滞无进展的种子。正集可在详情页『补下本番』重试；特别篇/未知集只能对准那一条点『下载』。",
+                "下载失败过（取种/发送失败）或长期停滞无进展的种子。正集可在详情页『下载该源』重试；特别篇/未知集只能对准那一条点『下载』。",
                 anime.failed_rows)
 
         # ---- 事件处理（闭包，直接引用上面的刷新函数）----
@@ -644,14 +648,14 @@ def anime_page(t: str = ""):
                 anime.confirm_anime(anime_id, pref)
                 n = await anime.download_pending_for_anime(anime_id)
                 refresh_all()
-                ui.notify(f"已确认，补下 {n} 集" + (f"（源：{pref}）" if pref else ""))
+                ui.notify(f"已确认，补下 {n} 集" + (f"（源：{pref}）" if pref else ""), type="positive")
             return h
 
         def _reject(anime_id):
             def h():
                 anime.reject_anime(anime_id)
                 refresh_all()
-                ui.notify("已忽略，移到『已忽略』页")
+                ui.notify("已忽略，移到『已忽略』页", type="positive")
             return h
 
         def _restore(anime_id):
@@ -659,7 +663,7 @@ def anime_page(t: str = ""):
                 anime.restore_anime(anime_id)
                 n = await anime.download_pending_for_anime(anime_id)
                 refresh_all()
-                ui.notify(f"已恢复到『订阅中』，补下 {n} 集")
+                ui.notify(f"已恢复到『订阅中』，补下 {n} 集", type="positive")
             return h
 
         def _del_files(anime_id, name, cnt):
@@ -687,7 +691,7 @@ def anime_page(t: str = ""):
             def h():   # 取消排除：把 excluded 放回待下
                 anime.unexclude_torrent(tid)
                 refresh_all()
-                ui.notify("已恢复到待下")
+                ui.notify("已恢复到待下", type="positive")
             return h
 
         def _bind(anime_id, inp):
@@ -723,12 +727,17 @@ def anime_page(t: str = ""):
         async def _download_all():
             n = await anime.download_all_pending()
             refresh_all()   # 含 manage_panel，好让季度小结的已下/待下计数也即时更新（展开/页码已持久化，不打乱视图）
-            ui.notify(f"已触发补下 {n} 集")
+            ui.notify(f"已触发补下 {n} 集", type="positive")
 
         async def _qb_sync_now():
             """『下载状态』的立刻刷新：主动向 qB 拉一次在下种子的进度，不必等后台轮询（默认间隔可能上千秒）。"""
             if not config.QB_ENABLED:
                 ui.notify("qB 未启用（去设置页开启『发送种子到 qB』）", type="warning")
+                return
+            if engine.sync_busy(AnimeTorrent):
+                # 后台那一轮正在跑。不排队等它：sync 对"qB 里查不到的种子"要连续两轮 miss 才判死，
+                # 两轮压在一起会把宽限窗口抹平（见 engine._sync_locks）。这里直接告诉用户"已经在同步了"。
+                ui.notify("已有一轮同步在跑，稍等片刻再看", type="info")
                 return
             try:
                 n = await anime.sync_qb_status()
@@ -747,7 +756,7 @@ def anime_page(t: str = ""):
                     ui.notify("正在重新识别中，请稍候…", type="info")
                     return
                 scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
-                ui.notify(f"正在重新识别（{scope}）…走 bgm，可能要一会儿")
+                ui.notify(f"正在重新识别（{scope}）…走 bgm，可能要一会儿", type="info")
                 _reident_busy["v"] = True
                 try:
                     cnt = await anime.reenrich_scope(seasons)

@@ -45,7 +45,17 @@ def _url() -> str:
 def include_object(obj, name, type_, reflected, compare_to):
     """只让本 role 该管的表进入比对与建表范围。"""
     if type_ == "table":
+        # 【两条版本链的版本表要互相排除】meta 与 data 各有一张 alembic_version_*，
+        # 而它们【不在】任何一个 role 的 metadata 里。不排除的话，按 db/schema.py 文档化的流程
+        # 跑 autogenerate 会生成 `op.drop_table('alembic_version_meta')` —— 应用之后第二次启动
+        # 就会因为版本号丢失而重跑 baseline，撞上 "table setting already exists" 变成永久 fatal。
+        if name.startswith("alembic_version"):
+            return False
         return (name in META_TABLES) is (ROLE == "meta")
+    if type_ == "index" and name and name.endswith("_inflight"):
+        # in-flight 的 partial index 是 db/dialect.py 按方言手工建的（带 WHERE 子句），
+        # 不在 SQLModel 的 metadata 里；不排除会被 autogenerate 当成"多余索引"生成 drop_index。
+        return False
     return True
 
 
