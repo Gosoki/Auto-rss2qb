@@ -311,3 +311,60 @@ def test_first_sight_of_the_snapshot_only_records_it(testdb, monkeypatch):
     assert snap is not None and "movie" in snap.value, "第一次见就该把当前全集记成快照"
     assert chosen.value == "failed", "第一次见快照键时不该动用户已有的选择"
     assert config._v["NOTIFY_EVENTS"] == ["failed"]
+
+
+async def test_unsubscribed_state_event_does_not_burn_the_bucket(sent, cfg):
+    """没订阅的状态型事件不该扣令牌——它每轮都判成翻转，能把别的事件饿死一整小时（F11）。
+
+    enabled() 原本在 event() 内部才判，而 `_state_now` 只在发送成功时才落记忆：
+    于是未订阅的 kind 每一轮都判翻转、每一轮扣一枚。db_watch 每 30 秒一轮 = 120 次/小时，
+    足够把额度打光。
+    """
+    cfg(NOTIFY_EVENTS=["db_down"])                 # 只订阅 db_down
+    for _ in range(N._STATE_CAP_PER_HOUR + 4):     # 未订阅的 qb_down 反复翻转
+        await N.state("qb_down", True, "坏了")
+        await N.state("qb_down", False, "好了", "恢复")
+    assert sent == []
+    # 【直接断言桶】而不是断言"别的 kind 还发得出去"——桶已经按 kind 分账了，
+    # 那样断言会被分账那一半掩蔽掉，测不到"扣费时机"这件事本身。
+    assert not N._state_times.get("qb_down"), \
+        f"没订阅的 kind 扣了 {len(N._state_times.get('qb_down', []))} 枚令牌"
+
+    await N.state("db_down", True, "库停摆了")      # 已订阅的照常发
+    assert len(sent) == 1 and "库停摆" in sent[0]
+
+
+async def test_state_buckets_are_per_kind(sent, cfg):
+    """一个抖动的 kind 不该把别的 kind 饿死——桶按 kind 分账。"""
+    cfg(NOTIFY_EVENTS=["qb_down", "db_down"])
+    for _ in range(N._STATE_CAP_PER_HOUR + 2):
+        await N.state("qb_down", True, "坏")
+        N._state_now.pop("qb_down", None)          # 强制每轮都判成翻转
+    burned = len(sent)
+    await N.state("db_down", True, "库停摆了")
+    assert len(sent) == burned + 1, "qb_down 把 db_down 的额度吃光了"
+
+
+async def test_concurrent_flips_push_only_once(sent, cfg, monkeypatch):
+    """同一次翻转被两个协程同时看到时只推一条（F12）。
+
+    边沿判定与写回之间隔着 await：qB 掉线时 qB 同步轮与 flush 的 qb_precheck 会同时进来
+    （分属不同锁），两个协程都读到同一个 prev、都判成翻转。
+    """
+    import asyncio
+
+    cfg(NOTIFY_EVENTS=["qb_down"])
+    slow = asyncio.Event()
+
+    async def _slow_notify(msg, **kw):
+        await slow.wait()
+        sent.append(msg)
+        return True
+    monkeypatch.setattr(N, "notify", _slow_notify)
+
+    t1 = asyncio.create_task(N.state("qb_down", True, "qB 连不上"))
+    t2 = asyncio.create_task(N.state("qb_down", True, "qB 连不上"))
+    await asyncio.sleep(0)
+    slow.set()
+    await asyncio.gather(t1, t2)
+    assert len(sent) == 1, f"同一次翻转推了 {len(sent)} 条"

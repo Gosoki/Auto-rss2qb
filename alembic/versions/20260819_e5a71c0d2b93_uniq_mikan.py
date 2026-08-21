@@ -1,10 +1,3 @@
-✨feat(tests,docs): 新增测试套件并更新文档说明
-
-📝docs(.gitignore): 更新测试套件入库说明，强调其重要性
-🧪test(tests): 新增 430+ 个用例，确保功能覆盖和回归测试
-🐛fix(config): 修复下载目录配置问题，确保新用户能正确设置
-♻️refactor(core): 重构 SSRF 守卫逻辑，增强安全性
-🔧chore(deps): 更新依赖项，确保兼容性和稳定性
 """movie.mikan_id 改唯一索引。
 
 【为什么】_upsert_movie 是"先查后插"，mikan_id 上没有唯一约束时，两轮扫描交错就会给

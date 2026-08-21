@@ -41,7 +41,7 @@ def _ep_short(e) -> str:
     if e == -1:
         return "特别篇"
     if e == -2:
-        return "未识别"
+        return "未知集"   # 与详情页同一个词；"未识别"是 bgm 那一档的词，别混用
     return f"第 {ep_str(e)} 集"
 
 

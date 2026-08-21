@@ -115,13 +115,20 @@ def test_proxy_mode_skips_dns_but_not_literal_internal_ips(monkeypatch):
     asyncio.run(ssrf.guard_redirect_request(wan))
 
 
-def test_proxy_mode_still_blocks_literal_internal_ip_on_the_torrent_path(monkeypatch):
-    """取种是严格口径，代理开着也一样拦——download_url 整个来自 RSS 正文。"""
+def test_proxy_mode_still_blocks_literal_internal_ip_on_the_torrent_path(monkeypatch, site):
+    """取种是严格口径，代理开着也一样拦——download_url 整个来自 RSS 正文。
+
+    【走真实入口 engine.fetch_torrent_bytes】直接调 ssrf.block_internal_request 是在测钩子本身，
+    测不到"取种那条路径到底装没装这个钩子"——实测把 core/engine.py 里装钩子那一行删掉，
+    全套用例照样全绿，而真实取种会当场把 SSRF 载荷打到 qB 上。
+    """
+    from core import engine
     monkeypatch.setitem(config._v, "OPEN_PROXY", True)
     monkeypatch.setitem(config._v, "PROXY_URL", "http://127.0.0.1:1")
+    url = f"http://127.0.0.1:{site.victim_port}/api/v2/torrents/delete?hashes=all"
     with pytest.raises(ValueError, match="SSRF"):
-        asyncio.run(ssrf.block_internal_request(
-            httpx.Request("GET", "http://127.0.0.1:8080/api/v2/torrents/delete?hashes=all")))
+        asyncio.run(engine.fetch_torrent_bytes(url))
+    assert site.victim.hits == [], "SSRF 载荷打到目标服务上了"
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "10.0.0.1", "192.168.1.1", "[::1]",
@@ -134,10 +141,17 @@ def test_internal_addresses_in_every_notation_are_refused(host):
         asyncio.run(ssrf.guard_redirect_request(req))
 
 
-def test_torrent_path_blocks_even_the_first_hop():
-    """取种走的是【每一跳都判】的严格口径：download_url 整个来自 RSS 正文，没有"用户自填"这回事。"""
+def test_torrent_path_blocks_even_the_first_hop(site):
+    """取种走的是【每一跳都判】的严格口径：download_url 整个来自 RSS 正文，没有"用户自填"这回事。
+
+    同样走真实入口。断言落在"受害端零痕迹"上：只断言抛异常是不够的——
+    SSRF 的伤害在请求本身（qB 的 delete 是个 GET），事后再抛异常已经晚了。
+    """
+    from core import engine
+    url = f"http://127.0.0.1:{site.victim_port}/feed.xml"    # 首跳就是内网，取种口径下必须拦
     with pytest.raises(ValueError, match="SSRF"):
-        asyncio.run(ssrf.block_internal_request(httpx.Request("GET", "http://127.0.0.1/x.torrent")))
+        asyncio.run(engine.fetch_torrent_bytes(url))
+    assert site.victim.hits == []
 
 
 def test_same_host_redirect_is_allowed(site):

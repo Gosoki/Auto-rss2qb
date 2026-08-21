@@ -14,7 +14,7 @@ from db import backup
 from services import notify
 from db.dialect import BINARY_COLLATION
 from sources.parse import format_quarter
-from .layout import confirm, frame, warn_banner
+from .layout import busy_action, confirm, frame, warn_banner
 
 _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "NOTIFY_MAX_PER_HOUR", "NOTIFY_BACKLOG_MIN", "ANIME_IDLE_DAYS", "SWEEP_INTERVAL_MIN",
@@ -335,7 +335,16 @@ def _db_panel(f: dict) -> None:
             ui.notify(f"已切库，但业务初始化失败（源组可能为空）：{type(e).__name__}: {str(e)[:120]}",
                       type="warning")
         _status.refresh()
-        ui.notify(f"已切到 {db.data_target_desc()}（数据未改动）。刷新页面看新库内容。", type="positive")
+        # 【不能无条件报成功】switch_data_engine 在"切回本地却仍然迁移失败"这条路径上是
+        # **保留 fatal 并静默 return** 的（见 db/__init__.py 那段说明）——此时系统仍然停摆，
+        # 而这里却弹一句绿色的"已切到 本地 SQLite（数据未改动）"，用户会以为救回来了。
+        # 全站的口径是：提示只描述【已经发生的事实】。
+        if db.is_data_down():
+            ui.notify(f"连接已切到 {db.data_target_desc()}，但系统仍在停摆："
+                      f"{db.data_down_reason()}", type="warning")
+        else:
+            ui.notify(f"已切到 {db.data_target_desc()}（数据未改动）。刷新页面看新库内容。",
+                      type="positive")
 
     async def _migrate(to_mysql: bool):
         """复制数据；连接不变。"""
@@ -406,9 +415,17 @@ def _db_panel(f: dict) -> None:
     # 所以放在字段正下方，别混进下面的『切换』分区惹人误会。
     # 代码位置必须在 _test/_create_db 定义之后；这中间没有别的 UI 元素，渲染出来仍紧贴字段。
     with ui.row().classes("gap-2 flex-wrap"):
-        ui.button("测试连接", icon="network_check", on_click=_test).props(
+        ui.button("测试连接", icon="network_check",
+                  on_click=lambda e: busy_action(e.sender, "db-op", _test,
+                                                 fail="测试连接失败")).props(
             "flat color=primary no-caps").tooltip("只连一下看通不通，不改变当前在用的库")
-        ui.button("创建数据库", icon="add", on_click=_create_db).props(
+        # 【五个按钮共用一个去重键 "db-op"】它们全都动同一个 engine：切库跑到一半时再点迁移，
+        # 或者连点两次『切到 MySQL』，都会让连接层与 alembic 在半途互相打断。
+        # 共用键 = 天然互斥；而 busy_action 顺带给了 loading（切库与迁移都【没有时间上界】：
+        # connect + 完整 alembic + 整库复制，此前全程零反馈）。
+        ui.button("创建数据库", icon="add",
+                  on_click=lambda e: busy_action(e.sender, "db-op", _create_db,
+                                                 fail="创建数据库失败")).props(
             "flat color=primary no-caps").tooltip(
             "在 MySQL 服务器上建一个空库（CREATE DATABASE，utf8mb4）。只建库不建表，"
             "表在你『切到 MySQL』时自动建。库已存在则什么都不做。")
@@ -418,9 +435,15 @@ def _db_panel(f: dict) -> None:
     ui.label("用于目标库里已经有数据、或想先切到空库再迁。切错了再切回来即可，数据不会丢。").classes(
         "text-xs text-gray-500 mb-1")
     with ui.row().classes("gap-2 flex-wrap"):
-        ui.button("切到 MySQL", icon="storage", on_click=lambda: _switch_backend(True)).props(
+        ui.button("切到 MySQL", icon="storage",
+                  on_click=lambda e: busy_action(e.sender, "db-op",
+                                                 lambda: _switch_backend(True),
+                                                 fail="切换失败")).props(
             "color=primary unelevated no-caps")
-        ui.button("切回本地 SQLite", icon="undo", on_click=lambda: _switch_backend(False)).props(
+        ui.button("切回本地 SQLite", icon="undo",
+                  on_click=lambda e: busy_action(e.sender, "db-op",
+                                                 lambda: _switch_backend(False),
+                                                 fail="切换失败")).props(
             "flat color=grey no-caps")
 
     ui.separator().classes("my-2")
@@ -429,9 +452,13 @@ def _db_panel(f: dict) -> None:
              "目标库非空时会要你确认清空。迁移期间建议先在上面『番剧』里关掉后台采集，避免边搬边写。").classes(
         "text-xs text-gray-500 mb-1")
     with ui.row().classes("gap-2 flex-wrap"):
-        ui.button("本地 SQLite → MySQL", icon="upload", on_click=lambda: _migrate(True)).props(
+        ui.button("本地 SQLite → MySQL", icon="upload",
+                  on_click=lambda e: busy_action(e.sender, "db-op", lambda: _migrate(True),
+                                                 fail="迁移失败")).props(
             "color=primary unelevated no-caps")
-        ui.button("MySQL → 本地 SQLite", icon="download", on_click=lambda: _migrate(False)).props(
+        ui.button("MySQL → 本地 SQLite", icon="download",
+                  on_click=lambda e: busy_action(e.sender, "db-op", lambda: _migrate(False),
+                                                 fail="迁移失败")).props(
             "flat color=primary no-caps")
 
 

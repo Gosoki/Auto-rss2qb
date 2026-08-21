@@ -236,7 +236,11 @@ def upgrade() -> None:
             batch_op.create_index(batch_op.f('ix_sourcegroup_name'), ['name'], unique=False)
     if bind.dialect.name == "sqlite":
         # partial index：in-flight 集合天然极小，常态『无在下』时不必全表扫两表才能确认为空。
-        # MySQL 没有 CREATE INDEX ... WHERE，那边靠上面建的普通复合索引兜。
+        # MySQL 没有 CREATE INDEX ... WHERE。
+        # 【注意：MySQL 侧目前【没有】任何等价索引】此处原本写着"那边靠上面建的普通复合索引兜"，
+        # 而那个索引根本不存在（上面 create_table 只建了 anime_id / info_hash 等单列索引）。
+        # 留着那句假话会让下一个人以为这事已经办过了。要补的话是 (status, qb_progress) 复合索引，
+        # 但前提是 status 先有定长（见 db/dialect.py 的 _COL_LEN —— 它现在落成 TEXT，MySQL 上建不了索引）。
         for t in ("animetorrent", "movietorrent"):
             op.execute(_inflight_index_sql(t))
 

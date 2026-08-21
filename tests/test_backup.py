@@ -220,3 +220,35 @@ def test_prune_counts_each_scope_separately(clean_tables, fresh_backup_dir):
     left = B.list_backups()
     assert sum(1 for d in left if d["scope"] == "full") == 2, "full 必须自己留满 2 份"
     assert sum(1 for d in left if d["scope"] == "meta") == 2
+
+
+def test_scope_is_not_full_when_the_business_db_is_configured_as_mysql(tmp_path, monkeypatch):
+    """DB_BACKEND=mysql 时不得标成 full——哪怕此刻 engine 还指着本地 SQLite。
+
+    参数不全时 apply_configured_backend 走 mark_data_fatal，engine 保持在本地 SQLite，
+    于是"两个引擎是不是同一个文件"这个判据恒真 → 标 full、note 说"含全部业务数据"，
+    而真数据在够不着的 MySQL 上。用户拿着这份"完整备份"，实际一条番剧数据都没有。
+    """
+    import config
+
+    from db import backup as B
+
+    monkeypatch.setattr(B, "BACKUP_DIR", tmp_path)
+    monkeypatch.setitem(config._v, "DB_BACKEND", "mysql")
+    rep = B.backup_now(keep=3)
+    assert rep["scope"] == "meta", "配置成 MySQL 却把备份标成了 full"
+    assert "源组" in rep["note"] and "不在其中" in rep["note"], \
+        f"note 要说清源组也不在备份里：{rep['note']}"
+
+
+def test_meta_note_does_not_claim_source_groups_are_backed_up(tmp_path, monkeypatch):
+    """meta 备份的说明不能把『源组』算进去——sourcegroup 是业务表，不在 META_TABLES 里。"""
+    import config
+
+    from db import backup as B
+
+    monkeypatch.setattr(B, "BACKUP_DIR", tmp_path)
+    monkeypatch.setitem(config._v, "DB_BACKEND", "mysql")
+    note = B.backup_now(keep=3)["note"]
+    assert "只备了 settings" in note
+    assert "源组" in note and note.index("源组") > note.index("不在其中") - 200

@@ -113,16 +113,22 @@ def enabled(kind: str) -> bool:
 
 
 _STATE_CAP_PER_HOUR = 12          # 状态型自己的小桶：6 组"坏+好"，足够表达真实故障，挡得住抖动风暴
-_state_times: list[float] = []
+# 【按 kind 分账，不是一个全局桶】桶的立论是"单一 kind 反复抖动时要有上界"——
+# 那用每个 kind 各一个桶就够了，而共用一个桶会让一个抖动的 kind 把别的饿死：
+# qb_down 抖起来能把 db_down 与 backlog 的额度一起吃光，而后两者恰恰是最需要送达的。
+# 上界从 12/小时 变成 12×kind 数，仍然有界。
+_state_times: dict[str, list[float]] = {}
 
 
-def _state_rate_ok() -> bool:
-    """状态型事件的独立限流。见 state() 里的说明。"""
+def _state_rate_ok(kind: str) -> bool:
+    """状态型事件的独立限流（每个 kind 各一个桶）。见 state() 里的说明。"""
     now = time.monotonic()
-    _state_times[:] = [t for t in _state_times if t > now - 3600]
-    if len(_state_times) >= _STATE_CAP_PER_HOUR:
+    times = [t for t in _state_times.get(kind, ()) if t > now - 3600]
+    if len(times) >= _STATE_CAP_PER_HOUR:
+        _state_times[kind] = times
         return False
-    _state_times.append(now)
+    times.append(now)
+    _state_times[kind] = times
     return True
 
 
@@ -192,6 +198,12 @@ async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "") -> None:
     prev = _state_now.get(kind)
     if prev == bad:
         return
+    # 【订阅判定要在扣费之前】enabled() 原本在 event() 内部才判，于是一个【没订阅】的 kind
+    # 每一轮都判成翻转、每一轮扣一枚令牌，而它永远发不出去、_state_now 也永远不落记忆。
+    # db_watch 每 30 秒一轮 = 120 次/小时，足够把 12 枚一小时的额度打光，
+    # 把另外两个【已订阅】的状态型事件一起饿死。实测：未订阅的 qb_down 调 12 轮 → 桶 12/12。
+    if not enabled(kind):
+        return
     # 【状态记忆也要等发送成功】早先是先写记忆再发：一条被限流吞掉的 qb_down / db_down
     # 就此【永远不会重发】——因为状态已经记成"坏"，后续每一轮都判为"没翻转"而静默返回，
     # 用户最后只会收到一条孤零零的"已恢复"。而这两个恰恰是全项目唯一的带外故障信号。
@@ -200,15 +212,26 @@ async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "") -> None:
     # 但也【不能完全不限流】："单次翻转最多两条"是真的，"每小时的翻转次数有上界"却不是：
     # qB 在掉线边缘反复抖动时，判据每轮翻转一次，两小时能打出几百条。
     # 独立小桶两头都占住：不被 delivered 挤掉，自己也失控不了。
-    if not _state_rate_ok():
+    if not _state_rate_ok(kind):
         return                          # 抖动风暴：本轮不记也不发，等它稳定下来
-    if bad:
-        if await event(kind, bad_msg, bypass_rate=True):
-            _state_now[kind] = bad
-    elif prev is None:
-        _state_now[kind] = bad          # 首次观测到"好"：只记不发（一切正常时不该有通知）
-    elif not ok_msg or await event(kind, ok_msg, bypass_rate=True):
-        _state_now[kind] = bad
+    # 【先占位再发】边沿判定（上面那个 prev）与写回之间隔着 await（最长 NOTIFY_TIMEOUT）。
+    # qB 掉线时两条路径会同时进来（qB 同步轮 与 flush 的 qb_precheck，分属不同锁；
+    # 或页面『补下全部』被双击——它没有防重入），两个协程都读到同一个 prev、都判成翻转，
+    # 于是同一次翻转推【两条】、占两枚令牌。对称交错还能把一次真实掉线告警吞掉一轮。
+    # 占位之后失败再还原，"没发出去就不落记忆"这条性质保持不变。
+    _state_now[kind] = bad
+    try:
+        if bad:
+            ok = await event(kind, bad_msg, bypass_rate=True)
+        elif prev is None:
+            ok = True                   # 首次观测到"好"：只记不发（一切正常时不该有通知）
+        else:
+            ok = (not ok_msg) or await event(kind, ok_msg, bypass_rate=True)
+    except Exception:
+        _state_now[kind] = prev         # 【异常也要还原】否则那次翻转被永久吃掉
+        raise
+    if not ok:
+        _state_now[kind] = prev
 
 
 def reset_state() -> None:

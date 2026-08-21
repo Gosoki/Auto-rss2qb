@@ -3,7 +3,8 @@ from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (WEEKDAY_CN, confirm, ep_str, meta_card, name_of, parse_bgm_id,
+from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, ep_str, meta_card,
+                     name_of, parse_bgm_id,
                      qb_live_text, season_label, source_options, torrent_status_cn,
                      warn_banner)
 
@@ -274,6 +275,23 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                 _neg_tip
                                 + (_retry_tip.replace("后重试", "后仍不会自动重发，需人工下")
                                    if t.retry_at else ""))
+                        elif not cur.confirmed and not cur.rejected:
+                            # 【subscribed_where 的第三半】flush 的判据是"已确认 且 未忽略 且
+                            # （开停订时）未判完结"。上面那条完结分支与 download_plan 里的 rejected
+                            # 闸各补了一半，只有 confirmed 这一半没跟上——于是"待确认"番的每一条
+                            # pending 都会拿到 plan、被标成蓝色『将下载』，tooltip 还写着"补下/自动下会下它"。
+                            # 而 flush 一条都不挑，点『下载该源』也直接返回 0：
+                            # 同一行在仪表盘『新入库』里显示的是橙色『待确认』，两个界面结论相反。
+                            # 判序与 core.anime.pending_breakdown 对齐（未知 → 未确认 → 已完结 → 计划）。
+                            ui.badge("待确认·不自动下").props("color=orange").tooltip(
+                                "这部番还没确认，后台不会自动下它的任何一集。"
+                                "点上方的『确认下载』放行，或点右边『下载』只要这一集。")
+                        elif cur.rejected:
+                            # 同理：『超期忽略』(apply_start_date_filter 置 rejected 但不动种子状态)
+                            # 的番，pending 行还在，落进下面的 else 会被说成"锁定源过滤光了"——同一句错话。
+                            ui.badge("已忽略·不自动下").props("color=grey").tooltip(
+                                "这部番在『已忽略』里，后台不会自动下它。"
+                                "到上方点『恢复订阅』，或点右边『下载』只要这一集。")
                         elif cur.finished_at and config.ANIME_FINISH_UNSUB:
                             # 【要排在 retry / plan / covered 【全部】之前】这部番已判完结且开了停订 ⇒
                             # 它整个掉出 subscribed_where，flush 一条都不会挑，所以：
@@ -310,8 +328,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             _why + (f"点右边『下载』或『下载该源』手动重试{_tried}"
                                     if _bf else f"下载失败过{_tried}"))
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删/已排除)按状态
+                        # 【严重度色取公共表】写死 blue-grey 会让同一条 stalled/error 在仪表盘是
+                        # 橙红、在详情页是中性灰——而两边渲染的是同一列 status。
                         ui.badge(torrent_status_cn(t.status, t.qb_progress, t.qb_synced_at)).props(
-                            "color=blue-grey")
+                            f"color={SEVERITY_COLOR.get(t.status, 'blue-grey')}")
                     if t.status == "excluded":  # 已排除：给『恢复』放回待下
                         ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
                             "size=sm flat dense color=primary").style("font-size:12px").tooltip(
@@ -363,17 +383,21 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         ui.notify(f"版本限定『{v}』：只下原名含此词的版本（缺此版本的集不兜底）" if v
                   else "已取消版本限定", type="warning" if v else "positive")
 
-    async def _enrich():
+    async def _enrich(e=None):
         # 识别成功会写入 bgm 名/季号 → 归档目录随之改变，必须和绑定(_bind)、列表页那两条路径
         # 一样问一句要不要搬迁。剧场版侧的同名 _enrich 本来就是这么写的（pages/movies.py:213）；
         # 番剧详情页这条一直漏着，已下的集会被静默遗弃在旧目录、同一部番裂成两个文件夹。
-        old_path = anime.anime_save_path(anime_id)
-        ok = await anime.manual_enrich(anime_id)   # 含清零后台重试计数（三个入口同口径）
-        _after()
-        ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）",
-                  type="positive" if ok else "warning")
-        if ok:
-            await maybe_relocate_anime(anime_id, old_path, _after)
+        # 【走 busy_action】识别的时间预算是 120 秒（enrich._RESOLVE_BUDGET）——
+        # 期间按钮毫无反应，用户会连点，于是并发跑好几轮、重复弹搬迁确认框。
+        async def _go():
+            old_path = anime.anime_save_path(anime_id)
+            ok = await anime.manual_enrich(anime_id)   # 含清零后台重试计数（三个入口同口径）
+            _after()
+            ui.notify("识别成功" if ok else "未识别到（Mikan/bgm 没有或查不到）",
+                      type="positive" if ok else "warning")
+            if ok:
+                await maybe_relocate_anime(anime_id, old_path, _after)
+        await busy_action(getattr(e, "sender", None), f"enrich:{anime_id}", _go, fail="识别失败")
 
     async def _bind():
         dlg = ui.dialog()
@@ -395,13 +419,18 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if not bid:
             ui.notify("没认出 bgm ID（粘 bgm.tv/subject/数字 或纯数字）", type="warning")
             return
-        old_path = anime.anime_save_path(anime_id)   # 重绑前的归档路径（bind 可能改名/季度/季号）
-        ok = await anime.bind_anime_bgm(anime_id, bid)
-        _after()
-        ui.notify("已绑定并识别 ✓（回到待确认，去点确认下载）" if ok
-                  else "绑定失败：ID 不存在或取不到 bgm 数据", type="positive" if ok else "negative")
-        if ok:
-            await maybe_relocate_anime(anime_id, old_path, _after)
+        # 【弹窗关掉之后这一段才是长操作】bind 会走 fetch_by_id（预算 120 秒），
+        # 期间页面没有任何反馈，用户会以为没点上而再点一次。走 busy_action 去重。
+        async def _go():
+            old_path = anime.anime_save_path(anime_id)   # 重绑前的归档路径（bind 可能改名/季度/季号）
+            ok = await anime.bind_anime_bgm(anime_id, bid)
+            _after()
+            ui.notify("已绑定并识别 ✓（回到待确认，去点确认下载）" if ok
+                      else "绑定失败：ID 不存在或取不到 bgm 数据",
+                      type="positive" if ok else "negative")
+            if ok:
+                await maybe_relocate_anime(anime_id, old_path, _after)
+        await busy_action(None, f"bind:{anime_id}", _go, fail="绑定失败")
 
     async def _edit_quarter():
         cur = anime.get_anime(anime_id)

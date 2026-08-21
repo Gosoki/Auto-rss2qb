@@ -139,7 +139,17 @@ class RssSource(Source):
                 if mb:
                     anime_title, search_names = mb
             if not anime_title:
-                return None  # 番名解析为空（如纯多括号格式）→ 无法定位/去重，跳过免撞库
+                # 【要记一行】番名为空就丢掉整条，而这是**完全静默**的：worker 那行日志打的是
+                # 过滤【后】的条数，被丢的条目连计数都不出现；也不入库，所以『待识别』里也看不到。
+                # 用户端表现是"这部番从某几个组那里一集都收不到"，界面和日志零信号——
+                # 番名自带【】的番（【我推的孩子】）曾经整类掉在这里，没有任何人能发现。
+                # 【必须是 info】root logger 定死在 INFO 且全项目没有级别开关
+                # （core/logsetup.py，grep LOG_LEVEL 零命中），debug 这一行**永远不会输出**——
+                # 那 D5 承诺的"至少留一行痕迹"就没有兑现，用户端仍是"界面和日志零信号"。
+                # 刷屏的担心不成立：真正会大量出现的是纯标签条目，而那些在 is_batch /
+                # 白名单等更早的闸就被挡掉了；能走到这里的是"有内容但解析不出名字"，值得看见。
+                log.info("%s 番名解析为空，跳过：%s", self.name, raw_title[:80])
+                return None
             # 白名单：子串匹配、大小写不敏感（与 title_filter 同口径，见 parse.kw_match），
             # 兼顾联合发布（如 "喵萌奶茶屋&LoliHouse"）
             if self.subgroups and not any(kw_match(g, group) for g in self.subgroups):

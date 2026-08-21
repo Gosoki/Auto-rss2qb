@@ -212,8 +212,92 @@ def extract_episode(text: str):
     return -1 if ("特别篇" in text or "OVA" in text.upper()) else -2
 
 
+# 【番名本身就写成【…】的番】`【我推的孩子】`/`【推しの子】`/`【咒术回战】` —— 那对方括号
+# 是官方标题的一部分，不是标签块。_TAG_BLK_RE 会把它整块删掉，于是番名洗成空串，
+# 而 sources/base.py 对空番名是【静默丢弃整条】：那部番从某几个组那里一集都收不到，
+# 界面和日志零信号（实测：日志一条记录都没有，连计数都不出现）。
+# 判据用【纯回退】：先按原样洗一遍，洗不出可用名字时才走解包。
+# 【原注释说"正常标题一律走原路径、行为不变""回退只会让它们从丢弃变成能解析"——那是错的】：
+# 第一版只判"首块不是标签"，在 1499 条真实标题语料上有 12 条行为改变，
+# 而且全部是从"丢弃"变成"**猜错名字**"——后者严重得多（丢弃是零 DB 写入的静默丢包，
+# 猜错名字会写下不可逆的 alias 行与 info_hash 占用）。现在的三条判据见下面 _clean_name。
+_LEAD_BLK_RE = re.compile(r"^\s*[\[【]([^\]】]+)[\]】]")
+
+
+# 只是一个季号、没有番名的残渣：'S2' / 'Season 2' / '2nd Season'。
+# 【为什么要单独判】strip_season 只认中文季名（第X季/期），英文写法它不动。
+# 于是 `【我推的孩子】 S2 - 03` 洗完剩下 'S2'，非空 → 解包回退不触发 →
+# 番名就是 'S2'：该组所有这么写的【】番全并进一部叫 S2 的假番里（与 F1 同款损坏）。
+# 真番名不会长成这样，所以整段匹配是安全的。
+_SEASON_ONLY_RE = re.compile(
+    r"(?:S|Season)\s*\d{1,2}|\d{1,2}(?:st|nd|rd|th)\s*Season"
+    r"|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+"                      # 罗马数字季号：'【我推的孩子】Ⅱ' 曾解析出番名 'Ⅱ'
+    r"|\d{1,2}\s*[期季部]|Part\s*\d{1,2}", re.I)
+
+
+def _unwrap_name_block(name_part: str) -> str | None:
+    """整段是不是「番名本身写在括号里」的形状？是就返回解包后的文本，否则 None。
+
+    **全项目唯一一份判据**，`_clean_name`（定番名）与 `_clean_for_search`（定搜索词）共用。
+    【为什么必须共用】它们是同一件事的两半，而分家过一次、代价很大：
+    第 11 轮只给 `_clean_name` 加了这条回退，于是 `【咒术回战】 第二季 - 24` 的番名修好了，
+    **搜索词却塌成 `['第二季']`** —— 而 search_names 是 enrich.resolve 的唯一入参，
+    两部不同的「第二季」会搜到同一个 bgm 条目、被合并成一部番（不可逆）。
+
+    三条判据（缺一不可，理由见 _clean_name）：
+      ① 非标签块恰好一个；② 它是首块；③ 只有一个块，或块外还有正文。
+    """
+    blocks = [b[1:-1] for b in _TAG_BLK_RE.findall(name_part or "")]
+    real = [b for b in blocks if not _is_skip_block(b)]
+    outside = _TAG_BLK_RE.sub("", name_part or "").strip()
+    if len(real) == 1 and blocks and blocks[0] == real[0] and (len(blocks) == 1 or outside):
+        return _LEAD_BLK_RE.sub(r"\1", name_part, count=1)
+    return None
+
+
+def _usable_name(s: str) -> bool:
+    """洗出来的这段能当番名用吗——去掉季名后还得剩点东西，且不能是季号/标签一类的残渣。
+
+    【为什么要问 _is_skip_block】本模块早就有一份「这不是番名」的词表（画质/语言/来源/完结…），
+    但它以前只在解包回退里被调用，主路径从不问它 —— 于是同一个词写在括号里判成标签、
+    写在括号外就成了番名：`【咒术回战】 完结 - 24` 解析出的番名是 `完结`、
+    `【我推的孩子】Ⅱ` 是 `Ⅱ`。这类残渣当番名的后果与季号一样：该组所有这么写的番
+    共用一个别名、被并成同一部；而 `Ⅱ` 只有一个字符，还会被 candidate_names 的长度闸滤掉，
+    bgm 永远救不回来。
+    """
+    t = strip_season(t2s(s or "")).strip()
+    return bool(t) and not _SEASON_ONLY_RE.fullmatch(t) and not _is_skip_block(t)
+
+
 def _clean_name(name_part: str) -> str:
-    """去掉 [..]/【..】 标签块、扩展名与集数段，得到干净番名（无空格）。"""
+    """去掉 [..]/【..】 标签块、扩展名与集数段，得到干净番名（无空格）。
+
+    **洗成空时把开头那个块解包再洗一遍**（纯回退，正常情况下这一支根本不会走到）。
+    见上面 _LEAD_BLK_RE 的说明。
+    """
+    s = _clean_name_once(name_part)
+    if _usable_name(s):
+        return s
+    # 【只解包"整段就是一个番名块"这一种形状】——那正是 D5 要修的 `【我推的孩子】 - 11`。
+    # 判据有两条，缺一不可：
+    #   ① 非标签块【恰好一个】；② 它就是【首块】。
+    # 【为什么不能只看首块】第一版只判了"首块不是标签"，于是任何全括号标题的第一个块都被当成番名：
+    #   [诸神字幕组][2024年10月新番][青之箱][05][1080P] → 番名 '2024年10月新番'
+    #   [天使动漫论坛][www.tsdm39.com][10月新番][败犬女主太多了][01] → 番名 'www.tsdm39.com'
+    # 后果不是"名字难看"：该组当季所有番共用这一个别名、被并成同一部——落进同一个目录，
+    # 集去重键 (anime_id, episode) 还会让不同番的同号集互相撞成 skipped，且 info_hash 被占死【不可逆】。
+    # 而且它**架空了 ANIME_MULTIBRACKET_PARSE 开关**：全括号命名本该由 parse_multibracket 处理，
+    # 那条路径受开关管（默认关，因为猜名可能猜错），这里却无条件先把名字猜了。
+    unwrapped = _unwrap_name_block(name_part)
+    if unwrapped is not None:
+        alt = _clean_name_once(unwrapped)
+        if _usable_name(alt):
+            return alt
+    return s if _usable_name(s) else ""
+
+
+def _clean_name_once(name_part: str) -> str:
+    # 注：_is_skip_block 定义在本文件更下方，运行时才解析名字，不影响。
     s = _PROMO_RE.sub("", _EXT_RE.sub("", _TAG_BLK_RE.sub("", name_part)))
     for pat in _STRIP_PATTERNS:
         m = pat.search(s)
@@ -324,6 +408,16 @@ def parse_title(raw_title: str):
     season = extract_season(body)
     episode = extract_episode(body)                  # 集数从整体正文抽：中文段在前时也不丢 '- EE'
     anime_title = strip_season(t2s(_clean_name(name_part)))
+    if not anime_title and _SLASH_RE.search(body):
+        # 选中的语言段被洗空了（如 '【我推的孩子】第二季' —— 块被当标签删掉、只剩季名再被 strip 掉），
+        # 而【别的语言段还在】。丢掉整条不如换一段：番名为空 = 主流程静默丢弃整条种子。
+        for seg in _SLASH_RE.split(body):
+            if seg is name_part:
+                continue
+            alt = strip_season(t2s(_clean_name(seg)))
+            if alt:
+                anime_title = alt
+                break
     return group, anime_title, season, episode
 
 
@@ -348,6 +442,23 @@ def _clean_for_search(s: str) -> str:
     return s.strip().strip("[]【】()（）〔〕 ")
 
 
+def _search_name_of(seg: str) -> str:
+    """一段文本 → 搜 bgm 用的关键词，**含"番名写在括号里"的解包回退**。
+
+    与 _clean_name 共用 _unwrap_name_block：那两条路径必须同进同退，
+    否则会出现"番名解析对了、搜索词却是『第二季』"这种最难查的分家（第 12 轮踩过）。
+    """
+    out = _clean_for_search(seg)
+    if _usable_name(out):
+        return out
+    unwrapped = _unwrap_name_block(seg)
+    if unwrapped is not None:
+        alt = _clean_for_search(unwrapped)
+        if _usable_name(alt):
+            return alt
+    return out
+
+
 def candidate_names(raw_title: str) -> list[str]:
     """从标题提取所有可用于搜 bgm 的候选名（日文原名/罗马音/中文，含繁→简）。
 
@@ -360,7 +471,7 @@ def candidate_names(raw_title: str) -> list[str]:
 
     names: list[str] = []
     for p in parts:
-        cleaned = _clean_for_search(p)
+        cleaned = _search_name_of(p)      # 含解包回退，见那里
         if cleaned:
             names.append(cleaned)
             simp = t2s(cleaned)                  # bgm 的 name_cn 是简体
@@ -382,16 +493,27 @@ _NAME_BLOCK_SKIP = re.compile(
     # '4月新番'/'10月新番'/'四月新番' 是【季度栏目名】不是番名。漏了它的后果比看起来重：
     # 天使动漫等论坛的每条标题都带这个块，且它排在真番名【前面】，于是同一论坛当季所有番会
     # 共用别名 ('4月新番', 1) 被并成同一部假番——落进同一个目录，集号还会互相撞成 skipped。
-    r"^(?:(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*月新?番|"
+    # 【年份前缀要一起吃掉】'10月新番' 挡得住，'2024年10月新番' 挡不住——它从行首锚定，
+    # 年份一加就落空。而后者正是「番名写在【】里」那条修法明确交给 parse_multibracket 的
+    # 那类标题，交过去之后它会犯同样的错：该组当季所有番共用一个别名、挂同一个 anime_id。
+    r"^(?:(?:\d{2,4}\s*年\s*)?(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*月新?番|"
     r"招募\w*|招聘\w*|合集|全集|完結|"
-    r"国漫|国番|日漫|港漫|美漫|新番|完结|補番|补番|\d{4}|\d{1,4}(?:\.\d+)?|"
+    # 版本/修订类：它们与"完结"同族——写在括号里判成标签、写在括号外就成了番名。
+    # `【某番】 修正版 - 03` 曾解析出番名 '修正版'，该组所有这么发的番共用一个别名。
+    r"修正版|修正|重制版|重製版|无修版?|無修版?|TV版|剧场版|劇場版|完结撒花|完結撒花|"
+    r"国漫|國漫|国番|國番|日漫|港漫|美漫|新番|完结|補番|补番|\d{4}|\d{1,4}(?:\.\d+)?|"
     r"\d+P|\d+x\d+|4K|\d{1,2}\s*bits?|x26[45]|H\.?26[45]|HEVC|AVC|AAC|FLAC|OPUS|DDP|"
     r"GB|BIG5|CHT|CHS|BDRIP|BD|WEB-?RIP|WEB-?DL|Baha|B-?Global|CR|Crunchyroll|"
     r"Bilibili|IQIYI|Netflix|ViuTV|NTV|MKV|MP4|TS|SRT|ASS|"
     # 语言块：简/繁/日… 后面常挂 内嵌/内封/外挂/双语（'简日内嵌'『繁日內嵌』）。逐块列举列不完，
     # 按『语言字 ×1~3 + 可选字幕形式』整体匹配。真番名不会长成这样（'日常' 的 '常' 不在语言字里，
     # 整块匹配不上 → 不会被误跳过）。
-    r"(?:[简繁中日英港台][体體语語文]?){1,3}(?:内嵌|內嵌|内封|內封|外挂|外掛|双语|雙語|双字|雙字|字幕)?)$", re.I)
+    # 【语言字要简繁成对】后缀那一半（体體/语語）本来就成对，唯独首字漏了「簡」——
+    # 于是繁体组的 [簡繁內封] / [簡日雙語] / [簡體] 全部逃过跳过闸，而它们的简体版全部命中。
+    # 逃过之后那个块会被当成番名：parse_multibracket 挑名时可能挑中它，
+    # _clean_name 的解包回退也会把它当番名 —— 结果是建出一部叫「簡繁內封」的假番，
+    # 而该组当季所有番共用这一个别名、被并成同一部。
+    r"(?:[简簡繁中日英港台][体體语語文]?){1,3}(?:内嵌|內嵌|内封|內封|外挂|外掛|双语|雙語|双字|雙字|字幕)?)$", re.I)
 
 
 def _is_skip_block(blk: str) -> bool:
@@ -448,16 +570,40 @@ _MANGLED_RE = re.compile(r"[\[\]【】★]")
 # candidate_names 只锚掉『 - 07』式集号，这些写法会整段留在名字里：第03话 / EP03 / - 03 END
 # 末尾允许再挂一个分隔符（'番名 - 05 -'）：清理跑在 strip 之前，不带上它就只剥掉那根光杆连字符、
 # 把 '- 05' 留在搜索词里，去种子站一条都搜不到（补齐该源因此永远空手而归）。
+# 【每个 \s* 后面都跟一个【必需】的 token，不要留相邻的可选空白】
+# 原写法尾部是 `\s*(?:END|FIN|完结?)?\s*[-–—]?\s*$` —— 三段 \s* 中间夹两个可选组，
+# 一段空白可以被这三段以指数级多种方式瓜分。整体匹配失败时正则引擎要把它们全试一遍：
+# 实测 "- 12" + 500 个空格 + "x" 单条耗时 230ms，且随长度约立方增长
+# （clip_title 只截到 512 字符、**不归一空白**，所以这个上限压不住它）。
+# 而这段解析跑在采集主链路上、同步阻塞事件循环：一个这样的 feed 就能把整轮采集拖住。
 _EP_LEFT_RE = re.compile(
     r"\s*(?:第\s*\d{1,4}\s*[话話集]|\b(?:EP|Episode)\s*\.?\s*\d{1,3}\b|"
-    r"[-–—]\s*\d{1,3}(?:\.\d+)?\s*(?:END|FIN|完结?)?\s*[-–—]?\s*$)", re.I)
+    r"[-–—]\s*\d{1,3}(?:\.\d+)?(?:\s*(?:END|FIN|完结?))?(?:\s*[-–—])?\s*$)", re.I)
 
 
 def _split_langs(s: str) -> list[str]:
     """把『中文名/罗马音』这类无空格并列的写法拆开（candidate_names 只拆有空格的 ' / '）。
-    仅当两侧语种不同（一侧含 CJK、一侧不含）才拆——同语种的 'Fate/Zero' 是名字本身，拆了反而搜不到。"""
+
+    判据是**每一侧的脚本都纯净**：整段要么只有 CJK、要么只有拉丁。
+    【为什么不能只判"两侧语种不同"】那样会把 `Fate/Grand Order -绝对魔兽战线巴比伦尼亚-`
+    拆成 `Fate` + 右半段 —— 右半边恰好带中文就判成"多语言并列"了。而拆出来的 `Fate`
+    会排在候选第一位，详情页那个『补齐该源』按钮（name_filter=False，不做番名近似）
+    就拿它去搜站，把同组的 Fate/Zero、Fate/Apocrypha 等**别的番**的种子按 anime_id 硬挂进来。
+    且不可逆：那些 hash 从此被本番占死，真正属于它们的番之后在 hash 去重处静默 return False，
+    永远收不到；UI 里的"删除"是改 status 不是删行，hash 永久占用。
+    `Fate/Zero`（两侧都是拉丁）以前就被挡住了，漏的是"拉丁名 + 中文右半"这一半——
+    而那正是中文字幕组发 Fate 系列时的多数形态。
+    """
     parts = [p.strip() for p in s.split("/") if p.strip()]
-    if len(parts) > 1 and any(_CJK.search(p) for p in parts) and any(not _CJK.search(p) for p in parts):
+    if len(parts) < 2:
+        return [s]
+
+    def _pure(p: str) -> bool:
+        """这一段是不是"纯粹一种脚本"：要么整段没有拉丁字母，要么整段没有 CJK。"""
+        return not (_CJK.search(p) and re.search(r"[A-Za-z]", p))
+
+    if (all(_pure(p) for p in parts)
+            and any(_CJK.search(p) for p in parts) and any(not _CJK.search(p) for p in parts)):
         return parts
     return [s]
 

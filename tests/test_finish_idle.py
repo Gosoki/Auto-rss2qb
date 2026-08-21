@@ -509,3 +509,26 @@ async def test_idle_backfill_also_covers_anime_outside_the_subscription_set(
         s.commit()
     assert await A.sweep_idle() == 0, f"回填漏了它，报出一条 800 天前的假断更：{sent}"
     assert sent == []
+
+
+async def test_finish_backfill_latch_drops_on_the_first_round_with_hits(
+        clean_tables, make, cfg, monkeypatch):
+    """「首轮回填不推送」的闩要在【第一轮有命中】时就落下（F10）。
+
+    原写法只在"≥6 命中"那一轮落闩，而那一轮正是被静默的那一轮。于是一个从来没有过
+    ≥6 命中的库，闩永远不落；等到季末某一轮真有 6 部同时完结时，那一轮被当成"首轮回填"
+    整批静默——finished_at 照写、停订照生效，而用户一条通知都收不到。
+    """
+    sent = []
+    monkeypatch.setattr(A, "notify_event", lambda k, m, **kw: _async(bool(sent.append(m)) or True))
+    cfg(ANIME_FINISH_ENABLED=True)
+    _clear_backfill_mark("_FINISH_BACKFILL_DONE")
+
+    make(1, [(1, "sent")])                       # 第 1 轮：只有 1 部完结 → 正常推送并落闩
+    assert await A.sweep_finished() == 1
+    assert len(sent) == 1
+
+    for _ in range(6):                           # 第 2 轮：6 部同时完结，不该被当成"首轮回填"
+        make(1, [(1, "sent")])
+    assert await A.sweep_finished() == 6
+    assert len(sent) == 7, f"6 部同时完结被整批静默了：{sent}"

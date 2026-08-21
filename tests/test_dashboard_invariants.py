@@ -86,3 +86,101 @@ def test_orphan_and_rejected_go_to_backup(clean_tables, mixed_library, cfg):
 def test_breakdown_keys_are_stable(clean_tables, mixed_library):
     """页面按键名取值。少一个键就是 KeyError（白屏），多一个键无害但要有人知道。"""
     assert set(A.pending_breakdown()) == {"will", "backup", "unconfirmed", "unknown", "finished"}
+
+
+def test_auto_off_reasons_matches_pending_breakdown_wording(clean_tables, cfg):
+    """『为什么不自动下』三种原因的用词与判序必须与 pending_breakdown 一致。
+
+    以前渲染侧只有 confirmed 一个布尔，于是已忽略/已完结的番也被显示成『待确认』
+    并把用户指去那个 tab —— 而它们根本不在里面，用户到那儿只看到一个空列表。
+    """
+    from datetime import datetime
+
+    from core import anime as A
+    from db.models import Anime
+
+    cfg(ANIME_FINISH_UNSUB=True)
+    with clean_tables.get_session() as s:
+        rows = {
+            "待确认": Anime(title="a", quarter="26A", confirmed=False),
+            "已忽略": Anime(title="b", quarter="26A", confirmed=True, rejected=True),
+            "已完结": Anime(title="c", quarter="26A", confirmed=True, finished_at=datetime.now()),
+        }
+        normal = Anime(title="d", quarter="26A", confirmed=True)
+        for r in rows.values():
+            s.add(r)
+        s.add(normal)
+        s.commit()
+        ids = {k: r.id for k, r in rows.items()}
+        ids["正常"] = normal.id
+
+    got = A.auto_off_reasons(set(ids.values()))
+    for want, aid in ids.items():
+        if want == "正常":
+            assert aid not in got, "会自动下的番不该出现在原因表里"
+        else:
+            assert got.get(aid) == want, f"{want} 被判成了 {got.get(aid)!r}"
+
+
+def test_live_status_judges_unknown_episodes_first(cfg):
+    """-1/-2 要【最先判】——与 pending_breakdown 同口径，否则卡片数与列表条数对不上。"""
+    from pages.layout import live_status
+
+    # 一部"待确认"番的特别篇：pending_breakdown 把它算进『未知』，渲染侧也必须
+    assert live_status("pending", in_plan=False, episode=-1, auto_off="待确认")[0] == "特别篇"
+    assert live_status("pending", in_plan=False, episode=-2, auto_off="已忽略")[0] == "未知集"
+
+
+def test_internal_marker_names_actually_exist_in_production_code():
+    """conftest 清的那几个「一次性标记」必须是生产代码里真有的键。
+
+    写错了**不会报错**，只是白清一个不存在的键——而它的后果是隐蔽的：
+    前一个用例做过的事会让后一个用例走上另一条分支。已经踩过两次
+    （`_backfill_legacy_progress_done` 是编的、`_idle_backfilled` 当初忘了加）。
+    """
+    import pathlib
+
+    from tests.conftest import _INTERNAL_MARKERS
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    src = "\n".join((root / d).read_text(encoding="utf-8")
+                    for d in ("core/anime.py", "core/engine.py", "config.py"))
+    missing = [k for k in _INTERNAL_MARKERS if f'"{k}"' not in src and f"'{k}'" not in src]
+    assert not missing, f"conftest 里这些键在生产代码里不存在：{missing}"
+
+
+def test_no_undefined_names_in_pages():
+    """pages/ 下不能有「用到了但没导入」的名字。
+
+    NiceGUI 的 handler 大多是 lambda / 闭包，里面的名字**只在点击那一刻才解析**——
+    漏一个 import，`import pages.x` 照样成功、页面照常渲染 200，
+    只有用户真的点下去才 NameError，而那个异常又只进服务端日志（用户看到"点了没反应"）。
+    刚刚就漏过一次：给设置页五个按钮接上 busy_action，却没加那一行 import。
+    """
+    import ast
+    import builtins
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    bad = {}
+    for p in sorted((root / "pages").glob("*.py")):
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        bound = set()
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    bound.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(n.name)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                bound.add(n.id)
+            elif isinstance(n, ast.arg):
+                bound.add(n.arg)
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                bound.update(n.names)
+        used = {n.id for n in ast.walk(tree)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        miss = sorted(used - bound - set(dir(builtins)))
+        if miss:
+            bad[p.name] = miss
+    assert not bad, f"这些名字用到了但没定义/导入：{bad}"

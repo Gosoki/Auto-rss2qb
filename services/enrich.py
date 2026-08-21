@@ -291,12 +291,27 @@ async def _fetch_by_id_inner(bgm_id: int) -> dict | None:
             except Exception as e:
                 log.info("声优信息取不到（不影响识别）：%s: %s", type(e).__name__, e)
                 cast = None
-    except (httpx.HTTPError, ValueError) as e:
-        log.warning("按 id 取 bgm 失败 %s: %s", bgm_id, e)
+    except Exception as e:
+        # 【口径与兄弟路径 _resolve_inner 一致（那边是 except Exception）】只接
+        # (httpx.HTTPError, ValueError) 漏掉一整族：代理填成 'socks5://…' 而没装 socksio 时，
+        # httpx.AsyncClient 是在【建 client 那一步】抛 ImportError（不是发请求时），
+        # 而它既不是 HTTPError 也不是 ValueError。漏出去之后一路穿透 bind_anime_bgm /
+        # bind_movie_bgm / manual.identify_folder（三者都没有 try）逃进 NiceGUI 的 on_click——
+        # 而 NiceGUI 默认只 log.exception，用户侧连一条 notify 都没有：按钮点了没反应。
+        # 同一个弹窗里的『重新识别』走 resolve、那条是 except Exception，同样的故障它会正常弹提示：
+        # 同一页同一故障，一个按钮报错、旁边那个装死。
+        log.warning("按 id 取 bgm 失败 %s: %s: %s", bgm_id, type(e).__name__, e)
         return None
     if not isinstance(j, dict) or not j.get("id"):
         return None
-    info = _subject_to_info(bgm_id, j)
+    try:
+        info = _subject_to_info(bgm_id, j)
+    except Exception as e:
+        # 纯本地转换也要兜——与 _resolve_inner 里给同一句加的独立 try 同款理由：
+        # bgm 换一次字段形状（rating 从 dict 变成字符串之类）就是 AttributeError/TypeError，
+        # 而它同样会从本函数逃出去变成一个死键。实测 _subject_to_info(1, {"id":1,"rating":"8.5"}) 抛 AttributeError。
+        log.warning("bgm 详情字段形状异常 %s: %s: %s", bgm_id, type(e).__name__, e)
+        return None
     info["cast"] = cast
     return info
 

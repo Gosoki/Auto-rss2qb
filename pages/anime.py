@@ -11,7 +11,7 @@ from db.models import AnimeTorrent
 from core import anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail
-from .layout import (confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
+from .layout import (busy_action, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, recent_table, season_label, source_options,
                      warn_banner)
@@ -397,7 +397,10 @@ def anime_page(t: str = ""):
                 srcs = smap.get(a.id, [])
                 with ui.card().classes("w-full"):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
-                        ui.badge("未匹配").props("color=red")
+                        # 全站统一叫『待识别』：tab、KPI 卡、空状态文案、剧场版侧的 tooltip
+                        # 都用这个词，只有这里曾写「未匹配」。同一个状态三个叫法会让用户
+                        # 以为是三件事（GLOSSARY 里没有把它列为"有意的分歧"）。
+                        ui.badge("待识别").props("color=red")
                         ui.label(name_of(a)).classes(
                             "text-lg cursor-pointer text-blue-400 hover:underline").on(
                             "click", lambda aid=a.id: open_detail(aid))
@@ -451,6 +454,9 @@ def anime_page(t: str = ""):
             pend_aids = {r["anime_id"] for r in raw
                          if r["status"] in engine.DOWNLOADABLE_STATUSES and r["anime_id"]}
             confirmed = anime.confirmed_anime_ids(pend_aids)
+            # 【为什么不下】而不只是【下不下】：三种原因的指引完全不同，
+            # 以前一律显示『待确认』并把用户指去那个 tab，而已忽略/已完结的番不在里面。
+            off_why = anime.auto_off_reasons(pend_aids)
             # 两种口径【一次算出】：pending 行看『自动会下吗』，error 行看『补下会挑吗』
             # ——后台自动下从不重试 error，用同一个集合会标反。
             # 两者只差"候选含不含 error"，分开调会把番元数据、种子行、"已有一份"的键全部重算一遍。
@@ -463,7 +469,9 @@ def anime_page(t: str = ""):
                 else:
                     conf, in_plan = True, None
                 text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
-                                          r["qb_synced_at"], r["qb_dlspeed"], in_plan, conf)
+                                          r["qb_synced_at"], r["qb_dlspeed"], in_plan, conf,
+                                          episode=r["episode"],
+                                          auto_off=off_why.get(r["anime_id"], ""))
                 rows.append({
                     "id": r["id"],
                     "detail_id": r["anime_id"],
@@ -695,42 +703,56 @@ def anime_page(t: str = ""):
             return h
 
         def _bind(anime_id, inp):
-            async def h():
+            async def h(e=None):
                 bid = parse_bgm_id(inp.value or "")
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
-                # 【必须在识别之前记下旧目录】待识别的番 jp_name/display_name 都是空的，
-                # apply_bgm_meta 的 keep_path 只冻结【已有值】的字段，挡不住它们被 bgm 名整体写入
-                # → 归档目录当场就变了。不问搬迁的话，之前下好的集会被静默遗弃在旧目录，
-                # 同一部番裂成两个文件夹（详情页那条路径一直是问的，这里漏了）。
-                old_path = anime.anime_save_path(anime_id)
-                ok = await anime.bind_anime_bgm(anime_id, bid)
-                refresh_all()
-                ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
-                          type="positive" if ok else "negative")
-                if ok:
-                    await maybe_relocate_anime(anime_id, old_path, refresh_all)
+
+                # 走 busy_action：bind 会调 fetch_by_id（预算 120 秒），期间没有反馈会被连点
+                async def _go():
+                    # 【必须在识别之前记下旧目录】待识别的番 jp_name/display_name 都是空的，
+                    # apply_bgm_meta 的 keep_path 只冻结【已有值】的字段，挡不住它们被 bgm 名整体写入
+                    # → 归档目录当场就变了。不问搬迁的话，之前下好的集会被静默遗弃在旧目录，
+                    # 同一部番裂成两个文件夹（详情页那条路径一直是问的，这里漏了）。
+                    old_path = anime.anime_save_path(anime_id)
+                    ok = await anime.bind_anime_bgm(anime_id, bid)
+                    refresh_all()
+                    ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
+                              type="positive" if ok else "negative")
+                    if ok:
+                        await maybe_relocate_anime(anime_id, old_path, refresh_all)
+                await busy_action(getattr(e, "sender", None), f"bind:{anime_id}", _go,
+                                  fail="绑定失败")
             return h
 
         def _refail(anime_id):
-            async def h():
-                old_path = anime.anime_save_path(anime_id)   # 同 _bind：识别成功会改归档目录
-                # 【必须走 manual_enrich】这里曾直接调 enrich_anime，不清 enrich_tries：
-                # 试满 5 次的番点了这个按钮只当场试一次，此后仍然一次都不自动重试，
-                # 而详情页那个同名按钮是清的——同一个操作两个页面两种行为。
-                ok = await anime.manual_enrich(anime_id)
-                refresh_all()
-                ui.notify("识别成功 ✓" if ok else "还是没识别到（可手动粘贴 bgm 链接绑定）",
-                          type="positive" if ok else "warning")
-                if ok:
-                    await maybe_relocate_anime(anime_id, old_path, refresh_all)
+            async def h(e=None):
+                # 走 busy_action：识别预算 120 秒，期间按钮无反应会被连点（同详情页理由）
+                async def _go():
+                    old_path = anime.anime_save_path(anime_id)   # 同 _bind：识别成功会改归档目录
+                    # 【必须走 manual_enrich】这里曾直接调 enrich_anime，不清 enrich_tries：
+                    # 试满 5 次的番点了这个按钮只当场试一次，此后仍然一次都不自动重试，
+                    # 而详情页那个同名按钮是清的——同一个操作两个页面两种行为。
+                    ok = await anime.manual_enrich(anime_id)
+                    refresh_all()
+                    ui.notify("识别成功 ✓" if ok else "还是没识别到（可手动粘贴 bgm 链接绑定）",
+                              type="positive" if ok else "warning")
+                    if ok:
+                        await maybe_relocate_anime(anime_id, old_path, refresh_all)
+                await busy_action(getattr(e, "sender", None), f"refail:{anime_id}", _go,
+                                  fail="识别失败")
             return h
 
-        async def _download_all():
-            n = await anime.download_all_pending()
-            refresh_all()   # 含 manage_panel，好让季度小结的已下/待下计数也即时更新（展开/页码已持久化，不打乱视图）
-            ui.notify(f"已触发补下 {n} 集", type="positive")
+        async def _download_all(e=None):
+            # 【补下全部要防重入】它可能跑几十秒，而同文件 758 行的『重新识别』早就有现成写法。
+            # 连点会叠出多轮并发补下：同一集被多轮各挑一次候选，qB 侧靠 409 兜着，
+            # 但日志与"已触发 N 集"的数字会变得没法解释。
+            async def _go():
+                n = await anime.download_all_pending()
+                refresh_all()   # 含 manage_panel，好让季度小结的已下/待下计数也即时更新
+                ui.notify(f"已触发补下 {n} 集", type="positive")
+            await busy_action(getattr(e, "sender", None), "download-all", _go, fail="补下失败")
 
         async def _qb_sync_now():
             """『下载状态』的立刻刷新：主动向 qB 拉一次在下种子的进度，不必等后台轮询（默认间隔可能上千秒）。"""

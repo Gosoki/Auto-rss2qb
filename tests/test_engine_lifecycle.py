@@ -200,3 +200,111 @@ async def test_archive_off_when_tracking_disabled(archivable, cfg, monkeypatch):
     deleted = []
     assert await _archive(cfg, monkeypatch, deleted, QB_SYNC_STATUS=False) == 0
     assert deleted == []
+
+
+def test_switching_back_to_local_keeps_the_ui_reachable_when_migration_is_broken(monkeypatch):
+    """迁移本身坏掉时，「切回本地 SQLite」至少要把连接层救回来（否则自救按钮也是死的）。
+
+    fatal 的来源之一就是"启动时建表/迁移失败"，而它的两条清除路径以前**都**要先跑一遍迁移——
+    当 fatal 的根因就在 alembic 层时（一条 revision 文件坏了、一条在两个后端上都失败的 revision），
+    用户唯一的自救按钮跑的正是那件失败的事：实测两个出口都抛同一个 SyntaxError。
+    """
+    import db
+
+    monkeypatch.setattr(db, "upgrade_data_schema",
+                        lambda: (_ for _ in ()).throw(SyntaxError("revision 文件坏了")))
+    db.mark_data_fatal("启动初始化失败")
+
+    db.switch_data_engine(None)          # 不该抛
+
+    # engine_for(None) 建的是新引擎而不是 meta_engine 本身（同一个文件两个池），故比 URL
+    assert str(db.engine.url) == str(db.meta_engine.url), "连接层没回到本地，设置页也就打不开"
+    assert db.is_data_down(), "迁移仍然失败，停摆不该被解除"
+    assert "迁移仍然失败" in db.data_down_reason()
+
+    db._data_fatal = db._data_down = ""   # 还原，别污染后面的用例
+
+
+def test_switching_to_another_engine_still_rolls_back_on_failure(monkeypatch, tmp_path):
+    """切到【别的库】失败时仍然原样退回旧引擎——这一半的行为不变。"""
+    import db
+
+    before = db.engine
+    monkeypatch.setattr(db, "upgrade_data_schema",
+                        lambda: (_ for _ in ()).throw(RuntimeError("连不上")))
+    with pytest.raises(RuntimeError):
+        db.switch_data_engine(f"sqlite:///{tmp_path/'other.db'}")
+    assert db.engine is before
+
+
+async def test_reconnect_button_consumes_the_pending_init_immediately(clean_tables, monkeypatch):
+    """「立即重连」探通之后要【当场】补跑业务初始化，不能等看守协程那一轮。
+
+    probe_data_engine 一成功，is_data_down() 当场变 False，各后台循环下一次醒来就开始交付
+    （写 downloading 行）。而 run_db_watch 的恢复边沿最多 30 秒后才轮到——那时它调的
+    reset_downloading 打的就是**正在交付**的行：打回 pending 会当场解除集去重，
+    同一集被两个源各下一份到同一目录。
+    """
+    from datetime import datetime
+
+    import db as _db
+    import pages.layout as L
+    from core import worker
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="番", quarter="26A", confirmed=True)
+        s.add(a)
+        s.commit()
+        s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="a" * 40, raw_title="[组][01]",
+                           episode=1, status="downloading", created_at=datetime.now()))
+        s.commit()
+
+    monkeypatch.setattr(worker, "_startup_reset_pending", True)
+    monkeypatch.setattr(L.ui, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(L.ui, "navigate", type("X", (), {"reload": staticmethod(lambda: None)})())
+    _db.mark_data_down("模拟停摆")
+
+    await L._db_reconnect()
+
+    assert worker._startup_reset_pending is False, "欠账没被消费，看守协程稍后会打到正在交付的行上"
+    with clean_tables.get_session() as s:
+        assert s.exec(select(AnimeTorrent)).one().status == "pending"
+
+
+async def test_relocate_with_qb_disabled_changes_nothing(clean_tables, cfg, monkeypatch):
+    """qB 关着时 relocate 一行都不动——原写法把已下集清成 pending「待重下」。
+
+    那个前提不成立：qB 关着时三条下载入口第一行就 return False，flush 与两个批量补下
+    实测全部返回 0，**没有任何路径能把它们下回来**。而清掉的代价是三重的：
+      ① 页面照着 rep["redownload"] 提示"旧文件在 X 需你手动清理"，用户照做就删光了唯一一份；
+      ② "哪些集已到手"的记录被永久抹掉；
+      ③ 清成 pending 后掉出 HAVE_STATUSES，而两个删除按钮的门槛正是 HAVE ——
+         那份旧文件连 UI 入口都没有了。
+    """
+    from datetime import datetime
+
+    from core import anime as A
+
+    cfg(QB_ENABLED=False, DOWN_PATH="/data")
+    with clean_tables.get_session() as s:
+        a = Anime(title="番", display_name="番", quarter="26A", confirmed=True)
+        s.add(a)
+        s.commit()
+        s.refresh(a)
+        for i, h in enumerate("abc"):
+            s.add(AnimeTorrent(anime_id=a.id, info_hash=h * 40, raw_title=f"[组][{i}]",
+                               episode=i + 1, status="sent", qb_progress=1.0,
+                               save_path="/data/26A/番", created_at=datetime.now()))
+        s.commit()
+        aid = a.id
+
+    rep = await A.relocate_anime(aid, old_path="/data/26A/番")
+
+    assert rep.get("error") and "qB 未启用" in rep["error"]
+    assert not rep.get("redownload"), "qB 关着时不该把已下集清成 pending"
+    with clean_tables.get_session() as s:
+        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == aid)))
+    assert all(t.status == "sent" and t.qb_progress == 1.0 for t in rows), \
+        "已下集的状态被改写了——那份记录抹掉就再也回不来"
+    assert all(t.save_path == "/data/26A/番" for t in rows), "路径不该被改成新目录"

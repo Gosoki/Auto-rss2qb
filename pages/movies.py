@@ -12,7 +12,7 @@ import db
 from db.models import MovieTorrent
 from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN
-from .layout import (WEEKDAY_CN, barline, confirm, expand_collapse_bar, frame,
+from .layout import (WEEKDAY_CN, barline, busy_action, confirm, expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
                      name_of, paginate, parse_bgm_id, qb_live_text,
                      recent_table, torrent_status_cn, warn_banner)
@@ -146,7 +146,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                 if cur.rejected:
                     ui.badge("已忽略").props("color=grey")
                 elif not cur.bangumi_id:
-                    ui.badge("未识别").props("color=red")
+                    ui.badge("待识别").props("color=red")
             if on_close:
                 ui.button(icon="close", on_click=on_close).props("flat round dense").classes(
                     "shrink-0")
@@ -235,24 +235,31 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         if refresh_outer:
             refresh_outer()
 
-    async def _enrich():
-        old_path = mov.movie_save_path(movie_id)
-        ok = await mov.enrich_movie(movie_id)
-        _after()
-        ui.notify("识别成功" if ok else "未识别到（可粘贴 bgm 链接绑定）",
-                  type="positive" if ok else "warning")
-        if ok:
-            await _maybe_relocate_movie(movie_id, old_path, _after)
+    async def _enrich(e=None):
+        # 走 busy_action：识别的时间预算是 120 秒，期间按钮毫无反应、用户会连点，
+        # 于是并发跑好几轮并重复弹搬迁确认框（与番剧详情页同款理由）。
+        async def _go():
+            old_path = mov.movie_save_path(movie_id)
+            ok = await mov.enrich_movie(movie_id)
+            _after()
+            ui.notify("识别成功" if ok else "未识别到（可粘贴 bgm 链接绑定）",
+                      type="positive" if ok else "warning")
+            if ok:
+                await _maybe_relocate_movie(movie_id, old_path, _after)
+        await busy_action(getattr(e, "sender", None), f"mov-enrich:{movie_id}", _go, fail="识别失败")
 
-    async def _refresh_versions():
-        r = await mov.refresh_movie_torrents(movie_id)
-        if not r["ok"]:
-            ui.notify(r["msg"], type="warning")
-            return
-        _after()
-        ui.notify(f"站上 {r['seen']} 个版本，新增 {r['added']} 个"
-                  if r["added"] else f"站上 {r['seen']} 个版本，没有新的",
-                  type="positive" if r["added"] else "info")
+    async def _refresh_versions(e=None):
+        async def _go():
+            r = await mov.refresh_movie_torrents(movie_id)
+            if not r["ok"]:
+                ui.notify(r["msg"], type="warning")
+                return
+            _after()
+            ui.notify(f"站上 {r['seen']} 个版本，新增 {r['added']} 个"
+                      if r["added"] else f"站上 {r['seen']} 个版本，没有新的",
+                      type="positive" if r["added"] else "info")
+        await busy_action(getattr(e, "sender", None), f"mov-refresh:{movie_id}", _go,
+                          fail="刷新版本失败")
 
     def _reject():
         mov.reject_movie(movie_id)
@@ -498,7 +505,7 @@ def movies_page(t: str = ""):
                                 "text-lg cursor-pointer text-blue-400 hover:underline font-bold").on(
                                 "click", lambda mid=m.id: open_detail(mid))
                             if not m.bangumi_id:
-                                ui.badge("未识别").props("color=red").tooltip("bgm 没匹配上，去『待识别』手动绑定")
+                                ui.badge("待识别").props("color=red").tooltip("bgm 没匹配上，去『待识别』手动绑定")
                         with ui.row().classes("gap-4 text-xs text-gray-400 flex-wrap"):
                             ui.label(f"放送 {m.air_date or '—'}")
                             ui.label(f"版本 {len(ts)}")
@@ -731,7 +738,7 @@ def movies_page(t: str = ""):
             for m in items:
                 with ui.card().classes("w-full"):
                     with ui.row().classes("items-center gap-3 flex-wrap"):
-                        ui.badge("未识别").props("color=red")
+                        ui.badge("待识别").props("color=red")
                         ui.label(name_of(m)).classes(
                             "text-lg cursor-pointer text-blue-400 hover:underline").on(
                             "click", lambda mid=m.id: open_detail(mid))
@@ -806,6 +813,11 @@ def movies_page(t: str = ""):
                                 "flat dense size=sm color=primary").style("font-size:14px").tooltip(
                                 "放回可下")
 
+        # 手动扫描表单的暂存：本面板会被『保存自动扫描设置』整块 refresh，而那个表单就在同一面板里。
+        # 不暂存的话，用户刚填好的年份/季度会被静默清回默认值——同文件里的另一处注释
+        # （"sources 是表单，刷一下用户没保存的编辑就没了"）已经写下过这条规则，但只对定时器执行了。
+        _manual_form: dict = {}
+
         @ui.refreshable
         def sources_panel():
             ui.label("剧场版/OVA 的来源固定为 Mikan 季度浏览页的『剧场版/OVA 桶』——非 RSS 订阅，"
@@ -831,10 +843,12 @@ def movies_page(t: str = ""):
             # 手动立即扫描（可指定年份/季度回填历史）
             with ui.card().classes("w-full"):
                 ui.label("手动立即扫描").classes("font-bold")
-                sel_seasons = set(SEASON_CN)   # 默认全选（A/B/C/D）
+                # 季度选择同理：默认全选，但被 refresh 掉之前选过的要留住
+                sel_seasons = _manual_form.setdefault("seasons", set(SEASON_CN))
                 with ui.row().classes("items-stretch gap-3 flex-wrap"):
-                    year = ui.number("年份", value=datetime.now().year, format="%d").props(
-                        "dense outlined").classes("w-28")
+                    year = ui.number("年份", value=_manual_form.get("year") or datetime.now().year,
+                                     format="%d").props("dense outlined").classes("w-28")
+                    year.on("blur", lambda e, y=year: _manual_form.update(year=y.value))
                     with ui.row().classes("items-stretch gap-2"):
                         for _k, _v in SEASON_CN.items():
                             _season_toggle_btn(_k, _v, sel_seasons)

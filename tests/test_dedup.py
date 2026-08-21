@@ -6,6 +6,8 @@ auto_downloadable_ep 被四条下载路径共用（flush、即时下、补下挑
 """
 import pytest
 
+from sqlmodel import select
+
 from core.anime import _foldable, ambiguous_range, auto_downloadable_ep, dedup_key
 
 
@@ -88,3 +90,75 @@ def test_dedup_key_none_source_is_stable():
 def test_dedup_key_tolerates_non_numeric_episode():
     """集号异常时不能抛——它在四条下载路径的热路径上，抛一次就是整轮放行中断。"""
     assert dedup_key((12, 24), 1, None, "ANi") == (1, None)
+
+
+def test_revive_uses_the_same_dedup_key_as_flush(clean_tables):
+    """换源兜底的分组键必须与 flush 同口径（dedup_key），不能按 (番, 集)。
+
+    歧义段（O<T 的番在 (O,T] 上两套编号重叠）里，同一个集号在不同源下指的是**不同的集**。
+    按 (番,集) 分组时，B 源那条已 sent 的"第 13 集"会和 A 源真正失败的"第 13 集"算进同一组，
+    组里出现 HANDLED ⇒ 判成"该集已有着落" ⇒ A 源的 skipped 兄弟永远不会被复活，
+    那一集永久卡死在唯一失败源上（flush 与补下都只挑 pending/error，永不碰 skipped）。
+    """
+    from datetime import datetime
+
+    from core import anime as A
+    from db.models import Anime, AnimeTorrent
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="歧义番", display_name="歧义番", confirmed=True,
+                  ep_offset=12, total_episodes=24)
+        s.add(a)
+        s.commit()
+        s.refresh(a)
+        assert A.ambiguous_range(a) == (12, 24), "用例前提不成立：没有歧义段"
+        now = datetime.now()
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="a" * 40, raw_title="[A源][13]",
+                           episode=13, source="A源", status="error", created_at=now))
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="b" * 40, raw_title="[A源][13] 备用",
+                           episode=13, source="A源", status="skipped", created_at=now))
+        # B 源的"第 13 集"在歧义段上是【另一集】，不该给 A 源当挡箭牌
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="c" * 40, raw_title="[B源][13]",
+                           episode=13, source="B源", status="sent", created_at=now))
+        s.commit()
+
+    A._revive_orphaned_skipped()
+
+    with clean_tables.get_session() as s:
+        revived = s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == "b" * 40)).one()
+    assert revived.status == "pending", "A 源的 skipped 兄弟没被复活——被 B 源的同号集掩蔽了"
+
+
+def test_restore_uses_the_same_dedup_key_as_flush(clean_tables):
+    """`restore_anime` 复活 skipped 兄弟时也要用 dedup_key（第六条消费路径）。
+
+    歧义段里 A 源用绝对号发的『13』与 B 源用季内号发的『13』不是同一集。按裸集号算的话，
+    A 源那条已下的挡住 B 源真正的第 13 集：那条 skipped 永远不复活，而 flush（只挑 pending）、
+    批量补下、换源兜底（要组里有 error，而 reject 把 error 也压成了 skipped）三条路都不碰它
+    ⇒ 那一集永久收不到，页面却弹绿色「已恢复到『订阅中』」。
+    """
+    from datetime import datetime
+
+    from core import anime as A
+    from db.models import Anime, AnimeTorrent
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="歧义番", display_name="歧义番", confirmed=True, rejected=True,
+                  ep_offset=12, total_episodes=24)
+        s.add(a)
+        s.commit()
+        s.refresh(a)
+        assert A.ambiguous_range(a) == (12, 24), "用例前提不成立：没有歧义段"
+        now = datetime.now()
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="a" * 40, raw_title="[A源][13]",
+                           episode=13, source="A源", status="sent", created_at=now))
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="b" * 40, raw_title="[B源][13]",
+                           episode=13, source="B源", status="skipped", created_at=now))
+        s.commit()
+        aid = a.id
+
+    A.restore_anime(aid)
+
+    with clean_tables.get_session() as s:
+        b = s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == "b" * 40)).one()
+    assert b.status == "pending", "B 源真正的第 13 集被 A 源的同号集挡住了，永远复活不了"

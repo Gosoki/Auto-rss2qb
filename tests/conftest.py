@@ -46,8 +46,12 @@ def testdb():
 # 落在 meta 库里的【内部标记】（不是用户配置）。它们记录的是"这件一次性的事做过了"，
 # 跨重启有效——正因为如此，用例之间也必须清掉，否则前一个用例做过的事会让后一个用例
 # 走上另一条分支（实测踩过：完结回填标记）。
+# ⚠️ 这里的字符串必须与生产代码里那个键【逐字相同】——写错了不会报错，只是白清一个不存在的键。
+# 已经踩过两次：`_backfill_legacy_progress_done` 是编的，真实键是 core/engine.py 的
+# `_QB_PROGRESS_BACKFILLED`；`_idle_backfilled` 当初压根忘了加。
+# 下面那条用例会去生产代码里核对，别再手抄漏了。
 _INTERNAL_MARKERS = ("_FINISH_BACKFILL_DONE", "_KNOWN_NOTIFY_EVENTS",
-                     "_backfill_legacy_progress_done", "_idle_backfilled")
+                     "_QB_PROGRESS_BACKFILLED", "_idle_backfilled")
 
 
 @pytest.fixture
@@ -66,3 +70,35 @@ def clean_tables(testdb):
                 s.delete(row)
         s.commit()
     return testdb
+
+
+@pytest.fixture
+def upgrade_from(tmp_path):
+    """造一个【真正的旧库】：升到指定 revision 就停，灌完数据再升到 head。
+
+    用法：
+        eng = upgrade_from("c7e1a93b4d02")      # 停在那一版，此时表结构是旧的
+        ... 用 eng 灌数据（可以插入新版会被约束拦下的数据）...
+        upgrade_from.to_head(eng)               # 走真实的升级路径
+        ... 断言 ...
+
+    【为什么需要它】本项目的缺陷有相当比例**只在存量库上出现**：第 9 轮五条 P1 里三条如此，
+    而全套用例当时用的都是新建库 fixture——新建库一路建到 head，永远碰不到"老结构 + 新代码"
+    这条路径。"建到 head 再把版本号改回去"是不够的：那样表结构其实还是新的。
+    """
+    import sqlalchemy as sa
+
+    from db import schema
+
+    made = []
+
+    def _make(revision: str):
+        p = tmp_path / f"old-{revision}-{len(made)}.db"
+        eng = sa.create_engine(f"sqlite:///{p}")
+        schema.upgrade(eng, "data", revision)
+        made.append(eng)
+        return eng
+
+    _make.to_head = lambda eng: schema.upgrade(eng, "data")
+    _make.revision_of = lambda eng: schema.current_revision(eng, "data")
+    return _make

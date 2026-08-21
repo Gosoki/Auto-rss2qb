@@ -235,9 +235,20 @@ async def test_background_reenrich_never_moves_a_downloaded_anime_folder(clean_t
                 "quarter": "25A", "bangumi_id": 12345}
     monkeypatch.setattr(A.enrich, "resolve", _fake_resolve)
 
-    assert await A.enrich_anime(aid, freeze_empty_path=True)
-    assert A.anime_save_path(aid) == before, "后台重识别把已下番的归档目录改了"
+    # 【走真实入口，不要自己把 freeze_empty_path 传进去】那样是在测我传的参数：
+    # 实测把两个调用点的 freeze_empty_path=True 同时删掉，全套用例照样全绿，
+    # 而 retry_unmatched() 与 reenrich_scope(None) 都会把归档目录改掉。
+    with clean_tables.get_session() as s:
+        row = s.get(Anime, aid)
+        row.bangumi_id = None                # 让它进得了 retry_unmatched 的候选池
+        row.enrich_tries = 0
+        s.commit()
+    assert await A.retry_unmatched() >= 0
+    assert A.anime_save_path(aid) == before, "后台 retry_unmatched 把已下番的归档目录改了"
+
+    assert await A.reenrich_scope(None) >= 0
+    assert A.anime_save_path(aid) == before, "批量『重新识别』把已下番的归档目录改了"
 
     # 带 relocate 的入口不受影响：它要能把目录修正过来，否则详情页那个按钮就成了摆设
-    assert await A.enrich_anime(aid)
+    assert await A.manual_enrich(aid)
     assert A.anime_save_path(aid) != before

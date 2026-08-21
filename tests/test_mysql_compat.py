@@ -168,3 +168,83 @@ def test_col_len_values_all_fit_the_legacy_index_limit():
     for col in keyed:
         n = _COL_LEN[col]
         assert n * 4 <= 767, f"{col}={n} → {n*4} 字节，超过老 InnoDB 的 767 索引键上限"
+
+
+def test_float_columns_are_double_on_mysql():
+    """浮点列在 MySQL 上必须是 8 字节 DOUBLE，不能是默认的 4 字节 FLOAT。
+
+    【这是一条 DDL 快照断言】本项目日常只跑 SQLite，而 SQLite 的 REAL 本来就是 8 字节，
+    所以这一类"只在 MySQL 上错"的问题本地跑一辈子也碰不到。断言直接对着编译出来的
+    MySQL DDL 提，成本几乎为零。
+
+    坏掉的后果见 core/engine.sync_qb_status 的 epsilon 注释：进度冻结时约 50% 概率
+    被误判成"推进了"（实测 10000 个值里 4988 个 float32 往返后变大），
+    于是 status 永远走不到 stalled、停滞检测整个功能失效。
+    """
+    from sqlalchemy.dialects import mysql
+    from sqlalchemy.schema import CreateTable
+    from sqlmodel import SQLModel
+
+    import db.models  # noqa: F401  触发 adapt_metadata
+
+    import sqlalchemy as sa
+
+    # 【从 metadata 枚举，不要手抄列清单】手抄的那一版漏了 animetorrent.episode，
+    # 而用例自己也手抄同一份清单 —— 两边一起漏，等于没测。
+    for table in SQLModel.metadata.tables.values():
+        floats = [c.name for c in table.columns if isinstance(c.type, sa.Float)]
+        if not floats:
+            continue
+        ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
+        for col in floats:
+            line = next(x.strip() for x in ddl.split("\n") if x.strip().startswith(col + " "))
+            assert "DOUBLE" in line.upper(), f"{table.name}.{col} 在 MySQL 上不是 DOUBLE：{line}"
+
+
+def test_the_widening_revision_covers_every_float_column():
+    """加宽 revision 的 `_FLOAT_COLS` 必须覆盖 metadata 里【全部】浮点列。
+
+    上一条断言的是 `SQLModel.metadata` —— 那是 `db/dialect.adapt_metadata` 改过的对象，
+    而**生产库的结构完全由 alembic 建**，两者之间没有任何联系。实测把整条 revision 的
+    upgrade() 首行改成 `return`，全套用例照样全绿：D2 那条修复曾经没有任何回归网。
+    这条用例补的正是那一半——直接对着 revision 里那张手抄表断言。
+    """
+    import importlib.util
+
+    import sqlalchemy as sa
+    from sqlmodel import SQLModel
+
+    import db.models  # noqa: F401
+
+    def _load(path, name):
+        spec = importlib.util.spec_from_file_location(name, path)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    # 【要看所有加宽 revision 【合起来】的覆盖】已应用的 revision 是不可变的，
+    # 补漏只能新开一条 —— 所以守卫也必须按"并集"算，而不是盯着某一条。
+    r1 = _load("alembic/versions/20260819_f2b4c8e7a105_double_float.py", "_rev_f2b4")
+    r2 = _load("alembic/versions/20260820_a3c9e1f70b28_double_episode.py", "_rev_a3c9")
+
+    want = {(t.name, c.name) for t in SQLModel.metadata.tables.values()
+            for c in t.columns if isinstance(c.type, sa.Float)}
+    have = {(t, c) for t, cols in r1._FLOAT_COLS.items() for c in cols}
+    have |= {(t, c) for t, c, _ in r2._COLS}
+    assert want == have, f"没有 revision 加宽：{sorted(want - have)}；多余的：{sorted(have - want)}"
+    assert set(r1._NULLABLE) == {(t, c) for t, cols in r1._FLOAT_COLS.items() for c in cols}, \
+        "_NULLABLE 与 _FLOAT_COLS 不同步"
+
+
+def test_progress_comparison_survives_float32_round_trip():
+    """『进度推进了吗』的判据要能扛住窄浮点的往返噪声。
+
+    这是第二道保险：即便列类型将来又退回 FLOAT，也不该把"没动"读成"推进了"。
+    """
+    import struct
+
+    raw = 0.0021056853504462045                       # float32 往返后会【变大】的一个真实值
+    noisy = struct.unpack("f", struct.pack("f", raw))[0]
+    assert noisy > raw, "用例前提不成立：这个值往返后没有变大"
+    assert not (noisy > raw + 1e-9), "epsilon 挡不住 float32 噪声"
+    assert 0.43 > raw + 1e-9, "epsilon 太大，真实推进也认不出来了"

@@ -3,6 +3,7 @@
 页面级组件放在自己的页面文件里；这里只放跨页面复用的东西。
 """
 import asyncio
+import logging
 import re
 from contextlib import contextmanager
 from html import escape
@@ -12,7 +13,9 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 
 import config
 import db
-from core import engine
+from core import engine, worker
+
+log = logging.getLogger("autorss")
 
 # ui.notify 认的是【当前槽位】：内部走 context.client → slot.parent.client，而 Slot 对 parent
 # 只有【弱引用】。处理器 await 期间，它所在的面板随时可能被刷掉——30s 定时器就在刷仪表盘，
@@ -74,7 +77,10 @@ ui.button.default_props("no-caps")
 #   剧场版/OVA → 「剧场版」    （不用"电影/影片/OVA・剧场版"）
 #   一条可下载的种子 → 「种子」（剧场版侧历史上叫"版本"，见 docs 里待裁决项 Q9）
 #   status=pending → 「待下」  （剧场版侧显示成"可下载"，同上）
-#   review 策略 → 「人工审核」  rejected → 「已忽略」  未匹配 bgm → 「未识别」
+#   review 策略 → 「人工审核」  rejected → 「已忽略」  未匹配 bgm → 「待识别」
+#     ↑ 这一项曾经三个叫法：术语表写「未识别」、tab 与 KPI 用「待识别」、番剧卡片写「未匹配」。
+#       统一取「待识别」——tab、KPI、空状态文案、以及各处 tooltip 里的"去『待识别』手动绑定"都是它。
+#   episode=-2（集号没解析出来）→ 「未知集」（不要写成"未识别"，那是 bgm 那一档的词）
 NAV = [("manage", "番剧", "/"), ("movies", "剧场版", "/movies"),
        ("parse", "解析测试", "/parse"), ("manual", "手动下载", "/manual"),
        ("logs", "运行日志", "/logs"), ("settings", "全局设置", "/settings")]
@@ -369,8 +375,15 @@ def qb_live_text(t) -> str:
     return " ".join(parts)
 
 
+# 状态 → 徽标色的【严重度】部分，全站唯一一份。没列进来的状态是中性（blue-grey）。
+# 这张表存在的理由：同一个 error 以前在番剧侧是红的、在剧场版侧是灰的——
+# 而两边渲染的是同一列 status。颜色是最先被读到的信号，不该按渲染路径分叉。
+SEVERITY_COLOR = {"error": "red", "stalled": "deep-orange"}
+
+
 def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
-                qb_dlspeed=0, in_plan=None, confirmed=True) -> tuple[str, str]:
+                qb_dlspeed=0, in_plan=None, confirmed=True, episode=None,
+                auto_off: str = "") -> tuple[str, str]:
     """新入库/正在下载：把一条种子压成 (文案, 徽标色)，复刻详情页那套阶梯。
 
     有 qB 实时态 → 『下载中 X% ↓速度』/『做种 100%』(完成绿、在下蓝)；否则 in_plan 非空(番剧)时
@@ -379,8 +392,8 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
     confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。"""
     # 同 qb_live_text：人工终态与停滞的 qB 残留态是陈旧的，别拿它盖住真实 status
     if status in engine.MANUAL_TERMINAL_STATUSES or status == "stalled":
-        return torrent_status_cn(status, qb_progress, qb_synced_at), (
-            "deep-orange" if status == "stalled" else "blue-grey")
+        return (torrent_status_cn(status, qb_progress, qb_synced_at),
+                SEVERITY_COLOR.get(status, "blue-grey"))
     if qb_state:
         pr = qb_progress or 0
         parts = [qb_state_cn(qb_state), f"{pr * 100:.0f}%"]
@@ -392,12 +405,27 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
         # 决定要不要算 in_plan，这里再逐个状态分支出文案。它不是集合判断故无法直接引用常量——
         # 将来往 DOWNLOADABLE_STATUSES 加成员时，这里必须同步加分支，否则新状态会静默掉进下面的兜底。
         if status == "pending":
+            # 【判序与 core.anime.pending_breakdown 一致：未知 → 番级原因 → 计划】
+            # 那边把 -1/-2 列为【最先判】，理由写得很清楚："不论番确不确认"，
+            # 否则卡片数与点开的列表条数对不上。这里以前先判 confirmed，两处结论相反。
+            if episode is not None and episode < 0:
+                return ("特别篇" if episode == -1 else "未知集"), "purple"
+            if auto_off:
+                # 番级原因（待确认/已忽略/已完结）：三者都不会自动下，但**指引不同**。
+                # 以前一律显示『待确认』并把用户指去那个 tab，而已忽略/已完结的番不在里面，
+                # 用户到那儿只会看到一个空列表。
+                return auto_off, ("orange" if auto_off == "待确认" else
+                                  "grey" if auto_off == "已忽略" else "teal")
             if not confirmed:
                 return "待确认", "orange"
             return ("将下载", "blue") if in_plan else ("备用项", "blue-grey")
         if status == "error":
             return ("失败·可补下", "orange") if in_plan else ("失败", "red")
-    return torrent_status_cn(status, qb_progress, qb_synced_at), "blue-grey"
+    # 【严重度配色对所有渲染路径一致】兜底这一支以前一律给中性灰，于是 error 在
+    # in_plan is None 的路径（剧场版全线）上被压成灰色，而番剧侧同一个状态是红的：
+    # 同一件事在两条线上一个像告警、一个像普通信息。颜色是这套界面里最先被读到的信号，
+    # 它不该取决于"这条渲染路径当初是谁写的"。
+    return torrent_status_cn(status, qb_progress, qb_synced_at), SEVERITY_COLOR.get(status, "blue-grey")
 
 
 def paginate(seq: list, page: int, size: int):
@@ -595,9 +623,63 @@ async def _db_reconnect() -> None:
     err = await asyncio.to_thread(db.probe_data_engine)
     if err:
         ui.notify(f"还是连不上：{err}", type="negative")
-    else:
-        ui.notify("数据库回来了，正在刷新…", type="positive")
-        ui.navigate.reload()
+        return
+    # 【探通了就【立刻】把欠下的初始化补上，不能等看守协程】probe_data_engine 一成功，
+    # is_data_down() 当场变 False，各后台循环下一次醒来就开始交付（写 downloading 行）。
+    # 而 run_db_watch 的恢复边沿最多要 30 秒后才轮到——那时它调的 reset_downloading
+    # 打的就是【正在交付】的行：打回 pending 会当场解除集去重，同一集被两个源各下一份到
+    # 同一目录（这正是 _startup_reset_pending 那段注释警告的事）。
+    # 在这里补做，窗口从 30 秒缩到几毫秒；标记被消费掉之后，看守协程那次会以
+    # reset_leftovers=False 跑，只剩两个幂等操作，无害。
+    try:
+        await asyncio.to_thread(worker.init_business_state, worker._startup_reset_pending)
+    except Exception as e:
+        log.exception("重连后补跑业务初始化失败")
+        ui.notify(f"数据库通了，但初始化没跑成：{type(e).__name__}: {e}（看守协程 30 秒后会再试）",
+                  type="warning")
+    ui.notify("数据库回来了，正在刷新…", type="positive")
+    ui.navigate.reload()
+
+
+# 长操作的按钮状态：全站唯一一份。
+# 【为什么要收成一份】站里本来有三种各自正确的写法（备份按钮的 loading、『重新激活』的
+# 模块级 busy 标志、『立刻刷新』的 sync_busy 预判），但它们各自只落在一两处，
+# 而**十二个**同样耗时的按钮一件都没做：最长的是绑定 bgm / 重新识别那几个——
+# _RESOLVE_BUDGET 是 120 秒，期间按钮毫无反应，用户会连点，于是并发跑好几轮、
+# 重复弹搬迁确认框。异常兜底同理：NiceGUI 的 on_click 里逃出去的异常只进服务端日志，
+# 用户看到的就是"点了没反应"。
+_BUSY: dict = {}
+
+
+async def busy_action(btn, key: str, coro_fn, *, ok: str = "", fail: str = "操作失败"):
+    """跑一个长操作：置 loading、按 key 去重、兜住异常、给一句 toast。
+
+    key 是【模块级】去重键（同一个按钮在多个客户端/多次渲染下共用），所以不同页面的
+    同类操作要用不同的 key。coro_fn 是一个无参 async 函数（用 lambda 闭包传参）。
+    返回 coro_fn 的返回值；被去重挡下或抛异常时返回 None。
+
+    【为什么不做成装饰器】这些处理器的参数五花八门（有的要 refresh 外层、有的要接着问
+    搬迁确认），闭包传进来最省事，也不必改各处的签名。
+    """
+    if _BUSY.get(key):
+        ui.notify("上一次还没跑完，请稍候", type="info")
+        return None
+    _BUSY[key] = True
+    if btn is not None:
+        btn.props("loading")
+    try:
+        res = await coro_fn()
+        if ok:
+            ui.notify(ok, type="positive")
+        return res
+    except Exception as e:
+        log.exception("按钮操作失败：%s", key)
+        ui.notify(f"{fail}：{type(e).__name__}: {str(e)[:160]}", type="negative")
+        return None
+    finally:
+        _BUSY.pop(key, None)
+        if btn is not None:
+            btn.props(remove="loading")
 
 
 @contextmanager

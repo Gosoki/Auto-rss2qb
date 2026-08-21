@@ -142,3 +142,196 @@ def test_subgroup_whitelist_is_case_insensitive():
     assert kw_match("lolihouse", "LoliHouse")
     assert kw_match("LoliHouse", "lolihouse")
     assert not kw_match("nekomoe", "LoliHouse")
+
+
+@pytest.mark.parametrize("name", [
+    "Fate/Grand Order -绝对魔兽战线巴比伦尼亚-",
+    "Fate/kaleid liner 魔法少女伊莉雅",
+    "Fate/strange Fake 伪典",
+    "Fate/Zero",
+])
+def test_slash_inside_a_title_is_not_a_language_separator(name):
+    """斜杠属于番名本身时不许拆。
+
+    只判「两侧语种不同」是不够的：`Fate/Grand Order -绝对魔兽战线巴比伦尼亚-` 的右半边
+    恰好带中文，于是被当成"中文名/罗马音"拆出一个 `Fate`。而 `Fate` 会排在候选第一位，
+    详情页『补齐该源』(name_filter=False，不做番名近似) 拿它去搜站，
+    把同组 Fate/Zero、Fate/Apocrypha 等**别的番**的种子按 anime_id 硬挂进来——
+    而且不可逆：那些 hash 从此被本番占死，真正属于它们的番永远收不到。
+    判据要改成「每一侧的脚本都纯净」。
+    """
+    from sources.parse import _split_langs
+    assert _split_langs(name) == [name]
+
+
+@pytest.mark.parametrize("name,want", [
+    ("进击的巨人/Shingeki no Kyojin", ["进击的巨人", "Shingeki no Kyojin"]),
+    ("孤独摇滚/Bocchi the Rock!", ["孤独摇滚", "Bocchi the Rock!"]),
+    ("转生史莱姆/Tensei Shitara Slime Datta Ken", ["转生史莱姆", "Tensei Shitara Slime Datta Ken"]),
+    ("Steins;Gate/命运石之门", ["Steins;Gate", "命运石之门"]),   # 两侧脚本都纯净＝真并列
+])
+def test_real_bilingual_pairs_are_still_split(name, want):
+    """收紧判据不能误伤真正的『中文名/罗马音』并列——那是这个函数存在的全部理由。"""
+    from sources.parse import _split_langs
+    assert _split_langs(name) == want
+
+
+@pytest.mark.parametrize("raw,want_name,want_ep", [
+    ("[喵萌奶茶屋&LoliHouse] 【我推的孩子】 / Oshi no Ko - 11 [WebRip 1080p].mkv", "我推的孩子", 11),
+    ("[NC-Raws] 【我推的孩子】 - 11 (B-Global 1920x1080).mp4", "我推的孩子", 11),
+    ("[Skymoon-Raws] 【推しの子】 - 05 [WebRip][1080p]", "推しの子", 5),
+])
+def test_title_wrapped_in_brackets_is_not_eaten_as_a_tag(raw, want_name, want_ep):
+    """番名本身就写成【…】的番不能被当成标签块删掉。
+
+    `_TAG_BLK_RE` 会把 `【我推的孩子】` 整块删掉 → 番名洗成空串 → sources/base.py
+    对空番名是【静默丢弃整条】：那部番从某几个组那里一集都收不到，界面和日志零信号
+    （实测：日志一条记录都没有，连计数都不出现）。
+    """
+    from sources.parse import parse_title
+    _, name, _, ep = parse_title(raw)
+    assert name == want_name and ep == want_ep
+
+
+@pytest.mark.parametrize("raw", [
+    "[组][1080P][x264][CHS]",
+    "[组] [1080p] - 12 [x265]",
+])
+def test_tag_only_titles_still_yield_no_name(raw):
+    """解包回退不能反过来把画质标签认成番名——那会建出一部叫 '1080p' 的番。"""
+    from sources.parse import parse_title
+    assert parse_title(raw)[1] == ""
+
+
+def test_episode_regex_has_no_catastrophic_backtracking():
+    """标题解析不能被一条畸形标题拖住事件循环。
+
+    `_EP_LEFT_RE` 的尾部曾是 `\\s*(?:END|FIN|完结?)?\\s*[-–—]?\\s*$` —— 三段 \\s* 中间夹两个
+    可选组，一段空白能被它们以指数级多种方式瓜分；整体匹配失败时引擎要全试一遍。
+    实测 "- 12" + 500 空格 + "x" 单条 230ms，而 clip_title 只截长度、**不归一空白**。
+    这段解析跑在采集主链路上、同步阻塞事件循环：一个这样的 feed 就能把整轮采集拖住。
+    """
+    import time
+
+    from sources.parse import clip_title, search_query_names
+
+    # 【长度要选在 clip_title 截完之后仍带着结尾那个 'x' 的档】600 个空格会被
+    # MAX_TITLE_LEN=512 把尾部的 'x' 正好截掉，于是新旧两版正则都是 0ms —— 守卫恒真。
+    # 180 个空格截完仍是 192 字符、'x' 还在：实测旧写法 38ms、新写法 0.9ms。
+    evil = clip_title("[组] 某番 - 12" + " " * 180 + "x")
+    assert evil.endswith("x"), "用例前提不成立：evil 串的触发尾巴被 clip_title 截掉了"
+    t0 = time.perf_counter()
+    search_query_names(evil)
+    cost = time.perf_counter() - t0
+    assert cost < 0.005, f"畸形标题解析耗时 {cost * 1000:.1f}ms，正则有回溯问题"
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("[组] 某番 - 12", "某番"),
+    ("[组] 某番 - 12 END", "某番"),
+    ("[组] 某番 - 12.5", "某番"),
+    ("[组] 某番 第03话", "某番"),
+    ("[组] 某番 EP03", "某番"),
+    ("[组] 某番 - 12 完", "某番"),
+])
+def test_episode_suffix_stripping_is_unchanged(raw, want):
+    """消除回溯不能改变语义——这几种是真实字幕组的集号写法。"""
+    from sources.parse import search_query_names
+    assert want in " ".join(search_query_names(raw))
+
+
+@pytest.mark.parametrize("trad,simp", [
+    ("簡繁內封", "简繁内封"), ("簡日雙語", "简日双语"), ("簡體", "简体"),
+    ("繁體", "繁体"), ("簡中", "简中"),
+])
+def test_language_blocks_are_recognised_in_both_scripts(trad, simp):
+    """语言块的简繁两种写法必须同判——字类里曾有「繁」而漏了「簡」。
+
+    逃过跳过闸的后果不是"少跳一个块"：那个块会被当成番名（parse_multibracket 挑名、
+    _clean_name 的解包回退都会），于是建出一部叫「簡繁內封」的假番，
+    而该组当季所有番共用这一个别名、被并成同一部——落进同一个目录，集号还互相撞成 skipped。
+    """
+    from sources.parse import _is_skip_block
+    assert _is_skip_block(trad) == _is_skip_block(simp) is True
+
+
+@pytest.mark.parametrize("name", ["簡単な生活", "日常", "中二病", "英雄王", "台风"])
+def test_real_titles_starting_with_a_language_char_are_not_skipped(name):
+    """收进「簡」不能误伤以语言字开头的真番名。"""
+    from sources.parse import _is_skip_block
+    assert _is_skip_block(name) is False
+
+
+@pytest.mark.parametrize("raw,want_name,want_season", [
+    ("[喵萌奶茶屋] 【我推的孩子】第二季 - 03 [1080p]", "我推的孩子", 2),
+    ("[喵萌奶茶屋] 【我推的孩子】第2季 - 03 [1080p]", "我推的孩子", 2),
+    ("[组] 【葬送的芙莉莲】第三期 - 03 [1080p]", "葬送的芙莉莲", 3),
+])
+def test_bracket_title_with_a_season_suffix_still_parses(raw, want_name, want_season):
+    """`【番名】第二季` 不能被静默丢弃。
+
+    解包回退的判空时机曾在 `strip_season` 【之前】：洗完剩下 `第二季`（非空）→ 回退不触发，
+    到调用方那里才被 strip_season 变成空 → 整条种子静默丢弃。
+    """
+    from sources.parse import parse_title
+    _, name, season, _ = parse_title(raw)
+    assert (name, season) == (want_name, want_season)
+
+
+@pytest.mark.parametrize("raw", [
+    "[喵萌奶茶屋] 【我推的孩子】 S2 - 03 [1080p]",
+    "[组] 【葬送的芙莉莲】 Season 2 - 03 [1080p]",
+])
+def test_bracket_title_never_yields_a_season_marker_as_the_name(raw):
+    """`【番名】 S2` 不能解析出一个叫 `S2` 的番名。
+
+    strip_season 只认中文季名，英文写法它不动 → 洗完剩下 `S2`（非空）→ 回退不触发 →
+    番名就是 `S2`：该组所有这么写的【】番全并进一部叫 S2 的假番里，
+    落进同一目录、集号互撞、info_hash 被占死。
+    """
+    from sources.parse import parse_title
+    name = parse_title(raw)[1]
+    assert name not in ("S2", "Season2", "2ndSeason") and len(name) > 3, f"番名成了季号：{name!r}"
+
+
+@pytest.mark.parametrize("raw,leaked", [
+    ("[某组] 【我推的孩子】Ⅱ - 03 [1080p]", "Ⅱ"),
+    ("[某组] 【咒术回战】 完结 - 24", "完结"),
+    ("[某组] 【某番】 修正版 - 03", "修正版"),
+    ("[某组] 【我推的孩子】 2期 - 03", "2期"),
+    ("[组] 【葬送的芙莉莲】 Season 2 - 03 [1080p]", "Season2"),
+])
+def test_leftover_fragments_never_become_the_anime_name(raw, leaked):
+    """季号/完结/版本这类残渣不能单独成为番名。
+
+    本模块早有一份「这不是番名」的词表，但它以前只在解包回退里被调用、主路径从不问它——
+    于是同一个词写在括号里判成标签、写在括号外就成了番名：
+    `【咒术回战】 完结 - 24` 解析出的番名是 `完结`，该组所有这么发的番共用一个别名、
+    被并成同一部（而 `Ⅱ` 只有一个字符，还会被 candidate_names 的长度闸滤掉，bgm 永远救不回来）。
+    """
+    from sources.parse import parse_title
+    name = parse_title(raw)[1]
+    assert name != leaked, f"残渣 {leaked!r} 成了番名"
+    assert len(name) > 2, f"番名退化成 {name!r}"
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("[组] 劇場版 少女☆歌劇 - 01", "剧场版少女☆歌剧"),
+    ("[ANi] 葬送的芙莉莲 - 12 [1080P]", "葬送的芙莉莲"),
+    ("[组] IS 无限斯特拉托斯 - 05", "IS无限斯特拉托斯"),
+])
+def test_widening_the_skip_table_does_not_eat_real_titles(raw, want):
+    """收紧判据不能误伤真番名——「剧场版 XX」整段是名字，不是标签。"""
+    from sources.parse import parse_title
+    assert parse_title(raw)[1] == want
+
+
+def test_year_prefixed_season_block_is_a_tag_not_a_name():
+    """`2024年10月新番` 要和裸 `10月新番` 一样被认成标签。
+
+    月份分支从行首锚定，年份一加就落空——而这类标题正是「番名写在【】里」那条修法
+    明确交给 parse_multibracket 的，交过去之后它会犯同样的错。
+    """
+    from sources.parse import _is_skip_block, parse_multibracket
+    assert _is_skip_block("2024年10月新番") is True
+    assert parse_multibracket("[X][2024年10月新番][青之箱][05][1080P]")[0] == "青之箱"
