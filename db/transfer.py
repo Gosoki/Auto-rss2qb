@@ -254,6 +254,18 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
             + "\n最常见的是老库里同一个 Mikan 番组留下了两行剧场版。"
               "办法：先用本程序把【源库】当业务库打开一次，启动时的升级会自动摘掉重复的链接，再回来迁。")
     dst_counts = count_rows(dst_engine)
+    # 【第四道：空源 + 覆盖 = 纯破坏，没有任何正当用途】
+    # 真实形态：用户先切到了 MySQL（于是本地 SQLite 的业务表一直是空的），过后"为保险"
+    # 再点一次『本地 SQLite → MySQL』—— 目标就是他当前正在用的那个库，六张表被 DELETE 干净，
+    # 再从空源写入 0 行；而 verify 拿 0==0 判"一致"，页面弹的是绿色的「迁移完成并校验一致」。
+    # 用户唯一可能察觉的时刻，反而确认了一切正常。而 DB_BACKEND=mysql 时备份的 scope 恒是
+    # meta，业务数据一条都不在备份里 —— 没有任何退路。
+    if overwrite and not any(src_counts.values()) and any(dst_counts.values()):
+        busy = "、".join(f"{k} {v} 行" for k, v in dst_counts.items() if v)
+        raise ValueError(
+            f"源库是空的（0 行），而目标库有数据（{busy}）——这样迁只会把目标库清空。"
+            "已中止，目标库的数据未被改动。\n"
+            "如果你是想把数据【从目标库搬回源库】，请点另一个方向的迁移按钮。")
     if not overwrite and any(dst_counts.values()):
         busy = "、".join(f"{k} {v} 行" for k, v in dst_counts.items() if v)
         raise ValueError(f"目标库已有数据（{busy}）。请先勾选『覆盖目标库』，或换一个空库。")

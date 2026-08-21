@@ -87,12 +87,6 @@ _data_down = ""
 _data_fatal = ""
 
 
-def _tables(meta: bool) -> list:
-    """按归属拆表：meta=True 取 setting，False 取业务表。"""
-    return [t for name, t in SQLModel.metadata.tables.items()
-            if (name in META_TABLES) is meta]
-
-
 def data_backend() -> str:
     """当前业务数据落在哪：'sqlite' | 'mysql'。"""
     return "mysql" if is_mysql(engine) else "sqlite"
@@ -321,24 +315,47 @@ def engine_for(url: str | None):
 def switch_data_engine(url: str | None) -> None:
     """把业务数据引擎切到 url（None=切回本地 SQLite）。【只切连接，不搬数据】。
 
-    切换点的安全性：本项目所有 `with get_session()` 块内都没有 await（审计用 AST 全仓核过），
-    单进程 asyncio 下这些块是原子的，故从 UI 处理器里切不会切在半个事务中间。
-    新库连不上/建表失败就原样退回旧引擎，别把应用留在半死状态。
+    切换点的安全性：`with get_session()` 块内都没有 await，所以**在事件循环这一条线上**
+    它们是原子的，从 UI 处理器里切不会切在半个事务中间。
+    【但"单进程 asyncio ⇒ 全都原子"这个说法不准，别照抄】数据库并非只被事件循环访问：
+    `pages/api.py` 的 `/api/qb/done` 是**同步**路由，FastAPI 会把它丢进 anyio 工作线程；
+    `asyncio.to_thread(db.probe_data_engine)`（看守协程与页面的『立即重连』）同理。
+    这几条线程路径与事件循环里的"读改写"序列是真的会交错的——
+    这正是 DECISIONS 的 E-12 要拍板的事。在它定下来之前，这段话只对事件循环内部成立。
+
+    【迁移失败时的两种处理，取决于切去哪】
+      · 切到【别的库】失败 → 原样退回旧引擎并抛，别把应用留在半死状态（旧行为，不变）。
+      · 切回【本地 SQLite】失败 → 仍然把 engine 指过去，但**保留 fatal 标记**。
+        理由：fatal 的来源之一就是"启动时建表/迁移失败"，而它的两条清除路径
+        （启动时的 apply_configured_backend、设置页的本函数）以前**都**要先跑一遍迁移——
+        当 fatal 的根因就在 alembic 层时，用户唯一的自救按钮跑的正是那件失败的事，
+        「切回本地 SQLite」与「去设置页改数据库」两个出口同时是死的（实测复现过：
+        一条 revision 文件坏掉时，两个按钮都抛同一个 SyntaxError）。
+        至少要让连接层回到本地，好让用户看得到设置页、看得到那条 fatal 原因。
     """
-    global engine
+    global engine, _data_down, _data_fatal
     old = engine
     engine = engine_for(url)
     try:
         upgrade_data_schema()
-    except Exception:
-        if engine is not old:
-            engine.dispose()
-        engine = old
-        raise
+    except Exception as e:
+        if url is not None:
+            if engine is not old:
+                engine.dispose()
+            engine = old
+            raise
+        # 切回本地却仍然失败：连接层落到本地，但停摆状态【不解除】——
+        # 表结构可能是半截的，让后台在上面跑比停着更糟。
+        if old is not meta_engine:
+            old.dispose()
+        _data_fatal = (f"已切回本地 SQLite，但迁移仍然失败：{type(e).__name__}: {e}。"
+                       "这多半不是连接问题（迁移脚本本身有问题）——请看日志，"
+                       "修好之后重启；界面此刻可用，但采集/下载仍停着。")
+        log.exception("切回本地 SQLite 后迁移仍失败，保留停摆")
+        return
     if old is not meta_engine:   # 默认态下 old 就是 meta_engine，不能 dispose（配置还要用它）
         old.dispose()
-    global _data_down, _data_fatal
-    # 切过来的库刚跑通了迁移，必然是活的；两种停摆一并解除
+    # 走到这里说明迁移真的跑通了，库必然是活的；两种停摆一并解除
     # （配置层那条也要清：用户在设置页补全参数后正是靠这个动作恢复的）
     _data_down = _data_fatal = ""
     log.info("业务数据库已切换到：%s", data_target_desc())

@@ -355,8 +355,12 @@ def ambiguous_range(a) -> tuple | None:
 def dedup_key(amb, aid, ep, source):
     """集去重键：歧义段带上源，其余按 (番, 集)。amb=ambiguous_range(番) 的结果（None=无歧义段）。
 
-    四条去重路径（flush 的 have_eps、_download_candidates、download_anime_torrent 的同集闸、
-    download_plan 的标注）必须共用它，否则同一条种子会因走哪条路而命运不同。
+    **六条**去重路径必须共用它，否则同一条种子会因走哪条路而命运不同：
+    flush 的 have_eps、_download_candidates、download_anime_torrent 的同集闸、
+    download_plan 的标注、以及 _revive_orphaned_skipped 的分组
+    以及 restore_anime 的"复活 skipped 兄弟"。
+    （后两条以前都按 (番,集) 算、不在名单里——歧义段上另一个源的同号集会把真正的那一集
+    掩蔽掉，它的 skipped 兄弟永远不会被复活。两次都是同一种广度错误。）
     """
     if amb and isinstance(ep, (int, float)) and amb[0] < ep <= amb[1]:
         return (aid, ep, source or "")
@@ -573,9 +577,10 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool |
     【并发下不会对同一集放行两份】worker flush 与 UI 补下可能同时挑中同一集的不同源。
     真正扛住这件事的是下面那句『原子占位』：它在【任何 await 之前】就把状态落库成 downloading，
     而 downloading ∈ TRACKED_STATUSES，后到的协程一进来就被上面的幂等短路挡掉。
-    单线程事件循环 + 该段内无 await（tests/test_invariants.py 全仓核过）⇒ 这段本身就是原子的。
+    单线程事件循环 + 该段内无 await ⇒ 这段本身就是原子的。
+    （原注释说"tests/test_invariants.py 全仓核过"——**那个文件不存在**，全仓只有这一条引用。这类"引用一个不存在的用例来给自己背书"的注释比没有注释更糟。）
     _download_lock 因此是【冗余的保险】：实测去掉它并发测试仍全绿，而去掉原子占位则当场重复下载
-    （tests/test_concurrency.py 用变异测试量过）。留着它是为了将来万一有人往这段里加 await。
+    留着它是为了将来万一有人往这段里加 await。（原注释说"tests/test_concurrency.py 用变异测试量过"——**那个文件同样不存在**。）
     force=True：强制下这一条（无视当前状态、跳过集去重），用于详情页手动指定下载。
     """
     if not config.QB_ENABLED:
@@ -797,19 +802,28 @@ def _revive_orphaned_skipped() -> None:
         # 整行 ORM 装配的开销随 sent 行数线性增长，而下面只用到 (id, 番, 集, 状态)。
         # 真正要改写的那几行在下面按 id 单独取（通常只有个位数）。
         rows = list(s.exec(select(AnimeTorrent.id, AnimeTorrent.anime_id,
-                                  AnimeTorrent.episode, AnimeTorrent.status).where(
+                                  AnimeTorrent.episode, AnimeTorrent.status,
+                                  AnimeTorrent.source).where(
             AnimeTorrent.anime_id.in_(auto_ids),
             AnimeTorrent.status.in_(("error", "skipped") + HANDLED_STATUSES))))
+        # 【分组键必须与 flush 同口径：dedup_key，不是 (番, 集)】歧义段（O<T 的番在 (O,T] 上
+        # 两套编号重叠）里，同一个集号在不同源下指的是【不同的集】——flush 正因如此才按
+        # (番,集,源) 去重。这里按 (番,集) 分组的话，B 源那条已 sent 的"第 5 集"会把
+        # A 源真正失败的"第 5 集"一起算进同一组，组里出现 HANDLED ⇒ 判定"该集已有着落" ⇒
+        # A 源的 skipped 兄弟永远不会被复活，那一集永久卡死在唯一失败源上。
+        amb_map = {a.id: ambiguous_range(a) for a in s.exec(
+            select(Anime).where(Anime.id.in_(auto_ids)))}
         by_ep: dict = {}
-        for _tid, aid, ep, st in rows:
-            by_ep.setdefault((aid, ep), set()).add(st)
+        for _tid, aid, ep, st, src in rows:
+            by_ep.setdefault(dedup_key(amb_map.get(aid), aid, ep, src), set()).add(st)
         # 目标集：有 error，且无 sent/downloading/deleted/stalled（首选已败、该集尚无可用/已删/停滞的下载）。
         # stalled 也算『已处理』→ 不复活兄弟源：停滞的那条留人工处理，不自动换源（与 flush 阻断口径一致）。
         revive = {k for k, sts in by_ep.items()
                   if "error" in sts and not (set(HANDLED_STATUSES) & sts)}
         if not revive:
             return
-        ids = [tid for tid, aid, ep, st in rows if st == "skipped" and (aid, ep) in revive]
+        ids = [tid for tid, aid, ep, st, src in rows
+               if st == "skipped" and dedup_key(amb_map.get(aid), aid, ep, src) in revive]
         changed = 0
         for tid in ids:                    # 只把真要改的那几行取成 ORM 实例
             t = s.get(AnimeTorrent, tid)
@@ -1222,7 +1236,15 @@ async def sweep_finished() -> int:
     # 判据必须是"本库【从来】没判过完结"，而不是"当前一部都没标记"：cands 排除了 finish_optout，
     # 用户对已完结的番点几次『继续订阅』就会让后者重新成立，于是下一批真的完结的番静默无声。
     # 用一条 setting 记"回填做过了"，一次性、跨重启有效。
-    backfill = len(hits) > 5 and not _finish_backfilled()
+    # 【闩要在"第一轮有命中"时就落下，不能只在回填那一轮落】原写法是
+    # `backfill = len(hits) > 5 and not _finish_backfilled()`，而唯一的落闩点在
+    # `if backfill:` 里面——于是闩的语义变成"本库出现过一轮 ≥6 命中"，
+    # 而落闩那一轮恰恰就是被静默的那一轮。后果：一个从来没有过 ≥6 命中的库，
+    # 闩永远不落；等到季末某一轮真有 6 部同时完结时，那一轮被当成"首轮回填"整批静默，
+    # finished_at 照写、停订照生效，用户一条通知都收不到。
+    # 兄弟路径 sweep_idle 的同款闩是【无条件】落库的（见那里）。
+    first_ever = not _finish_backfilled()
+    backfill = first_ever and len(hits) > 5
     now = datetime.now()
     done, undone = [], []
     with get_session() as s:
@@ -1242,8 +1264,9 @@ async def sweep_finished() -> int:
             s.add(row)
             undone.append(a)
         s.commit()
+    if hits and first_ever:
+        _mark_finish_backfilled()   # 有命中的第一轮就落闩，与是否静默无关
     if backfill:
-        _mark_finish_backfilled()
         log.info("完结判定：首轮回填 %d 部（不推送，避免把限流额度占满）", len(done))
     else:
         for a in done:
@@ -1480,6 +1503,33 @@ def confirmed_anime_ids(ids) -> set:
             Anime.id.in_(ids), *subscribed_where())))
 
 
+def auto_off_reasons(ids) -> dict:
+    """给定番 id，返回 {id: 「为什么后台不会自动下它」}；会自动下的番不出现在结果里。
+
+    值取自 `pending_breakdown` 用的同一套词：『待确认』/『已忽略』/『已完结』。
+    **判序也与它一致**（未确认 → 已忽略 → 已完结），这样渲染侧与统计侧不会给出两种说法。
+
+    【为什么需要它】`confirmed_anime_ids` 只回答"会不会下"，回答不了"为什么不下"。
+    于是渲染侧只能把三种情况统统显示成『待确认』，并把用户指去『待确认』tab——
+    而已忽略/已完结的番根本不在那个 tab 里，用户到那儿只会看到一个空列表。
+    """
+    ids = {i for i in ids if i}
+    if not ids:
+        return {}
+    out = {}
+    with get_session() as s:
+        for aid, confirmed, rejected, finished in s.exec(select(
+                Anime.id, Anime.confirmed, Anime.rejected, Anime.finished_at).where(
+                Anime.id.in_(ids))):
+            if rejected:
+                out[aid] = "已忽略"
+            elif not confirmed:
+                out[aid] = "待确认"
+            elif finished is not None and config.ANIME_FINISH_UNSUB:
+                out[aid] = "已完结"
+    return out
+
+
 def get_anime(anime_id: int) -> Anime | None:
     with get_session() as s:
         return s.get(Anime, anime_id)
@@ -1640,12 +1690,21 @@ def restore_anime(anime_id: int) -> None:
         a.confirmed = True   # 恢复=确认，confirmed=True → 改开始日不会再把它判超期忽略（超期忽略需 confirmed=False）
         s.add(a)
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
-        # 复活 skipped 兄弟用 HANDLED_STATUSES（含 deleted）：用户特意删过的集，其去重落选的兄弟不该被复活重下。
-        have_eps = {t.episode for t in all_rows if t.status in HANDLED_STATUSES}
+        # 【键必须是 dedup_key，不能是裸 episode】这是 dedup_key 的第六条消费路径——
+        # 歧义段（O<T 的番在 (O,T] 上两套编号重叠）里，A 源用绝对号发的『13』与 B 源用季内号
+        # 发的『13』不是同一集。按裸集号算的话，A 源那条已下的『13』会把 B 源真正的第 13 集
+        # 一起挡在外面：那条 skipped 永远不复活，而 flush（只挑 pending）、批量补下、
+        # 换源兜底（要组里有 error，而 reject 把 error 也压成了 skipped）三条路都不碰它 ⇒
+        # 那一集永久收不到，页面却弹绿色「已恢复到『订阅中』，补下 N 集」。
+        # 兄弟路径 _revive_orphaned_skipped 已经改过，这条当时没跟上。
+        amb = ambiguous_range(a)
+        have_eps = {dedup_key(amb, 0, t.episode, t.source)[1:]
+                    for t in all_rows if t.status in HANDLED_STATUSES}
         for t in all_rows:
             # 只放回『该集尚无下载/未被删过』的 skipped（集去重留下的旧版本）；用户主动删过的记为 deleted，
             # 其集已进 have_eps 而被排除——免得恢复订阅时把用户特意删掉的文件又重新下回来。
-            if t.status == "skipped" and t.episode not in have_eps:
+            if (t.status == "skipped"
+                    and dedup_key(amb, 0, t.episode, t.source)[1:] not in have_eps):
                 t.status = "pending"
                 s.add(t)
         s.commit()
@@ -1771,7 +1830,11 @@ async def enrich_anime(anime_id: int, freeze_empty_path: bool = False) -> bool:
             return False
         # 无已下集就采用 bgm 季度（纠正种子解析得来的错季度）；有已下集才保留，避免散目录
         handled = _has_handled_torrents(s, anime_id)
-        snap = ({k: getattr(a, k) for k in ("quarter", "jp_name", "display_name")}
+        # season 也在快照里：_apply_bgm 会从【刚被填上、还没还原】的新名字反推季号并留下来
+        # （它跑在 apply_bgm_meta 之后、下面的还原之前），而 build_save_path 的入参正是
+        # (quarter, 名字, season)。漏了它，开着 ANIME_SEASON_SUBFOLDER 时新集会落进
+        # Season 3 而已下的集留在 Season 1 —— 同一部番裂成两个目录，而这两条链路都不 relocate。
+        snap = ({k: getattr(a, k) for k in ("quarter", "jp_name", "display_name", "season")}
                 if (freeze_empty_path and handled) else None)
         _apply_bgm(a, info, keep_path=handled)
         if snap is not None:
@@ -2122,7 +2185,9 @@ def _plans_for_ids(anime_ids, modes: tuple) -> dict:
         # sent 是只增不减的终态，跑一年的库里它比 pending 多一两个数量级。
         # 一条查询把两边一起取回来，等于每次刷新仪表盘都把整张种子历史用 8 列实例化进内存。
         # 实测 18000 行库：合并取回 174ms，拆开 + distinct 后 115ms；把 have 判据下推成
-        # NOT EXISTS 还能再降到个位数（那需要改写成子查询，留作下一步）。
+        # 【不要试图把 have 判据下推成 NOT EXISTS】原注释写着"还能再降到个位数（留作下一步）"，
+        # 实测【比现状慢】：24.8ms → 35.4ms（20k 种子库，且已额外建了理想覆盖索引并确认走了它）。
+        # 留着那句话会诱导下一轮做一次负优化。
         # 取所有口径用到的候选状态的并集，各口径再在内存里按自己的判据筛。
         cand_statuses = tuple(set().union(*(
             set(DOWNLOADABLE_STATUSES if m else ("pending",)) for m in modes)))

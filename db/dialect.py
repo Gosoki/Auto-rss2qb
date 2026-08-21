@@ -52,7 +52,11 @@ _COL_LEN = {
     "movietorrent.info_hash": 64,
     "movie.mikan_id": 64,
     "sourcegroup.name": 191,     # 唯一约束 + 索引，取保守值，老 InnoDB 也进得去
-    "anime_alias.title": 191,    # 与 season 组成复合唯一约束，两列合计要留余量
+    # 191 字符 × 4 字节 = 764 B。复合唯一约束 (title, season) 在 MySQL 8/9 的默认 DYNAMIC 行格式下
+    # 上限是 3072 B，绰绰有余。【注意 764 + season(4B) = 768 > 767】——所以本项目
+    # 【不支持】老的 COMPACT/REDUNDANT 行格式（那个上限才是 767）。以前这里写的是"留余量"，
+    # 但按 767 算余量是负的，那句话把不支持写成了支持。
+    "anime_alias.title": 191,
     "setting.key": 191,          # 主键；虽然 setting 永远留在本地 SQLite，仍一并定型免得将来踩坑
     # 下面两条不是索引列，是为了【躲开 MySQL 的 TEXT 不能有 DEFAULT】（错误 1101）：
     # fail_reason 是 NOT NULL DEFAULT ''，落成 TEXT 时 ALTER TABLE 当场报错（SQLite 不报，只有真
@@ -121,6 +125,16 @@ def adapt_metadata(metadata) -> None:
                 # 一起回滚，而该行因进度写不上去永远留在 in-flight，每轮复发且界面零报错。
                 # 用 variant：SQLite 侧 BIGINT 仍是 INTEGER，DDL 等价、零行为变化。
                 col.type = sa.BigInteger().with_variant(mysql.BIGINT(), "mysql")
+            elif isinstance(col.type, sa.Float):
+                # 【浮点也要显式给 DOUBLE】MySQL 的 FLOAT 是 4 字节：qB 报的 0.4212345 存进去
+                # 读回来变成 0.42123448848724365。而 sync_qb_status 判"进度有没有推进"用的是
+                # `t.qb_progress > prev_progress`，round-trip 精度损失让它在进度【冻结】时
+                # 也有约一半概率为真 → qb_progress_at 每轮刷新 → 永远走不到 status="stalled"。
+                # 后果不是"少一个徽标"：该行恒满足 _inflight_where（qB 同步循环永不休眠、每轮空打 qB），
+                # 而它仍是 sent ∈ HAVE_STATUSES，集去重闸一直挡着 ⇒ 同集换源永远不会发生。
+                # 用户看到的是一集永远卡在 42%、界面零告警。
+                # SQLite 的 REAL 是 8 字节、round-trip 精确，所以本地跑一辈子也碰不到。
+                col.type = sa.Float().with_variant(mysql.DOUBLE(asdecimal=False), "mysql")
             elif _is_unlen_string(col):
                 key = f"{table.name}.{col.name}"
                 if col.name in keyed or key in _COL_LEN:

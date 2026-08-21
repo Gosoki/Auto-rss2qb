@@ -15,6 +15,7 @@
 生成的脚本记得按 role 分支（meta 只碰 setting），并检查 SQLite/MySQL 两边都成立。
 """
 import logging
+import threading
 from pathlib import Path
 
 # 【必须在 import alembic 之前】alembic 那堆 "setup plugin …" / "Context impl …" 是 INFO 级，
@@ -33,6 +34,20 @@ log = logging.getLogger("autorss")
 
 _ROOT = Path(__file__).resolve().parent.parent
 _INI = _ROOT / "alembic.ini"
+
+# 【整个 alembic 调用必须串行化】alembic 的 EnvironmentContext 装的是**进程级模块代理**
+# （alembic/op.py、alembic/context.py 的 create_module_class_proxy）——两次升级重叠时，
+# 后退出的那个 `del globals_[attr]` 会删掉对方的代理。
+# 而本项目真的会并发调它：schema.upgrade 有 5 个调用点，其中两个在【非事件循环线程】里
+# （看守协程每 30 秒一次的 probe_data_engine、页面『立即重连』按钮），还有一个是
+# run.io_bound 里的整库迁移。实测（200 次独立进程）：KeyError: 'script'、
+# "index already exists"、**6% 概率整进程 Segmentation fault**，
+# 以及 **4.5% 概率收尾是「alembic_version=head 而索引没建上」** —— 而 upgrade() 开头那句
+# `if cur == head: return` 会让这一态【永远不会被修复】。
+#
+# 锁要加在这一层（而不是"把 engine 传下去"）：根因是进程级代理，不是引擎选谁——
+# 用两个不同的库、两个不同的 engine 并发跑，8/8 照样复现 KeyError。
+_LOCK = threading.Lock()
 
 
 def _config(engine, role: str) -> Config:
@@ -60,16 +75,23 @@ def head_revision() -> str | None:
     return ScriptDirectory(str(_ROOT / "alembic")).get_current_head()
 
 
-def upgrade(engine, role: str) -> None:
-    """把 engine 升到最新版本（已经是最新则什么都不做）。全新库会一路建到 head。"""
-    cur = current_revision(engine, role)
-    head = head_revision()
-    if cur == head:
-        return
-    command.upgrade(_config(engine, role), "head")
-    log.info("数据库版本升级[%s]：%s → %s", role, cur or "空库", head_revision())
+def upgrade(engine, role: str, target: str = "head") -> None:
+    """把 engine 升到 target（默认最新；已经在那一版则什么都不做）。全新库会一路建过去。
+
+    target 不是给生产用的——生产恒是 "head"。它存在是为了让测试能造出
+    **真正的旧库**（升到某个中间 revision 就停），而不是"建到 head 再把版本号改回去"：
+    后者的表结构其实是新的，测不出"老结构 + 新代码"这一类问题。
+    而本项目的缺陷有相当比例只在存量库的升级路径上出现（见 docs/audit-2026-08-r9.md §5）。
+    """
+    with _LOCK:      # 连"检查当前版本"一起包住：否则两个线程可能都读到旧版本再各跑一遍
+        cur = current_revision(engine, role)
+        if cur == (head_revision() if target == "head" else target):
+            return
+        command.upgrade(_config(engine, role), target)
+        log.info("数据库版本升级[%s]：%s → %s", role, cur or "空库", current_revision(engine, role))
 
 
 def stamp_head(engine, role: str) -> None:
     """只打版本戳、不执行任何 DDL。给"表已经建好了但没有版本记录"的库补票用。"""
-    command.stamp(_config(engine, role), "head")
+    with _LOCK:      # 同 upgrade：alembic 的模块代理是进程级的，不能有两个同时在跑
+        command.stamp(_config(engine, role), "head")

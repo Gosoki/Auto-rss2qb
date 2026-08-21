@@ -175,29 +175,43 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
     返回 {'movies','torrents','seen','errors'}。
     """
     seasons = seasons or ["A", "B", "C", "D"]
+    try:
+        async with mikan.make_client() as client:
+            return await _discover_loop(client, year, seasons)
+    except Exception as e:
+        # 【建 client 那一步也会抛，而它在原来的 try 之外】代理填成 '127.0.0.1:7890'（漏 scheme）
+        # 抛 ValueError、填 'socks5://…' 而没装 socksio 抛 ImportError —— 两者都不属 httpx 异常族，
+        # 且都发生在【建 AsyncClient 时】而不是发请求时。漏出去就一路逃进 /movies 那个
+        # 『立即扫描』按钮的 on_click：先弹"扫描中…请稍候"，然后永远没有下文，页面零反馈。
+        # refresh_movie_torrents 早就为这件事加了同款守卫（47 行之下），这里没跟上。
+        log.error("剧场版扫描失败 %s：%s: %s", year, type(e).__name__, e)
+        return {"movies": 0, "torrents": 0, "seen": 0, "errors": 1}
+
+
+async def _discover_loop(client, year: int, seasons: list) -> dict:
+    """discover_movies 的主体（拆出来只是为了让建 client 也能被同一个 try 罩住）。"""
     added_movies = added_torrents = seen = errors = 0
-    async with mikan.make_client() as client:
-        for letter in seasons:
+    for letter in seasons:
+        try:
+            bucket = await mikan.discover_movie_bucket(client, year, letter)
+        except Exception as e:
+            log.error("发现剧场版失败 %s%s: %s", year, letter, e)
+            errors += 1
+            continue
+        log.info("Mikan %s年%s 剧场版/OVA 桶：%d 部",
+                 year, mikan.season_cn(letter), len(bucket))
+        for mikan_id, title, mlabel in bucket:
             try:
-                bucket = await mikan.discover_movie_bucket(client, year, letter)
+                bgm_id = await mikan.fetch_detail(client, mikan_id)
+                info = await enrich.fetch_by_id(bgm_id) if bgm_id is not None else None
+                movie_id, is_new = _upsert_movie(mikan_id, title, bgm_id, info, mlabel)
+                seen += 1
+                added_movies += 1 if is_new else 0
+                items = await mikan.fetch_bangumi_torrents(client, mikan_id)
+                added_torrents += _store_movie_torrents(movie_id, items)
             except Exception as e:
-                log.error("发现剧场版失败 %s%s: %s", year, letter, e)
+                log.error("处理剧场版失败 mikan=%s(%s): %s", mikan_id, title, e)
                 errors += 1
-                continue
-            log.info("Mikan %s年%s 剧场版/OVA 桶：%d 部",
-                     year, mikan.season_cn(letter), len(bucket))
-            for mikan_id, title, mlabel in bucket:
-                try:
-                    bgm_id = await mikan.fetch_detail(client, mikan_id)
-                    info = await enrich.fetch_by_id(bgm_id) if bgm_id is not None else None
-                    movie_id, is_new = _upsert_movie(mikan_id, title, bgm_id, info, mlabel)
-                    seen += 1
-                    added_movies += 1 if is_new else 0
-                    items = await mikan.fetch_bangumi_torrents(client, mikan_id)
-                    added_torrents += _store_movie_torrents(movie_id, items)
-                except Exception as e:
-                    log.error("处理剧场版失败 mikan=%s(%s): %s", mikan_id, title, e)
-                    errors += 1
     log.info("剧场版发现完成 %s：命中 %d/新增 %d/种子 %d，出错 %d",
              year, seen, added_movies, added_torrents, errors)
     return {"movies": added_movies, "torrents": added_torrents, "seen": seen, "errors": errors}

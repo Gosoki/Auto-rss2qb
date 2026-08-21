@@ -57,7 +57,13 @@ def backup_now(keep: int = 7) -> dict:
         raise RuntimeError("配置库不是本地 SQLite，无法备份")
 
     # 业务库与配置库同一个文件时，一份快照就把两边都备了；切到 MySQL 时只备得到配置。
-    same = _sqlite_path(engine) == meta_path
+    # 【不能只看"两个引擎是不是同一个 SQLite 文件"】DB_BACKEND=mysql 但连接参数不全时，
+    # apply_configured_backend 走 mark_data_fatal，engine 仍指着本地 SQLite ——
+    # 于是 same 恒真、标成 full、note 说"含全部业务数据"，而真数据在够不着的 MySQL 上。
+    # 用户拿着这份"完整备份"，实际一条番剧数据都没有。配置说了算，engine 只是当下的状态。
+    import config
+    same = (_sqlite_path(engine) == meta_path
+            and (config.DB_BACKEND or "sqlite").lower() != "mysql")
     scope = "full" if same else "meta"
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -99,8 +105,11 @@ def backup_now(keep: int = 7) -> dict:
             raise
 
     pruned = prune(keep, protect=out)
+    # 【note 里不能写"源组"】META_TABLES 只有 setting 一张表；sourcegroup 是【业务表】，
+    # 它和番剧、剧场版、种子、番名对照一样都不在这份备份里。
     note = ("本次备份含【配置 + 全部业务数据】（两者同库）" if same else
-            "业务库当前是 MySQL，本次【只备了配置】（源组/设置），番剧与种子数据不在其中")
+            "业务库不是本地 SQLite，本次【只备了 settings 一张表】（全局设置）——"
+            "番剧、剧场版、种子、源组、番名对照都不在其中，那些要自己给业务库做备份")
     log.info("备份完成：%s（%.1f KB）%s", out.name, out.stat().st_size / 1024,
              f"，清理 {len(pruned)} 份旧备份" if pruned else "")
     return {"path": str(out), "scope": scope, "bytes": out.stat().st_size,

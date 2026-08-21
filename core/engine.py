@@ -246,7 +246,11 @@ def apply_bgm_meta(obj, info: dict | None, keep_path: bool = False) -> None:
     而 qB 那边没人去搬。此前只冻结了 quarter，名字是漏的——重识别走的是【全新 bgm 搜索】而非
     按 bangumi_id 取，命中同系列另一 cour/衍生作时 jp_name 会被整体改写（实测：猫と竜 → 猫と竜 ふたたび）。
     改名只留给显式『绑定 bgm』流程——那条路径本来就带 relocate，会把文件一起搬过去。
-    注：季号 season 不在这里冻结，但 anime._apply_bgm 是从 display_name/jp_name 反推它的，
+    注：季号 season 不在这里冻结。**这不等于它稳**——原注释说"名字冻住了季号自然也稳"，
+    那只在冻的是【非空】名字时成立；anime.enrich_anime 的 freeze_empty_path 那条路径是
+    "名字先被填上、_apply_bgm 从新名字反推季号、然后名字才被还原"，季号会漏出去，
+    所以那边的快照必须自己带上 season（已带）。原文如下，供理解 _apply_bgm 的意图：
+    anime._apply_bgm 是从 display_name/jp_name 反推它的，
     名字冻住了季号自然也稳；kind 等专属字段由各线自理。
     """
     if not info:
@@ -589,9 +593,20 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
             s.commit()
 
     all_ids = [tid for tid, _ in pairs]
-    if not config.QB_ENABLED:   # qB 关：只能清状态待重下 + 提醒
-        rep["stalled_kept"] = _stalled_of(all_ids)
-        rep["redownload"] = _clear(all_ids)
+    if not config.QB_ENABLED:
+        # 【qB 关着时一行都不动】原写法是 _clear 成 pending「待重下」，但那个前提不成立：
+        # qB 关着时 download_anime_torrent / download_movie_torrent / manual 三条下载入口
+        # 第一行就 return False，flush 与两个批量补下实测全部返回 0 ——
+        # **没有任何路径能把它们下回来**。而 _clear 的代价是三重的：
+        #   ① 页面照着 rep["redownload"] 提示"旧文件在 X 需你手动清理"，用户照做就删光了唯一一份；
+        #   ② "哪些集已到手"的记录被永久抹掉；
+        #   ③ 清成 pending 后掉出 HAVE_STATUSES，而两个删除按钮的门槛正是 HAVE ——
+        #      那份旧文件连 UI 入口都没有了。
+        # 与本函数另外两条分支同口径：已归档行"不在 qB，setLocation 移不动、别误清成 pending"，
+        # qB 连不上"一行都不动"。qB 关着与那两种是同一类：我们动不了文件，那就什么都别改。
+        rep["error"] = ("qB 未启用，无法代为移动文件：一行都没有改动，"
+                        f"这些集的文件仍在旧目录 {rep.get('old_path') or '（原处）'}。"
+                        "到设置页打开『发送种子到 qB』后再点一次即可。")
         return rep
     info = await qb.torrents_info([h for _, h in pairs])
     if info is None:
@@ -673,7 +688,15 @@ async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
     if h in info:
         log.info("add 被 qB 拒但该 hash 已在 qB（重复提交/跨表同种）→ 视作已交付 - %s", h[:12])
         return True
-    return False
+    # 【幂等兜底只能把 False 升级成 True，绝不能把 None 降级成 False】与 11 行之上那句
+    # "无从核实：连不上就报连不上"同款。res is None 的含义是【add 那一下根本没连上】
+    # （两次 ReadTimeout：大种子入库校验 / 磁盘忙 / qB 正在 recheck 一大批）；
+    # 而紧跟着的 torrents_info 是个便宜的 GET，秒回 200 很正常，此刻 qB 只是还没把该 hash 列出来。
+    # 无条件 return False 的后果不是"少下一集"：调用方把 False 当成"这一条自己的毛病"，
+    # 写 status=error + "qB 未接受"，而 error ∉ HAVE_STATUSES ⇒ 下一轮 flush 认为这一集还缺，
+    # 把同集另一个源放行到【同一个 save_path】——而 qB 其实已经收下了第一份。
+    # 同一集两份文件落进同一文件夹，正是 tests/test_qb_sync.py 开篇声明要守的那条故障链。
+    return None if res is None else False
 
 
 # ---------------- qB 实时态（对 AnimeTorrent / MovieTorrent 通用） ----------------
@@ -1051,7 +1074,11 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int:
             t.qb_dlspeed = int(d.get("dlspeed", 0) or 0)
             t.qb_size = int(d.get("size", 0) or 0)
             t.qb_synced_at = now
-            if t.qb_progress > prev_progress or t.qb_progress_at is None:
+            # 【比较要带 epsilon】这是第二道保险：即便列类型退回窄浮点（MySQL 的 4 字节 FLOAT
+            # 会把 0.4212345 存成 0.42123448848724365），也不会因 round-trip 噪声把"没动"
+            # 误判成"推进了"——而那个误判会让 status 永远走不到 stalled，停滞检测整个功能失效。
+            # 1e-9 远小于一次真实推进（qB 的 progress 至少按块跳），也远大于 float32 的噪声。
+            if t.qb_progress > prev_progress + 1e-9 or t.qb_progress_at is None:
                 t.qb_progress_at = now      # 进度推进(或首见)→ 刷新『上次推进时间』，作停滞判定基准
             if state == "error":
                 t.status = "error"          # qB 侧真错误 → 回传；missingFiles 有意不回传（只镜像显示）
