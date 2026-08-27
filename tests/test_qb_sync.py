@@ -348,3 +348,105 @@ async def test_manual_refresh_rechecks_missing_files_with_nothing_in_flight(
     await A.sync_qb_status(manual=True)          # 人工刷新（页面按钮走的就是这个）
     assert "f" * 40 in asked, "人工刷新没有补查文件缺失的行"
     assert _states(clean_tables)["ff"][1] == "uploading", "qB 侧修好后告警应自动消失"
+
+
+async def test_downtime_is_not_counted_as_a_stalled_torrent(clean_tables, torrents, cfg):
+    """qB 或整机停机之后的第一轮，不能把在下种子当成「长期无进度」。
+
+    qB 不可达时 sync 走 `info is None` 分支、**一个字段都不写**；autorss 自己停机时更是
+    一轮都没跑。两种情况下 `qb_progress_at` 都冻在断档之前，恢复后第一轮
+    `now - qb_progress_at` 当场超过阈值（默认 1 天）。后果是批量的：
+    关机一天后开机，进程做的第一件事就是把**所有**在下种子标成 stalled，
+    而 stalled ∉ TRACKED_STATUSES ⇒ sync 再也不看它们（哪怕 qB 已经在全速下），
+    stalled ∈ HAVE_STATUSES ⇒ 集去重挡着不换源，还推一条内容是错的告警。
+    """
+    cfg(QB_STALL_TIMEOUT_MIN=1440)
+    torrents(1)
+    old = datetime.now() - timedelta(days=2)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.status, t.qb_progress = "sent", 0.42
+        t.qb_progress_at = old          # 进度基准停在两天前
+        t.qb_synced_at = old            # 【关键】上一次同步也在两天前 = 我们没在看
+        s.commit()
+
+    async def fake(hashes):             # qB 回来了，种子好端端在下
+        return {h: {"state": "downloading", "progress": 0.42, "dlspeed": 3_000_000, "size": 1}
+                for h in hashes}
+    engine.qb.torrents_info = fake
+    await engine.sync_qb_status(AnimeTorrent)
+
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+    assert t.status != "stalled", "停机时间被算到种子头上了"
+    assert t.qb_progress_at is not None and t.qb_progress_at > old, "停滞计时没有重新起算"
+
+
+async def test_real_stall_is_still_detected(clean_tables, torrents, cfg):
+    """而真正卡死的种子仍要标停滞——观测一直是新鲜的，只有进度不动。"""
+    cfg(QB_STALL_TIMEOUT_MIN=1440)
+    torrents(1)
+    now = datetime.now()
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.status, t.qb_progress = "sent", 0.42
+        t.qb_progress_at = now - timedelta(days=2)   # 两天没推进
+        t.qb_synced_at = now - timedelta(seconds=30)  # 但我们一直在看
+        s.commit()
+
+    async def fake(hashes):
+        return {h: {"state": "stalledDL", "progress": 0.42, "dlspeed": 0, "size": 1}
+                for h in hashes}
+    engine.qb.torrents_info = fake
+    await engine.sync_qb_status(AnimeTorrent)
+
+    with clean_tables.get_session() as s:
+        assert s.exec(select(AnimeTorrent)).one().status == "stalled", "真卡死的没被标出来"
+
+
+@pytest.mark.parametrize("mid_state", ["checkingUP", "checkingResumeData", "moving"])
+async def test_missing_files_row_survives_a_transient_state(clean_tables, torrents, mid_state):
+    """`missingFiles` 的行被采样到一次中间态之后，仍要继续被跟踪。
+
+    这条路径是用户按**设计好的修复方式**走出来的：在 qB 里把文件放回去 → 强制重新校验 →
+    点页面『立刻刷新』。qB 此刻回的正是 `checkingUP`。
+    以前三处闸都在比字面量 "missingFiles"，于是覆写之后这一行【同时】失去两个身份：
+    不在 in-flight（被当成落定），也不在补查名单 ⇒ **再没有任何路径问过 qB 它怎么样了**。
+    后果分两支：校验成功 → UI 永久停在『校验中』；校验失败/文件仍缺 → 那条『文件缺失』告警
+    永不再出现，而行仍是 sent ∈ HAVE_STATUSES，集去重认定盘上有一份 ⇒ 既不重下也不报警。
+    """
+    torrents(1)
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent)).one()
+        row.status, row.qb_progress = "sent", 1.0
+        row.qb_state, row.qb_synced_at = mid_state, datetime.now()
+        s.commit()
+
+    asked = []
+
+    async def fake(hashes):
+        asked.extend(hashes)
+        return {h: {"state": "uploading", "progress": 1.0, "dlspeed": 0, "size": 1} for h in hashes}
+    engine.qb.torrents_info = fake
+
+    await engine.sync_qb_status(AnimeTorrent, manual=True)
+    assert asked, f"处在 {mid_state} 的行没有被任何一条路径问过 qB"
+    with clean_tables.get_session() as s:
+        assert s.exec(select(AnimeTorrent)).one().qb_state == "uploading"
+
+
+async def test_transient_rows_are_not_archived(clean_tables, torrents, cfg):
+    """处在中间态的行不能被归档——归档＝从 qB 移除种子，等于端掉唯一的修复入口。"""
+    torrents(1)
+    cfg(QB_ARCHIVE_AFTER_DAYS=1)
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent)).one()
+        row.status, row.qb_progress = "sent", 1.0
+        row.qb_state = "checkingUP"
+        row.qb_synced_at = datetime.now() - timedelta(days=30)
+        s.commit()
+
+    deleted = []
+    engine.qb.delete = lambda hs, delete_files=False: _async(bool(deleted.extend(hs)) or True)
+    n = await engine.archive_old_completed()
+    assert n == 0 and deleted == [], "校验中的行被归掉了"

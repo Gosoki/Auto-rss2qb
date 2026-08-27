@@ -9,6 +9,7 @@
 （32MB 上限 + asyncio.timeout(180) 流式读），这里把同一套范式抽出来给 feed/HTML 复用。
 """
 import asyncio
+import re
 import zlib
 
 import httpx
@@ -55,6 +56,39 @@ def _with_identity(kw: dict) -> None:
     kw["headers"] = hdrs
 
 
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
+
+
+def safe_url(url: str) -> str:
+    """一条 URL 里【可以写进日志】的那一段：只留 scheme://host[:port]。
+
+    路径与查询串都要去掉——本项目的两类地址恰好都把密钥放在那里：
+      · 推送：Bark/Server酱 把密钥放在 **path** 里（https://api.day.app/<密钥>/消息）
+      · 订阅：Mikan『我的番组』把 token 放在 **query** 里（/RSS/MyBangumi?token=…）
+    userinfo 同理（https://alice:hunter2@host/…）。
+    """
+    from urllib.parse import urlsplit
+    try:
+        p = urlsplit(url or "")
+        host = p.hostname or ""
+        if not host:
+            return "(地址无法解析)"
+        return f"{p.scheme}://{host}:{p.port}" if p.port else f"{p.scheme}://{host}"
+    except ValueError:
+        return "(地址无法解析)"
+
+
+def redact(text) -> str:
+    """把一段文本里出现的所有 URL 换成 safe_url 形式。
+
+    【为什么光改我们自己的消息不够】httpx 自己抛的 HTTPStatusError/ConnectError 的 str()
+    就带着完整 URL，而 core/worker.py 那行 `log.error("抓取失败 %s: %s", name, e)`
+    既不截断也不脱敏 —— Mikan『我的番组』订阅地址随便一次 403/500 就把 ?token=… 整条写进
+    data/autorss.log（滚动 5 份）与 /logs 页的「下载完整日志」。
+    """
+    return _URL_RE.sub(lambda m: safe_url(m.group(0)), str(text))
+
+
 class TooLarge(Exception):
     """响应体超过上限。单列一个类型，方便调用方在日志里区分"太大"与"网络错误"。"""
 
@@ -74,14 +108,14 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
         async for chunk in resp.aiter_raw():
             buf += chunk
             if len(buf) > cap:
-                raise TooLarge(f"响应体超过 {cap} 字节上限：{url}")
+                raise TooLarge(f"响应体超过 {cap} 字节上限：{safe_url(url)}")
         return bytes(buf)
     if len(codings) > 1:
         # 【分层压缩直接拒收】httpx 会把 'gzip, gzip' 逐层解开，而我们的回退路径只能看到
         # 最外层的原始字节数——实测 1831 字节的双层炸弹能把进程 RSS 顶到 2076MB（上限声称 16MB）。
         # 真实的 feed 服务端不会分层压缩；会这么发的只有想撑爆你的那一方。
         raise httpx.DecodingError(
-            f"响应用了多重压缩编码 {'+'.join(codings)}（正常服务端不会这么发）：{url}")
+            f"响应用了多重压缩编码 {'+'.join(codings)}（正常服务端不会这么发）：{safe_url(url)}")
     wbits = _ZLIB_WBITS.get(codings[0])
     if wbits is None:
         # 多重编码 / 我们不认识的单一编码：交回 httpx 解，但先确认它【真的解得开】。
@@ -92,21 +126,21 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
         if any(c not in _HTTPX_DECODERS for c in codings):
             bad = [c for c in codings if c not in _HTTPX_DECODERS]
             raise httpx.DecodingError(
-                f"响应用了本程序解不开的压缩编码 {'+'.join(bad)}（已请求 identity 但服务端未照做）：{url}")
+                f"响应用了本程序解不开的压缩编码 {'+'.join(bad)}（已请求 identity 但服务端未照做）：{safe_url(url)}")
         # 回退路径也【必须有原始字节闸】——不该是一个没有防护的洞。
         # num_bytes_downloaded 是 httpx 自己记的线上字节数。
         buf = bytearray()
         async for chunk in resp.aiter_bytes():
             buf += chunk
             if len(buf) > cap or resp.num_bytes_downloaded > cap:
-                raise TooLarge(f"响应体超过 {cap} 字节上限（编码 {'+'.join(codings)}）：{url}")
+                raise TooLarge(f"响应体超过 {cap} 字节上限（编码 {'+'.join(codings)}）：{safe_url(url)}")
         return bytes(buf)
     dec = zlib.decompressobj(wbits)
     raw_seen, out = 0, bytearray()
     async for chunk in resp.aiter_raw():
         raw_seen += len(chunk)
         if raw_seen > cap:                  # 线上原始字节也封顶：压缩体本身就不该有这么大
-            raise TooLarge(f"压缩响应超过 {cap} 字节上限：{url}")
+            raise TooLarge(f"压缩响应超过 {cap} 字节上限：{safe_url(url)}")
         # max_length 让每次最多解出"还能再收多少"，多出来的留在 unconsumed_tail 里不占额外内存
         try:
             piece = dec.decompress(chunk, max_length=cap - len(out) + 1)
@@ -124,13 +158,13 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
                 raise httpx.DecodingError(f"解压失败：{e}") from e
         out += piece
         if len(out) > cap:
-            raise TooLarge(f"解压后超过 {cap} 字节上限（疑似压缩炸弹）：{url}")
+            raise TooLarge(f"解压后超过 {cap} 字节上限（疑似压缩炸弹）：{safe_url(url)}")
     try:
         out += dec.flush()
     except zlib.error as e:
         raise httpx.DecodingError(f"解压收尾失败：{e}") from e
     if len(out) > cap:
-        raise TooLarge(f"解压后超过 {cap} 字节上限（疑似压缩炸弹）：{url}")
+        raise TooLarge(f"解压后超过 {cap} 字节上限（疑似压缩炸弹）：{safe_url(url)}")
     return bytes(out)
 
 

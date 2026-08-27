@@ -65,10 +65,23 @@ def test_qb_state_cn_covers_every_state():
     assert set(engine.QB_STATE_CN) == set(engine._QB_STATES)
 
 
-def test_seeding_states_are_all_settled():
-    """做种/完成态必然是落定态（不再需要轮询跟踪）。漏了 X 会让下完的种子永久留在 in-flight，
-    同步循环永不休眠、每个活跃间隔空打一次 qB。"""
-    assert engine._QB_SEEDING <= engine._QB_SETTLED
+def test_steady_seeding_states_are_all_settled():
+    """**稳定的**做种/完成态必然是落定态（不再需要轮询跟踪）。
+
+    漏了 X 会让下完的种子永久留在 in-flight，同步循环永不休眠、每个活跃间隔空打一次 qB。
+
+    【为什么要排除短暂态】`checkingUP` 同时是 S 与 T：它确实是"已完成的种子"，
+    但它在**校验中**——而 qB 对"曾经下完的种子强制重新校验"报的正是它，
+    那恰恰是用户修复 missingFiles 的标准动作。给它带 X 的话，这一行会同时掉出
+    in-flight 与补查名单，从此没有任何路径再问过 qB 它怎么样了（既不重下也不报警，静默缺片）。
+    短暂态按定义会自己结束，不会造成"永久留在 in-flight"，所以这条不变式只管稳定态。
+    """
+    assert engine._QB_SEEDING - engine._QB_TRANSIENT <= engine._QB_SETTLED
+
+
+def test_transient_states_are_never_settled():
+    """反过来：短暂态一律不能是落定态——它们还在动，必须继续跟。"""
+    assert not (engine._QB_TRANSIENT & engine._QB_SETTLED)
 
 
 def test_missing_files_is_settled_but_not_seeding():

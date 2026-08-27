@@ -80,6 +80,7 @@ systemctl restart autorss         # 重启
 | [docs/audit-2026-08-r10.md](docs/audit-2026-08-r10.md) | 第 10 轮：**仓库 HEAD 曾经起不来**、双引擎设计评估（结论：骨架都对，不要重构）、4 条运行时缺陷、**3 条守卫回退掉照样全绿** |
 | [docs/audit-2026-08-r11.md](docs/audit-2026-08-r11.md) | 第 11 轮：**上一轮的修复引入了一个 P0**（全括号标题的首块被当番名）、通知的三条缺陷、以及「已应用的 revision 不可变」这条教训 |
 | [docs/audit-2026-08-r12.md](docs/audit-2026-08-r12.md) | 第 12 轮（收官）：**又一条 P0 来自上一轮的修复**（搜索词塌成季名）、alembic 并发实测 4/6 留下「版本号到了而 DDL 没跑」+ 2/6 段错误、设计语言第二层落地 |
+| [docs/audit-2026-08-r13.md](docs/audit-2026-08-r13.md) | 第 13 轮：停机时间被当成「种子停滞」、missingFiles 行被中间态吃掉三道闸、三条凭据泄露、以及**一条我自己刚写下的假用例** |
 | **[docs/DECISIONS.md](docs/DECISIONS.md)** | 拍板清单（**24/24 已全部实施**）——保留每条的**为什么**，回退时要用 |
 | [docs/benchmark-ani-rss.md](docs/benchmark-ani-rss.md) | 与 [ani-rss](https://github.com/wushuo894/ani-rss) 的逐维度差距分析、值得借鉴的 Top 5、明确不做的 |
 

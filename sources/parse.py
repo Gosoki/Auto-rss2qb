@@ -266,7 +266,16 @@ def _usable_name(s: str) -> bool:
     bgm 永远救不回来。
     """
     t = strip_season(t2s(s or "")).strip()
-    return bool(t) and not _SEASON_ONLY_RE.fullmatch(t) and not _is_skip_block(t)
+    if not t or _SEASON_ONLY_RE.fullmatch(t):
+        return False
+    # 【纯数字要放行】_NAME_BLOCK_SKIP 里有 `\d{4}` 与 `\d{1,4}` 两条——它们是给**括号块**用的
+    # （`[05]`、`[2024]` 这种块几乎必然是集号/年份），可整段番名是纯数字却完全正当：
+    # `86`、`1122`。把那条规则原样套到整段名字上，`[ANi] 86 - 05` 的番名会变成空串，
+    # 而空番名 = 主流程**静默丢弃整条种子** —— 那部番一集都收不到。
+    # （这一条是把 _is_skip_block 接进本函数时漏想的：块级判据的作用域被扩到了整段名字。）
+    if t.replace(".", "").isdigit():
+        return True
+    return not _is_skip_block(t)
 
 
 def _clean_name(name_part: str) -> str:

@@ -149,8 +149,8 @@ def test_internal_marker_names_actually_exist_in_production_code():
     assert not missing, f"conftest 里这些键在生产代码里不存在：{missing}"
 
 
-def test_no_undefined_names_in_pages():
-    """pages/ 下不能有「用到了但没导入」的名字。
+def test_no_undefined_names_anywhere():
+    """全仓不能有「用到了但没导入」的名字。
 
     NiceGUI 的 handler 大多是 lambda / 闭包，里面的名字**只在点击那一刻才解析**——
     漏一个 import，`import pages.x` 照样成功、页面照常渲染 200，
@@ -163,7 +163,11 @@ def test_no_undefined_names_in_pages():
 
     root = pathlib.Path(__file__).resolve().parent.parent
     bad = {}
-    for p in sorted((root / "pages").glob("*.py")):
+    # 【扫全仓，不只是 pages/】同一个坑在 core/worker.py 与 services/notify.py 上又踩过一次：
+    # 加了 fetch.redact(...) 却没绑定 fetch，import 照样成功、只有真跑到那一行才 NameError。
+    files = [f for d in ("pages", "core", "services", "sources", "db")
+             for f in sorted((root / d).glob("*.py"))]
+    for p in files:
         tree = ast.parse(p.read_text(encoding="utf-8"))
         bound = set()
         for n in ast.walk(tree):
@@ -178,9 +182,13 @@ def test_no_undefined_names_in_pages():
                 bound.add(n.arg)
             elif isinstance(n, (ast.Global, ast.Nonlocal)):
                 bound.update(n.names)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                bound.add(n.name)                       # except ... as e
         used = {n.id for n in ast.walk(tree)
                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-        miss = sorted(used - bound - set(dir(builtins)))
+        # 模块级魔术名不是"导入"来的
+        miss = sorted(used - bound - set(dir(builtins))
+                      - {"__file__", "__name__", "__doc__", "__package__"})
         if miss:
             bad[p.name] = miss
     assert not bad, f"这些名字用到了但没定义/导入：{bad}"

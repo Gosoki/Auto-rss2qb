@@ -422,7 +422,7 @@ async def archive_old_completed() -> int:
                 # 归掉——而归档=从 qB 移除种子，恰恰把唯一的修复入口（在 qB 里恢复文件后重新校验）
                 # 一起端掉了，UI 上那条醒目的告警也被改写成温和的『已归档』。
                 # 同模块的 qb_summary 早就显式把它排除在"已完成"之外，这里补齐同一口径。
-                model_cls.qb_state != "missingFiles",
+                func.coalesce(model_cls.qb_state, "").not_in(_QB_NEEDS_RECHECK_LIST),
             ).limit(_ARCHIVE_BATCH)) if t.info_hash]   # 每轮封顶：归档幂等，剩下的下轮接着来
         for tid, h in rows:
             if not await qb.delete([h], delete_files=False):  # 只删种子、保留硬盘文件
@@ -741,7 +741,10 @@ _QB_STATES: dict[str, tuple[str, str]] = {
     "forcedUP":           ("SX", "已完成"),
     "stalledUP":          ("SX", "已完成"),
     "queuedUP":           ("SX", "已完成"),
-    "checkingUP":         ("SX", "校验中"),
+    # 【校验中不是落定】原来带 X（不再轮询）。可 qB 对"曾经下完的种子强制重新校验"报的正是它，
+    # 而那恰恰是用户修复 missingFiles 的标准动作：把文件放回去 → 强制校验 → 点『立刻刷新』。
+    # 带 X 时这一行同时掉出 in-flight 与补查名单，从此再没有任何路径问过 qB 它怎么样了。
+    "checkingUP":         ("ST", "校验中"),
     "pausedUP":           ("SX", "已完成"),
     "stoppedUP":          ("SX", "已完成"),
     # ---- 落定但不是完成 ----
@@ -776,6 +779,14 @@ _QB_NOT_ADVANCING = _states_with("W")   # qB 没在推进它（排队/暂停）�
 QB_STATE_CN = {s: cn for s, (_, cn) in _QB_STATES.items()}
 # 预算成 list 供 SQL in_/not_in 复用（集合恒定、只读；避免热路径每次调用重新 list()）
 _QB_SETTLED_LIST = list(_QB_SETTLED)
+# 【"还不能当它已经完事"的那些态】——三处消费者共用一份，别再各比各的字面量。
+#   · 补查名单：这些态要继续问 qB（否则被采样到中间态的行就此永久冻结）
+#   · 归档闸：归档＝从 qB 移除种子，对这些态做等于端掉唯一的修复入口
+#   · qb_summary 的"已完成"：进度可能记着 1.0，但盘上未必真有那份文件
+# 以前三处都在比字面量 "missingFiles"，于是 missingFiles 行只要被采样到一次 checkingUP/
+# moving/checkingResumeData，三道闸【同时】失效：既不再跟踪、又被归掉、还在仪表盘算成已完成。
+_QB_NEEDS_RECHECK = {"missingFiles"} | _QB_TRANSIENT
+_QB_NEEDS_RECHECK_LIST = list(_QB_NEEDS_RECHECK)
 _QB_TRANSIENT_LIST = list(_QB_TRANSIENT)
 
 
@@ -913,6 +924,18 @@ def backfill_legacy_progress_once() -> None:
         log.info("一次性迁移：%d 条历史 sent 种子标记为已完成（qb_progress=1，脱离 in-flight）", n)
 
 
+def _observation_gap(prev_synced, now) -> bool:
+    """距上一次成功同步是不是隔了太久——久到这段空白【不能归因于种子】。
+
+    窗口取 max(600 秒, QB_SYNC_INTERVAL*10)：正常在线时 sync 每 QB_SYNC_INTERVAL 秒刷新一次
+    qb_synced_at，远在窗口内，此闸永不误伤（与 has_active_downloads 的新鲜度闸同一套推理）。
+    prev_synced 为空＝这一行还没被同步过，同样不该拿它去判停滞。
+    """
+    if prev_synced is None:
+        return True
+    return (now - prev_synced) > timedelta(seconds=max(600, config.QB_SYNC_INTERVAL * 10))
+
+
 async def sync_qb_status(model_cls, manual: bool = False) -> int:
     """从 qB 拉某表『在下的』种子实时态并写回。返回更新数。整轮串行化，实现见 _sync_qb_status。
 
@@ -964,7 +987,7 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int:
         recheck = [(t.id, t.info_hash, True)
                    for t in s.exec(select(model_cls).where(
                        model_cls.status.in_(TRACKED_STATUSES),
-                       model_cls.qb_state == "missingFiles"))
+                       model_cls.qb_state.in_(_QB_NEEDS_RECHECK_LIST)))
                    if t.info_hash] if (rows or manual) else []
     if not rows and not recheck:
         return 0
@@ -1069,6 +1092,8 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int:
                 continue
             state = d.get("state", "") or ""
             prev_progress = t.qb_progress or 0.0
+            # 【这段空白是"种子没动"还是"我们没在看"？】上一次同步的时刻，覆写之前先留下来。
+            prev_synced = t.qb_synced_at
             t.qb_state = state
             t.qb_progress = float(d.get("progress", 0) or 0)
             t.qb_dlspeed = int(d.get("dlspeed", 0) or 0)
@@ -1089,8 +1114,19 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int:
                 # 否则 max_active_downloads 一小、批量补番时整批会被误标停滞异常
                 # （脱离轮询 + 不自动换源 + UI 一堆假告警）。
                 t.qb_progress_at = now
+            elif _observation_gap(prev_synced, now):
+                # 【观测断档：这段时间我们根本没在看】qB 不可达时 sync 走 `info is None` 分支、
+                # 一个字段都不写；autorss 自己停机时更是一轮都没跑。两种情况下 qb_progress_at
+                # 都冻在断档之前，恢复后第一轮 `now - qb_progress_at` 当场超过停滞阈值（默认 1 天）。
+                # 后果是批量的：关机一天后开机，进程做的第一件事就是把【所有】在下种子标成 stalled，
+                # 而 stalled ∉ TRACKED_STATUSES ⇒ sync 再也不看它们（哪怕 qB 已经 3MB/s 在下），
+                # stalled ∈ HAVE_STATUSES ⇒ 集去重挡着不换源，还推一条内容是错的告警。
+                # 判据与 has_active_downloads 的"新鲜度闸"同源：那条注释写的正是
+                # 「qB 掉线时 sync 走 None 分支不刷新 qb_synced_at」——两个消费者共用一个判据，别再分家。
+                t.qb_progress_at = now      # 重新起算，而不是把断档算到种子头上
             elif (config.QB_STALL_TIMEOUT_MIN > 0 and t.qb_progress < 1.0
                   and t.qb_progress_at is not None
+                  and not _observation_gap(prev_synced, now)
                   and now - t.qb_progress_at > timedelta(minutes=config.QB_STALL_TIMEOUT_MIN)):
                 # 已交付但进度长期(默认1天)零推进 → 标『停滞(异常)』：脱离 in-flight、【不自动换源】、供人工处理。
                 # 只看进度是否推进：慢但在动的种子 qb_progress_at 持续刷新→不会误杀；真卡死(无源0速)才中招。
@@ -1122,7 +1158,8 @@ def qb_summary(model_cls) -> dict:
         # 唯一例外 missingFiles：进度虽记着 1.0，但文件已从盘上消失，不该报成『已完成』（只在跟踪数里体现）。
         completed = s.exec(select(func.count()).select_from(model_cls).where(
             model_cls.status.in_(TRACKED_STATUSES),
-            model_cls.qb_state != "", model_cls.qb_state != "missingFiles",
+            model_cls.qb_state != "",
+            func.coalesce(model_cls.qb_state, "").not_in(_QB_NEEDS_RECHECK_LIST),
             model_cls.qb_progress >= 1.0)).one()
     tracked = downloading = dlspeed = 0
     prog_sum = 0.0

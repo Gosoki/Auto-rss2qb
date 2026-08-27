@@ -1,0 +1,106 @@
+"""日志与页面里不能出现凭据。
+
+本项目有三类 URL 内嵌的秘密，且它们都没有别的配置方式：
+  · 推送密钥在 **path** 里（Bark/Server酱：https://api.day.app/<密钥>/消息）
+  · 推送的 basic-auth 在 **userinfo** 里（config 里没有 NOTIFY_USER/NOTIFY_PASS，这是唯一方式）
+  · Mikan『我的番组』订阅 token 在 **query** 里
+而日志会落盘（data/autorss.log 滚动 5 份）并可从 /logs 页整份下载。
+"""
+import httpx
+import pytest
+
+import config
+from services.fetch import redact, safe_url
+from services.notify import _safe_host
+
+_SECRETS = ["hunter2", "SECRETKEY22CHARS0000", "MYTOKEN123"]
+
+
+@pytest.mark.parametrize("url,want", [
+    ("https://alice:hunter2@ntfy.homelab/mytopic", "ntfy.homelab"),
+    ("https://api.day.app/SECRETKEY22CHARS0000/msg", "api.day.app"),
+    ("http://user:pw@host:8080/x", "host:8080"),
+    ("", "(未配置)"),
+])
+def test_safe_host_drops_userinfo(url, want, monkeypatch):
+    """`_safe_host` 不能返回 netloc —— 那一段【含 userinfo】。
+
+    `urlsplit('https://alice:hunter2@h/t').netloc == 'alice:hunter2@h'`，
+    于是任何一次推送失败都会把 basic-auth 口令写进日志。
+    （core/ssrf.py 用的是 httpx.URL.netloc，那个不含 userinfo，所以那边抄对了。）
+    """
+    monkeypatch.setitem(config._v, "NOTIFY_URL", url)
+    assert _safe_host() == want
+
+
+@pytest.mark.parametrize("url,want", [
+    ("https://mikanani.me/RSS/MyBangumi?token=MYTOKEN123", "https://mikanani.me"),
+    ("https://api.day.app/SECRETKEY22CHARS0000/msg", "https://api.day.app"),
+    ("https://alice:hunter2@ntfy.lan/t", "https://ntfy.lan"),
+    ("http://127.0.0.1:8080/x", "http://127.0.0.1:8080"),
+])
+def test_safe_url_keeps_only_scheme_and_host(url, want):
+    """path / query / userinfo 三处都要去掉——本项目的秘密恰好分布在这三处。"""
+    assert safe_url(url) == want
+
+
+def test_redact_cleans_urls_inside_third_party_messages():
+    """光改我们自己的消息不够：httpx 抛的异常 str() 就带完整 URL。
+
+    Mikan『我的番组』随便一次 403/500，`log.error("抓取失败 %s: %s", name, e)`
+    就把 ?token=… 整条写进 data/autorss.log。
+    """
+    url = "https://mikanani.me/RSS/MyBangumi?token=MYTOKEN123"
+    # 直接用 httpx 真实产生的那句消息（Server error '500' for url '<完整URL>'）
+    out = redact(f"Server error '500 Internal Server Error' for url '{url}'")
+    assert "MYTOKEN123" not in out and "mikanani.me" in out
+
+
+def test_our_own_fetch_errors_do_not_carry_the_full_url():
+    """`services/fetch` 造的异常消息以前是以完整 URL 结尾的。"""
+    import asyncio
+
+    from services import fetch
+
+    url = "https://api.day.app/SECRETKEY22CHARS0000/msg"
+
+    def _handler(request):
+        # 用 stream 回内容，避免 MockTransport 上的 content 被读两次（StreamConsumed）
+        return httpx.Response(200, stream=httpx.ByteStream(b"x" * 100), request=request,
+                              headers={"Content-Length": "100"})
+
+    async def _go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as c:
+            with pytest.raises(fetch.TooLarge) as ei:
+                await fetch.get_bytes(c, url, cap=10)
+        return str(ei.value)
+
+    msg = asyncio.run(_go())
+    assert "SECRETKEY22CHARS0000" not in msg, f"异常消息里带着路径密钥：{msg}"
+    assert "api.day.app" in msg
+
+
+@pytest.mark.parametrize("tok", ["A1b2+C3d4/e5=", "tok&admin", "tok#1", "my token", "令牌abc"])
+def test_callback_token_is_url_encoded_in_the_curl_command(tok):
+    """设置页给的那条 curl 里，token 必须 URL 编码。
+
+    `openssl rand -base64` 产出的 token 带 `+` 是最现实的情形，而 `+` 在 query 里被解成空格。
+    实测：`+` `&` `#` 都会让回调收到错的 token，空格会让 curl 直接退出码 3（请求没发出去），
+    而全程静默（curl -s、qB 不显示外部程序输出、api 侧一行日志都没有）。
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    from pages.settings import qb_callback_curl
+
+    # 【必须调生产函数】原先这条用例自己调 quote() 拼同一条命令、从不 import 本模块——
+    # 把生产代码里那句 quote(...) 换回裸 tok，全量用例照样全绿（实测过）。
+    cmd = qb_callback_curl(tok, 2333)
+    url = cmd.split('"')[1]
+    assert parse_qs(urlsplit(url).query)["t"] == [tok], "编码后解不回原值"
+    assert " " not in url, "URL 里有裸空格，curl 会当成两个参数"
+
+
+def test_empty_token_yields_no_t_parameter():
+    """没配 token 时命令里不该出现空的 &t=——那会让 api 侧走进「设了 token」的分支。"""
+    from pages.settings import qb_callback_curl
+    assert "&t=" not in qb_callback_curl("", 2333)

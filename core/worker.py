@@ -11,6 +11,7 @@ import config
 from core import engine, movies
 import db
 from core.anime import existing_hashes, flush_ready_downloads, list_source_groups, process_item
+from services import fetch
 from services.notify import state as notify_state
 from sources import SOURCES
 from sources.nyaa import nyaa_feed_url
@@ -60,7 +61,12 @@ async def poll_once() -> None:
         try:
             items = await source.fetch()
         except Exception as e:
-            log.error("抓取失败 %s: %s", source.name, e)
+            # 【必须脱敏】httpx 自己抛的 HTTPStatusError/ConnectError 的 str() 带完整 URL，
+            # 而 Mikan『我的番组』订阅地址把 token 放在 query 里 ——
+            # 随便一次 403/500 就把 ?token=… 整条写进 data/autorss.log（滚动 5 份）
+            # 与 /logs 页的「下载完整日志」。这里以前既不截断也不脱敏。
+            log.error("抓取失败 %s: %s: %s", source.name, type(e).__name__,
+                      fetch.redact(e)[:200])
             continue
         # 【本源这一批的 hash 一次查完】RSS 一轮的条目绝大多数是上一轮就见过的，
         # 逐条各开一个 session 去查等于把 100 次数据库往返摊在采集主链路上

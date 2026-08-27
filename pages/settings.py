@@ -9,6 +9,8 @@ import json
 from nicegui import context, run, ui
 
 from core import anime, engine, netguard, worker
+from urllib.parse import quote
+
 import config
 from db import backup
 from services import notify
@@ -27,6 +29,26 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
+
+
+def qb_callback_curl(tok: str, port: int) -> str:
+    """qB『Torrent 完成时运行外部程序』要填的那条命令。**页面与用例共用这一份。**
+
+    【token 必须 URL 编码】它是用户自己填的任意串，而 `openssl rand -base64` 产出的
+    token 带 `+` `/` `=` 是最现实的情形。原样拼进 query 的后果实测过：
+      A1b2+C3d4/e5=  → `+` 被解成空格 → bad token
+      tok&admin      → `&` 截断参数    → bad token
+      tok#1          → `#` 起是 fragment，服务端根本收不到
+      my token       → curl 退出码 3，请求压根没发出去
+    而且配了 token 反而更糟：pages/api.py 设了 token 就整体跳过"本机免鉴权"那一支，
+    于是回调一条路都走不通，且全程静默（curl -s、qB 不显示外部程序输出）。
+    库里存原样，只编码渲染进命令的这一份。
+
+    **抽成函数是为了让用例能测到它**：原先用例自己调 `quote()` 拼同一条命令、
+    从不 import 本模块——把上面那句 `quote(...)` 换回裸 `tok`，全量用例照样全绿。
+    """
+    q = f'&t={quote(tok, safe="")}' if tok else ''
+    return f'curl -s -X POST "http://127.0.0.1:{port}/api/qb/done?hash=%I{q}"'
 
 
 def _env_values() -> dict:
@@ -550,8 +572,16 @@ def settings():
                     @ui.refreshable
                     def _cb_cmd():
                         tok = (f["QB_CALLBACK_TOKEN"].value or "").strip()   # 读输入框实时值，不是已保存值
-                        cmd = (f'curl -s -X POST "http://127.0.0.1:{config.WEB_PORT}/api/qb/done?hash=%I'
-                               + (f'&t={tok}' if tok else '') + '"')
+                        # 【token 要 URL 编码】它是用户自己填的任意串，而 `openssl rand -base64`
+                        # 产出的 token 带 `+` `/` `=` 是最现实的情形。原样拼进 query 的后果实测过：
+                        #   A1b2+C3d4/e5=  → `+` 被解成空格 → bad token
+                        #   tok&admin      → `&` 截断参数    → bad token
+                        #   tok#1          → `#` 起是 fragment，服务端根本收不到
+                        #   my token       → curl 退出码 3，请求压根没发出去
+                        # 而且配了 token 反而更糟：pages/api.py 设了 token 就整体跳过"本机免鉴权"
+                        # 那一支，于是回调一条路都走不通，且全程静默（curl -s、qB 不显示外部程序输出）。
+                        # 库里存原样，只编码渲染进命令的这一份。
+                        cmd = qb_callback_curl(tok, config.WEB_PORT)
 
                         async def _copy(c=cmd):
                             # ui.clipboard.write 是【单向】的 run_javascript：非安全上下文（局域网

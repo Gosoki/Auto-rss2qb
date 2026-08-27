@@ -12,6 +12,7 @@ from urllib.parse import quote
 import httpx
 
 import config
+from services import fetch
 from services.fetch import TooLarge, get_bytes
 
 # 事件表：键 → (中文名, 图标)。
@@ -46,10 +47,20 @@ def _safe_host() -> str:
 
     Bark / Server酱 / ntfy 这类服务把推送密钥放在 URL 【路径】里
     （如 https://api.day.app/<密钥>/消息），所以日志里绝不能出现完整 URL。
+
+    【netloc 不行，要用 hostname】netloc **含 userinfo**：
+    `https://alice:hunter2@ntfy.homelab/topic` 的 netloc 是 `alice:hunter2@ntfy.homelab`，
+    于是任何一次推送失败都会把 basic-auth 口令写进 data/autorss.log（滚动 5 份）
+    与 /logs 页的「下载完整日志」。而 config 里没有 NOTIFY_USER/NOTIFY_PASS——
+    URL 内嵌凭据是给推送端加 basic-auth 的**唯一方式**，所以这不是个边角情形。
+    （core/ssrf.py 用的是 httpx.URL.netloc，那个【不含】userinfo，所以那边抄对了；
+    这里抄的是 urlsplit 的 netloc，语义不同。）
     """
     from urllib.parse import urlsplit
     try:
-        return urlsplit(config.NOTIFY_URL or "").netloc or "(未配置)"
+        p = urlsplit(config.NOTIFY_URL or "")
+        host = p.hostname or ""
+        return (f"{host}:{p.port}" if p.port else host) or "(未配置)"
     except ValueError:
         return "(地址无法解析)"
 
@@ -99,7 +110,11 @@ async def notify(message: str) -> bool:
             return False
         return True   # 3xx：有些推送服务受理后就是 302 到状态页，那也是送到了
     except Exception as e:
-        log.warning("通知发送失败：%s: %s（%s）", type(e).__name__, str(e)[:80], _safe_host())
+        # 【str(e) 要脱敏再截断】上面 HTTPStatusError 那一支的注释写着"原样记下去密钥就公开了"，
+        # 而这条兜底以前是裸 str(e)[:80]：services/fetch.py 造的异常消息正是以完整 URL 结尾，
+        # 而 notify 的 url 含 Bark/Server酱 的路径密钥。截断也救不了——22 位密钥能塞进 80 字符。
+        log.warning("通知发送失败：%s: %s（%s）", type(e).__name__,
+                    fetch.redact(e)[:120], _safe_host())
         return False
 
 
