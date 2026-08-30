@@ -104,3 +104,107 @@ def test_empty_token_yields_no_t_parameter():
     """没配 token 时命令里不该出现空的 &t=——那会让 api 侧走进「设了 token」的分支。"""
     from pages.settings import qb_callback_curl
     assert "&t=" not in qb_callback_curl("", 2333)
+
+
+# ---------------- 代理：内网地址不走代理（E-20） ----------------
+
+def _proxy_of(client, url):
+    """这个 client 打这条 URL 时会不会走代理；走则返回代理主机，否则 None。"""
+    t = client._transport_for_url(httpx.URL(url))
+    pool = getattr(t, "_pool", None)
+    px = getattr(pool, "_proxy_url", None) if pool else None
+    return px.host.decode() if px else None
+
+
+@pytest.mark.parametrize("target", [
+    "http://127.0.0.1:8080/api/v2/auth/login",
+    "http://192.168.1.5:8080/x",
+    "http://10.0.0.9/x",
+    "http://172.16.3.4/x",
+    "http://localhost:8080/x",
+])
+def test_internal_targets_bypass_the_proxy(target, monkeypatch):
+    """内网/本机地址一律直连。
+
+    qB 通常就在 127.0.0.1 或局域网上，一旦被代理走，登录请求里的 username/password
+    是**明文** POST 给那个代理的；而代理回的 502 还会落进「凭据错」分支、冷却 300 秒，
+    并在日志里让用户去改密码——把锅甩给用户。
+    """
+    monkeypatch.setenv("HTTP_PROXY", "http://10.9.9.9:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://10.9.9.9:1")
+    monkeypatch.setitem(config._v, "PROXY_SKIP_INTERNAL", True)
+    with httpx.Client(**config.http_client_kwargs(5, url=target)) as c:
+        assert _proxy_of(c, target) is None, "内网地址被代理走了"
+
+
+def test_public_targets_still_use_the_proxy(monkeypatch):
+    """而公网仍要走代理——「跳过内网」不能把代理功能整个废掉。"""
+    monkeypatch.setitem(config._v, "PROXY_SKIP_INTERNAL", True)
+    monkeypatch.setitem(config._v, "OPEN_PROXY", True)
+    monkeypatch.setitem(config._v, "PROXY_URL", "http://10.9.9.9:1")
+    with httpx.Client(**config.http_client_kwargs(5, url="https://api.bgm.tv/x")) as c:
+        assert _proxy_of(c, "https://api.bgm.tv/x") == "10.9.9.9"
+
+
+def test_env_proxy_is_overridden_for_internal_targets(monkeypatch):
+    """环境变量里的 HTTP_PROXY 也要被压住。
+
+    httpx 默认 trust_env=True，那条路径**不经过设置页的「启用代理」开关**——
+    开关关着时它照样接管。只有挂载表压得住它（实测 mounts 同时压过环境代理与显式 proxy）。
+    """
+    monkeypatch.setenv("HTTP_PROXY", "http://10.9.9.9:1")
+    monkeypatch.setitem(config._v, "PROXY_SKIP_INTERNAL", True)
+    monkeypatch.setitem(config._v, "OPEN_PROXY", False)      # 开关是【关】的
+    url = "http://127.0.0.1:8080/x"
+    with httpx.Client(**config.http_client_kwargs(5, url=url)) as c:
+        assert _proxy_of(c, url) is None
+
+
+def test_qb_login_never_goes_through_the_proxy(monkeypatch):
+    """qB 的登录请求不能被代理走——那条请求里的 username/password 是**明文**的。
+
+    qB 客户端曾是全仓唯一自建 client 的出站，完全绕过代理设置；而 httpx 默认
+    trust_env=True，于是环境里的 HTTP_PROXY 会把 /auth/login 连同凭据一起 POST 给代理，
+    代理回的 502 还会落进「凭据错」分支、冷却 300 秒并让用户去改密码——把锅甩给用户。
+
+    【断言的是行为，不是源码文本】上一版这条用例 grep `_login` 的源码找
+    "http_client_kwargs"，而**我自己写的注释里就有这几个字**——把代码回退掉照样绿。
+    """
+    import asyncio
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen = []
+
+    class _Proxy(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            seen.append(self.rfile.read(n).decode("utf-8", "replace"))
+            self.send_response(502)
+            self.end_headers()
+
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(502)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _Proxy)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{srv.server_address[1]}")
+        monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{srv.server_address[1]}")
+        monkeypatch.setitem(config._v, "PROXY_SKIP_INTERNAL", True)
+        monkeypatch.setitem(config._v, "QB_URL", "http://127.0.0.1:9/")   # 9=discard，必然连不上
+        monkeypatch.setitem(config._v, "QB_USERNAME", "admin")
+        monkeypatch.setitem(config._v, "QB_PASSWORD", "s3cr3t-pw")
+
+        from services.qbittorrent import QBittorrent
+        asyncio.run(QBittorrent()._login())
+    finally:
+        srv.shutdown()
+
+    assert seen == [], f"qB 登录被代理走了，代理收到：{[x[:60] for x in seen]}"
+    assert not any("s3cr3t-pw" in x for x in seen)

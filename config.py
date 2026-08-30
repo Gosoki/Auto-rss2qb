@@ -44,6 +44,9 @@ try:
 except ValueError:
     WEB_PORT = _WEB_PORT_DEFAULT
 # 监听地址：空/未设=只本机(127.0.0.1)。0.0.0.0=整个局域网可访问——本工具无鉴权、含 qB 密码，慎改（见设置页提示）
+# 【它只监听 IPv4】而很多系统的 `localhost` 先解析成 IPv6 的 ::1 —— 浏览器打 http://localhost:2333
+# 会连 [::1] 被拒、直接显示自己的错误页（一片白，且后端日志里一个字都没有，因为请求根本没到）。
+# 启动横幅打印的是确切地址，照那个开。要两个协议栈都进得来就设 0.0.0.0。
 WEB_HOST = os.getenv("WEB_HOST") or "127.0.0.1"
 try:
     ipaddress.ip_address(WEB_HOST)       # 拼错的绑定地址（非法 IP）→回落 127，别让 ui.run 绑定失败起不来
@@ -105,6 +108,11 @@ _SPEC = {
     "PROXY_URL": (str, ""),                  # 代理地址：支持 http:// / https://；socks5:// 需另装 socksio 包
     "PROXY_USER": (str, ""),                 # 代理账号（需认证的代理才填；空=不认证）
     "PROXY_PASS": (str, ""),                 # 代理密码（同上）
+    # 【默认开】内网/本机地址不走代理。关掉它之前请想清楚：qB 通常就在 127.0.0.1 或局域网上，
+    # 一旦被代理走，登录请求里的 username/password 是【明文】POST 给那个代理的。
+    # 它同时也压过**环境变量**里的 HTTP_PROXY —— httpx 默认 trust_env=True，
+    # 于是设置页开关关着时环境里那个代理照样接管，本项开着才挡得住。
+    "PROXY_SKIP_INTERNAL": (bool, True),
     "WEB_ALLOW_CIDRS": (str, ""),   # Web 访问网段白名单(CIDR,逗号分隔;空=不限)——绑 0.0.0.0 时限定可信内网,本机恒放行,即时生效
     "NOTIFY_URL": (str, ""),
     # 想收哪些事件（键见 services/notify.EVENTS）。【留空 = 全关】，不是全开——
@@ -196,7 +204,52 @@ def __getattr__(name):
     raise AttributeError(f"module 'config' has no attribute {name!r}")
 
 
-def http_client_kwargs(timeout: int = 30) -> dict:
+# 恒直连的地址形状。httpx 的 URLPattern 不支持 CIDR，所以私网【网段】没法写成通配，
+# 只能靠调用方把真实目标 URL 传进来（见 http_client_kwargs 的 url 形参）；
+# 这里能静态覆盖的是本机与常见的内网域名后缀。
+_DIRECT_PATTERNS = ("all://localhost", "all://127.0.0.1", "all://[::1]",
+                    "all://*.local", "all://*.lan", "all://*.internal", "all://*.home.arpa")
+
+
+def _direct_mounts(url: str | None) -> dict:
+    """要绕开代理直连的挂载表。空表＝没有需要绕的。
+
+    【为什么用 mounts 而不是 NO_PROXY】实测 httpx 的 mounts **同时压过环境变量代理与显式 proxy**，
+    所以这一份挂载在两种来源下都成立——而"环境变量在开关关着时接管"正是要挡的事之一。
+    """
+    if not _v.get("PROXY_SKIP_INTERNAL", True):
+        return {}
+    mounts = {p: None for p in _DIRECT_PATTERNS}
+    host = _internal_literal_host(url)
+    if host:
+        mounts[f"all://{host}"] = None     # 目标就是个字面内网 IP（qB 常见写法）
+    return mounts
+
+
+def _internal_literal_host(url: str | None) -> str:
+    """url 的主机若是【字面】内网/环回 IP 就返回它，否则空串。
+
+    只认字面量：域名要解析才知道，而这里是同步路径，不能在事件循环上做 DNS。
+    真实场景里 qB 与自建服务的地址几乎都是直接写 IP 的，够用。
+    """
+    if not url:
+        return ""
+    import ipaddress
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(url).hostname or "").strip("[]")
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return ""
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    ok = (ip.is_private or ip.is_loopback or ip.is_link_local
+          or ip.is_reserved or ip.is_unspecified)
+    return host if ok else ""
+
+
+def http_client_kwargs(timeout: int = 30, url: str | None = None) -> dict:
     """httpx.AsyncClient 的公共 kwargs：超时 + 跟随重定向 +（启用时）代理。各处抓取统一走它。
     代理账号/密码任一非空时走带认证的 httpx.Proxy；socks5:// 需自行装 socksio——
     缺了它是在【建 AsyncClient 那一步】就抛 ImportError（不是发请求时），而且抛的不是 httpx.HTTPError，
@@ -209,6 +262,11 @@ def http_client_kwargs(timeout: int = 30) -> dict:
     from core import ssrf
     kwargs = {"timeout": timeout, "follow_redirects": True,
               "event_hooks": {"request": [ssrf.guard_redirect_request]}}
+    mounts = _direct_mounts(url)
+    if mounts:
+        # 【即使没配代理也挂上】它同时挡住环境变量里的 HTTP_PROXY——
+        # 那条路径不经过我们的开关，只有挂载表压得住。
+        kwargs["mounts"] = mounts
     proxy = __getattr__("PROXY")
     if proxy:
         user, pw = _v["PROXY_USER"], _v["PROXY_PASS"]

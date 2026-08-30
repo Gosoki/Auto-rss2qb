@@ -68,7 +68,13 @@ class QBittorrent:
     async def _login(self) -> httpx.AsyncClient | None:
         """新建并登录一个 AsyncClient；成功返回它（不 aclose，交缓存复用），失败返回 None 并清理。"""
         try:
-            client = httpx.AsyncClient(base_url=config.QB_URL, timeout=30)
+            # 【必须走 config.http_client_kwargs】这里曾是全仓唯一自建 client 的出站，
+            # 于是完全绕过了代理设置：httpx 默认 trust_env=True，环境里的 HTTP_PROXY
+            # 会把下面那条 /auth/login 连同【明文的 username/password】一起 POST 给代理，
+            # 而代理回的 502 还会落进"凭据错"分支、冷却 300 秒并在日志里让用户去改密码。
+            # 把 QB_URL 传进去，PROXY_SKIP_INTERNAL（默认开）就能让本机/局域网的 qB 直连。
+            kw = config.http_client_kwargs(30, url=config.QB_URL)
+            client = httpx.AsyncClient(base_url=config.QB_URL, **kw)
         except Exception as e:                 # QB_URL 非法等 → 建 client 就抛，别逃逸成未处理异常
             log.error("qBittorrent 客户端创建失败（QB_URL 非法？）: %s", e)
             return None

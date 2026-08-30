@@ -94,7 +94,7 @@ async def notify(message: str) -> bool:
         # 走 config.http_client_kwargs：这里曾是全仓唯一【绕过代理设置】的出站请求。
         # NOTIFY_URL 指向墙外服务（Telegram/Pushover 等）时，通知会永远发不出去，
         # 而日志里只有一行"通知发送失败"，没人会想到是它没走代理。
-        async with httpx.AsyncClient(**config.http_client_kwargs(timeout)) as client:
+        async with httpx.AsyncClient(**config.http_client_kwargs(timeout, url=url)) as client:
             await get_bytes(client, url, cap=_BODY_CAP, timeout=timeout)
         return True
     except TooLarge:

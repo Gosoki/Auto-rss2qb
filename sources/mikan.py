@@ -91,7 +91,8 @@ class MikanSource(RssSource):
 
 def make_client() -> httpx.AsyncClient:
     """给编排层用的共享 client（一次发现批量复用连接 + 代理设置）。"""
-    return httpx.AsyncClient(**config.http_client_kwargs())
+    # 传 MIKAN_BASE：自建 Mikan 镜像常写成局域网 IP，PROXY_SKIP_INTERNAL 靠它认出来
+    return httpx.AsyncClient(**config.http_client_kwargs(url=config.MIKAN_BASE))
 
 
 def mikan_search_url(query: str) -> str:

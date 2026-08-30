@@ -57,6 +57,10 @@ def build_sources() -> list:
 
 
 async def poll_once() -> None:
+    # 【每轮只探一次 qB】传给本轮所有 process_item，让"最高优先级即时下载"在 qB 不可达时
+    # 别去白取种（详见 anime.process_item 的 qb_alive 说明）。探测本身就是 flush 前那一次，
+    # 顺带把状态型通知的翻转也发了，所以不额外增加请求。
+    qb_alive = await anime.qb_precheck()
     for source in build_sources():
         try:
             items = await source.fetch()
@@ -80,7 +84,7 @@ async def poll_once() -> None:
         new = 0
         for item in items:
             try:
-                if await process_item(item, known_hashes=known):
+                if await process_item(item, known_hashes=known, qb_alive=qb_alive):
                     new += 1
             except Exception as e:
                 log.error("处理失败 %s: %s", getattr(item, "anime_title", "?"), e)
@@ -90,7 +94,7 @@ async def poll_once() -> None:
         log.info("源 %s：%d 条，新增 %d", source.name, len(items), new)
 
     try:
-        n = await flush_ready_downloads()
+        n = await flush_ready_downloads(qb_alive=qb_alive)
         if n:
             log.info("缓冲窗口放行下载 %d 集", n)
     except Exception as e:

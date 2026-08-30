@@ -465,11 +465,20 @@ def existing_hashes(hashes) -> set[str]:
         return set(s.exec(select(AnimeTorrent.info_hash).where(AnimeTorrent.info_hash.in_(hs))))
 
 
-async def process_item(item, known_hashes: set | None = None) -> bool:
+async def process_item(item, known_hashes: set | None = None,
+                       qb_alive: bool | None = None) -> bool:
     """处理一条标准条目。返回 True 表示是新种子（之前没见过）。
 
     known_hashes：调用方批量预取的"库里已有的 hash"集合（见 existing_hashes）。
     传了就用它做去重、不再单独查库；不传则照旧自己查一次（手动补齐等零散入口走这条）。
+
+    qb_alive：本轮开头【只探一次】的 qB 可达性（poll_once 传进来）。
+    【为什么不在这里各探各的】"最高优先级即时下载"默认开着，而种入的 ANi 组 priority=100，
+    于是几乎每条新种子都走那条路、一条都不走 flush。qB 没开机时，download_anime_torrent
+    会先真去源站把种子取回来（最长 180 秒），才发现 qB 连不上——一轮 7 条新条目 = 7 次无用 GET。
+    可原样把 qb_precheck 搬进来也不对：qB 在线时每个新条目都要多打一次 GET /app/version
+    （实测 1 → 8 次/轮），拿常态的开销换罕态的浪费，净收益为负。
+    每轮探一次、传下来，两头都不亏。None＝调用方没探（零散入口），按老路走不额外拦。
     """
     # 1) 种子级去重：同一 hash 见过就跳过（跨源相等）
     if known_hashes is not None:
@@ -552,6 +561,7 @@ async def process_item(item, known_hashes: set | None = None) -> bool:
     # 最高优先级即时下载：开关开 + 自动下的番 + 来自最高优先级组 + (未锁源或正是锁定源) → 入库就下，不等缓冲窗口。
     # 只放行正集（见 auto_downloadable_ep）：与 flush 同一判据，别让一条种子是否被下取决于它走了哪条路。
     if (config.ANIME_TOP_PRIORITY_INSTANT and should_download
+            and qb_alive is not False          # 本轮开头探过且 qB 不可达 → 别白取一次种
             and auto_downloadable_ep(item.episode)
             and (item.priority or 0) >= _top_priority()
             and (not lock or lock == (item.source or ""))
@@ -855,7 +865,7 @@ async def qb_precheck() -> bool:
     return alive
 
 
-async def flush_ready_downloads() -> int:
+async def flush_ready_downloads(qb_alive: bool | None = None) -> int:
     """缓冲窗口 + 严格优先级：每轮跑一次。
 
     对『自动下载且已确认』的番，把待下种子按 (anime_id, 集) 归组——因为按番的真实身份
@@ -867,7 +877,9 @@ async def flush_ready_downloads() -> int:
     # 不在的 qB"。qB 掉线时本轮一行不动，种子留在待下，等它回来自然继续。
     # （中途才挂掉的由 download_anime_torrent 的 defer_status 兜住，两处配合才没有重试风暴：
     #   掉线期间每轮只多花这一个 GET。）
-    if not await qb_precheck():
+    # qb_alive 由 poll_once 在本轮开头探过一次并传下来（见 process_item 的说明）——
+    # 复用它，别在同一轮里对同一个 qB 探第二次。零散入口不传，照旧自己探。
+    if not (qb_alive if qb_alive is not None else await qb_precheck()):
         return 0
     _revive_orphaned_skipped()   # 先把『首选源已失败、该集无其它下载』的 skipped 兄弟放回 pending，本轮即可换源
     grace = timedelta(minutes=max(0, config.ANIME_DOWNLOAD_GRACE_MIN))  # 负值会使门槛永假、废掉多源补齐，钳到 0

@@ -280,7 +280,7 @@ async def fetch_torrent_bytes(url: str) -> bytes:
     """
     if not (url or "").lower().startswith(("http://", "https://")):
         raise ValueError(f"拒绝非 http(s) 下载地址（防 SSRF）：{(url or '')[:80]}")
-    kwargs = config.http_client_kwargs(60)
+    kwargs = config.http_client_kwargs(60, url=url)
     kwargs["event_hooks"] = {"request": [ssrf.block_internal_request]}
     async with httpx.AsyncClient(**kwargs) as client:
         # 复用 services.fetch 的封顶实现，别再手写一份：那份已经处理了"上限只作用在解压后"

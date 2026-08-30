@@ -634,6 +634,13 @@ def settings():
                      "代理支持 http:// / https://；socks5:// 需另装 socksio 包（未装时填 socks5:// 会在请求时出错）。"
                      "代理账号/密码仅『需认证的代理』才填，留空=不认证。通知 URL：留空=关闭推送。")
             _switch_field("OPEN_PROXY", "启用代理", config.OPEN_PROXY)
+            _switch_field("PROXY_SKIP_INTERNAL",
+                          "内网/本机地址不走代理（qB、自建镜像、局域网 webhook）",
+                          config.PROXY_SKIP_INTERNAL)
+            ui.label("默认开。关掉之前请想清楚：qB 通常就在 127.0.0.1 或局域网上，"
+                     "一旦被代理走，登录请求里的账号密码是【明文】发给那个代理的。"
+                     "本项同时也压过环境变量里的 HTTP_PROXY —— 那条路径不经过上面那个开关。").classes(
+                "text-xs text-gray-500 -mt-1 mb-1")
             with ui.element("div").classes("field-grid w-full"):
                 _text("PROXY_URL", "代理地址", config.PROXY_URL, "http://… 或 https://…（socks5 需装 socksio）")
                 f["PROXY_URL"].classes(add="col-span-2")   # 代理地址占 1/2（4 列栅格里跨 2 格）

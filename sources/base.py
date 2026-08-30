@@ -104,7 +104,7 @@ class RssSource(Source):
     async def fetch(self) -> list[ParsedItem]:
         import config
         from services import fetch as _fetch
-        async with httpx.AsyncClient(**config.http_client_kwargs(30)) as client:
+        async with httpx.AsyncClient(**config.http_client_kwargs(30, url=self.rss_url)) as client:
             # 走带上限+总超时的取回：feed 地址是用户填的、内容来自第三方，
             # 裸 client.get + resp.content 既能被涓流响应永久挂住，也能被超大 body 撑爆内存
             content = await _fetch.get_bytes(client, self.rss_url)

@@ -13,8 +13,15 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env      # 可选：只放 Web 端口等结构项
-python main.py            # 浏览器打开 http://<host>:2333
+python main.py            # 浏览器打开 http://127.0.0.1:2333（启动横幅会打印确切地址）
 ```
+
+> ⚠️ **用 `127.0.0.1` 而不是 `localhost`。** `WEB_HOST` 默认 `127.0.0.1`，uvicorn 只监听
+> **IPv4** 回环；而不少系统的 `localhost` 会先解析成 IPv6 的 `::1`。curl 会自动回落到 IPv4，
+> **Chrome 不一定会**——它连 `[::1]:2333` 被拒之后直接显示自己的错误页，看起来就是一片白屏，
+> 而后端日志里【一个字都没有】（请求根本没到）。控制台里的迹象是
+> `Unsafe attempt to load URL … from frame with URL chrome-error://chromewebdata/`。
+> 要让两个协议栈都能进，把 `.env` 里的 `WEB_HOST` 设成 `0.0.0.0`（⚠️ 那会对局域网开放，见下方警告）。
 
 需要 **Python ≥ 3.11**（网络层用了 3.11 才有的 `asyncio.timeout`——所有抓取/识别/取种都靠它做总超时；
 3.10 上界面能开，但采集、bgm 识别、下载会全部静默失败）。`deploy.sh` 走 uv 独立 Python 3.12，不受系统版本影响。
