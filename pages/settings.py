@@ -121,7 +121,7 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str,
     tpl_label：模板输入框标签（文件夹命名用『命名模板』；季度显示项传『季度模板』）。"""
     ui.separator()
     _section(title, note + "\n\n占位：{yy}=26  {yyyy}=2026  {q}=C  {season}=夏  {m}=7")
-    inp = ui.input(tpl_label, value=value).props("dense outlined").classes("w-full")
+    inp = ui.input(tpl_label, value=value).classes("w-full")
     f[key] = inp
     preview = ui.label().classes("text-sm text-blue-400")
 
@@ -140,22 +140,22 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str,
             _prev()
 
     ui.select(_QUARTER_PRESETS, label="预设（选中填入上面模板，可再手改）",
-              on_change=_pick).props("dense outlined").classes("w-full")
+              on_change=_pick).classes("w-full")
     _prev()
 
 
 # 模块级表单助手：settings() 里那几个同名闭包只在页面函数内可见，_db_panel 在模块级，
 # 需要自己的一份。语义与闭包版一致（写进同一个 f 字典，由统一的 _save 收集）。
 def _text_into(f: dict, key: str, label: str, val, ph: str = "") -> None:
-    f[key] = ui.input(label, value=str(val), placeholder=ph).props("dense outlined").classes("w-full")
+    f[key] = ui.input(label, value=str(val), placeholder=ph).classes("w-full")
 
 
 def _num_into(f: dict, key: str, label: str, val) -> None:
-    f[key] = ui.number(label, value=val, format="%d").props("dense outlined").classes("w-full")
+    f[key] = ui.number(label, value=val, format="%d").classes("w-full")
 
 
 def _pw_into(f: dict, key: str, label: str) -> None:
-    f[key] = ui.input(label, value="", password=True).props("dense outlined").classes("w-full")
+    f[key] = ui.input(label, value="", password=True).classes("w-full")
 
 
 def _backup_panel(f: dict) -> None:
@@ -169,7 +169,7 @@ def _backup_panel(f: dict) -> None:
                          "直接拷主文件会拿到一份看着正常、其实缺最近写入的库）。"
                          "业务库切到 MySQL 时这里只备得到配置，页面会明确标出来。")
     with ui.element("div").classes("field-grid w-full"):
-        f["BACKUP_ENABLED"] = ui.switch("开启自动备份", value=config.BACKUP_ENABLED).props("dense")
+        f["BACKUP_ENABLED"] = ui.switch("开启自动备份", value=config.BACKUP_ENABLED)
         _num_into(f, "BACKUP_INTERVAL_HOURS", "间隔（小时）", config.BACKUP_INTERVAL_HOURS)
         _num_into(f, "BACKUP_KEEP", "保留份数（0=不清理）", config.BACKUP_KEEP)
 
@@ -237,7 +237,7 @@ def _db_panel(f: dict) -> None:
         with ui.row().classes("items-center gap-2 flex-wrap"):
             ui.label("当前业务数据库：").classes("text-sm")
             ui.badge(db.data_target_desc()).props(
-                f"color={'purple' if db.data_backend() == 'mysql' else 'blue-grey'}").classes("text-sm")
+                f"color={'purple' if db.data_backend() == 'mysql' else 'blue-grey'}")
             # 【必须兜住】这是页面【构建期】对业务库发的查询。业务库若是运行中掉线的 MySQL，
             # 异常会从构建函数冒出去让 /settings 整页 500——而『切回本地 SQLite』按钮和底部
             # 『保存』都排在本面板之后，用户就再也没有页面入口能自救了，
@@ -500,16 +500,15 @@ def settings():
         f: dict = {}  # 表单控件，key = .env 键名
 
         def _switch_field(key, label, val):
-            f[key] = ui.switch(label, value=val).props("dense")
+            f[key] = ui.switch(label, value=val)
 
         def _text(key, label, val, ph=""):
-            f[key] = ui.input(label, value=str(val), placeholder=ph).props(
-                "dense outlined").classes("w-full")
+            f[key] = ui.input(label, value=str(val), placeholder=ph).classes("w-full")
 
         def _select(key, label, options, val):
             # 下拉单选：options={键:显示名}，存的是键；当前值不在选项里时回落到第一个键
             v = val if val in options else next(iter(options))
-            f[key] = ui.select(options, label=label, value=v).props("dense outlined").classes("w-full")
+            f[key] = ui.select(options, label=label, value=v).classes("w-full")
 
         def _num(key, label, val, mn=None, mx=None):
             # 数字项：标签在框内浮动，框占满所在栅格格（配合 field-grid 即 1/4 宽）。1/4 窄框放不下的长标签会截断成 …
@@ -518,11 +517,10 @@ def settings():
                 kw["min"] = mn
             if mx is not None:
                 kw["max"] = mx
-            f[key] = ui.number(label, value=val, format="%d", **kw).props(
-                "dense outlined").classes("w-full")
+            f[key] = ui.number(label, value=val, format="%d", **kw).classes("w-full")
 
         def _password(key, label):
-            f[key] = ui.input(label, value="", password=True).props("dense outlined").classes("w-full")  # 不回填现值
+            f[key] = ui.input(label, value="", password=True).classes("w-full")  # 不回填现值
 
         _sub_ph = ("留空=直接落工作目录；或填相对目录名（如 番剧）" if config.DOWN_PATH
                    else "工作目录未设，此处须填绝对路径")
@@ -603,7 +601,7 @@ def settings():
                                           "请手动全选左边那行命令复制", type="warning")
 
                         with ui.row().classes("items-center gap-2 w-full no-wrap"):
-                            ui.input(value=cmd).props("dense outlined readonly").classes(
+                            ui.input(value=cmd).props("readonly").classes(
                                 "grow font-mono min-w-0").style("font-size:12px")
                             ui.button(icon="content_copy", on_click=_copy).props(
                                 "flat round dense color=primary").tooltip("复制命令")
@@ -656,7 +654,7 @@ def settings():
             f["NOTIFY_EVENTS"] = ui.select(
                 {k: f"{icon} {cn}" for k, (cn, icon) in notify.EVENTS.items()},
                 value=list(config.NOTIFY_EVENTS or []), multiple=True,
-                label="推送这些事件").props("dense outlined use-chips").classes("w-full")
+                label="推送这些事件").props("use-chips").classes("w-full")
             with ui.element("div").classes("field-grid w-full"):
                 _num("NOTIFY_MAX_PER_HOUR", "每小时最多几条（0=不限）", config.NOTIFY_MAX_PER_HOUR)
                 _num("NOTIFY_BACKLOG_MIN", "待识别积压到几部才提醒", config.NOTIFY_BACKLOG_MIN)
@@ -670,9 +668,9 @@ def settings():
                      "唯一自动手段（那类故障不报错，表现只是『好几天没更新了』）。")
             with ui.element("div").classes("field-grid w-full"):
                 f["ANIME_FINISH_ENABLED"] = ui.switch(
-                    "判定完结（只标记+通知）", value=config.ANIME_FINISH_ENABLED).props("dense")
+                    "判定完结（只标记+通知）", value=config.ANIME_FINISH_ENABLED)
                 f["ANIME_FINISH_UNSUB"] = ui.switch(
-                    "判完结后停止自动下新集", value=config.ANIME_FINISH_UNSUB).props("dense")
+                    "判完结后停止自动下新集", value=config.ANIME_FINISH_UNSUB)
                 _num("ANIME_IDLE_DAYS", "断更提醒阈值（天，0=关）", config.ANIME_IDLE_DAYS)
                 # 【给下限】这一项没有"0=关"的语义（关完结/断更各有自己的开关），
                 # 而 run_sweep 里是 max(60, ...) 秒——填 0 会变成每 60 秒来一次全表扫描。

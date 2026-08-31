@@ -11,7 +11,8 @@ from db.models import AnimeTorrent
 from core import anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail
-from .layout import (busy_action, confirm, ep_str, expand_collapse_bar, frame, group_by_quarter,
+from .layout import (busy_action, confirm, confirm_bind_merge, ep_str, expand_collapse_bar,
+                     frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, recent_table, season_label, source_options,
                      warn_banner)
@@ -90,7 +91,7 @@ def anime_page(t: str = ""):
                     pol = "自动下载" if policy == "auto" else "人工审核"
                     tail = "" if enabled else " · 停用"
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
-                        f"color={'blue' if enabled else 'grey'}").classes("text-sm")   # 启用=蓝，停用=灰
+                        f"color={'blue' if enabled else 'grey'}")   # 启用=蓝，停用=灰
 
         # 环图图例选择的持久化：用户点图例排除某字幕组后存下选择态，重建时塞回 legend.selected，
         # 任何刷新路径（定时器/用户操作/重识别）重建环图都不会把排除的源刷回来。
@@ -230,7 +231,7 @@ def anime_page(t: str = ""):
             chips.append(("种子数", k["torrents"], "grey", "全部种子数（各状态之和）"))
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
-                    b = ui.badge(f"{label} {val}").props(f"color={color}").classes("text-sm")
+                    b = ui.badge(f"{label} {val}").props(f"color={color}")
                     if tip:
                         b.tooltip(tip)
             # ── 下载状态 ──（qB 实时态，独立成区；后台每 QB_SYNC_INTERVAL 秒刷，也可点『立刻刷新』手动拉一次）
@@ -247,14 +248,13 @@ def anime_page(t: str = ""):
                 _sync.tooltip("立即向 qB 拉一次最新进度（不必等后台轮询）" if _qb_on
                               else "qB 未启用，去设置页开启后可同步")
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
-                ui.badge(f"已完成 {q['completed']}").props("color=green").classes("text-sm")
-                ui.badge(f"下载中 {q['downloading']}").props("color=blue").classes("text-sm")
-                ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").classes("text-sm").tooltip(
+                ui.badge(f"已完成 {q['completed']}").props("color=green")
+                ui.badge(f"下载中 {q['downloading']}").props("color=blue")
+                ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").tooltip(
                     "qB 里正在跟踪的种子数（已交付给 qB 的）")
                 if q["dlspeed"]:
-                    ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=blue").classes("text-sm")
-                ui.badge(f"完成率 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").classes(
-                    "text-sm").tooltip("已交付种子的平均完成度")
+                    ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=blue")
+                ui.badge(f"完成率 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").tooltip("已交付种子的平均完成度")
 
             # ── 采集状态 / 源组 ──
             enr, tot = ov["enriched"]
@@ -269,13 +269,13 @@ def anime_page(t: str = ""):
                         ui.menu_item("识别全部", on_click=_reident(None))
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 ui.badge("采集开启" if ov["config"]["poll_on"] else "采集暂停").props(
-                    f"color={'green' if ov['config']['poll_on'] else 'red'}").classes("text-sm").tooltip(
+                    f"color={'green' if ov['config']['poll_on'] else 'red'}").tooltip(
                     "后台是否在抓取（在设置页『采集』开关切换）")
-                ui.badge(f"识别番数 {enr}/{tot}").props("color=blue").classes("text-sm").tooltip(
+                ui.badge(f"识别番数 {enr}/{tot}").props("color=blue").tooltip(
                     "已匹配到 bgm 的番 / 全部")
-                ui.badge(f"轮询间隔 {ov['config']['poll']}s").props("color=blue-grey").classes("text-sm").tooltip(
+                ui.badge(f"轮询间隔 {ov['config']['poll']}s").props("color=blue-grey").tooltip(
                     "后台每隔这么久抓一次源（设置页可改）")
-                ui.badge(f"缓冲窗口 {ov['config']['grace']}min").props("color=blue-grey").classes("text-sm").tooltip(
+                ui.badge(f"缓冲窗口 {ov['config']['grace']}min").props("color=blue-grey").tooltip(
                     "一集首次发现后等这么久再下，给更高优先级的源补齐（设置页可改）")
 
         @ui.refreshable
@@ -304,8 +304,7 @@ def anime_page(t: str = ""):
                                 # 预填当前锁定源：这个番可能是【补齐/绑定 bgm 打回来的】、本来就设过锁，
                                 # 下拉恒空会让用户点一下『确认下载』就把锁静默解掉（选中值会被写回）。
                                 sel = ui.select(source_options(srcs, "从哪下：按优先级"),
-                                                value=(a.pref_source or "")).props(
-                                    "dense outlined").classes("min-w-48")
+                                                value=(a.pref_source or "")).classes("min-w-48")
                                 ui.button("确认下载", on_click=_approve(a.id, sel)).props("color=primary unelevated")
                                 ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
@@ -414,8 +413,7 @@ def anime_page(t: str = ""):
                             "target=_blank").classes("text-xs")
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         inp = ui.input(
-                            placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").props(
-                            "dense outlined").classes("w-96 min-w-0 max-sm:w-full")   # 桌面 384px；手机满卡宽(min-w-0 让 q-input 真能收缩，否则撑破卡片横向溢出)
+                            placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").classes("w-96 min-w-0 max-sm:w-full")   # 桌面 384px；手机满卡宽(min-w-0 让 q-input 真能收缩，否则撑破卡片横向溢出)
                         ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("color=primary unelevated")
                         ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("flat color=grey")
                         ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
@@ -443,7 +441,7 @@ def anime_page(t: str = ""):
                                 "border-bottom:1px solid rgba(255,255,255,.08)"):
                             ui.label(f'{r["name"]}  第{ep_str(r["episode"])}集').classes(
                                 "grow break-all min-w-0")
-                            ui.badge(text).props(f"color={color}").classes("shrink-0 text-sm")
+                            ui.badge(text).props(f"color={color}").classes("shrink-0")
 
         @ui.refreshable
         def recent_panel():
@@ -499,7 +497,7 @@ def anime_page(t: str = ""):
                     with ui.card().classes("gap-2 py-3").style("flex:1 1 300px"):
                         with ui.row().classes("items-center gap-2"):
                             ui.badge(b["tag"]).props(
-                                f"color={'primary' if b['tag'] == '当季' else 'blue-grey'}").classes("text-sm")
+                                f"color={'primary' if b['tag'] == '当季' else 'blue-grey'}")
                             ui.label(engine.quarter_label(b["key"])).classes("font-bold text-base")
                         with ui.row().classes("gap-6"):
                             for num, lbl, color in stats:
@@ -707,6 +705,10 @@ def anime_page(t: str = ""):
                 bid = parse_bgm_id(inp.value or "")
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
+                    return
+                # 【绑定前回显】与详情页同一道闸（共用 layout.confirm_bind_merge）：
+                # 这里是『待识别』列表里的绑定按钮，同样会触发身份合并、同样会删掉另一条番。
+                if not await confirm_bind_merge(anime_id, bid):
                     return
 
                 # 走 busy_action：bind 会调 fetch_by_id（预算 120 秒），期间没有反馈会被连点

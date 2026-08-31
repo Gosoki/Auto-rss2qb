@@ -3,7 +3,8 @@ from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, ep_str, meta_card,
+from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, confirm_bind_merge,
+                     ep_str, meta_card,
                      name_of, parse_bgm_id,
                      qb_live_text, season_label, source_options, torrent_status_cn,
                      warn_banner)
@@ -155,12 +156,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             if sources:  # 下载源放最前：按优先级=多源兜底；选具体组=锁定，之后只下这个组
                 ui.select(source_options(sources, "下载源：按优先级·多源兜底"),
                           value=(cur.pref_source or ""),
-                          on_change=_set_source).props("dense outlined").classes(
+                          on_change=_set_source).classes(
                     "w-full sm:w-auto sm:min-w-52").tooltip(
                     "『按优先级』= 多源自动挑、缺集用别的源兜底；"
                     "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）")
                 _kwin = ui.input(value=(cur.pref_keyword or ""), label="版本",
-                                 placeholder="繁日/简日/1080p…").props("dense outlined").classes(
+                                 placeholder="繁日/简日/1080p…").classes(
                     "w-36").tooltip(
                     "版本关键词：在『下载源』基础上，再只下种子原名含此词的版本（繁日/简日/画质等，大小写不敏感）。"
                     "留空=不限；硬过滤、缺此版本的集不兜底。回车或点输入框外生效。")
@@ -405,8 +406,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label("绑定 bgm").classes("font-bold")
             ui.label("自动认错了就把正确的 bgm 链接或 ID 填这——直接取权威元数据覆盖。").classes(
                 "text-xs text-gray-400")
-            inp = ui.input(placeholder="bgm.tv/subject/464376 或 464376").props(
-                "dense outlined autofocus").classes("w-80 min-w-0 max-sm:w-full")
+            inp = ui.input(placeholder="bgm.tv/subject/464376 或 464376").props("autofocus").classes("w-80 min-w-0 max-sm:w-full")
             inp.on("keydown.enter", lambda: dlg.submit(inp.value))   # 有 autofocus 就该能回车提交
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
@@ -418,6 +418,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         bid = parse_bgm_id(val)
         if not bid:
             ui.notify("没认出 bgm ID（粘 bgm.tv/subject/数字 或纯数字）", type="warning")
+            return
+        # 【绑定前回显】可能删掉另一条番记录 —— 闸门与列表页共用一份，见 layout.confirm_bind_merge
+        if not await confirm_bind_merge(anime_id, bid):
             return
         # 【弹窗关掉之后这一段才是长操作】bind 会走 fetch_by_id（预算 120 秒），
         # 期间页面没有任何反馈，用户会以为没点上而再点一次。走 busy_action 去重。
@@ -439,8 +442,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label("编辑归档季度").classes("font-bold")
             ui.label("内部键 = 两位年 + 季母（A冬 B春 C夏 D秋），如 26A=2026年冬。"
                      "改后可把已下文件移到新目录。").classes("text-xs text-gray-400")
-            inp = ui.input("季度键", value=(cur.quarter if cur else "")).props(
-                "dense outlined autofocus").classes("w-60 min-w-0 max-sm:w-full")
+            inp = ui.input("季度键", value=(cur.quarter if cur else "")).props("autofocus").classes("w-60 min-w-0 max-sm:w-full")
             prev = ui.label().classes("text-sm text-blue-400")
 
             def _pv():
@@ -597,8 +599,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.label("改集号").classes("font-bold")
                 ui.label("这条集号没解析出来（批量/命名怪）。填对集号，它就进正常下载+去重流程。"
                          "支持 .5（如 12.5）。").classes("text-xs text-gray-400")
-                num = ui.number("集号", value=1, min=0, step=1, format="%g").props(
-                    "dense outlined autofocus")
+                num = ui.number("集号", value=1, min=0, step=1, format="%g").props("autofocus")
                 num.on("keydown.enter", lambda: dlg.submit(num.value))
                 with ui.row().classes("gap-2 justify-end w-full"):
                     ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")

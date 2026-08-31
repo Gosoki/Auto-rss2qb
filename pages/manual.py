@@ -37,8 +37,7 @@ def manual_page():
             # ========== 种子来源 ==========
             ui.label("种子来源（链接 或 上传文件，二选一）").classes("font-bold text-sm")
             tin = ui.input("magnet: / http(s) .torrent 链接",
-                           placeholder="magnet:?xt=urn:btih:… 或 https://…/x.torrent").props(
-                "dense outlined clearable").classes("w-full")
+                           placeholder="magnet:?xt=urn:btih:… 或 https://…/x.torrent").props("clearable").classes("w-full")
             ui.label("— 或 —").classes("text-xs text-gray-500 self-center")
 
             @ui.refreshable
@@ -75,8 +74,7 @@ def manual_page():
             ui.separator()
             # ========== 保存位置 ==========
             ui.label("保存位置").classes("font-bold text-sm")
-            spath = ui.input("保存目录（默认 工作目录/Temp）", value=manual.temp_path()).props(
-                "dense outlined").classes("w-full")
+            spath = ui.input("保存目录（默认 工作目录/Temp）", value=manual.temp_path()).classes("w-full")
             ui.label("远程 qB 时这是【qB 主机上】的绝对路径。填 bgm 识别后可一键设成正常番剧目录。").classes(
                 "text-xs text-gray-500")
 
@@ -84,8 +82,7 @@ def manual_page():
             # ========== bgm 识别（可选）==========
             ui.label("bgm 识别（可选 → 算出正常番剧目录）").classes("font-bold text-sm")
             with ui.row().classes("items-stretch gap-3 w-full"):
-                bgm = ui.input("bgm 链接 / ID", placeholder="bgm.tv/subject/12345 或 12345").props(
-                    "dense outlined clearable").classes("grow")
+                bgm = ui.input("bgm 链接 / ID", placeholder="bgm.tv/subject/12345 或 12345").props("clearable").classes("grow")
 
                 async def _identify():
                     r = await manual.identify_folder(bgm.value or "")

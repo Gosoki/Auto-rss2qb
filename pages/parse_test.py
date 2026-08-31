@@ -53,10 +53,9 @@ def parse_test_page():
                  "——粘 ANi/Lilith 的标题，看番名/集数是否照旧。").classes("text-xs text-gray-400 mb-2")
 
         with ui.card().classes("w-full gap-3"):
-            inp = ui.input("种子标题", placeholder="粘贴一条种子名…").props(
-                "dense outlined clearable autofocus").classes("w-full")
+            inp = ui.input("种子标题", placeholder="粘贴一条种子名…").props("clearable autofocus").classes("w-full")
             with ui.row().classes("items-center gap-2 flex-wrap"):
-                sw = ui.switch("多括号回退捕获", value=config.ANIME_MULTIBRACKET_PARSE).props("dense")
+                sw = ui.switch("多括号回退捕获", value=config.ANIME_MULTIBRACKET_PARSE)
                 ui.label("多括号命名：番名也塞在 [ ] 括号块里（如 [组][番名/别名][集数][分辨率]），"
                          "常规解析取不到番名；打开则从括号块回退捞出番名。全局生效，等同设置页那个开关").classes(
                     "text-xs text-gray-500")
@@ -99,13 +98,13 @@ def parse_test_page():
                     ui.label(name or "（番名为空）").classes(
                         "text-lg font-bold" + ("" if name else " text-gray-500"))
                     ui.badge("合集" if batch else "单集").props(
-                        f"color={'red' if batch else 'green'}").classes("text-sm")
+                        f"color={'red' if batch else 'green'}")
                 # 组 / 季 / 集 徽标
                 with ui.row().classes("gap-2 flex-wrap items-center"):
-                    ui.badge(f"组 · {group or '—'}").props("color=blue-grey").classes("text-sm")
-                    ui.badge(f"第 {season} 季").props("color=blue-grey").classes("text-sm")
+                    ui.badge(f"组 · {group or '—'}").props("color=blue-grey")
+                    ui.badge(f"第 {season} 季").props("color=blue-grey")
                     ui.badge(f"集 · {_ep_short(episode)}").props(
-                        f"color={'orange' if episode == -2 else 'blue-grey'}").classes("text-sm").tooltip(
+                        f"color={'orange' if episode == -2 else 'blue-grey'}").tooltip(
                         _ep_label(episode))
                 ui.separator()
                 # bgm 候选名（识别就靠它们）
@@ -113,7 +112,7 @@ def parse_test_page():
                 if cands:
                     with ui.row().classes("gap-2 flex-wrap"):
                         for c in cands:
-                            ui.badge(c).props("color=indigo").classes("text-sm")
+                            ui.badge(c).props("color=indigo")
                 else:
                     ui.label("（无——识别不到会进『待识别』，可手动绑定 bgm）").classes("text-sm text-gray-400")
 

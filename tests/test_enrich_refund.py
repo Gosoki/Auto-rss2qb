@@ -204,3 +204,100 @@ async def test_candidate_names_are_capped(monkeypatch):
     monkeypatch.setattr(E, "_resolve_inner", capture)
     await E.resolve([f"名{i}" for i in range(10)], None, 1, None)
     assert len(seen["n"]) == E._MAX_CANDIDATE_NAMES == 3
+
+
+# ---------------- (R14) 平票不绑，退『待识别』 ----------------
+
+def _stub_search(mapping):
+    """把 name → (subject_id, 放送日) 的映射做成 _search_one 的桩。"""
+    from datetime import datetime as _dt
+
+    async def _one(client, name, est, date_ref):
+        hit = mapping.get(name)
+        if hit is None:
+            return None
+        sid, day = hit
+        return {"id": sid, "name": name}, _dt.fromisoformat(day)
+    return _one
+
+
+async def _resolve_with(monkeypatch, mapping, names, *, episode=1174, release_time=None):
+    from services import enrich as E
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"id": 975, "name": "ONE PIECE", "name_cn": "航海王",
+                    "date": "1999-10-20", "eps": 1191}
+
+    async def _retryable(fn):
+        return _Resp()
+
+    async def _no_cast(client, bid):
+        return None
+
+    async def _no_bridge(client, ih):
+        return None
+
+    monkeypatch.setattr(E, "_search_one", _stub_search(mapping))
+    monkeypatch.setattr(E, "_retryable", _retryable)
+    monkeypatch.setattr(E, "_fetch_cast", _no_cast)
+    monkeypatch.setattr(E, "_mikan_bridge", _no_bridge)
+    return await E.resolve(names, release_time=release_time, episode=episode)
+
+
+async def test_tied_votes_do_not_bind(monkeypatch):
+    """几个候选名各命中一部不同的番、又没有放送日可判 → 【什么都不绑】。
+
+    修前是 `sorted(votes, key=...)[0]`，而 sorted 是稳定排序：全平局时"第一个"就是
+    候选名的【书写顺序】——等于拿种子标题里哪个名字写在前面来决定绑哪部番。
+    真库 anime#99 就是这样绑成了「海贼王女」(2021)，随后被判超期忽略、一集都不下。
+    """
+    got = await _resolve_with(monkeypatch, {
+        "海贼王": (311310, "2021-10-02"),          # 2-gram「海贼」误命中「海贼王女」
+        "ワンピース": (90795, "2005-12-18"),
+        "One Piece S01E1174": (975, "1999-10-20"),  # 正确答案，同样只有 1 票
+    }, ["海贼王", "ワンピース", "One Piece S01E1174"])
+    assert got is None, f"三方平票必须留待人工，实际绑成了 {got}"
+
+
+async def test_unanimous_names_still_bind(monkeypatch):
+    """多个名字命中【同一部】不是平票——它恰恰是最强的证据，必须照常绑。"""
+    got = await _resolve_with(monkeypatch, {
+        "航海王": (975, "1999-10-20"),
+        "ONE PIECE": (975, "1999-10-20"),
+    }, ["航海王", "ONE PIECE"])
+    assert got is not None and got["bangumi_id"] == 975
+
+
+async def test_single_name_hit_still_binds(monkeypatch):
+    """只有一个名字命中也不是平票（并列者只有它自己），照常绑——
+    否则 feed 缺 pubDate 的番会集体退回『待识别』。"""
+    got = await _resolve_with(monkeypatch, {"航海王": (975, "1999-10-20")},
+                              ["航海王", "查不到的名字"])
+    assert got is not None and got["bangumi_id"] == 975
+
+
+async def test_more_votes_wins_over_tie(monkeypatch):
+    """票数不同就不是平票：2 票的胜过 1 票的。"""
+    got = await _resolve_with(monkeypatch, {
+        "航海王": (975, "1999-10-20"),
+        "ONE PIECE": (975, "1999-10-20"),
+        "海贼王": (311310, "2021-10-02"),
+    }, ["航海王", "ONE PIECE", "海贼王"])
+    assert got is not None and got["bangumi_id"] == 975
+
+
+async def test_date_proximity_breaks_the_tie(monkeypatch):
+    """同票但放送日贴合度不同 → 仍按日期判，不算平票。
+
+    这条守住的是"平票判据别扩得太宽"：季番（集号 1..30 且有发布时间）有日期基准，
+    gap 各不相同，绝不该被误判成平票而集体退回『待识别』。
+    """
+    from datetime import datetime
+    got = await _resolve_with(monkeypatch, {
+        "某番": (975, "1999-10-20"),
+        "Some Show": (311310, "2021-10-02"),
+    }, ["某番", "Some Show"], episode=5, release_time=datetime(2021, 11, 1))
+    assert got is not None, "有日期基准时不该判成平票"

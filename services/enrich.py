@@ -393,7 +393,32 @@ async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
             bgm_id = None
             if votes:
                 # 优先被多个名字一致命中的；其次放送日最贴的
-                bgm_id = sorted(votes, key=lambda i: (-votes[i], gap.get(i, 10 ** 9)))[0]
+                ranked = sorted(votes, key=lambda i: (-votes[i], gap.get(i, 10 ** 9)))
+                best = ranked[0]
+                bkey = (votes[best], gap.get(best, 10 ** 9))
+                tied = [i for i in ranked if (votes[i], gap.get(i, 10 ** 9)) == bkey]
+                if len(tied) > 1:
+                    # 【平票不绑，退『待识别』】以前这里直接取 sorted 的第一个——而 Python 的
+                    # sorted 是稳定排序，全平局时"第一个"就是【候选名的书写顺序】，等于
+                    # 拿种子标题里哪个名字写在前面来决定绑哪部番。
+                    #
+                    # 这不是理论风险：长番（集号 > 30）会走进 est=date_ref=None 那一支，
+                    # 放送日校验整个关闭 → gap 恒为 999 → 只要几个名字各命中一个不同的 subject
+                    # 就是全平局。真库 anime#99 实测：
+                    #   '海贼王' → 311310「海贼王女」(2021-10-02，2-gram「海贼」误命中)
+                    #   'ワンピース' → 90795     'One Piece S01E1174' → 975「航海王」(正确)
+                    # 三票全平 → 取第一个 → 绑成「海贼王女」，随后 air_date=2021 早于开始使用日，
+                    # 整部番被判「超期忽略」，一集都不会下。而且详情页的『重新识别』同样平局、
+                    # 会把人工绑好的 975 再覆盖成另一部（实测 90390「航海王：奈美之章」）。
+                    #
+                    # 平局时【什么都不绑】更好：bgm_id 留 None 会落到下面的 Mikan-hash 桥——
+                    # 那是按 info_hash 精确查番组，比"按名字书写顺序猜"可靠得多；桥也不通就留在
+                    # 『待识别』等人工绑定，由 run_reenrich_retry 按退避重试。宁可多一条待办，
+                    # 不要一个静默绑错的番（绑错之后没有任何告警，而它会连带决定归档目录与超期判定）。
+                    log.info("bgm 识别平票（%d 个候选各 %d 票、放送日贴合度相同），不绑定、留待人工：%s",
+                             len(tied), votes[best], "/".join(names)[:60])
+                else:
+                    bgm_id = best
 
             # ② 兜底：Mikan-hash 桥
             if bgm_id is None and info_hash:

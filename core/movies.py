@@ -24,7 +24,7 @@ from db.models import AnimeTorrent, Movie, MovieTorrent
 from services import enrich
 from services.notify import event as notify_event
 from sources import mikan
-from sources.parse import format_quarter
+from sources.parse import format_quarter, quarter_sort_key
 
 log = logging.getLogger("autorss")
 
@@ -300,7 +300,9 @@ def overview() -> dict:
     q_of = {m.id: (m.quarter or "未知") for m in active}   # 键域即 active 的 id 集，成员判断复用它
     total_by_q = Counter(q_of[m.id] for m in active)
     dl_by_q = Counter(q_of[mid] for mid in dl_ids if mid in q_of)
-    qs = sorted((q for q in total_by_q if q != "未知"), reverse=True)
+    # 【按四位年排】季度键的年份只有两位，纯字符串比较下 '99D' > '26C'，
+    # 1999 年的番会排到当季前面（仪表盘的季度分布条同样中招，不只是番剧列表）。
+    qs = sorted((q for q in total_by_q if q != "未知"), key=quarter_sort_key, reverse=True)
     if "未知" in total_by_q:
         qs.append("未知")
     return {
@@ -372,8 +374,12 @@ def list_movies() -> list[Movie]:
 def list_rejected_movies() -> list[Movie]:
     """已忽略的剧场版/OVA（/movies 页底部『已忽略』区展示，可恢复）。"""
     with get_session() as s:
-        return list(s.exec(select(Movie).where(Movie.rejected == True)  # noqa: E712
-                           .order_by(Movie.quarter.desc(), Movie.id)))
+        rows = list(s.exec(select(Movie).where(Movie.rejected == True)))  # noqa: E712
+    # 【不能用 SQL 的 ORDER BY quarter DESC】季度键的年份只有两位，字符串比较下 '99D' > '26C'，
+    # 1999 年的片会排到最前。别处的季度排序都过 quarter_sort_key，唯独这条是【平铺渲染】——
+    # pages/movies.py 的『已忽略』页直接按本函数的返回序渲染，没有上层分组重排来兜底，
+    # 所以这里排错就是用户直接看到的错。
+    return sorted(rows, key=lambda m: (quarter_sort_key(m.quarter), -(m.id or 0)), reverse=True)
 
 
 def get_movie(movie_id: int) -> Movie | None:
@@ -563,6 +569,36 @@ async def enrich_movie(movie_id: int) -> bool:
                     Movie.bangumi_id == m.bangumi_id, Movie.id != m.id))):
                 _merge_movie(s, other.id, m.id)
     return bool(info)
+
+
+def bind_preview(movie_id: int, bgm_id: int) -> dict:
+    """剧场版侧的『绑定 bgm』回显 —— 与 core.anime.bind_preview 对称，返回同一个形状。
+
+    番剧侧加了回显闸之后，这一半一直是漏的：`bind_movie_bgm` 末尾同样有身份守卫
+    （core/movies.py 的 `_merge_movie`），最后一步同样是 `s.delete(loser)`，
+    两个调用点（详情页『绑定 bgm』、列表页待识别的『绑定』）却零预览零确认。
+    「番剧侧补了、剧场版侧没补」正是本项目最常见的那种广度错误。
+
+    与番剧侧的差别只有一处：剧场版没有集号，所以不产生「同一集两个编号」那类告警，
+    warn 恒为空；要说明的只有"哪一条记录会被删、它下过几个版本"。
+    """
+    out: dict = {"merge": [], "warn": []}
+    with get_session() as s:
+        me = s.get(Movie, movie_id)
+        if me is None:
+            return out
+        for o in s.exec(select(Movie).where(Movie.bangumi_id == bgm_id, Movie.id != movie_id)):
+            rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == o.id)))
+            out["merge"].append({
+                "id": o.id,
+                "name": o.display_name or o.title or "?",
+                "state": "已忽略" if o.rejected else "正常",
+                "torrents": len(rows),
+                "handled": sum(1 for t in rows if t.status in engine.HANDLED_STATUSES),
+                "aliases": 0,      # 剧场版没有别名表，形状对齐番剧侧即可
+                "episodes": [],
+            })
+    return out
 
 
 async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:

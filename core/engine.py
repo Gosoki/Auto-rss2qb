@@ -22,6 +22,7 @@ from core import ssrf
 from services import fetch
 from services.qbittorrent import QBittorrent
 from sources.parse import format_quarter
+from sources.parse import quarter_year as _quarter_year
 
 log = logging.getLogger("autorss")
 
@@ -138,15 +139,15 @@ def quarter_label(quarter: str) -> str:
     return format_quarter(quarter, config.QUARTER_FMT_UI)
 
 
-def quarter_year(quarter: str) -> int | None:
-    """季度键(26C) → 四位年份(2026)；解析不出回 None。**"从季度取年份"只此一份**。
-
-    曾有两份各写各的：core/movies.py 的小结返回 `2000+int(q[:2])`（四位 int），
-    pages/movies.py 的分组返回 `q[:2]`（两位 str），而两者的"解析不出"判据也不同。
-    剧场版整条线都按年归档（MOVIE_QUARTER_FMT 默认 {yyyy}），这是它最常用的一个派生量。
-    """
-    q = quarter or ""
-    return 2000 + int(q[:2]) if len(q) >= 2 and q[:2].isdigit() else None
+# 【quarter_year 只此一份，实现在 sources/parse.py】那里才是季度键的定义处
+# （_QUARTER_KEY_RE、_CENTURY_PIVOT、format_quarter 都在那）。本模块只是把它转出来，
+# 让 `engine.quarter_year(...)` 这个既有调用形态继续可用（pages/movies.py 与两处 overview 在用）。
+#
+# 历史：这里曾经自己写着 `2000 + int(q[:2])`，docstring 还宣称「从季度取年份只此一份」——
+# 而 format_quarter 的 {yyyy} 占位另写了一份 f"20{yy}"。两份共享同一个「两位年一律当 20xx」的错，
+# 于是 '99D' 在排序、显示、归档三条路径上都给出 2099。
+# 现在换成再导出而不是「薄包装函数」：包装函数留着，下一个人往里加两行逻辑就又分家了。
+quarter_year = _quarter_year
 
 
 def prev_quarter(q: str) -> str:
@@ -156,7 +157,9 @@ def prev_quarter(q: str) -> str:
         return ""
     yy, letter = int(m.group(1)), m.group(2)
     if letter == "A":
-        return f"{yy - 1:02d}D"
+        # % 100 是必须的：'00A'(2000冬) 的上一季是 '99D'(1999秋)，不取模会拼出 '-1D'——
+        # 一个谁都解析不出的键，quarter_brief 的"上季"卡会当场空掉。
+        return f"{(yy - 1) % 100:02d}D"
     return f"{yy}{chr(ord(letter) - 1)}"
 
 

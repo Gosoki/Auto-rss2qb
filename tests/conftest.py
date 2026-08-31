@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # 【必须在 import config 之前】config.DB_PATH 是模块级、启动时从环境变量读一次。
 # 指到临时文件，免得用例把开发用的 data/autorss.db 写脏（init_db 会真的建表、跑迁移）。
+_TMP_ROOT = os.path.realpath(tempfile.gettempdir())   # 钉死在 import 时，见 _assert_throwaway
 _TMP_DB = Path(tempfile.mkdtemp(prefix="autorss-test-")) / "test.db"
 os.environ["DB_PATH"] = str(_TMP_DB)
 
@@ -54,11 +55,87 @@ _INTERNAL_MARKERS = ("_FINISH_BACKFILL_DONE", "_KNOWN_NOTIFY_EVENTS",
                      "_QB_PROGRESS_BACKFILLED", "_idle_backfilled")
 
 
+def _assert_throwaway(engine, what: str) -> None:
+    """删数据之前，先确认删的是【一次性的库】。不是就当场炸掉。
+
+    【为什么必须有这一道】clean_tables 用的是 `testdb.get_session()`，而它读的是
+    **调用时刻的 `db.engine`**——不是本文件顶上那个 DB_PATH。任何代码只要在用例里
+    （或在一个 import 了 db 的探针脚本里）把 `db.engine` 重新指向别处，这个夹具就会
+    照着新目标 DELETE 六张业务表，而且一声不吭。
+
+    这不是假想：2026-08-31 真的发生过一次——一个只读审计的 agent 为了复现问题写了个探针，
+    把 db.engine 指到了 data/autorss.db，然后用了 clean_tables。开发库里 99 部番、1621 条种子
+    被清空，只剩下它自己插进去的夹具行（`番0`）。数据是从备份恢复的，但那次的代价是运气好：
+    恰好 90 分钟前有一份完整备份。
+
+    判据取"路径必须在系统临时目录下"而不是"路径不等于 data/autorss.db"：
+    后者是黑名单，换个库名就绕过去了；前者是白名单，凡不是一次性的一律拦下。
+    """
+    url = engine.url
+    if url.get_backend_name() != "sqlite":
+        raise RuntimeError(f"拒绝在非 SQLite 上跑 {what}：{url.render_as_string(hide_password=True)}")
+    path = url.database
+    if not path:
+        return                      # :memory: —— 天然一次性
+    # 【用会话启动时钉住的临时根，不用 gettempdir()】gettempdir() 每次都读 tempfile.tempdir，
+    # 而那是个可写的模块级变量：用例里 `tempfile.tempdir = "/"` 之后判据就恒真、闸形同虚设
+    # （实测可绕过）。_TMP_ROOT 在 import 本文件时算一次，之后谁也改不动它。
+    real = os.path.realpath(path)
+    if not real.startswith(_TMP_ROOT + os.sep):
+        raise RuntimeError(
+            f"拒绝在【非临时库】上跑 {what}：{real}\n"
+            f"测试夹具只允许操作系统临时目录下的一次性库（本次会话是 {_TMP_DB}）。\n"
+            f"如果你是在写探针脚本：不要把 db.engine 指向开发库再用 clean_tables —— "
+            f"它会 DELETE 掉全部六张业务表。")
+
+
+@pytest.fixture(autouse=True)
+def _guard_every_session(monkeypatch):
+    """把"测试不许碰非一次性库"这条约束装到【所有会话入口】上，而不只是 clean_tables。
+
+    【为什么必须扩到这里】上一版闸只挂在 clean_tables，而那条约束的作用域大得多：
+      · testdb 夹具本身会 db.init_db()，在【调用时刻的 db.engine】上跑 alembic upgrade
+        （SQLite 侧 batch_alter_table 是"建影子表→拷数据→改名"，中途出错就是真丢数据）；
+      · **用例里调任何生产函数**都用 db.get_session()——探针实测：把 db.engine 指到一个
+        开发库之后调 core.anime._merge_anime，它照样把行 DELETE 掉了；
+      · upgrade_from 那条路同理。
+    也就是说 2026-08-31 那次把开发库清空的形状，只堵住 clean_tables 是【原样可复现】的。
+
+    改成 autouse 地包住 get_session / get_meta_session：会话一开就查，覆盖上面全部路径，
+    且不需要生产代码知道测试的存在（生产侧一行没动）。
+    """
+    import db as _db
+    real_s, real_m = _db.get_session, _db.get_meta_session
+
+    def _s():
+        _assert_throwaway(_db.engine, "get_session（用例里的任何写库操作）")
+        return real_s()
+
+    def _m():
+        _assert_throwaway(_db.meta_engine, "get_meta_session（用例里的任何写库操作）")
+        return real_m()
+
+    monkeypatch.setattr(_db, "get_session", _s)
+    monkeypatch.setattr(_db, "get_meta_session", _m)
+    # 生产模块在 import 时就 `from db import get_session` 绑过去了，得逐个换掉
+    for mod in ("core.anime", "core.movies", "core.engine", "core.worker", "core.manual"):
+        try:
+            m = __import__(mod, fromlist=["*"])
+        except Exception:
+            continue
+        if hasattr(m, "get_session"):
+            monkeypatch.setattr(m, "get_session", _s)
+        if hasattr(m, "get_meta_session"):
+            monkeypatch.setattr(m, "get_meta_session", _m)
+
+
 @pytest.fixture
 def clean_tables(testdb):
     """每个用例前清空业务表与内部标记，用例之间互不干扰。"""
     from sqlmodel import delete
     from db.models import Anime, AnimeTorrent, AnimeAlias, Movie, MovieTorrent, Setting
+    _assert_throwaway(testdb.engine, "clean_tables（会 DELETE 六张业务表）")
+    _assert_throwaway(testdb.meta_engine, "clean_tables 的 meta 侧")
     with testdb.get_session() as s:
         for m in (AnimeTorrent, AnimeAlias, Anime, MovieTorrent, Movie):
             s.exec(delete(m))

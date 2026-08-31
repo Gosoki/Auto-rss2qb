@@ -59,22 +59,22 @@ def render_sources() -> None:
         for g in groups:
             with ui.card().classes("w-full"):
                 with ui.row().classes("items-center gap-2 w-full flex-wrap"):
-                    name = ui.input("名字", value=g.name).props("dense outlined").classes("w-32")
+                    name = ui.input("名字", value=g.name).classes("w-32")
                     # 【库里的值不在选项里也要能渲染】ui.select 拿到不在 options 里的 value 会抛，
                     # 而这一页正是删除源组的【唯一入口】——一旦崩掉，用户连把那个坏组删掉都做不到。
                     # 后台对同样的数据只是 log.warning 跳过（见 core/worker.py 的 build_sources），
                     # 没有理由 UI 这边反而硬崩。
                     site = ui.select(_opts_with(SITE_OPTS, g.site), value=g.site,
-                                     label="类型").props("dense outlined").classes("w-32")
+                                     label="类型").classes("w-32")
                     policy = ui.select(_opts_with(POLICY_OPTS, g.policy), value=g.policy,
-                                       label="策略").props("dense outlined").classes("w-32")
-                    priority = ui.number("优先级", value=g.priority, format="%d").props("dense outlined").classes("w-32")
-                    enabled = ui.switch("启用", value=g.enabled).props("dense")
-                feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).props("dense outlined").classes("w-full")
+                                       label="策略").classes("w-32")
+                    priority = ui.number("优先级", value=g.priority, format="%d").classes("w-32")
+                    enabled = ui.switch("启用", value=g.enabled)
+                feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).classes("w-full")
                 subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）",
-                                     value=g.subgroups).props("dense outlined").classes("w-full")
+                                     value=g.subgroups).classes("w-full")
                 tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日）",
-                                   value=g.title_filter).props("dense outlined").classes("w-full")
+                                   value=g.title_filter).classes("w-full")
                 with ui.row().classes("gap-2"):
                     ui.button("保存", icon="save",
                               on_click=_save(g.id, name, site, policy, priority, enabled, feed, subgroups, tfilter)
@@ -86,13 +86,13 @@ def render_sources() -> None:
         ui.label("添加新组").classes("font-bold")
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center gap-2 w-full flex-wrap"):
-                n_name = ui.input("名字").props("dense outlined").classes("w-32")
-                n_site = ui.select(SITE_OPTS, value="nyaa", label="类型").props("dense outlined").classes("w-32")
-                n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").props("dense outlined").classes("w-32")
-                n_priority = ui.number("优先级", value=50, format="%d").props("dense outlined").classes("w-32")
-            n_feed = ui.input("feed（nyaa 用户名如 Lilith-Raws，或完整 RSS URL）").props("dense outlined").classes("w-full")
-            n_subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）").props("dense outlined").classes("w-full")
-            n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").props("dense outlined").classes("w-full")
+                n_name = ui.input("名字").classes("w-32")
+                n_site = ui.select(SITE_OPTS, value="nyaa", label="类型").classes("w-32")
+                n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").classes("w-32")
+                n_priority = ui.number("优先级", value=50, format="%d").classes("w-32")
+            n_feed = ui.input("feed（nyaa 用户名如 Lilith-Raws，或完整 RSS URL）").classes("w-full")
+            n_subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）").classes("w-full")
+            n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").classes("w-full")
             ui.button("添加", icon="add",
                       on_click=_add(n_name, n_site, n_policy, n_priority, n_feed, n_subgroups, n_tfilter)
                       ).props("color=primary unelevated")

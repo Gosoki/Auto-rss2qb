@@ -11,8 +11,9 @@ import config
 import db
 from db.models import MovieTorrent
 from core import engine, movies as mov, worker
-from sources.parse import SEASON_CN
-from .layout import (WEEKDAY_CN, barline, busy_action, confirm, expand_collapse_bar, frame,
+from sources.parse import SEASON_CN, quarter_sort_key
+from .layout import (WEEKDAY_CN, barline, busy_action, confirm, confirm_bind_merge,
+                     expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
                      name_of, paginate, parse_bgm_id, qb_live_text,
                      recent_table, torrent_status_cn, warn_banner)
@@ -38,12 +39,14 @@ def _group_by_year_quarter(items):
     by_year: dict = defaultdict(lambda: defaultdict(list))
     for it in items:
         q = it.quarter or "未知"
+        # 【用四位年做分组键】原来是 f"{_y - 2000:02d}"：1999 年的片会算出 '-1'，
+        # 下面的 -int(y) 排序把它当成最大、显示又拼成『20-1 年』。四位年三处都正确。
         _y = engine.quarter_year(q)
-        year = f"{_y - 2000:02d}" if _y is not None else "未知"
+        year = str(_y) if _y is not None else "未知"
         by_year[year][q].append(it)
     out = []
     for year in sorted(by_year, key=lambda y: (1, 0) if y == "未知" else (0, -int(y))):
-        qs = sorted(by_year[year], reverse=True)
+        qs = sorted(by_year[year], key=quarter_sort_key, reverse=True)
         if "未知" in qs:                       # 未知季度垫到年内最后
             qs.remove("未知"); qs.append("未知")
         out.append((year, [(q, by_year[year][q]) for q in qs]))
@@ -331,8 +334,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             ui.label("绑定 bgm").classes("font-bold")
             ui.label("自动认错了就把正确的 bgm 链接或 ID 填这——直接取权威元数据覆盖。").classes(
                 "text-xs text-gray-400")
-            inp = ui.input(placeholder="bgm.tv/subject/464376 或 464376").props(
-                "dense outlined autofocus").classes("w-80 min-w-0 max-sm:w-full")
+            inp = ui.input(placeholder="bgm.tv/subject/464376 或 464376").props("autofocus").classes("w-80 min-w-0 max-sm:w-full")
             inp.on("keydown.enter", lambda: dlg.submit(inp.value))   # 同番剧页：autofocus 就该能回车提交
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
@@ -344,6 +346,9 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         bid = parse_bgm_id(val)
         if bid is None:
             ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
+            return
+        # 【绑定前回显】与番剧侧同一道闸：身份守卫 _merge_movie 的最后一步是 s.delete(loser)
+        if not await confirm_bind_merge(movie_id, bid, kind="movie"):
             return
         old_path = mov.movie_save_path(movie_id)
         ok = await mov.bind_movie_bgm(movie_id, bid)
@@ -452,6 +457,9 @@ def movies_page(t: str = ""):
                 bid = parse_bgm_id(inp.value or "")
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
+                    return
+                # 【绑定前回显】同上，这里是『待识别』列表里的绑定按钮
+                if not await confirm_bind_merge(movie_id, bid, kind="movie"):
                     return
                 old_path = mov.movie_save_path(movie_id)
                 ok = await mov.bind_movie_bgm(movie_id, bid)
@@ -573,7 +581,7 @@ def movies_page(t: str = ""):
             chips.append(("种子数", k["versions"], "blue-grey", "全部种子/版本数（各状态之和）"))
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
-                    b = ui.badge(f"{label} {val}").props(f"color={color}").classes("text-sm")
+                    b = ui.badge(f"{label} {val}").props(f"color={color}")
                     if tip:
                         b.tooltip(tip)
             # ── 下载状态 ──（qB 实时态，独立成区；与番剧页同款：后台轮询之外可点『立刻刷新』手动拉一次）
@@ -590,14 +598,13 @@ def movies_page(t: str = ""):
                 _sync.tooltip("立即向 qB 拉一次最新进度（不必等后台轮询）" if _qb_on
                               else "qB 未启用，去设置页开启后可同步")
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
-                ui.badge(f"已完成 {q['completed']}").props("color=green").classes("text-sm")
-                ui.badge(f"下载中 {q['downloading']}").props("color=blue").classes("text-sm")
-                ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").classes("text-sm").tooltip(
+                ui.badge(f"已完成 {q['completed']}").props("color=green")
+                ui.badge(f"下载中 {q['downloading']}").props("color=blue")
+                ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").tooltip(
                     "qB 里正在跟踪的种子数（已交付给 qB 的）")
                 if q["dlspeed"]:
-                    ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=blue").classes("text-sm")
-                ui.badge(f"完成率 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").classes(
-                    "text-sm").tooltip("已交付种子的平均完成度")
+                    ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=blue")
+                ui.badge(f"完成率 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").tooltip("已交付种子的平均完成度")
 
             # ── 采集状态 ──（剧场版=Mikan 季度扫描；开关/间隔在『订阅源』tab 调）
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
@@ -605,14 +612,14 @@ def movies_page(t: str = ""):
                 ui.label("后台采集与识别").classes("text-xs text-gray-400")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 ui.badge("扫描开启" if config.MOVIE_SCAN_ENABLED else "扫描暂停").props(
-                    f"color={'green' if config.MOVIE_SCAN_ENABLED else 'red'}").classes("text-sm").tooltip(
+                    f"color={'green' if config.MOVIE_SCAN_ENABLED else 'red'}").tooltip(
                     "后台是否定期扫 Mikan 剧场版/OVA 桶（『订阅源』页切换）")
-                ui.badge(f"识别 {k['matched']}/{k['total']}").props("color=blue").classes("text-sm").tooltip(
+                ui.badge(f"识别 {k['matched']}/{k['total']}").props("color=blue").tooltip(
                     "已匹配到 bgm 的 / 全部")
                 ui.badge(f"扫描间隔 {config.MOVIE_SCAN_INTERVAL // 3600}h").props(
-                    "color=blue-grey").classes("text-sm")
+                    "color=blue-grey")
                 ui.badge(f"上次 {config.MOVIE_SCAN_LAST or '从未'}").props(
-                    "color=blue-grey").classes("text-sm")
+                    "color=blue-grey")
 
         @ui.refreshable
         def inflight_panel():
@@ -635,7 +642,7 @@ def movies_page(t: str = ""):
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1 no-wrap").style(
                                 "border-bottom:1px solid rgba(255,255,255,.08)"):
                             ui.label(r["name"]).classes("grow break-all min-w-0")
-                            ui.badge(text).props(f"color={color}").classes("shrink-0 text-sm")
+                            ui.badge(text).props(f"color={color}").classes("shrink-0")
 
         @ui.refreshable
         def recent_panel():
@@ -670,7 +677,7 @@ def movies_page(t: str = ""):
                     with ui.card().classes("gap-2 py-3").style("flex:1 1 300px"):
                         with ui.row().classes("items-center gap-2 flex-wrap"):
                             ui.badge(b["tag"]).props(
-                                f"color={'primary' if b['tag'] == '今年' else 'blue-grey'}").classes("text-sm")
+                                f"color={'primary' if b['tag'] == '今年' else 'blue-grey'}")
                             ui.label(f"{b['key']} 年 · {b['total']} 部").classes("font-bold text-base")
                         with ui.row().classes("gap-6"):
                             for num, lbl, color in stats:
@@ -703,7 +710,7 @@ def movies_page(t: str = ""):
             for i, (year, quarters) in enumerate(shown):
                 year_open = exp if exp is not None else i == 0   # 一级(年份)可折叠，默认仅最新年展开
                 year_total = sum(len(grp) for _, grp in quarters)
-                _yt = "未知年份" if year == "未知" else f"20{year} 年"   # 未知季度别拼成『20未知 年』
+                _yt = "未知年份" if year == "未知" else f"{year} 年"   # year 已是四位年（见 _group_by_year_quarter）
                 year_exp = ui.expansion(f"{_yt}   ·   {year_total} 部",
                                         value=year_open).classes("w-full")
                 # 懒加载在『年』这级：年展开才建内容。二级『季度』不折叠——小标题 + 卡直接全铺开。
@@ -829,7 +836,7 @@ def movies_page(t: str = ""):
                 ui.label("自动扫描").classes("font-bold")
                 f = {}
                 f["enabled"] = ui.switch("开启自动扫描（后台定期扫『当年』四季的剧场版/OVA）",
-                                         value=config.MOVIE_SCAN_ENABLED).props("dense")
+                                         value=config.MOVIE_SCAN_ENABLED)
                 with ui.row().classes("items-center gap-3 flex-wrap"):
                     f["hours"] = ui.number("扫描间隔（小时）",
                                            value=round(config.MOVIE_SCAN_INTERVAL / 3600, 1),
@@ -847,7 +854,7 @@ def movies_page(t: str = ""):
                 sel_seasons = _manual_form.setdefault("seasons", set(SEASON_CN))
                 with ui.row().classes("items-stretch gap-3 flex-wrap"):
                     year = ui.number("年份", value=_manual_form.get("year") or datetime.now().year,
-                                     format="%d").props("dense outlined").classes("w-28")
+                                     format="%d").classes("w-28")
                     year.on("blur", lambda e, y=year: _manual_form.update(year=y.value))
                     with ui.row().classes("items-stretch gap-2"):
                         for _k, _v in SEASON_CN.items():

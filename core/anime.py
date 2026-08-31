@@ -21,6 +21,7 @@ from db.models import Anime, AnimeTorrent, MovieTorrent, SourceGroup, AnimeAlias
 from services import enrich
 from services.notify import event as notify_event, state as notify_state
 from sources.parse import (extract_episode_abs, kw_match, parse_title, quarter_of,
+                           quarter_sort_key,
                            search_query_names, season_from_name)
 
 log = logging.getLogger("autorss")
@@ -111,6 +112,86 @@ def _aired_before_start(air_date) -> bool:
     return _aired_before(air_date, _parse_date(config.ANIME_START_DATE))
 
 
+# 【离季余量】判"这条种子还可能属于所绑的那一季吗"时留的宽限。26 周＝半年。
+# 迟发、补流、BD 补档、字幕组追补都在这个量级内。真库上做过灵敏度扫描：
+# 余量取 8/13 周会误伤『金牌得主 第二季』（本季 9 集、种子在首播后 26 周才来，是正常补流），
+# 而 26/52/104 周三档的命中集合完全相同（只剩真正绑错的那一部）——26 是这个平台的下沿，
+# 不是凑出来的数。
+_OFF_SEASON_SLACK_WEEKS = 26
+
+
+def _episode_cannot_belong(a, item) -> bool:
+    """这条种子的集号【不可能】属于 a 所绑的那一季 —— 即 bgm 多半匹配错了季。
+
+    两个条件同时成立才算数，缺一不可：
+      ① 集号超出该季总集数 —— 但**这一条单独完全不够**。真库实测：98 部有 bgm 的番里
+         有 15 部（15%）满足它，其中 8 部正在正常追番下载。原因是"用全系列绝对编号"
+         是字幕组的常规写法（『相反的你和我 第二季』本季 13 集、种子写 14–21），
+         绑定本身是对的，集号归一交给 ep_offset 那套机制处理。只按这一条判就会把它们
+         全推进『待确认』，等于把自动化关掉。
+      ② 种子的发布时间已经远远超出该季的播出窗口（首播日 + 总集数周 + 半年余量）。
+         一季播完很久之后不会再有新集 —— 除非我们绑错了季。
+
+    真实案例（本项目实测）：`[百冬练习组&LoliHouse] Re:从零开始的异世界生活 … - 78`
+    标题没有季标记 → season=1 → 两个候选名【一致】命中 bgm 140001『第一季』(2016-04-03，26 集)
+    → 不是平票、直接绑上 → air_date 2016 早于开始使用日 → 整部番判『超期忽略』，一集不下。
+    而正确答案是 633836『第四季 夺还篇』(绝对第 78 集 = 该季第 1 集)。
+    这条判据抓的就是"第 78 集 > 26 集，且种子比该季首播晚了 543 周（本季跨度只有 26 周）"。
+
+    【为什么不直接拒绝绑定】绑定本身还有用：元数据、封面、ep_offset 的学习都要它，
+    而"绑错了哪一季"人来看一眼就知道。所以只降级成『待确认』等人工，不清空 bangumi_id。
+    """
+    ep = getattr(item, "episode", None)
+    total = a.total_episodes or 0
+    if not isinstance(ep, (int, float)) or ep < 1 or total <= 0:
+        return False
+    if ep <= total:
+        return False
+    aired = _parse_date(a.air_date)
+    rel = getattr(item, "release_time", None)
+    if aired is None or rel is None:
+        return False          # 判不了就不判（与本项目"宁可不判，绝不误判"的一贯口径一致）
+    weeks = (rel.date() - aired).days / 7
+    return weeks > total + _OFF_SEASON_SLACK_WEEKS
+
+
+def binding_looks_wrong(s, a) -> bool:
+    """这部番的 bgm 绑定看着不对 —— 从库里【已有的种子】推，不需要手上正好有一条 item。
+
+    两条判据，命中任一即为可疑：
+      ① 有种子的集号【不可能属于所绑的那一季】（见 _episode_cannot_belong）；
+      ② 所绑条目只有 1 集，却收到了多个不同的正片集号 —— 典型是被绑到了单集特典上。
+
+    `_episode_cannot_belong(a, item)` 只用到 item 的 `episode` 与 `release_time` 两个属性，
+    而 AnimeTorrent 行恰好同名，可以直接当 item 传进去。这样同一个判据就能用在
+    "手上没有 item、只有一部番"的场合（批量重算超期、以后的巡检/页面提示）。
+
+    【为什么必须有这个形态】"绑错季 → 待确认"的闸原来只装在两个【有 item】的地方
+    （建番、自动升确认），而决定『超期忽略』的地方是**三处** —— 第三处
+    `apply_start_date_filter()` 是批量重算，它手上一条 item 都没有。
+    于是用户在设置页点一次『应用开始使用日过滤』，被降级的番就被打回『超期忽略』，
+    修复等于没做。真库实测：anime#100（Re:Zero，绑成 2016 年第一季）点一次就掉回去。
+    这是本轮第三次同款广度错误，所以这次把判据做成"给一部番就能算"，而不是再加第三处拷贝。
+    """
+    if a is None or a.bangumi_id is None:
+        return False
+    rows = s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == a.id)).all()
+    if any(_episode_cannot_belong(a, t) for t in rows):
+        return True
+    # 【第二条判据：单集条目收到了多集正片】bgm 上一部作品常拆成很多条目——正片、
+    # 特别篇、PV、单集特典各占一条。搜名字时特典与正片同名，而 resolve 只按名字投票，
+    # 于是整部番可能被绑到那条【只有 1 集】的特典上。
+    # 真库实证：anime#96 绑到 664060『AKANE On My Mind〜饅頭こわい』(1 集·类型=其他)，
+    # 而它的种子是「朱音落语」第 3~12 集、已下 10 集；正确答案是 576121『落语朱音』(12 集·TV)。
+    # 后果不只是名字错：total_episodes=1 让完结判定永远算不对，归档目录名也是特典的名字。
+    #
+    # 判据要数【不同的集号】而不是种子条数：一部真的单集作品会有多个字幕组/多个版本的种子，
+    # 那是正常的。全库实测：命中 1 部（就是 #96），另有 3 部真单集作品不受影响，零误报。
+    eps = {t.episode for t in rows
+           if isinstance(t.episode, (int, float)) and t.episode >= 1}
+    return (a.total_episodes or 0) == 1 and len(eps) > 1
+
+
 def apply_start_date_filter() -> int:
     """按『开始使用日』重算超期忽略。超期忽略 = (rejected=True, confirmed=False)——人工拒绝必是 confirmed=True，
     故此组合唯一表示超期忽略、可与人工决定区分。可逆、只动该动的番：
@@ -123,6 +204,12 @@ def apply_start_date_filter() -> int:
         for a in s.exec(select(Anime)):
             out = _aired_before(a.air_date, start)
             if out and not a.rejected and not a.confirmed:      # 超期 + 待确认 → 判超期忽略
+                # 【绑定看着不对的番不判超期】它的 air_date 来自一个多半绑错了的 bgm 条目
+                # （绑错季时往往绑到十年前的初代），拿这个日期去判超期就是拿错误的前提做结论，
+                # 而结论是"从主列表消失、永久停更"。留在『待确认』等人工看一眼。
+                # 只在真要翻状态时才查种子，避免给每部番都多一次查询。
+                if binding_looks_wrong(s, a):
+                    continue
                 a.rejected = True
                 s.add(a); changed += 1
             elif not out and a.rejected and not a.confirmed:    # 不再超期 + 当前是超期忽略 → 释放回待确认
@@ -145,6 +232,11 @@ def ignore_confirmed_before_start() -> int:
     with get_session() as s:
         for a in s.exec(select(Anime).where(Anime.confirmed == True, Anime.rejected.is_not(True))):  # noqa: E712
             if _aired_before(a.air_date, start):
+                # 【第五处写 rejected 的地方，同样要让路】判据与 apply_start_date_filter 逐字相同：
+                # 绑定看着不对的番，它的 air_date 来自一个多半绑错了的 bgm 条目，
+                # 拿这个日期去判超期就是拿错误的前提做结论，而结论是"从主列表消失、永久停更"。
+                if binding_looks_wrong(s, a):
+                    continue
                 a.confirmed, a.rejected = False, True
                 s.add(a); changed += 1
         if changed:
@@ -234,9 +326,20 @@ async def _resolve_anime(item) -> int:
                 confirmed=auto,
             )
             _apply_bgm(anime, info)   # 落 air_date 等 bgm 字段（下面判超期要用）
-            # 新入库即判超期：与 apply_start_date_filter 同口径（超期+非人工决定 → 超期忽略），
-            # 不分自动源/review 源——否则 review 源的老番会滞留『待确认』，跟批量重算结果不一致。
-            if _aired_before_start(anime.air_date):
+            # 【匹配到了错误的季 → 留给人工，别让它掉进任何一个自动结论】
+            # 这一支必须排在超期判定【前面】并且互斥：绑错季时 air_date 往往是十年前的初代
+            # （Re:Zero 绑成 2016 年的第一季），超期判定会二话不说把它打成『超期忽略』——
+            # 一部正在更新的番就此静默停更，而界面上它和用户手动拒绝的番长得一模一样。
+            # 判据见 _episode_cannot_belong：要"集号超出本季"【且】"发布时间远超本季窗口"，
+            # 单看前者会误伤 15% 的正常番（它们只是用了全系列绝对编号）。
+            if _episode_cannot_belong(anime, item):
+                anime.confirmed, anime.rejected = False, False   # → 『待确认』，等人工看一眼
+                log.warning("bgm 可能匹配到了错误的季，留待人工确认：%s（绑到 bgm %s『%s』"
+                            "首播 %s 共 %s 集，而本条是第 %s 集、发布于 %s）",
+                            item.anime_title, anime.bangumi_id, anime.display_name or anime.title,
+                            anime.air_date, anime.total_episodes, item.episode,
+                            item.release_time.date() if item.release_time else "?")
+            elif _aired_before_start(anime.air_date):
                 anime.confirmed, anime.rejected = False, True   # 早于开始使用日 → 超期忽略，不自动下（种子照常入库）
             s.add(anime)
             s.commit()          # Anime 无唯一约束，(title,季) 的去重由 AnimeAlias 负责，此处不会撞约束
@@ -532,8 +635,18 @@ async def process_item(item, known_hashes: set | None = None,
         #   · 番超期(早于开始使用日，续季/老番补齐正是这种) → 走下面 rejected=True 分支被判
         #     『超期忽略』，从主列表消失、永久停更，而它压根不在弹窗指引的『待确认』页，用户无从发现。
         # 判据用"有没有 HANDLED 状态的种子"：补齐/重绑的番按定义已下过，待救的两种情形则没有。
+        # 【绑错季的番不许被自动升确认】_episode_cannot_belong 原来只在 _resolve_anime 的
+        # "新建番"分支里判过一次，而这条升确认分支的入口条件与被降级的番完全吻合：
+        # 待确认(0,0) + 有 bangumi_id + auto 源 + 一集都没下过 —— 一条新种子进来就把它升回『追番中』。
+        #
+        # 【作用域，别记错】下面的函数体还有一道 `not _aired_before_start(a.air_date)`，
+        # 所以"绑到十年前的老季"那一类（如 Re:Zero 绑成 2016 年第一季）本来就被超期判据挡住了，
+        # 不靠这道闸。这道闸真正管的是**另一半**：绑错的季【不早于】开始使用日时
+        # （绑到同年另一个 cour、绑到今年的衍生作），超期判据一点忙都帮不上，
+        # 没有它就会被静默升成『追番中』并开始自动下。判据与建番时那次逐字相同，不引入第二套口径。
         if (a is not None and not a.confirmed and not a.rejected
                 and a.bangumi_id is not None and _is_auto(item.policy)
+                and not binding_looks_wrong(s, a)
                 and not s.exec(select(AnimeTorrent).where(
                     AnimeTorrent.anime_id == anime_id,
                     AnimeTorrent.status.in_(HANDLED_STATUSES),
@@ -974,7 +1087,9 @@ def overview() -> dict:
     # 各季度总番数（含待确认/待识别/已忽略）——供下面的 3 桶分解用
     total_by_q = Counter((q or "未知") for _, q in all_aq)
     aid_q = {aid: (q or "未知") for aid, q in all_aq}
-    qs = sorted((q for q in total_by_q if q != "未知"), reverse=True)
+    # 【按四位年排】季度键的年份只有两位，纯字符串比较下 '99D' > '26C'，
+    # 1999 年的番会排到当季前面（仪表盘的季度分布条同样中招，不只是番剧列表）。
+    qs = sorted((q for q in total_by_q if q != "未知"), key=quarter_sort_key, reverse=True)
     if "未知" in total_by_q:
         qs.append("未知")
 
@@ -1736,7 +1851,20 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
         # 迁订阅态，别随 loser 删掉致停更/复活：追不追=confirmed 且未 rejected，按两方『活跃』并集；
         # 都不活跃时保留『拒绝优先于待确认』；pref_source 空则补。
         active = (keeper.confirmed and not keeper.rejected) or (loser.confirmed and not loser.rejected)
-        if active:
+        # 【两边都要查】这道闸跑在种子搬家【之前】（重指 anime_id 的循环在几十行之后），
+        # 而 bind_anime_bgm / enrich_anime 的身份守卫里 keeper 恒是【当前正在操作的那条】——
+        # 常常是刚绑定、还没有种子的残条，攒着可疑种子的反而是 loser。
+        # 只查 keeper 的话，这道闸在最常见的那条路径上完全看不见证据（实测：keeper 无种子、
+        # loser 挂着 ep=78/2026-08 的可疑种子，合并后照样升成追番中）。
+        if active and (binding_looks_wrong(s, keeper) or binding_looks_wrong(s, loser)):
+            # 【绑定看着不对时，union-active 不能生效】这是决定订阅态的【第四处】。
+            # union-active 本身是对的（它防的是"番静默从追番中掉回待确认、从此停更"），
+            # 但合并跑在自动路径上时（enrich_anime 末尾的身份守卫，由后台 retry_unmatched /
+            # 批量重新识别驱动），它会把刚被降级的番悄悄升回『追番中』——而降级的意思正是
+            # "这个 bgm 绑定多半错了，等人看一眼"，没人看过就不该恢复自动下载。
+            # 落『待确认』而不是『已忽略』：前者在列表里看得见、一键就能确认，后者是静默的。
+            keeper.confirmed, keeper.rejected = False, False
+        elif active:
             keeper.confirmed, keeper.rejected = True, False
         else:
             keeper.confirmed = keeper.confirmed or loser.confirmed
@@ -1834,12 +1962,31 @@ async def enrich_anime(anime_id: int, freeze_empty_path: bool = False) -> bool:
         info_hash = t.info_hash if t else None
         release_time = t.release_time if t else None
         episode = t.episode if t else None
+        bgm_before = a.bangumi_id      # 见下面 await 之后的那道 compare-and-set
 
     info = await enrich.resolve(names, release_time, episode, info_hash)
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is None:
             return False
+        # 【await 期间别人改了 bangumi_id 就让路】enrich.resolve 的整体预算是 120 秒
+        # （services/enrich.py 的 _RESOLVE_BUDGET），这是全项目最长的一个 await 窗口之一。
+        # 原来这里只重取了一次 a，挡住的是"番在 await 期间被删了"，没挡"绑定在 await 期间变了"——
+        # 而 apply_bgm_meta 对 bangumi_id 是【无条件覆写】的（keep_path 只冻结 jp_name/display_name）。
+        #
+        # 于是这条时序会静默吃掉用户的人工决定：后台 retry_unmatched 选中一部『待识别』番
+        # （bangumi_id IS NULL）→ 进 enrich 等 bgm 最长 120 秒 → 这期间用户在详情页按界面指引
+        # 点『绑定 bgm』填了正确的 subject id → 后台回来用自己那次自动匹配的结果整个盖回去。
+        # 更大的触发面是设置页的『批量重新识别』(reenrich_scope)：它一次收齐几十个 id 再逐个跑，
+        # 窗口是几十个 120 秒之和。而覆写之后还会走下面的身份守卫 _merge_anime —— 那一步会
+        # 【删掉】另一条番记录，没有撤销入口。
+        #
+        # 判据用 compare-and-set 而不是"有值就不覆盖"：详情页的『重新识别』本来就是"我要你重算"，
+        # 它读到的 bgm_before 与回来时相同，照常覆写；只有【第三方在这段窗口里改过】才让路。
+        if a.bangumi_id != bgm_before:
+            log.info("重新识别期间该番的 bgm 绑定已被改动（%s → %s），本次结果作废、以后者为准：%s",
+                     bgm_before, a.bangumi_id, display_of(a))
+            return a.bangumi_id is not None
         # 无已下集就采用 bgm 季度（纠正种子解析得来的错季度）；有已下集才保留，避免散目录
         handled = _has_handled_torrents(s, anime_id)
         # season 也在快照里：_apply_bgm 会从【刚被填上、还没还原】的新名字反推季号并留下来
@@ -1860,6 +2007,73 @@ async def enrich_anime(anime_id: int, freeze_empty_path: bool = False) -> bool:
                     Anime.bangumi_id == a.bangumi_id, Anime.id != a.id))):
                 _merge_anime(s, other.id, a.id)
     return bool(info)
+
+
+def bind_preview(anime_id: int, bgm_id: int) -> dict:
+    """『绑定 bgm』按下去【之前】会发生什么——供 UI 回显。只读，不改任何数据。
+
+    回显的重点不是"元数据会变成什么"（那是可逆的、也看得见），而是这两件【不可逆】的事：
+
+      ① **另一条番会被删掉**。bind_anime_bgm 末尾有身份守卫：该 bgm_id 已被别的番占用时
+         调 _merge_anime 把它并过来，而 _merge_anime 的最后一步是 `s.delete(loser)`。
+         对用户来说这是"我只是想改个 ID"，结果一条【追番中、已经下过几集】的番记录没了。
+      ② **两边的集号体系可能不兼容**，合并后同一集会以两个去重键并存，各下一份到同一目录。
+         真实例子（本项目实测）：Re:Zero 的 LoliHouse 用全系列绝对编号 78/79/80，
+         ANi 用季内编号 12/13/14，两组是同一批集；合并后 3 集内容产生 6 个去重键。
+         ep_offset 救不了——它只能从 '16(88)' 那种双编号标题自动学，单编号标题学不到，
+         而全项目没有任何入口能手工设它。
+
+    返回 {"merge": [每条将被并入的番...], "warn": [人话告警...]}；merge 为空表示不会触发合并。
+    """
+    out: dict = {"merge": [], "warn": []}
+    with get_session() as s:
+        me = s.get(Anime, anime_id)
+        if me is None:
+            return out
+        others = list(s.exec(select(Anime).where(
+            Anime.bangumi_id == bgm_id, Anime.id != anime_id)))
+        if not others:
+            return out
+
+        def _eps(aid: int) -> list:
+            return sorted({t.episode for t in s.exec(
+                select(AnimeTorrent).where(AnimeTorrent.anime_id == aid))
+                if isinstance(t.episode, (int, float)) and t.episode >= 1})
+
+        my_eps = _eps(anime_id)
+        for o in others:
+            rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == o.id)))
+            o_eps = _eps(o.id)
+            out["merge"].append({
+                "id": o.id,
+                "name": display_of(o),
+                "state": ("追番中" if (o.confirmed and not o.rejected)
+                          else "已忽略" if o.rejected else "待确认"),
+                "torrents": len(rows),
+                "handled": sum(1 for t in rows if t.status in HANDLED_STATUSES),
+                "aliases": len(list(s.exec(select(AnimeAlias).where(AnimeAlias.anime_id == o.id)))),
+                "episodes": o_eps,
+            })
+            # 【集号区间不重叠】= 两边多半在用不同的编号体系（季内 vs 全系列绝对）。
+            # 判据故意保守：只在两边【都有】正片集号、且【一个交集都没有】时才告警——
+            # 有交集说明至少共用同一套编号，合并是安全的。
+            if my_eps and o_eps and not (set(my_eps) & set(o_eps)):
+                keys = len(set(my_eps) | set(o_eps))
+                out["warn"].append(
+                    f"本番集号 {_ep_span(my_eps)}，对方集号 {_ep_span(o_eps)}，两边【没有一集重合】。"
+                    f"若它们其实是同一批集的不同编号写法（如全系列绝对编号 vs 季内编号），"
+                    f"合并后会产生 {keys} 个去重键，每集各下一份到同一个目录。")
+    return out
+
+
+def _ep_span(eps: list) -> str:
+    """集号列表 → 人话区间。'12–14（3 集）' / '7（1 集）'。"""
+    if not eps:
+        return "无"
+    fmt = lambda e: str(int(e)) if float(e).is_integer() else str(e)   # noqa: E731
+    if len(eps) == 1:
+        return f"{fmt(eps[0])}（1 集）"
+    return f"{fmt(eps[0])}–{fmt(eps[-1])}（{len(eps)} 集）"
 
 
 async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:

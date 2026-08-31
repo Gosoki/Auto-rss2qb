@@ -192,3 +192,89 @@ def test_no_undefined_names_anywhere():
         if miss:
             bad[p.name] = miss
     assert not bad, f"这些名字用到了但没定义/导入：{bad}"
+
+
+# ---------------- (R14) 季度排序：两位年不能按字符串比 ----------------
+
+def test_every_quarter_ordering_uses_the_year_not_the_string():
+    """全项目【所有】给季度排序的地方都必须按四位年，一处都不能漏。
+
+    这一条是按"广度错误"写的，不是按某个函数写的：季度键的年份只有两位，
+    纯字符串比较下 '99D' > '26C'，1999 年首播的长番会排到当季前面。
+    修的时候第一遍只改了 pages/layout.group_by_quarter（番剧/剧场版列表），
+    结果打开首页看到的仍是 99D 在最前——因为默认标签页是【仪表盘】，
+    它的季度分布条走的是 core.anime.quarter_overview / core.movies 里另外两处
+    各自独立的 `sorted(..., reverse=True)`。三处必须同时成立。
+    """
+    from core import anime as A, movies as M
+    from pages.layout import group_by_quarter
+    from sources.parse import quarter_sort_key
+
+    qs = ["16B", "19A", "25C", "25D", "26A", "26B", "26C", "99D"]
+    want = ["26C", "26B", "26A", "25D", "25C", "19A", "16B", "99D"]
+
+    # ① 排序键本身
+    assert sorted(qs, key=quarter_sort_key, reverse=True) == want
+
+    # ② 列表分组（番剧页 / 剧场版页）
+    class _It:
+        def __init__(self, q):
+            self.quarter = q
+    assert [q for q, _ in group_by_quarter([_It(q) for q in qs])] == want
+
+    # ③ 剧场版页的【年份】分组：这一处曾是纯粹的覆盖缺口 —— 把 pages/movies 的四位年分组键
+    #    回退成 f"{y-2000:02d}"（1999 年算出 '-1'）之后，全套 699 条照样全绿。
+    #    下面这条钉住它：分组键必须是四位年、排序必须把 1999 放最后、"未知"垫底。
+    from pages.movies import _group_by_year_quarter
+
+    class _M:
+        def __init__(self, q):
+            self.quarter = q
+    got = _group_by_year_quarter([_M(q) for q in ["26C", "99D", "25D", None]])
+    years = [y for y, _ in got]
+    assert years == ["2026", "2025", "1999", "未知"], f"剧场版年份分组顺序错了：{years}"
+
+
+def test_dashboard_quarter_bars_put_1999_last(clean_tables):
+    """仪表盘的季度分布条：1999 的番必须垫底，不能顶在当季前面。
+
+    这是【行为】断言——建一个真库（含一部 quarter='99D' 的番）、调真的 overview()、
+    看它返回的 by_quarter 顺序。第一遍修复漏掉的正是这条路径。
+    """
+    from core import anime as A
+    with clean_tables.get_session() as s:
+        for i, q in enumerate(["26C", "26B", "25D", "19A", "99D"]):
+            s.add(Anime(title=f"番{i}", season=1, quarter=q, confirmed=True, bangumi_id=1000 + i))
+        s.commit()
+    got = [q for q, *_ in A.overview()["by_quarter_state"]]
+    assert got[0] == "26C", f"当季应排最前，实际 {got}"
+    assert got[-1] == "99D", f"1999 应垫底，实际 {got}"
+
+
+def test_movie_dashboard_quarter_bars_put_1999_last(clean_tables):
+    """剧场版仪表盘同款——两条线各有一份 sorted，必须一起成立。"""
+    from core import movies as M
+    from db.models import Movie
+    with clean_tables.get_session() as s:
+        for i, q in enumerate(["26C", "25D", "99D"]):
+            s.add(Movie(title=f"片{i}", quarter=q, bangumi_id=2000 + i))
+        s.commit()
+    got = [q for q, *_ in M.overview()["by_quarter"]]
+    assert got[0] == "26C", f"当季应排最前，实际 {got}"
+    assert got[-1] == "99D", f"1999 应垫底，实际 {got}"
+
+
+def test_rejected_movies_are_sorted_by_real_year(clean_tables):
+    """剧场版『已忽略』页是**平铺渲染**，没有上层分组重排来兜底 —— 这里排错就是用户直接看到的错。
+
+    原实现是 SQL 的 `ORDER BY quarter DESC`，季度键只有两位年，字符串比较下 '99D' > '26C'。
+    这条改动此前零覆盖：回退成 SQL 排序，全套 712 条照样全绿。
+    """
+    from core import movies as M
+    from db.models import Movie
+    with clean_tables.get_session() as s:
+        for q in ("26C", "99D", "25D", "00A"):
+            s.add(Movie(title=f"片{q}", quarter=q, rejected=True, bangumi_id=hash(q) % 100000))
+        s.commit()
+    got = [m.quarter for m in M.list_rejected_movies()]
+    assert got == ["26C", "25D", "00A", "99D"], f"已忽略页的季度顺序错了：{got}"

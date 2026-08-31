@@ -14,6 +14,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 import config
 import db
 from core import engine, worker
+from sources.parse import quarter_sort_key
 
 log = logging.getLogger("autorss")
 
@@ -120,10 +121,13 @@ def torrent_status_cn(status: str, qb_progress=0, qb_synced_at=None) -> str:
     return STATUS_CN.get(status, status)
 
 
-def parse_bgm_id(text: str) -> int | None:
-    """从用户输入里抠出 bgm subject id：优先 bgm.tv/subject/<id>，退而取任意数字。取不到返回 None。"""
-    m = re.search(r"subject/(\d+)", text or "") or re.search(r"(\d+)", text or "")
-    return int(m.group(1)) if m else None
+# 【parse_bgm_id 只此一份】原来 core/manual.py 与本文件各写了一份行为完全相同的实现
+# （实测 7/7 输入一致），而调用点分家：manual 那条手动下载路径用 core 那份，
+# 四个 UI 绑定入口（pages/anime.py、anime_detail.py、movies.py ×2）用本文件这份。
+# 这正是 DECISIONS.md 的 E-13「收紧 parse_bgm_id 的判据」踩坑的形状——真去收紧时必然只改一半，
+# 于是"页面上绑定被收紧了、手动下载那条路没有"，而两处都不会报错。
+# 各页面继续 `from .layout import parse_bgm_id`，导入路径不变。
+from core.manual import parse_bgm_id  # noqa: F401  转出给各页面用；实现在 core/manual.py
 
 
 def source_options(sources, blank: str = "按优先级") -> dict:
@@ -136,7 +140,10 @@ def group_by_quarter(items):
     by_q: dict[str, list] = {}
     for it in items:
         by_q.setdefault(it.quarter or "未知", []).append(it)
-    quarters = sorted((q for q in by_q if q != "未知"), reverse=True)
+    # 【按四位年排，不能按季度键的字符串排】季度键的年份只有两位，'99D' > '26C'，
+    # 于是 1999 年首播的长番（海贼王）会排到当季之上的第一位，而调用方又让第一组默认展开：
+    # 打开番剧页看到的是 1999 年那一部，当季反而折叠在下面。真库实测过。
+    quarters = sorted((q for q in by_q if q != "未知"), key=quarter_sort_key, reverse=True)
     if "未知" in by_q:
         quarters.append("未知")
     return [(q, by_q[q]) for q in quarters]
@@ -483,6 +490,44 @@ async def confirm(title: str, note: str = "", ok_label: str = "确定",
         dlg.delete()
 
 
+async def confirm_bind_merge(anime_id: int, bgm_id: int, kind: str = "anime") -> bool:
+    """绑定 bgm 之前的回显闸。返回 True 表示可以继续绑。
+
+    **两个调用点必须共用这一份**（详情页『绑定 bgm』、列表页待识别的『绑定』）——
+    `bind_anime_bgm` 的注释就点名了这两处，而本项目最常见的缺陷形状正是"同一件事只改了一半"。
+
+    为什么要挡：这个按钮看着只是"改个 ID"，实际可能【删掉另一条番记录】。
+    bind_anime_bgm 末尾的身份守卫会把占用同一个 bgm_id 的番 `_merge_anime` 过来，
+    而合并的最后一步是 `s.delete(loser)`，没有撤销入口。用户可能刚在列表里看着那条
+    『追番中、已经下过几集』的番，一次绑定之后它就没了。
+
+    只在【真的会触发合并】时弹框：不触发合并的绑定（绝大多数）照常一次点击完成，不加噪。
+    """
+    # 【两条线共用这一份】kind="movie" 走剧场版的对称实现。番剧侧补了闸而剧场版侧没补，
+    # 正是本项目最常见的广度错误；tests/test_bind_preview.py 的 AST 守卫现在两边都扫。
+    if kind == "movie":
+        from core import movies as _mod
+    else:
+        from core import anime as _mod
+    pv = _mod.bind_preview(anime_id, bgm_id)
+    if not pv["merge"]:
+        return True
+    lines = [f"bgm {bgm_id} 已被另一条番占用。绑定会把它并过来，并【删除】那条记录："]
+    for m in pv["merge"]:
+        what = "片" if kind == "movie" else "番"
+        lines.append(f"  · {'movie' if kind == 'movie' else 'anime'}#{m['id']}「{m['name']}」【{m['state']}】")
+        lines.append(f"    {m['torrents']} 条种子"
+                     + (f"（其中 {m['handled']} 条已下）" if m["handled"] else "")
+                     + (f"、{m['aliases']} 条别名" if m["aliases"] else "")
+                     + f"将迁到本{what}，该{what}记录被删除")
+    for w in pv["warn"]:
+        lines.append("")
+        lines.append("⚠ " + w)
+    return await confirm(f"这次绑定会合并两条{'剧场版' if kind == 'movie' else '番'}记录",
+                         "\n".join(lines),
+                         ok_label="仍然绑定", ok_icon="link")
+
+
 # ---- 恒定 head html（内容与运行时状态无关，提到模块级，frame() 每次渲染直接注入、免重复拼接）----
 # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
 _HEAD_REFERRER = '<meta name="referrer" content="no-referrer">'
@@ -575,7 +620,41 @@ _HEAD_BADGE_CSS = (
     ".q-btn.bg-primary,.q-btn.bg-negative{color:#0b0d10!important}"
     # 徽标字号统一 14px：此前列表/详情里的徽标是 12px、仪表盘的带 text-sm 是 14px，
     # 同一个『待确认』在同一屏出现三种大小。字号不该由调用点各写各的。
-    ".q-badge{font-size:14px}"
+    # 【字号与行高必须一起定，只定字号是把同一件事改了一半】Tailwind 的 `text-sm` 同时设
+    # font-size(14px) 与 line-height(20px)：上一次只全局定了字号，于是带 text-sm 的 19 个徽标
+    # 行高 20px、其余 52 个吃 Quasar 的 `line-height:1`(=14px) —— 框高 24px vs 18px，
+    # 同一个『待确认』在同一屏仍是两种高度，只是不再是两种字号。
+    # inline-flex + align-items:center 把"字在框里居中"从"靠字体度量碰运气"变成布局保证：
+    # Quasar 原样式没有 display 规则、靠 vertical-align:baseline 定位，而中日文字形的
+    # ascent+descent 超过 1em，line-height:1 时字会偏低、上下留白不等。
+    # 定死这三条之后，调用点不必（也不该）再各写 text-sm —— 见 tests/test_ui_badge_style.py 的守卫。
+    # 【字号与行高必须一起定，只定字号是把同一件事改了一半】Tailwind 的 `text-sm` 同时设
+    # font-size(14px) 与 line-height(20px)：此前只全局定了字号，于是带 text-sm 的 31 个徽标
+    # 行高 20px、其余 40 个吃 Quasar 的 `line-height:1`(=14px)——框高 24px vs 18px，
+    # 同一个『待确认』在同一屏仍是两种高度，只是不再是两种字号。31 处调用点的 text-sm 已剥净。
+    #
+    # 【!important 的真实理由：压 Tailwind，不是压 Quasar】——这一段曾经写错过，更正如下。
+    # NiceGUI 的 templates/index.html 第 13 行声明了层序：
+    #     @layer theme, base, quasar, nicegui, components, utilities, overrides, quasar_importants;
+    # Quasar 的两份 CSS 是通过 `@import ... layer(quasar)` / `layer(quasar_importants)` 进层的
+    # ——**层是在 @import 那一侧指定的**，所以 grep 它的文件内容看不到任何 @layer，
+    # 据此断言"Quasar 不在任何层里"是错的（我错过一次）。
+    # 正确的推论是：
+    #   · 普通声明按层序，`overrides` 在 `quasar` 之后 → 本段【本来就压得过】Quasar 的
+    #     `.q-badge{font-size:12px;line-height:1}`，font-size 那条历来是生效的；
+    #   · !important 声明层序反向（早的层赢），`quasar_importants` 排在最末 = 优先级最低，
+    #     这正是下面那批背景色规则要带 !important 才压得过 Quasar `.bg-*` 的原因；
+    #   · 真正需要 !important 的是 **Tailwind**：它由 tailwindcss.min.js 在运行时注入，
+    #     **不属于任何层**，而无层级的普通声明【压过】所有有层级的。调用点只要写一个
+    #     `inline-block` / `text-sm`，就能把本段的 display / font-size 顶掉。
+    # 所以这四条保留 !important，但理由是"挡住调用点顺手加的 Tailwind 工具类"，
+    # 而不是原先写的"否则压不过 Quasar"。
+    #
+    # inline-flex + align-items:center 把"字在框里居中"从"靠字体度量碰运气"变成布局保证：
+    # Quasar 原样式没有 display 规则、靠 vertical-align:baseline 定位，而中日文字形的
+    # ascent+descent 超过 1em，line-height 接近 1 时字会偏低、上下留白不等。
+    ".q-badge{font-size:14px!important;line-height:1.45!important;"
+    "display:inline-flex!important;align-items:center!important;justify-content:center!important}"
     "}</style>")
 
 
