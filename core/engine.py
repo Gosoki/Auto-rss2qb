@@ -264,8 +264,13 @@ def apply_bgm_meta(obj, info: dict | None, keep_path: bool = False) -> None:
         v = info.get(k)
         if v is not None and hasattr(obj, k):   # hasattr 跳过一方没有的列（番剧无 duration）
             setattr(obj, k, v)
-    if info.get("quarter") and not (keep_path and obj.quarter):
-        obj.quarter = info["quarter"]
+    # 【两条线取不同的键】番剧用 quarter（12 月开播归次年冬季，因为季播番跨 1–3 月播完），
+    # 剧场版用 movie_quarter（按上映那一年，因为它是一次性上映、归档目录只用年份）。
+    # 判据用"这个对象有没有 mikan_type 这一列"——那是 Movie 独有的，比传参更不容易漏：
+    # 新增调用点时不用记得多传一个 flag。理由见 sources.parse.movie_quarter_of（E-30）。
+    qk = "movie_quarter" if hasattr(obj, "mikan_type") else "quarter"
+    if info.get(qk) and not (keep_path and obj.quarter):
+        obj.quarter = info[qk]
 
 
 # ---------------- 下载原语（取种子 + 交 qB） ----------------
@@ -274,17 +279,28 @@ def apply_bgm_meta(obj, info: dict | None, keep_path: bool = False) -> None:
 # 而 config 是最底层，不能反过来 import 本模块。取种这条路径用【每一跳都判】的严格口径：
 # download_url 整个来自 RSS 正文，不存在"用户自填所以可信"。
 
-async def fetch_torrent_bytes(url: str) -> bytes:
+async def fetch_torrent_bytes(url: str, strict: bool = True) -> bytes:
     """流式下载 .torrent，封顶 32MB + 整体 180s 超时（download_url 源自 RSS 可被投毒 + 跟随重定向）。
 
     httpx 的 timeout=60 只是每次读的超时、逐块重置，慢速 trickle 连接能让它无限挂起并堵死整个下载/
     采集循环；故再套一层 asyncio.timeout 对总传输时长封顶。取到返回 bytes；HTTP/超限/超时失败抛异常，
-    由调用方回写 error。请求级钩子额外挡内网/环回字面 IP（防 SSRF，含重定向每一跳）。
+    由调用方回写 error。
+
+    strict=True（默认，采集链路用）：**每一跳都判内网**，含首跳。
+    download_url 整个来自 RSS 正文，没有"用户自填"这回事，所以首跳也不能信。
+
+    strict=False（手动下载页的『.torrent 链接』用）：**首跳放行、重定向后的每一跳仍强制判**，
+    与 docs/DECISIONS.md 的 **D-05** 同一口径。(E-21，2026-09-01 拍板)
+    两处口径原本分家，只是因为本函数当初只服务 RSS 来源、后来被手动下载复用了 ——
+    而手动那条的地址是【用户自己在输入框里打的】，"局域网自建镜像 / 内网私站取种"是正当用法，
+    按严格口径一律拒掉等于把这个功能对内网用户关掉；而被攻陷源站的 302 仍然拦得住，
+    因为守卫拦的从来就是"第三方替用户改写了目的地"那一半。
     """
     if not (url or "").lower().startswith(("http://", "https://")):
         raise ValueError(f"拒绝非 http(s) 下载地址（防 SSRF）：{(url or '')[:80]}")
     kwargs = config.http_client_kwargs(60, url=url)
-    kwargs["event_hooks"] = {"request": [ssrf.block_internal_request]}
+    kwargs["event_hooks"] = {
+        "request": [ssrf.block_internal_request if strict else ssrf.guard_redirect_request]}
     async with httpx.AsyncClient(**kwargs) as client:
         # 复用 services.fetch 的封顶实现，别再手写一份：那份已经处理了"上限只作用在解压后"
         # 这个坑（一个几百 KB 的 gzip 压缩体能在单个块里解出几十 MB，等发现超限内存早就上去了）。
@@ -1165,7 +1181,21 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int:
             if t.qb_progress > prev_progress + 1e-9 or t.qb_progress_at is None:
                 t.qb_progress_at = now      # 进度推进(或首见)→ 刷新『上次推进时间』，作停滞判定基准
             if state == "error":
-                t.status = "error"          # qB 侧真错误 → 回传；missingFiles 有意不回传（只镜像显示）
+                # 【落 stalled 而不是 error】(E-19，2026-09-01 拍板)
+                # 这一行回传的是"qB 侧出错了"，而盘上【有半成品】：种子还在 qB 里占着 save_path。
+                # 落 error 的后果不是"少下一集"：error ∉ HAVE_STATUSES ⇒ 下一轮 flush 认为
+                # 这一集还缺，把同集另一个源的第二份放行到【同一个 save_path】，
+                # 而 qB 那边第一份还在。两份文件落进同一文件夹，而原行【再没有任何 UI 入口能删】
+                #（详情页的删除按钮只对 HAVE 里的行出现）。
+                # stalled 同时满足三件事，正是为这种情形准备的：
+                #   · ∈ HAVE_STATUSES  → 集去重挡着，不会自动下第二份
+                #   · ∉ TRACKED_STATUSES → 同步循环能休眠，不再每轮空转
+                #   · mark_done_by_hash 认它 → qB 侧恢复（重新校验/换源做种）后回调救得回
+                # 【error 这个词此前被两条路径写成了两种语义】"从没交付出去"（取种失败/qB 拒收）
+                # 与"交付过、盘上有半成品"。前者留给 error，后者归 stalled——这也让
+                # failed_rows 的 ("error","stalled") 两栏各自名副其实。
+                # missingFiles 有意不回传（只镜像显示），见上面 _QB_NEEDS_RECHECK 的说明。
+                t.status = "stalled"
             elif t.status == "downloading" and t.qb_progress >= 1.0:
                 t.status = "sent"     # 兼容旧的 downloading 占位（正常已在交付时置 sent）
             elif state in _QB_NOT_ADVANCING:

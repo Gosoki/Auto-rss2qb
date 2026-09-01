@@ -36,8 +36,8 @@ class _Stream(httpx.AsyncByteStream):
             yield chunk
 
 
-def _client(handler):
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+def _client(handler, **kw):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), **kw)
 
 
 async def test_small_response_passes():
@@ -297,3 +297,31 @@ async def test_layered_compression_is_rejected():
     finally:
         tracemalloc.stop()
     assert peak < 24 * 1024 * 1024, f"峰值 {peak/1024/1024:.1f}MB"
+
+
+async def test_redirect_chain_is_capped(monkeypatch):
+    """(E-41) 重定向跳数要有上界 —— 中间跳的响应体【不受 cap 约束】。
+
+    httpx 在跟随重定向之前先 `await response.aread()` 把这一跳整个读进内存，
+    并把每一跳连同它的内容一路挂在 response.history 上带到最终响应：
+    N 跳的响应体是【累加驻留】的，而 _read_capped 只作用在最终那一个响应上，
+    从头到尾看不见中间跳。实测 4 跳 × 100MB → 进程 RSS 峰值 568MB。
+    压跳数不能根治，但立刻把最坏值压掉一个数量级，且不碰 SSRF 守卫
+    （守卫的跳数计数靠 httpx 的 extensions 传递，自己写重定向循环要一并接管，写错就是守卫失效）。
+    """
+    import config
+    assert config.http_client_kwargs(30).get("max_redirects") == config._MAX_REDIRECTS
+    assert config._MAX_REDIRECTS <= 5, "跳数上限放得太松了"
+
+    hops = {"n": 0}
+
+    def h(r):
+        hops["n"] += 1
+        if hops["n"] <= 10:
+            return httpx.Response(302, headers={"location": f"http://x/{hops['n']}"})
+        return _resp(b"done")
+
+    async with _client(h, follow_redirects=True, max_redirects=config._MAX_REDIRECTS) as c:
+        with pytest.raises(httpx.TooManyRedirects):
+            await get_bytes(c, "http://x/")
+    assert hops["n"] <= config._MAX_REDIRECTS + 1, f"跟了 {hops['n']} 跳，上限没生效"

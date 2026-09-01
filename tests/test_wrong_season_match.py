@@ -479,8 +479,12 @@ def test_suspect_duplicate_is_found_when_bgm_differs(clean_tables):
     assert d["a_rejected"] or d["b_rejected"]
 
 
-def test_same_bgm_pairs_are_not_reported(clean_tables):
-    """绑到同一个 subject 的两条由身份守卫自己合并，报出来是噪声。"""
+def test_same_bgm_pairs_are_reported_too(clean_tables):
+    """(E-18 之后) 绑到同一个 subject 的两条【也要报】。
+
+    以前跳过它的理由是"身份守卫会自己合"，而 E-18 定了【自动路径一律不合、不删行】——
+    于是同 bgm_id 的两条会一直留着，正需要有人看见并到详情页走人工路径合并（那条带回显）。
+    """
     from db.models import AnimeAlias
     with clean_tables.get_session() as s:
         a = Anime(title="某番", season=1, bangumi_id=111)
@@ -489,7 +493,7 @@ def test_same_bgm_pairs_are_not_reported(clean_tables):
         s.add(AnimeAlias(title="XYZ「某番」", season=1, anime_id=a.id))
         s.add(AnimeAlias(title="某番", season=1, anime_id=b.id))
         s.commit()
-    assert A.suspect_duplicate_anime() == []
+    assert len(A.suspect_duplicate_anime()) == 1, "同 bgm 的两条现在也该报出来"
 
 
 def test_a_title_that_starts_with_its_own_bracket_is_not_stripped(clean_tables):
@@ -536,3 +540,115 @@ def test_two_unbound_rows_sharing_a_name_are_reported(clean_tables):
         s.add(AnimeAlias(title="没认出来的番", season=1, anime_id=y.id))
         s.commit()
     assert len(A.suspect_duplicate_anime()) == 1, "两条都没绑 bgm 的重复番被静默跳过了"
+
+
+# ---------------- 批量『刷新资料』不得改绑定（E-42，R20） ----------------
+
+async def test_batch_reenrich_never_rebinds(clean_tables, monkeypatch, cfg):
+    """(E-42) 批量入口对【已绑上的番】只按 subject id 刷元数据，不重新匹配。
+
+    真库实测：已有绑定的正确率 96/98 = 98.0%，而把自动路径重跑一遍的绑定错误率是 4.3% ——
+    点一次『识别全部』就是拿 98% 去换 95.7%，而且改错的那几条还会走身份守卫 `_merge_anime`，
+    那一步会删掉另一条番记录、没有撤销入口。
+    """
+    from services import enrich
+    called = {"resolve": 0, "by_id": []}
+
+    async def no_resolve(*a, **kw):
+        called["resolve"] += 1
+        return {"bangumi_id": 999999, "display_name": "被改绑成了别的番"}
+
+    async def by_id(bid):
+        called["by_id"].append(bid)
+        return {"bangumi_id": bid, "display_name": "正确的番", "rating": 8.1}
+
+    monkeypatch.setattr(enrich, "resolve", no_resolve)
+    monkeypatch.setattr(enrich, "fetch_by_id", by_id)
+    with clean_tables.get_session() as s:
+        a = Anime(title="已绑好的番", season=1, confirmed=True, quarter="26C", bangumi_id=12345)
+        s.add(a)
+        s.commit()
+        s.refresh(a)
+        aid = a.id
+
+    await A.reenrich_scope(None)
+
+    with clean_tables.get_session() as s:
+        row = s.get(Anime, aid)
+        assert row.bangumi_id == 12345, "批量刷新把已绑好的番改绑了"
+        assert row.rating == 8.1, "元数据没刷上"
+    assert called["by_id"] == [12345], "没走按 id 直取"
+    assert called["resolve"] == 0, "已绑上的番仍然走了按名字投票的匹配"
+
+
+async def test_batch_reenrich_still_retries_the_unbound(clean_tables, monkeypatch, cfg):
+    """没绑上的照常尝试识别 —— 这个入口的另一半用途就是"把之前没认出来的再试试"。"""
+    from services import enrich
+    hit = []
+
+    async def resolve(*a, **kw):
+        hit.append(1)
+        return {"bangumi_id": 777, "display_name": "认出来了"}
+
+    monkeypatch.setattr(enrich, "resolve", resolve)
+    with clean_tables.get_session() as s:
+        a = Anime(title="没认出来的番", season=1, quarter="26C")
+        s.add(a)
+        s.commit()
+        s.refresh(a)
+        aid = a.id
+
+    await A.reenrich_scope(None)
+    with clean_tables.get_session() as s:
+        assert s.get(Anime, aid).bangumi_id == 777, "没绑上的番没有被尝试识别"
+    assert hit, "没走 resolve"
+
+
+async def test_enrich_never_deletes_a_row(clean_tables, monkeypatch, cfg):
+    """(E-18 + R20 收口) 识别路径【一律不合并、不删行】—— 合并只在『绑定 bgm』那条带回显的路上做。
+
+    `_merge_anime` 的最后一步是 `s.delete(loser)`，没有撤销入口。
+    `enrich_anime` 的四个入口没有一个满足"用户明确绑定并看过回显"这个前提：
+      · retry_unmatched / reenrich_scope —— 后台，没有人在看；
+      · 详情页与『待识别』列表的『重新识别』—— 虽然是人点的，但它在 resolve 之前
+        【根本不知道会绑到哪个 subject】，没法预先回显；用户按下去的意思是"帮这一部重算一次"，
+        不是"把另一条记录删掉"。
+    第 20 轮的审计端到端复现过：详情页点一次『重新识别』，另一条番整行消失、零提示。
+    """
+    from services import enrich
+
+    async def resolve(*a, **kw):
+        return {"bangumi_id": 555, "display_name": "同一部番"}
+    monkeypatch.setattr(enrich, "resolve", resolve)
+
+    with clean_tables.get_session() as s:
+        old = Anime(title="已经在追的", season=1, confirmed=True, quarter="26C", bangumi_id=555)
+        new_a = Anime(title="刚发现的", season=1, quarter="26C")
+        s.add(old); s.add(new_a); s.commit(); s.refresh(old); s.refresh(new_a)
+        old_id, new_id = old.id, new_a.id
+
+    await A.enrich_anime(new_id)
+    with clean_tables.get_session() as s:
+        assert s.get(Anime, old_id) is not None, "识别路径把另一条番删掉了"
+        assert s.get(Anime, new_id) is not None
+
+
+async def test_explicit_bind_still_merges(clean_tables, monkeypatch, cfg):
+    """『绑定 bgm』照常合并 —— 那条路的四个调用点全部经 require_bind_confirm，
+    用户已经看过"你要绑的是《X》"和"会删掉哪条"。不能因为 E-18 一起关掉。"""
+    from services import enrich
+
+    async def by_id(bid):
+        return {"bangumi_id": bid, "display_name": "同一部番"}
+    monkeypatch.setattr(enrich, "fetch_by_id", by_id)
+
+    with clean_tables.get_session() as s:
+        old = Anime(title="已经在追的", season=1, confirmed=True, quarter="26C", bangumi_id=556)
+        new_a = Anime(title="刚发现的", season=1, quarter="26C")
+        s.add(old); s.add(new_a); s.commit(); s.refresh(old); s.refresh(new_a)
+        old_id, new_id = old.id, new_a.id
+
+    await A.bind_anime_bgm(new_id, 556)
+    with clean_tables.get_session() as s:
+        assert s.get(Anime, old_id) is None, "带回显的绑定路径的合并被一起关掉了"
+        assert s.get(Anime, new_id) is not None

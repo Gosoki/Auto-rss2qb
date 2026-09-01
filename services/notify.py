@@ -227,6 +227,27 @@ def _rate_commit() -> None:
         _sent_times.append(time.monotonic())
 
 
+def cooldown_active(kind: str, key: str, cooldown: int) -> bool:
+    """这个 (kind, key) 此刻是不是还在冷却窗口里 —— 也就是"上次已经通知过了"。
+
+    【为什么调用方需要单独问一次】`event()` 返回 False 有【四种】互不相同的含义：
+      ① 没送出去（推送坏了 / 熔断中）—— 调用方该重来
+      ② 未订阅 / 没配 NOTIFY_URL —— 本来就不发，调用方该照常落自己的标记
+      ③ **被冷却挡下** —— 说明上次【已经通知过了】，调用方同样该照常落标记
+      ④ 被限流丢弃 —— 用户还没听到，调用方该重来
+    只按 True/False 分的话，② 和 ③ 会被当成 ①。真库上复现过 ③ 的代价：
+    sweep_finished 改成"通知成功才落 finished_at"之后，一部番只要"判完结 → 抖一下被撤销 →
+    再判完结"，第二次就会被 7 天冷却挡住，于是 `finished_at` **永远落不下来**、每轮重判一次。
+    （② 早先已经单独处理了，③ 是第 20 轮的审计端到端跑出来的。）
+
+    不把 event 改成返回四态：那会动到它全部 8 个调用点，而只有 sweep_finished 需要区分。
+    """
+    if cooldown <= 0:
+        return False
+    last = _last_sent.get((kind, key), 0.0)
+    return bool(last) and (time.monotonic() - last) < cooldown
+
+
 async def event(kind: str, message: str, *, key: str = "", cooldown: int = 0,
                 bypass_rate: bool = False) -> bool:
     """推一条事件通知。未订阅 / 冷却中 / 被限流 → 静默丢弃（通知永远不该影响主流程）。

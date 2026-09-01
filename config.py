@@ -260,6 +260,9 @@ def _internal_literal_host(url: str | None) -> str:
     return host if ok else ""
 
 
+_MAX_REDIRECTS = 3          # 见 http_client_kwargs 里那段说明（E-41）
+
+
 def http_client_kwargs(timeout: int = 30, url: str | None = None) -> dict:
     """httpx.AsyncClient 的公共 kwargs：超时 + 跟随重定向 +（启用时）代理。各处抓取统一走它。
     代理账号/密码任一非空时走带认证的 httpx.Proxy；socks5:// 需自行装 socksio——
@@ -271,7 +274,18 @@ def http_client_kwargs(timeout: int = 30, url: str | None = None) -> dict:
     # 对同机 qB 发一个源站可控的 GET（审查实测收到过 torrents/delete?hashes=all）。
     # 延迟导入：core.ssrf 要 import config，模块级会成环。
     from core import ssrf
-    kwargs = {"timeout": timeout, "follow_redirects": True,
+    # 【跳数压到 3】httpx 默认允许 20 跳，而每一跳的响应体都会被【完整读进内存】——
+    # httpx 在跟随重定向之前先 `await response.aread()`，并且把每一跳连同它的内容
+    # 一路挂在 response.history 上带到最终响应。也就是说 N 跳的响应体是【累加驻留】的，
+    # 而 services/fetch 那套逐块封顶（_read_capped）只作用在【最终】那一个响应上，
+    # 从头到尾看不见中间跳。实测 4 跳 × 100MB → 进程 RSS 峰值 568MB；
+    # 通知那条反差最大：它的 cap 只有 64KB。
+    # 【为什么不自己写重定向循环（E-41 的 A 案）】那要接管 Location 解析、相对路径拼接、
+    # 方法降级、循环检测，而 SSRF 守卫的跳数计数（autorss_hops）正是靠 httpx 的
+    # extensions 浅拷贝语义顺着链传下去的——自己写循环必须把这条一并接管，
+    # 写错就是守卫整个失效。压跳数是几行的事，立刻把最坏值压掉一个数量级，且不碰守卫。
+    # 3 跳够用：真实的 feed/取种最多是 "http→https" + "裸域→www" 这两跳。
+    kwargs = {"timeout": timeout, "follow_redirects": True, "max_redirects": _MAX_REDIRECTS,
               "event_hooks": {"request": [ssrf.guard_redirect_request]}}
     mounts = _direct_mounts(url)
     if mounts:

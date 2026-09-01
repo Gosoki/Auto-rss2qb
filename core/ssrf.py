@@ -35,16 +35,34 @@ def ip_is_internal(ip) -> bool:
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
-async def safe_ip_for(host: str) -> str | None:
+# 代理软件的 fake-ip 池。clash-meta 默认 `fake-ip-range: 198.18.0.1/16`，
+# sing-box 默认 `198.18.0.0/15` —— 取并集就是 198.18.0.0/15（RFC 2544 的基准测试段）。
+# 【为什么必须豁免它】开着 fake-ip 时，本机解析【每一个域名】都会得到这一段里的一个地址，
+# 而 ipaddress 把 198.18.0.0/15 判为 is_private=True。不豁免的话，
+# 代理模式下的内网判定会把**全部出站**（抓源、取种、bgm）一律拒掉——
+# 而 core/ssrf.py 自己的说明就写着"开着本机 clash/v2ray 几乎是默认姿势"。
+# 【豁免它是安全的】这一段在正常网络里不承载任何真实服务：只有当本机解析器【就是】
+# fake-ip 代理时才会返回它，而那时真正的连接由代理去建、目标是域名对应的真实主机。
+# 只豁免 IPv4：sing-box 的 IPv6 fake-ip 用 fc00::/18，落在 ULA 里，
+# 豁免它等于放行整段 ULA（真实的局域网 IPv6 就住在那儿），代价不对等。
+_FAKE_IP_V4 = ipaddress.ip_network("198.18.0.0/15")
+
+
+async def safe_ip_for(host: str, allow_fake_ip: bool = False) -> str | None:
     """解析 host 并逐个校验，返回一个【已校验安全】的 IP；有任何一个地址落在内网/环回则返回 None。
 
     返回 IP 而不是只回布尔，是为了让调用方把连接【钉】在这个地址上——见 block_internal_request
     里对 DNS 重绑定的说明。字面 IP 原样返回（校验通过的话），域名取第一个解析结果。
     解析失败/无结果保守视作内网（反正也连不上）。
     """
+    def _bad(ip) -> bool:
+        if allow_fake_ip and ip.version == 4 and ip in _FAKE_IP_V4:
+            return False                       # 代理的 fake-ip 池，见 _FAKE_IP_V4 处的说明
+        return ip_is_internal(ip)
+
     host = (host or "").strip("[]")            # 去 IPv6 字面量方括号
     try:
-        return None if ip_is_internal(ipaddress.ip_address(host)) else host
+        return None if _bad(ipaddress.ip_address(host)) else host
     except ValueError:
         pass
     try:
@@ -60,7 +78,7 @@ async def safe_ip_for(host: str) -> str | None:
             addr = ipaddress.ip_address(info[4][0])
         except ValueError:
             return None                        # 解析出无法识别的地址形态 → 保守拒
-        if ip_is_internal(addr):
+        if _bad(addr):
             return None                        # 只要有一个内网地址就整体拒（别给轮询解析留缝）
         if first is None:
             first = info[4][0]
@@ -86,13 +104,26 @@ async def block_internal_request(request: httpx.Request) -> None:
     """
     host = request.url.host or ""
     if config.PROXY:
-        try:
-            literal = ipaddress.ip_address(host.strip("[]"))
-        except ValueError:
-            return                     # 域名：解析交给代理侧，本地判不了也不该判
-        if ip_is_internal(literal):
+        # 【代理模式下也要解析主机名，只是不钉 IP】(E-40，2026-09-01 拍板)
+        # 旧写法的判据是"ipaddress 解析得出来的才判"，而那既不是"是不是字面 IP"、
+        # 更不是"是不是主机名"——三类东西一起从这个缺口出去：
+        #   ① `localhost`：它还被 config._DIRECT_PATTERNS 挂成【恒直连】，连代理都不走，
+        #      代理指向一个死端口时照样能打通；
+        #   ② `2130706433` / `0x7f000001` 这类整数写法：ipaddress 一律 ValueError → 放行，
+        #      而请求交给代理之后，本机 clash/v2ray 会自己 inet_aton 出 127.0.0.1
+        #      并从【同一台机器】连过去。这两个写法【正是】本项目自己
+        #      tests/test_ssrf.py 那条 "..._in_every_notation_are_refused" 参数表里的——
+        #      那条用例只在无代理模式下跑，是标准的"约束的作用域大于验证的作用域"。
+        #   ③ 攻击者自有域名指向 127.0.0.1（这一条是【有意放行】的，见下）。
+        #
+        # 【为什么不钉 IP】代理模式下真正去解析目标的是代理侧，本地钉了也没用
+        #（请求发给代理时 Host 才是目标），钉反而会把 URL 改写成一个代理够不着的地址。
+        # 【误伤面】域名指向局域网自建服务（Mikan 镜像 / Bark / ntfy）会被拦。
+        # 但 guard_redirect_request 的【首跳本来就放行】，被这一条影响的只有
+        # 「重定向之后的跳」与「取种」——那两处指向局域网本来就不是正当用法。
+        if await safe_ip_for(host, allow_fake_ip=True) is None:
             raise ValueError(f"拒绝请求内网/环回地址（防 SSRF）：{host}")
-        return                         # 字面公网 IP：无需解析，也不必钉
+        return
     ip = await safe_ip_for(host)
     if ip is None:
         raise ValueError(f"拒绝请求内网/环回地址（防 SSRF）：{host}")

@@ -3,7 +3,7 @@ from nicegui import ui
 
 from core import anime, engine
 import config
-from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, confirm_bind_merge,
+from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, require_bind_confirm,
                      ep_str, meta_card,
                      name_of, parse_bgm_id,
                      qb_live_text, season_label, source_options, torrent_status_cn,
@@ -439,8 +439,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if not bid:
             ui.notify("没认出 bgm ID（粘 bgm.tv/subject/数字 或纯数字）", type="warning")
             return
-        # 【绑定前回显】可能删掉另一条番记录 —— 闸门与列表页共用一份，见 layout.confirm_bind_merge
-        if not await confirm_bind_merge(anime_id, bid):
+        # 【绑定前回显】可能删掉另一条番记录 —— 闸门与列表页共用一份，见 layout.require_bind_confirm
+        if not await require_bind_confirm(anime_id, bid):
             return
         # 【弹窗关掉之后这一段才是长操作】bind 会走 fetch_by_id（预算 120 秒），
         # 期间页面没有任何反馈，用户会以为没点上而再点一次。走 busy_action 去重。

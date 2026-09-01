@@ -248,3 +248,145 @@ def test_progress_comparison_survives_float32_round_trip():
     assert noisy > raw, "用例前提不成立：这个值往返后没有变大"
     assert not (noisy > raw + 1e-9), "epsilon 挡不住 float32 噪声"
     assert 0.43 > raw + 1e-9, "epsilon 太大，真实推进也认不出来了"
+
+
+# ---------------- 查询也要有上界（E-2 / E-36，R20） ----------------
+
+def test_mysql_engine_sets_a_read_timeout():
+    """(E-2/E-36) `connect_timeout` 只盖住 TCP 握手那一段，查询本身也得有上界。
+
+    主机连得上但库查不动时（锁等待、磁盘满、大表全扫、网络半开），查询会永久挂着。
+    后果最重的是停摆状态机：它靠一条 `SELECT 1` 判活，那条查询挂住就永远进不了停摆态，
+    于是整站冻结而 db_down 通知一条都发不出去 —— 而"建连接有 5 秒上界"这句话
+    被好几处当成了"最坏也就卡 5 秒"的依据，那是个错觉。
+
+    ⚠️ 这条用例的第一版是【假的】：它去 `inspect.getsource` 里找字符串 "read_timeout"，
+    而生产代码的**注释里**就写着这个词 —— 删掉那两行真正的赋值，全套 887 条照样全绿
+    （第 20 轮的审计变异测试打出来的）。现在直接问 SQLAlchemy 建连接时会用什么参数。
+    """
+    import pymysql
+
+    import db as D
+    # 【看它真的传了什么，别去猜 connect_args 存在哪】那个位置随 SQLAlchemy 版本变，
+    # 而"建连接时 pymysql 收到哪些 kwargs"是唯一有意义的口径。
+    eng = D.make_mysql_engine("mysql+pymysql://u:p@127.0.0.1:3306/x")
+    seen = {}
+    real = pymysql.connect
+
+    def spy(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop")            # 不用真连上，只要看参数
+    pymysql.connect = spy
+    try:
+        try:
+            eng.connect()
+        except Exception:
+            pass
+    finally:
+        pymysql.connect = real
+        eng.dispose()
+    assert seen.get("read_timeout") == D.MYSQL_READ_TIMEOUT, \
+        f"建连接时没带 read_timeout：{ {k: v for k, v in seen.items() if 'timeout' in k} }"
+    assert seen.get("write_timeout") == D.MYSQL_READ_TIMEOUT
+    assert seen.get("connect_timeout") == D.MYSQL_CONNECT_TIMEOUT
+
+
+def test_migration_engine_has_no_query_timeout():
+    """迁移那条路径【不能】带查询超时：整库复制的单条 chunk 写入可能远超 15 秒，
+    而那正是"已清空目标、写到一半"最不能被打断的地方。
+
+    同样改成看【真的传了什么】——第一版只 grep 源码字符串，是假的。
+    """
+    import db as D
+    import pymysql
+    eng = D.make_mysql_engine("mysql+pymysql://u:p@127.0.0.1:3306/x", query_timeout=False)
+    seen = {}
+    real = pymysql.connect
+
+    def spy(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop")
+    pymysql.connect = spy
+    try:
+        try:
+            eng.connect()
+        except Exception:
+            pass
+    finally:
+        pymysql.connect = real
+        eng.dispose()
+    assert seen, "根本没走到建连接这一步，用例是空跑的"
+    assert "read_timeout" not in seen, "迁移引擎带上了查询超时 —— 大 chunk 会被中途切断"
+    assert "write_timeout" not in seen
+    assert seen.get("connect_timeout") == D.MYSQL_CONNECT_TIMEOUT, "连接超时不该被一起去掉"
+
+
+def test_the_settings_page_never_touches_mysql_on_the_event_loop():
+    """(E-36) 设置页里碰 MySQL 的处理器必须全部丢进线程。
+
+    建连接与查询都是【同步】调用：主机关机或被防火墙 DROP 时会把整个事件循环冻住——
+    界面、下载、qB 同步一起停。六个处理器里备份/建库/迁移三个早就走了 run.io_bound，
+    另外三个（测试连接 / 切到 MySQL / 迁移前的连通性预检）是漏下的。
+    """
+    import ast
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("pages/settings.py").read_text(
+        encoding="utf8")
+    tree = ast.parse(src)
+    offenders = []
+    # 【只看 async 处理器】它们才是跑在事件循环上的那一层。被 run.io_bound 包住的内层
+    # 同步小函数（_probe / _ping）正是该同步的 —— 按它们判会把正确的写法报成违规。
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        sub = ast.dump(node)                     # 整棵子树，含内层的同步小函数
+        if "make_mysql_engine" not in sub and "switch_data_engine" not in sub:
+            continue
+        if "io_bound" not in sub:
+            offenders.append(f"settings.py:{node.lineno} {node.name}()")
+    assert offenders == [], ("这些处理器在事件循环上同步碰 MySQL：\n  " + "\n  ".join(offenders))
+    # 反向：确认扫描确实看见了那几个处理器，别因为改名而空跑成绿
+    assert src.count("make_mysql_engine") >= 2 and "switch_data_engine" in src
+
+
+def test_no_function_references_an_undefined_global():
+    """(R20) 全仓扫一遍：有没有函数引用了【模块级根本不存在】的全局名。
+
+    ⚠️ 这条用例存在的理由：R20 把连通性预检丢进线程时，把 `other = db.make_mysql_engine(url)`
+    一起搬进了嵌套函数 `_ping()` —— `other` 从 `_migrate` 的局部变量变成了 `_ping` 的局部变量，
+    而 `_migrate` 后面那句 `src, dst = (…, other)` 被编译成 `LOAD_GLOBAL other`：
+    **两个迁移按钮当场 NameError 全死**，顺带把 E-17 新加的 dst_before 回滚提示变成到不了的代码。
+    而当时 889 条用例【全绿】—— 因为没有一条走页面这一层，全都直接调 transfer 里的函数。
+
+    这是本项目那句教训的又一次应验：整段替换会静默吞掉区间里的别的东西。
+    用 `symtable` 而不是自己数 AST：它给的正是编译器的判断（哪些名字是 GLOBAL），
+    自己数会把内建、异常变量、推导式变量都算错。
+    """
+    import builtins
+    import pathlib
+    import symtable
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    known_builtins = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__builtins__"}
+    offenders = []
+    for f in sorted(root.glob("**/*.py")):
+        if {".venv", "__pycache__", "tests", "alembic"} & set(f.relative_to(root).parts):
+            continue
+        src = f.read_text(encoding="utf8")
+        top = symtable.symtable(src, str(f), "exec")
+        module_names = {s.get_name() for s in top.get_symbols()}
+
+        def walk(table, path):
+            for sym in table.get_symbols():
+                if sym.is_global() and not sym.is_assigned():
+                    n = sym.get_name()
+                    if n not in module_names and n not in known_builtins:
+                        offenders.append(f"{f.relative_to(root)}:{table.get_lineno()} "
+                                         f"{'.'.join(path)} 引用了未定义的全局 `{n}`")
+            for child in table.get_children():
+                walk(child, path + [child.get_name()])
+
+        walk(top, [f.stem])
+    assert not offenders, (
+        "这些函数引用了模块级不存在的名字，调用时会 NameError：\n  " + "\n  ".join(offenders)
+        + "\n多半是把某个赋值搬进了嵌套函数。")

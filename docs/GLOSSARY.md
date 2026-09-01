@@ -52,6 +52,12 @@
 `excluded_torrent_rows`、`failed_rows`、`source_map` 在 `core/anime.py` 与 `core/movies.py` 各一份——
 两条线操作的是不同的表，合并只会多出一层表参数。
 
+`set_quarter` 也各一份，但它比上面几个更该分开：番剧那份改的是**季度**（季母有意义，
+开了 `ANIME_SEASON_SUBFOLDER` 时还影响 `Season N` 子目录）；剧场版那份只用其中的**年份**
+（页面上那一栏就叫「年份」，归档目录走 `MOVIE_QUARTER_FMT`，默认 `{yyyy}`）。
+两者存的都是季度键、共用同一套格式校验，但**问用户的问题不一样**——剧场版详情页收的是四位年份，
+拼成 `{yy}A` 再存。合并会把两个不同的概念挤进一个函数。
+
 `exclude_torrent`、`unexclude_torrent`、`reset_downloading`、`sync_qb_status` 是**门面**：
 真实现在 `core/engine.py`，两条线各转一层把自己的表带进去（各自 docstring 都写着「实现见 engine.*」）。
 改行为改 engine 那一份；两个包装只负责选表。

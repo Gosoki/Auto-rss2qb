@@ -12,8 +12,11 @@ from pages.layout import frame
 # 级别过滤档位：文案 → 最低 levelno（该值及以上才显示）
 _LEVELS = {"全部": 0, "警告以上": logging.WARNING, "仅错误": logging.ERROR}
 
-# levelname → 文字色，一眼分清正常/异常
-_COLOR = {"DEBUG": "text-gray-500", "INFO": "text-gray-300",
+# levelname → 文字色，一眼分清正常/异常。
+# 【INFO 不着色】它是基线：日志页大部分行都是 INFO，给它一档灰等于把"正常"也标成次要，
+# 而真正要一眼看见的 WARNING/ERROR 反而少了对比。DEBUG 才需要压下去。
+# 顺带这也把全站的灰收成两档（gray-400 / gray-500），见 layout.warn_banner 的说明。
+_COLOR = {"DEBUG": "text-gray-500", "INFO": "",
           "WARNING": "text-amber-400", "ERROR": "text-red-400", "CRITICAL": "text-red-400"}
 
 
@@ -54,7 +57,7 @@ def logs_page():
                     "font-size:12px;line-height:1.55"):
                 for x in items:
                     ui.label(x["line"]).classes(
-                        _COLOR.get(x["level"], "text-gray-300")).style(
+                        _COLOR.get(x["level"], "")).style(
                         "white-space:pre-wrap;word-break:break-all")
 
         view()

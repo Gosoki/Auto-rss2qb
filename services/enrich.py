@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
-from sources.parse import quarter_of
+from sources.parse import movie_quarter_of, quarter_of
 
 log = logging.getLogger("autorss")
 
@@ -244,6 +244,9 @@ def _subject_to_info(bgm_id, meta: dict) -> dict:
         "air_date": dt.strftime("%Y-%m-%d") if dt else None,
         "air_weekday": dt.weekday() if dt else None,     # 0=周一
         "quarter": quarter_of(dt) if dt else None,
+        # 剧场版用它，理由见 sources.parse.movie_quarter_of（12 月首映的片不该归到次年）。
+        # 两个都给出来，由调用方按自己是哪条线选——别在这里判，enrich 不知道自己在为谁工作。
+        "movie_quarter": movie_quarter_of(dt) if dt else None,
         "total_episodes": meta.get("total_episodes") or meta.get("eps") or None,
         "platform": meta.get("platform") or None,        # TV/剧场版/OVA…
         "cover_url": (meta.get("images") or {}).get("large") or None,

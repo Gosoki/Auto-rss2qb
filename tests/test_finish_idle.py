@@ -12,6 +12,21 @@ from core import anime as A
 from db.models import Anime, AnimeTorrent
 
 
+@pytest.fixture(autouse=True)
+def _fresh_notify_state():
+    """每条用例前清掉通知的进程内记忆。
+
+    `sweep_finished` 现在要问 `notify.cooldown_active`（区分"被冷却挡下"与"没送出去"，
+    见 core/anime.py 那段四种含义的说明），而 `_last_sent` 是【模块级】字典、不随用例重置。
+    番 id 在各条用例里是从 1 开始的小整数、会重复，于是上一条用例送出去的那条冷却
+    会渗进下一条 —— 表现是"推送坏着却落了标记"，而两条用例单独跑都是绿的。
+    """
+    from services import notify as _N
+    _N._last_sent.clear()
+    yield
+    _N._last_sent.clear()
+
+
 @pytest.fixture
 def make(clean_tables):
     """建一部番 + 若干集种子。eps 是 [(集号, 状态)]。"""
@@ -607,3 +622,77 @@ async def test_finish_backfill_latch_drops_on_the_first_round_with_hits(
         make(1, [(1, "sent")])
     assert await A.sweep_finished() == 6
     assert len(sent) == 7, f"6 部同时完结被整批静默了：{sent}"
+
+
+# ---------------- 完结通知丢了要能重来（E-32，R20） ----------------
+
+async def test_finish_mark_waits_for_the_push(clean_tables, make, cfg, monkeypatch):
+    """(E-32) 推送坏着的时候不落完结标记 —— 否则那条通知就是【永久丢】。
+
+    原来是【整批】commit 完 finished_at 才逐部发通知，而候选过滤卡的正是
+    `finished_at is None`：通知丢了下一轮不会重来。R17 加的连续失败熔断把这条放大了
+    （连挂 5 条就保证静默 300 秒，那 300 秒里判定的完结全部静默，而 finished_at 照落）。
+
+    【为什么不加 finish_notified_at 那一列】换个顺序就能拿到同样的性质，不用开 revision。
+    代价是推送坏着的那段时间 ANIME_FINISH_UNSUB 对这几部暂时不生效——它们会继续下新集，
+    那是本项目一贯的安全方向（多下几集 ≪ 停订一部还在更新的番）。
+    """
+    alive = [False]
+    sent = []
+    monkeypatch.setattr(A, "notify_enabled", lambda kind: True)   # 用户订阅了完结通知
+    monkeypatch.setattr(A, "notify_event",
+                        lambda k, m, **kw: (sent.append(m) if alive[0] else None,
+                                            _async(alive[0]))[1])
+    cfg(ANIME_FINISH_ENABLED=True)
+    aid = make(2, [(1, "sent"), (2, "sent")])
+
+    assert await A.sweep_finished() == 0, "推送坏着时不该落标记"
+    assert _a(clean_tables, aid).finished_at is None
+    assert sent == []
+
+    alive[0] = True                                    # 推送恢复
+    assert await A.sweep_finished() == 1, "推送恢复后下一轮要重新判、重新通知"
+    assert _a(clean_tables, aid).finished_at is not None
+    assert len(sent) == 1
+
+
+async def test_finish_mark_lands_when_nobody_subscribed(clean_tables, make, cfg, monkeypatch):
+    """未订阅/没配 NOTIFY_URL 时 notify_event 恒 False —— 但那不是"丢了"，是"本来就不发"。
+
+    少了这一支就会变成：没配通知的用户，finished_at 永远写不进去、停订永远不生效。
+    """
+    monkeypatch.setattr(A, "notify_enabled", lambda kind: False)
+    monkeypatch.setattr(A, "notify_event", lambda k, m, **kw: _async(False))
+    cfg(ANIME_FINISH_ENABLED=True)
+    aid = make(2, [(1, "sent"), (2, "sent")])
+    assert await A.sweep_finished() == 1, "没订阅通知的用户完结标记落不下去"
+    assert _a(clean_tables, aid).finished_at is not None
+
+
+async def test_cooldown_does_not_block_the_mark_forever(clean_tables, make, cfg, monkeypatch):
+    """(R20 回归) 「被 7 天冷却挡下」≠「没送出去」。
+
+    `notify_event` 返回 False 有【四】种含义：① 没送出去（推送坏/熔断/限流）② 未订阅
+    ③ **被冷却挡下** ④ ——，而 E-32 那版只分了两种，把 ③ 当成了 ①。
+
+    后果：一部番只要「判完结 → 抖一下被撤销 → 再判完结」，第二次就被 7 天冷却挡住，
+    于是 `finished_at` **永远落不下来**、每一轮巡检都重判一次。
+    实测复现过：改动前 R3 落标记，改动后 R3/R4/R5 全都不落。
+    """
+    from services import notify as N
+    sent = []
+    monkeypatch.setattr(A, "notify_event", N.event)
+    monkeypatch.setattr(N, "notify", lambda msg, **kw: _async(bool(sent.append(msg)) or True))
+    monkeypatch.setattr(N, "enabled", lambda kind: True)
+    monkeypatch.setattr(A, "notify_enabled", lambda kind: True)
+    cfg(ANIME_FINISH_ENABLED=True)
+    aid = make(2, [(1, "sent"), (2, "sent")])
+
+    assert await A.sweep_finished() == 1 and len(sent) == 1
+    with clean_tables.get_session() as s:          # 抖一下：撤销标记
+        s.get(Anime, aid).finished_at = None
+        s.commit()
+
+    assert await A.sweep_finished() == 1, "被冷却挡下之后完结标记再也落不下来了"
+    assert _a(clean_tables, aid).finished_at is not None
+    assert len(sent) == 1, f"冷却失效、重复推送了：{sent}"

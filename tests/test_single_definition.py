@@ -35,6 +35,9 @@ _INTENTIONAL = {
     "overview": "两个仪表盘的聚合口径不同（番剧按季度三桶、剧场版按年份）",
     "source_map": "同上",
     "bind_preview": "绑定前回显：两条线的可删对象与告警维度不同（剧场版没有集号，不产生编号冲突告警）",
+    "set_quarter": ("两条线各改各的表；且【语义不同】——番剧改的是『季度』（季母有意义、"
+                    "影响 Season 子目录），剧场版只用其中的年份（页面上那一栏就叫年份，"
+                    "归档目录走 MOVIE_QUARTER_FMT）。合并会把两个不同的概念挤进一个函数"),
     # ---- 门面：实现在 core/engine.py，两条线各一个薄包装（各自 docstring 写明「实现见 engine.*」）----
     "exclude_torrent": "实现在 core/engine.py，anime/movies 各转一层以带上自己的表",
     "reset_downloading": "同上",

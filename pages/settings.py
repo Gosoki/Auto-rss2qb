@@ -102,7 +102,7 @@ def _help(text: str) -> None:
     """标题旁的帮助 ⓘ：点击弹出说明（替代常驻灰色说明文，让页面更清爽）。"""
     with ui.button(icon="help_outline").props("flat round dense color=grey").classes("btn-sm"):
         with ui.menu():
-            ui.label(text).classes("text-xs text-gray-300 p-3").style(
+            ui.label(text).classes("text-xs p-3").style(   # 帮助气泡里的是正文，不着灰
                 "max-width:26rem;white-space:pre-line;line-height:1.6")
 
 
@@ -285,12 +285,20 @@ def _db_panel(f: dict) -> None:
         if url is None:
             ui.notify("MySQL 地址与库名都要填", type="warning")
             return
-        try:
+        # 【丢进线程】(E-36) 建连接与查询都是【同步】调用：主机关机或被防火墙 DROP 时，
+        # 它们会把整个事件循环冻住——界面、下载、qB 同步一起停。
+        # 六个碰 MySQL 的处理器里备份/建库/迁移三个早就走了 run.io_bound，这三个是漏下的。
+        # 【单靠超时不够，两件事要一起做】此前依赖的"建连接有 5 秒上界"只覆盖 TCP 握手；
+        # 连上之后查询没有上界，那正是 MYSQL_READ_TIMEOUT 这一轮补的。
+        def _probe():
             eng = db.make_mysql_engine(url)
-            with eng.connect() as c:
-                ver = c.exec_driver_sql("SELECT VERSION()").scalar()
-                cnt = transfer.count_rows(eng)
-            eng.dispose()
+            try:
+                with eng.connect() as c:
+                    return c.exec_driver_sql("SELECT VERSION()").scalar(), transfer.count_rows(eng)
+            finally:
+                eng.dispose()
+        try:
+            ver, cnt = await run.io_bound(_probe)
             ui.notify(f"连接成功：MySQL {ver}；该库现有业务数据 {sum(cnt.values())} 行", type="positive")
         except Exception as e:
             # 库不存在是最常见的一种失败，单独认出来给出下一步动作，别让用户对着
@@ -349,7 +357,11 @@ def _db_panel(f: dict) -> None:
                 ok_label=f"切到 {target}", ok_icon="swap_horiz", ok_color="primary"):
             return
         try:
-            db.switch_data_engine(url)
+            # 【丢进线程】(E-36) switch_data_engine 内部走 upgrade_data_schema → alembic
+            # → engine.connect()，全是同步调用；对着一台关机的主机点这个按钮，
+            # 整个事件循环会被冻住到 connect_timeout 到点为止。
+            # 与 pages/layout.py 的『立即重连』同款写法。
+            await run.io_bound(db.switch_data_engine, url)
         except Exception as e:
             if db.mysql_errno(e) == db.MYSQL_ERR_NO_DB:
                 ui.notify(f"库 `{config.DB_MYSQL_NAME}` 不存在，已留在原库 —— 先点『创建数据库』",
@@ -390,11 +402,23 @@ def _db_panel(f: dict) -> None:
         if url is None:
             ui.notify("MySQL 地址与库名都要填，并先点页面底部的『保存』", type="warning")
             return
+        # 【引擎建在这一层，别搬进 _ping】它下面还要当 src/dst 用（见 `src, dst = ...`）。
+        # 我第一版把 `other = ...` 一起搬进了嵌套函数，于是它成了 _ping 的局部变量，
+        # 而外面那句 `src, dst = (…, other)` 变成 LOAD_GLOBAL —— **两个迁移按钮当场 NameError 全死**，
+        # 顺带把 E-17 新加的 dst_before 回滚提示变成了到不了的代码。
+        # 889 条用例全绿，因为没有一条走页面这一层。第 20 轮的审计端到端复现了它。
+        #
+        # 【迁移本体的引擎不带查询超时】query_timeout=False：整库复制的单条 chunk 可能远超 15 秒，
+        # 而那是"已清空目标、写到一半"最不能被打断的地方。
+        other = db.make_mysql_engine(url, query_timeout=False)
         try:
-            other = db.make_mysql_engine(url)
-            with other.connect():
-                pass
+            # 连通性预检丢进线程：建连接是同步调用，对着一台关机的主机点这个按钮会冻住事件循环。
+            def _ping():
+                with other.connect():
+                    pass
+            await run.io_bound(_ping)
         except Exception as e:
+            other.dispose()
             ui.notify(f"连不上 MySQL：{type(e).__name__}: {str(e)[:160]}", type="negative")
             return
         # 【本地那一端恒取 meta_engine，绝不能用 db.engine】。db.engine 是"当前在用的业务库"——
@@ -403,7 +427,8 @@ def _db_panel(f: dict) -> None:
         # 最后 verify 拿"删完之后"的两边行数比 0==0，弹一句绿色的『迁移完成并校验一致』——
         # 用户的数据就这么没了。meta_engine 恒指向 DB_PATH 那个本地文件，两种后端下都对。
         src, dst = (db.meta_engine, other) if to_mysql else (other, db.meta_engine)
-        s_cnt, d_cnt = transfer.count_rows(src), transfer.count_rows(dst)
+        # count_rows 也要丢线程：它对每张业务表各发一条 COUNT(*)，其中一端是 MySQL。
+        s_cnt, d_cnt = await run.io_bound(lambda: (transfer.count_rows(src), transfer.count_rows(dst)))
         arrow = "本地 SQLite → MySQL" if to_mysql else "MySQL → 本地 SQLite"
         # 把两端【具体是哪个库】写进确认框：只写"本地/MySQL"时，用户无从发现方向算错了
         note = (f"{arrow}\n"
@@ -435,7 +460,8 @@ def _db_panel(f: dict) -> None:
             moved = res["moved"]
             # 用【迁前】的源快照校验：现查源库有个自证陷阱——万一两端其实是同一个库，
             # 清空之后现查两边都是 0，反而"校验通过"。
-            bad = transfer.verify(src, dst, res["src_before"])
+            bad = await run.io_bound(
+                lambda: transfer.verify(src, dst, res["src_before"], res.get("dst_before")))
         except Exception as e:
             ui.notify(f"迁移失败：{type(e).__name__}: {str(e)[:200]}", type="negative")
             return
@@ -443,7 +469,9 @@ def _db_panel(f: dict) -> None:
             other.dispose()
         detail = "、".join(f"{k} {v}" for k, v in moved.items() if v)
         if bad:
-            ui.notify(f"迁移完成但行数对不上：{'；'.join(bad)}", type="warning")
+            # 文案不能只说"行数对不上"：E-17 补的那一条报的是"目标库比迁移前少了行"，
+            # 那不是对不上，是【方向可能点反了】——用户要看的是这句，不是行数表。
+            ui.notify("迁移完成，但有要你看一眼的地方：\n" + "\n".join(bad), type="warning")
         else:
             ui.notify(f"迁移完成并校验一致：{detail or '（源库为空）'}。"
                       "连接仍在原库，要用新库请点『切换』。", type="positive")

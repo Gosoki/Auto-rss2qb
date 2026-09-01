@@ -11,6 +11,7 @@
 """
 import asyncio
 import logging
+import re
 from collections import Counter
 from datetime import datetime
 
@@ -139,6 +140,16 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         s.commit()
         s.refresh(movie)
         if movie.bangumi_id is not None:  # 身份守卫：同 bgm_id 合并
+            # 【这里的合并是安全的，别照搬番剧侧 E-18 的"自动路径不删行"】——我试着搬过一次，是错的。
+            # 两者形状不同：
+            #   · 番剧侧 E-18 防的是"自动识别把 X 【绑错】到 bgm B，然后删掉本来正确地占着 B 的 Y"，
+            #     错在【绑定】那一步，而删掉的是一部完全不同的番。
+            #   · 这里的 keeper 是【按 bgm_id 查出来的】（见本函数开头的查找顺序），
+            #     所以守卫命中时两行本来就声称同一个 subject —— 合并是构造上正确的；
+            #     而且 _merge_movie 会先把种子搬到 keeper 再删行，盘上文件不受影响，
+            #     丢的只是一行重复的元数据。
+            # 真正危险的是【摘 mikan_id】那条路（下面几行）：那里两行只是先后引用过同一个
+            # mikan_id，"同一部片"从没被证明过 —— 所以那条才需要"loser 下过就不并"。
             for other in list(s.exec(select(Movie).where(
                     Movie.bangumi_id == movie.bangumi_id, Movie.id != movie.id))):
                 _merge_movie(s, other.id, movie.id)
@@ -685,6 +696,36 @@ def _movie_folder(m, t=None):
     bgm 日文/中文名 → 种子原始标题 → m.title → 'movie'。缺 bgm 元数据时两处都回退到同一名字。"""
     return (((m.jp_name or m.display_name) if m else "")
             or (t.raw_title if t else "") or (m.title if m else "") or "movie")
+
+
+def set_quarter(movie_id: int, quarter: str) -> bool:
+    """手动改某部剧场版的归档年份（内部键如 26A；bgm 判错时的最终人工纠错）。
+
+    与番剧侧 `anime.set_quarter` 【同一套校验、同一个返回口径】——两条线的对称实现，
+    改行为要两边一起改。成功返回 True，改后由调用方触发 relocate 移动已下文件。
+
+    【为什么剧场版侧此前没有这个入口】(E-33，2026-09-01 拍板)
+    番剧侧一直有 `set_quarter` + 详情页的『编辑季度』，剧场版侧一个都没有——
+    而剧场版的归档年份【更容易算错】：`quarter_of` 带着番剧的规则「12 月归次年冬季」
+    （对季播番是对的：12 月开播实际跨 1–3 月播完），而剧场版是一次性上映，
+    真库 70 部里有 5 部因此被归到了次年。在这个入口存在之前，唯一的纠正办法是手改数据库。
+
+    【存的仍是季度键不是年份】列名与类型都不动（改列要迁移），而剧场版实际只用其中的年份——
+    页面上那一栏就叫『年份』、归档目录走 MOVIE_QUARTER_FMT（默认 {yyyy}）。
+    所以 UI 收的是年份，由调用方拼成 `{yy}A` 交给这里；这里仍按番剧的格式校验，
+    免得两条线的键格式分家。
+    """
+    q = (quarter or "").strip().upper()
+    if not re.fullmatch(r"\d{2}[A-D]", q):
+        return False
+    with get_session() as s:
+        m = s.get(Movie, movie_id)
+        if m is None:
+            return False
+        m.quarter = q
+        s.add(m)
+        s.commit()
+    return True
 
 
 def movie_save_path(movie_id: int) -> str | None:

@@ -91,7 +91,7 @@ def test_overlapping_episodes_do_not_warn(clean_tables):
 
 def test_every_bind_call_site_has_the_gate():
     """**广度不变量**：pages/ 里每一处调 bind_anime_bgm / bind_movie_bgm 的地方
-    都必须先过 confirm_bind_merge。
+    都必须先过 require_bind_confirm（它内含两道闸：先回显要绑到哪一部，再回显会不会删记录）。
 
     这条不写成行为断言是有意的：要挡的正是"将来有人加了第三个绑定入口却忘了加闸"，
     而"不存在第三个没加闸的入口"只能靠静态扫描回答。本项目最常见的缺陷形状就是
@@ -109,14 +109,14 @@ def test_every_bind_call_site_has_the_gate():
                 parent[child] = node
 
         def _gate_pos(node):
-            """这个函数体里 confirm_bind_merge 的调用位置（取最靠前的一个）；没有则 None。"""
+            """这个函数体里 require_bind_confirm 的调用位置（取最靠前的一个）；没有则 None。"""
             best = None
             for n in ast.walk(node):
                 if not isinstance(n, ast.Call):
                     continue
                 f = n.func
                 name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
-                if name != "confirm_bind_merge":
+                if name != "require_bind_confirm":
                     continue
                 # 【闸不能写在恒假分支里】实测 `if False:` 包住闸能骗过第一版守卫
                 anc, dead = n, False
@@ -152,3 +152,48 @@ def test_every_bind_call_site_has_the_gate():
             if not gated:
                 offenders.append(where)
     assert not offenders, f"这些绑定入口没有过回显闸：{offenders}"
+
+
+# ---------------- 绑定前先回显"要绑到哪一部"（E-13，R20） ----------------
+
+@pytest.mark.parametrize("text,want,why", [
+    ("https://bgm.tv/subject/12345", 12345, "标准链接"),
+    ("bgm.tv/subject/999", 999, "不带协议"),
+    ("12345", 12345, "整串就是数字"),
+    ("  12345  ", 12345, "两端空白无所谓"),
+    # 【兜底收紧】原来是 re.search(r"(\d+)")——从任意文本里抠第一串数字
+    ("第2季 1080p", None, "粘了一段番名 → 原来会得到 2，绑到一个完全不相干的 subject"),
+    ("某番名 2026", None, "同上"),
+    ("https://mikanani.me/Home/Bangumi/3384", None, "粘了 Mikan 链接 → 原来会得到 3384"),
+    ("", None, "空"),
+])
+def test_parse_bgm_id_only_takes_a_bare_number(text, want, why):
+    """(E-13) 兜底要求【整串就是数字】。
+
+    原来从任意文本里抠第一串数字，于是粘一段番名/一条 Mikan 链接都会得到一个"合法"的 id，
+    而绑定末尾的身份守卫会【删掉】另一条记录、没有撤销入口。
+    """
+    from core.manual import parse_bgm_id
+    assert parse_bgm_id(text) == want, why
+
+
+def test_the_gate_shows_the_target_name_before_writing():
+    """(E-13) 收紧正则挡不住【记错一位】—— 那只能靠绑定前回显取回的番名。
+
+    id 错一位取回的多半是一部完全不相干的作品，名字一摆出来就看出来了。
+    取不到 bgm 资料时不放行：那说明 id 不存在或此刻网络不通，
+    两种情况下都不该往库里写一个我们自己都没核实过的绑定。
+    """
+    import ast
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("pages/layout.py").read_text(
+        encoding="utf8")
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "require_bind_confirm")
+    calls = [n.func.attr for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+    names = [n.func.id for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert "fetch_by_id" in calls, "没有去 bgm 取回资料，就没法回显『你要绑的是哪一部』"
+    assert "confirm_bind_merge" in names, "没有接上原来那道『会不会删记录』的闸"
+    assert names.count("confirm") >= 1, "没有回显确认框"

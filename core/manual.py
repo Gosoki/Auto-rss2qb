@@ -29,9 +29,22 @@ def temp_path() -> str:
 
 
 def parse_bgm_id(text: str):
-    """从 bgm 链接/文本抠 subject id：优先 subject/<id>，退而取任意数字。取不到返回 None。"""
-    m = _BGM_ID_RE.search(text or "") or re.search(r"(\d+)", text or "")
-    return int(m.group(1)) if m else None
+    r"""从 bgm 链接/文本抠 subject id：优先 subject/<id>，否则【整串就是数字】才认。取不到返回 None。
+
+    【兜底为什么要求整串是数字】(E-13，2026-09-01 拍板) 原来是 `re.search(r"(\d+)")`——
+    从【任意】文本里抠出第一串数字。于是把一段番名、一条 Mikan 链接、甚至
+    "第2季 1080p" 粘进框里都会得到一个"合法"的 subject id，而绑定的末尾是身份守卫
+    `_merge_anime`，它会【删掉】另一条番记录、没有撤销入口。
+    整串数字这条判据把"我确实在填 id"和"我粘错了东西"分开，代价只是用户得把 id 单独粘出来。
+
+    但收紧正则挡不住【记错一位】——那只能靠绑定前回显取回的番名，
+    见 pages/layout.require_bind_confirm。两件事要一起做才有意义。
+    """
+    m = _BGM_ID_RE.search(text or "")
+    if m:
+        return int(m.group(1))
+    t = (text or "").strip()
+    return int(t) if t.isdigit() else None
 
 
 def magnet_hash(magnet: str):
@@ -103,7 +116,9 @@ async def add_manual(torrent_input: str, torrent_bytes, save_path: str) -> dict:
             ok = await engine.add_to_qb(None, save_path, MANUAL_CATEGORY, MANUAL_TAG,
                                         info_hash=ih or "", magnet=inp)
         elif inp.lower().startswith(("http://", "https://")):   # .torrent 链接：本地抓字节(带 SSRF 守卫)再交 qB
-            data = await engine.fetch_torrent_bytes(inp)
+            # strict=False：首跳放行、重定向后的每一跳仍强制判内网（与 D-05 同口径，见 E-21）。
+            # 这个地址是用户自己在输入框里打的，"内网私站/局域网镜像取种"是正当用法。
+            data = await engine.fetch_torrent_bytes(inp, strict=False)
             ih = info_hash_from_torrent(data)
             ok = await engine.add_to_qb(data, save_path, MANUAL_CATEGORY, MANUAL_TAG,
                                         info_hash=ih or "")

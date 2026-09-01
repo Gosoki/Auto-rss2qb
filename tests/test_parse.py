@@ -634,3 +634,29 @@ def test_roman_numerals_stay_out_of_extract_season():
     from sources.parse import extract_season
     assert extract_season("[某组] Clevatess II - 04 [1080p]") == 1, \
         "罗马数字渗进了种子标题的季号解析"
+
+
+# ---------------- 特典标记压过数字集号（E-43，R20） ----------------
+
+@pytest.mark.parametrize("title,want,why", [
+    # 真库 anime#95：唯一一部到今天还没识别出 bgm 的番，卡的就是这里
+    ("[ANi]  我的英雄學院 FINAL SEASON [特別篇] - 01 [1080P][Baha][WEB-DL][AAC AVC][CHT][MP4]",
+     -1, "『- 01』是这批特别篇里的第 1 个，不是正片第 1 集"),
+    ("[ANi] 某番 [特别篇] - 03 [1080P]", -1, "简体写法"),
+    ("[ANi] 某番 [OVA] - 02 [1080P]", -1, "OVA 独占方括号"),
+    ("[ANi] 某番 [SP] - 01 [1080P]", -1, "SP 独占方括号"),
+    ("[组] 某番 【映像特典】 - 01", -1, "全角方括号"),
+    # 【判据收紧到"独占一个方括号"的理由】宽松写法的失手方式是明摆着的
+    ("[LoliHouse] はたらく細胞!! OVA番名 - 03 [WebRip]", 3,
+     "番名本身带 OVA 的番不能被整部打成特典 —— 那会一集正片都不下"),
+    ("[组] 某番 [1080P][SPECIAL EDITION] - 07", 7,
+     "SPECIAL EDITION 是画质/版本标签，不是特典标记；判据要求方括号里【只有】标记词"),
+    ("[组] 某番 - 05 [1080p]", 5, "普通正片不受影响"),
+    ("[组] 某番 [BDRip] - 05", 5, "别的方括号标签不受影响"),
+    # 宽松那一支只在抽不到数字时兜底（它本来就不会自动下载，宽松是安全的）
+    ("[组] 某番 特别篇 [1080p]", -1, "抽不到数字 → 兜底细化成 -1"),
+    ("[组] 某番 完全看不出集号", -2, "既没数字也没标记 → 未知"),
+])
+def test_special_tag_overrides_the_number(title, want, why):
+    from sources.parse import extract_episode
+    assert extract_episode(title) == want, why

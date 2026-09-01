@@ -462,3 +462,59 @@ def test_no_button_sizes_itself_with_tailwind():
     bad = [f"{f}:{ln} classes={c!r}" for f, ln, _, cls in _button_calls()
            for c in cls if _METRIC_CLASSES.search(c)]
     assert not bad, "按钮用 Tailwind 类定了字号，绕开了 .btn-sm：\n  " + "\n  ".join(bad)
+
+
+def test_only_two_greys_exist():
+    """(E-37) 全站的灰只有两档：text-gray-400（说明文/字段名）与 text-gray-500（更弱的附注）。
+
+    正文不着灰（番剧简介、bgm 字段的值、帮助气泡正文、INFO 日志行）—— 那些是要读的内容，
+    用默认前景色；它们曾经用 gray-300，实际上是第三档灰，而"正文"和"说明文"
+    本来就不该在同一个灰阶里排队。hover 态用 hover:text-white，别用更亮的灰。
+
+    没有这条守卫时的实测状态：gray-400 六十处、gray-500 四十九处、gray-300 三处，
+    而 warn_banner 的文档写死的是"中性说明＝gray-500"——规矩写下之后没人照着做。
+    """
+    import re
+    allowed = {"text-gray-400", "text-gray-500"}
+    pat = re.compile(r"\b(?:hover:)?text-gray-(\d{2,3})\b")
+    offenders = []
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        src = path.read_text(encoding="utf8")
+        for m in pat.finditer(src):
+            token = m.group(0)
+            if token.startswith("hover:"):
+                offenders.append(f"{path.name}:{src[:m.start()].count(chr(10)) + 1} {token}"
+                                 "（hover 用 hover:text-white，别引入第三档灰）")
+            elif token not in allowed:
+                offenders.append(f"{path.name}:{src[:m.start()].count(chr(10)) + 1} {token}")
+    # 【CSS 字符串里写死的十六进制也要扫】token 类名那条判据看不见它们 ——
+    # 第 20 轮的审计正是从这儿翻出两处 `#d1d5dc`（Tailwind gray-300），
+    # 那是被 E-37 拿掉的第三档灰，只是换了个写法躲过了守卫。
+    # 颜色一律走 layout._TOKENS + text_token()，别再写死。
+    _GREYISH = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})\b")
+    _ALLOWED_HEX = {
+        # 底色，不是文字色
+        "#121212", "#0b0d10", "#1b1e24", "#15171c", "#1a1c22",
+        "#fff", "#ffffff", "#000", "#000000",
+        # 【ECharts 的配置例外】pages/anime.py 的环图 option 是【传给 JS 图表库的 JSON】、
+        # 走 canvas 渲染，不是 CSS。oklch() 在 canvas fillStyle 里的支持依赖浏览器版本，
+        # 而这个项目没有浏览器可验 —— 拿一个看不见的图去换"写法统一"不值。
+        # 代价是这两个值要与 layout._TOKENS 手工对齐：
+        #   #99a1af = grey(gray-400)、#d1d5dc = ink-soft。改 token 时记得同步。
+        "#99a1af", "#d1d5dc",
+    }
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        for ln, line in enumerate(path.read_text(encoding="utf8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue                      # 注释里提到某个色号不算
+            for m in _GREYISH.finditer(line):
+                if m.group(0).lower() in _ALLOWED_HEX:
+                    continue
+                r, g, b = (int(m.group(0)[1:][i:i + 2] or "0", 16) for i in (0, 2, 4)) \
+                    if len(m.group(0)) == 7 else (0, 0, 0)
+                if len(m.group(0)) == 7 and max(r, g, b) - min(r, g, b) <= 24:
+                    offenders.append(f"{path.name}:{ln} 写死了灰色 {m.group(0)} "
+                                     "（颜色走 layout._TOKENS + text_token()）")
+    assert not offenders, (
+        "只允许 text-gray-400 / text-gray-500 两档灰，颜色一律走 token：\n  " + "\n  ".join(offenders)
+        + "\n（要读的正文不着灰，用默认前景色）")

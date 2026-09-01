@@ -44,9 +44,15 @@ def _make_sqlite_engine(path: str):
 
 
 MYSQL_CONNECT_TIMEOUT = 5   # 秒。只管【建连接】，不限制查询本身
+# 秒。管【一次查询等回包】多久。connect_timeout 只覆盖 TCP 握手那一段——
+# 主机连得上但库查不动时（锁等待、磁盘满、大表全扫、网络半开），查询会永久挂着，
+# 而那正是"停摆状态机永远进不去、整站冻结而 db_down 通知一条发不出"的成因（E-2/E-36）。
+# 【迁移那条路径要不带它】整库复制的单条 chunk 写入可能远超 15 秒，
+# 而那恰恰是"已清空目标、写到一半"最不能被打断的地方 —— 见 make_mysql_engine 的 query_timeout 形参。
+MYSQL_READ_TIMEOUT = 15
 
 
-def make_mysql_engine(url: str):
+def make_mysql_engine(url: str, query_timeout: bool = True):
     """建 MySQL 引擎。pool_pre_ping 必开：服务端 wait_timeout(默认 8 小时) 会掐掉空闲长连接，
     而我们的后台协程正是"长期空闲后突然要查"，不 ping 就会撞 'MySQL server has gone away'。
 
@@ -56,10 +62,24 @@ def make_mysql_engine(url: str):
     界面、下载、qB 同步一起停。看守协程那条路径已经丢进线程池了（见 worker.run_db_watch，
     实测把界面冻结从 5 秒降到 29 毫秒），但普通查询这条路没有，只能靠超时兜底。
     5 秒对局域网/常见云库都绰绰有余，最坏卡顿也压到勉强可接受。
+
+    【connect_timeout 只盖住握手那一段，查询本身还得有上界】(E-2/E-36，2026-09-01 拍板)
+    主机连得上但库查不动时（锁等待、磁盘满、大表全扫、网络半开），查询会永久挂着——
+    而"建连接有 5 秒上界"这句话被好几处当成了"最坏也就卡 5 秒"的依据，那是个错觉。
+    后果最重的是停摆状态机：它靠一条 `SELECT 1` 判活，那条查询挂住就永远进不了停摆态，
+    于是整站冻结而 db_down 通知一条都发不出去。
+
+    query_timeout=False 给【迁移】那条路径用：整库复制的单条 chunk 写入可能远超 15 秒，
+    而那正是"已清空目标、写到一半"最不能被打断的地方。别的调用点一律用默认值。
     """
+    args = {"connect_timeout": MYSQL_CONNECT_TIMEOUT}
+    if query_timeout:
+        # pymysql 的 read_timeout / write_timeout 是【每次 socket 读写】的上界，
+        # 不是整条语句的总时长；对"查询挂住不回包"这一类足够了，也不会误杀慢但持续有回包的查询。
+        args["read_timeout"] = MYSQL_READ_TIMEOUT
+        args["write_timeout"] = MYSQL_READ_TIMEOUT
     return create_engine(url, echo=False, pool_pre_ping=True, pool_recycle=3600,
-                         pool_size=5, max_overflow=5,
-                         connect_args={"connect_timeout": MYSQL_CONNECT_TIMEOUT})
+                         pool_size=5, max_overflow=5, connect_args=args)
 
 
 # 【顺序要紧】metadata 是 import models 时才被填充的，必须先导入模型、再定型，最后才建引擎/建表。

@@ -22,8 +22,21 @@ from core import engine
 
 
 @app.post("/api/qb/done")
-def qb_done(request: Request, hash: str = "", t: str = "") -> dict:
-    """qB 完成回调：hash=种子 info hash（%I），t=可选 token。标记成功返回 {'ok':True,'marked':True}。"""
+async def qb_done(request: Request, hash: str = "", t: str = "") -> dict:
+    """qB 完成回调：hash=种子 info hash（%I），t=可选 token。标记成功返回 {'ok':True,'marked':True}。
+
+    【为什么是 async def】(E-12，2026-09-01 拍板)
+    同步的 `def` 处理器被 Starlette 丢到线程池里跑，于是这里曾是全项目【唯一从工作线程写库】
+    的路径——而整套并发假设建立在"单进程、事件循环内原子"之上：交付路径的原子占位
+    （`status` 从 pending 改成 downloading 那一步）、集去重、in-flight 判定，
+    全都靠"没有别人能在我 await 的间隙插进来"。多一条线程写库，那个不变式就不再成立，
+    而它失效的表现是间歇性的、只在 qB 恰好回调的那一瞬发生。
+    改成 async 之后，写库回到事件循环内，不变式收敛成一条。
+
+    【代价：mark_done_by_hash 是同步 IO，会短暂占住事件循环】它只做一次带索引的
+    单行查改（真库上 sub-ms），比起"多一条并发写库路径"这个不变式缺口，代价小得多。
+    不丢 run.io_bound 正是因为丢了就等于把线程写库又装回来。
+    """
     tok = config.QB_CALLBACK_TOKEN
     if not tok:
         # 【没设 token 时只认本机】以前 `if tok and ...` 在 token 为空时整条短路＝谁都能调。

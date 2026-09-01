@@ -19,7 +19,9 @@ from db import get_session
 from db.dialect import ALIAS_TITLE_LEN
 from db.models import Anime, AnimeTorrent, Movie, MovieTorrent, SourceGroup, AnimeAlias
 from services import enrich
-from services.notify import event as notify_event, state as notify_state
+from services.notify import (cooldown_active as notify_cooldown_active,
+                             enabled as notify_enabled, event as notify_event,
+                             state as notify_state)
 from sources.parse import (extract_episode_abs, kw_match, parse_title, quarter_of,
                            quarter_sort_key,
                            search_query_names, season_from_name)
@@ -455,11 +457,11 @@ def suspect_duplicate_anime() -> list[dict]:
             ax, ay = animes.get(x), animes.get(y)
             if ax is None or ay is None:
                 continue
-            # 【要判非空】身份守卫（_resolve_anime 建番处、enrich_anime 末尾）全都要求
-            # bangumi_id is not None，所以"两边都是 None"这一对【没有任何人会去合】——
-            # 而原来那个等式对它恒成立，等于把最该报的一类静默跳过了。
-            if ax.bangumi_id is not None and ax.bangumi_id == ay.bangumi_id:
-                continue     # 同 bgm 的两条身份守卫会自己合，报出来是噪声
+            # 【同 bgm 的那种现在也要报】(E-18 之后)
+            # 以前跳过它的理由是"身份守卫会自己合"，而 E-18 之后【自动路径一律不合、不删行】——
+            # 于是同 bgm_id 的两条会一直留着，正需要有人看见并到详情页走人工路径合并。
+            # 两边都是 None 的那种同样要报：身份守卫全都要求 bangumi_id is not None，
+            # 那一对没有任何人会去合，而原来那个等式对它恒成立、把最该报的一类静默跳过了。
             out.append({"a": x, "b": y, "shared": sorted(t for t, _ in shared),
                         "a_name": display_of(ax), "b_name": display_of(ay),
                         "a_bgm": ax.bangumi_id, "b_bgm": ay.bangumi_id,
@@ -1267,6 +1269,45 @@ def source_map() -> dict:
     return {aid: sorted(v) for aid, v in src.items() if v}
 
 
+def episode_progress(anime_ids) -> dict:
+    """{番 id: (已下集数, 库里有种子的集数)} —— 列表上那个 `12/21` 就是它。
+
+    【为什么按"集号"数而不是按"种子条数"数】同一集常有好几个源各一份种子，
+    按条数数出来的比值没有意义（多源番天生就"下得多"）。用户要看的是"这部番的第几集到手了"。
+
+    · 分子 = status ∈ HAVE_STATUSES（sent/downloading/stalled）的【不同正集号】个数。
+      口径比 episode_coverage 松：那个还要求 qb_progress >= 1.0（"真下完"，完结判定用），
+      而列表这里回答的是"这一集我发出去了没有"，在下的也该算——否则刚放行的一批会显示成没下。
+    · 分母 = 该番【所有】种子覆盖到的不同正集号个数（含 pending/error/skipped/excluded/deleted）。
+      也就是"库里一共见过多少集"。分母大于分子 = 有集号还没到手，那正是要查的。
+
+    小数集（11.5）与 -1/-2（特别篇/未知集）都不计：它们不参与"第几集"这个口径，
+    与 episode_coverage、auto_downloadable_ep 一致。
+
+    【为什么这个比值能查错】它把两类问题一眼摊开：
+      · `7/21` —— 库里有 21 集的种子却只下了 7 集（锁定源锁太死、关键词没匹配上、卡在缓冲窗口）。
+      · `33/33` 而 bgm 记着 12 集 —— 集号本身就不对（别的季的正片挂到了这条记录下面），
+        真库的 anime#6 就是这个样子。所以 tooltip 里要把 bgm 的总集数一起给出来。
+    """
+    ids = {i for i in anime_ids if i}
+    if not ids:
+        return {}
+    with get_session() as s:
+        rows = list(s.exec(select(
+            AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.status).where(
+            AnimeTorrent.anime_id.in_(ids), AnimeTorrent.episode >= 1).distinct()))
+    have: dict = {}
+    seen: dict = {}
+    for aid, ep, status in rows:
+        if not (isinstance(ep, (int, float)) and float(ep).is_integer()):
+            continue          # 小数集不计，理由同 episode_coverage
+        k = int(ep)
+        seen.setdefault(aid, set()).add(k)
+        if status in HAVE_STATUSES:
+            have.setdefault(aid, set()).add(k)
+    return {aid: (len(have.get(aid, ())), len(eps)) for aid, eps in seen.items()}
+
+
 def pending_confirm() -> list[Anime]:
     """待确认：已匹配 bgm 但未确认、未拒绝的番。未匹配的在『待识别』，绑定后才来这里。"""
     with get_session() as s:
@@ -1541,15 +1582,9 @@ async def sweep_finished() -> int:
     backfill = first_ever and len(hits) > 5
     now = datetime.now()
     done, undone = [], []
+
+    # ── 先把【撤销】那一半落库：它与通知无关，也不该被通知的成败拖住 ──
     with get_session() as s:
-        for a in hits:
-            row = s.get(Anime, a.id)
-            # 重取再确认：拿到候选之后要 await 发通知，期间用户随时可能点『继续订阅』。
-            if row is None or row.finished_at is not None or row.finish_optout:
-                continue
-            row.finished_at = now
-            s.add(row)
-            done.append(a)
         for a in stale:
             row = s.get(Anime, a.id)
             if row is None or row.finished_at is None or row.finish_optout:
@@ -1560,37 +1595,64 @@ async def sweep_finished() -> int:
         s.commit()
     if hits and first_ever:
         _mark_finish_backfilled()   # 有命中的第一轮就落闩，与是否静默无关
-    if backfill:
-        log.info("完结判定：首轮回填 %d 部（不推送，避免把限流额度占满）", len(done))
-    else:
-        for a in done:
+
+    # ── 再逐部：先通知、后落标记（E-32 的解法，不用加列）──
+    #
+    # 【为什么改成这个顺序】原来是【整批】commit 完 finished_at 才逐部发通知，
+    # 而候选过滤卡的正是 `finished_at is None` —— 于是通知丢了就是【永久丢】，下一轮不会重来。
+    # R17 加的连续失败熔断把这条风险放大了：连挂 5 条就保证静默 300 秒，
+    # 那 300 秒里判定的完结全部静默，而 finished_at 照落。
+    #
+    # 【为什么不加 finish_notified_at 那一列（E-32 的 A 案）】那要开一次 revision，
+    # 而这里换个顺序就能拿到同样的性质：
+    #   · 推送正常     → 通知成功 → 落标记。与原来一样。
+    #   · 推送坏着     → 通知失败 → 【不落标记】→ 下一轮 sweep 重新判、重新通知。自愈。
+    #   · 没订阅/没配 URL → notify_event 恒 False，但那不是"丢了"，是"本来就不发"→ 照常落标记。
+    #     少了这一支就会变成：没配通知的用户，finished_at 永远写不进去、停订永远不生效。
+    #   · 首轮回填     → 本来就不推送 → 照常落标记。
+    #
+    # 【代价，是有意接受的】推送坏着的那段时间里 finished_at 不落，于是
+    # ANIME_FINISH_UNSUB 对这几部暂时不生效——它们会继续自动下新集。
+    # 那是本项目一贯的安全方向（"宁可不判，绝不误判"）：多下几集 ≪ 停订一部还在更新的番。
+    for a in hits:
+        _cd = 7 * 24 * 3600
+        if backfill:
+            may_mark = True          # 首轮回填本来就不推送
+        else:
             # 【按番去重 + 长冷却】finished_at 只挡得住"标记还在"的重复，挡不住【反复翻转】：
             # 删掉一集 → 巡检撤销标记 → 补下回来 → 再判完结，每翻一次就多一条"全 N 集已下齐"。
             # qB 里删种、临时 missingFiles、总集数被 bgm 改来改去，都会让它翻。
-            # 冷却是进程内的（重启即忘），所以这是【压住抖动】不是【跨重启去重】——
-            # 后者的正解是给 Anime 加一列 finish_notified_at，要开 revision，留给下一版。
-            if not await notify_event(
-                    "finished", f"{display_of(a)} 全 {a.total_episodes} 集已下齐"
-                                + ("，已停止自动下新集" if config.ANIME_FINISH_UNSUB else ""),
-                    key=str(a.id), cooldown=7 * 24 * 3600):
-                # 未订阅/没配 URL 时这里恒为 False，所以只记 info 不记 warning——
-                # 但它是"这条完结通知没发出去"的唯一痕迹，而下一轮不会重来（见上）。
-                log.info("完结通知未发出（未订阅/限流/熔断中/推送失败），不会重发：%s", display_of(a))
-            # 完结这条【不】因为通知没发出去就回滚标记：finished_at 是业务状态（它决定停不停订），
-            # 不是"通知记账"。通知丢了顶多少一条推送，而详情页的徽标一直在。
-            # 【但要知道代价】上面 1391 行是【整批】commit 完 finished_at 才走到这个循环，
-            # 而候选过滤卡的正是 `finished_at is None`——所以这条通知丢了就是【永久丢】，
-            # 下一轮不会重来。真正的解是给 Anime 加一列 finish_notified_at（与 idle_notified_at 同款），
-            # 要开 revision，记在 docs/DECISIONS.md E-32 等拍板。
-            # 【R17 之后这条风险是【变大】了，不是变小 —— 上一版注释在这里写反了】
-            # 限流桶改成按送达记账确实拆掉了"桶满 → 静默一小时"那条放大路径，
-            # 但同一轮加的**连续失败熔断**换来了一条更硬的：连挂 5 条就保证静默 300 秒，
-            # 而 5 条很容易凑（一轮 flush 串行交付几集撞上一次网络抖动、推送容器重启、
-            # 对端 429 都够，且 _fail_streak 是跨事件类型共享的全局量）。
-            # 那 300 秒里判定出来的完结，finished_at 照落、通知一条不发、下一轮不会重来。
-            # 熔断本身是对的（它挡的是"每条白等一个超时拖垮交付主链路"），
-            # 正确的解法是让完结这条【不依赖当次推送成功】——即 DECISIONS E-32 的落库列。
-            # 在它落地之前，至少把没送出去的这一条记进日志，别只留一个静悄悄的徽标。
+            ok = await notify_event(
+                "finished", f"{display_of(a)} 全 {a.total_episodes} 集已下齐"
+                            + ("，已停止自动下新集" if config.ANIME_FINISH_UNSUB else ""),
+                key=str(a.id), cooldown=_cd)
+            # 【False 有【四】种含义，必须分开 —— 我先只分了两种，第 20 轮的审计端到端跑出了第三种】
+            #   ① 没送出去（推送坏了 / 熔断中 / 被限流丢弃）→ 不落标记，下一轮重来
+            #   ② 未订阅 / 没配 NOTIFY_URL → 不是"丢了"，是本来就不发 → 照常落标记
+            #      （少了它，没配通知的用户 finished_at 永远写不进去、停订永远不生效）
+            #   ③ **被 7 天冷却挡下** → 说明上一次【已经通知过了】→ 照常落标记
+            #      （少了它，一部番只要"判完结 → 抖一下被撤销 → 再判完结"，第二次就被冷却挡住，
+            #        于是 finished_at **永远落不下来**、每一轮巡检都重判一次。实测复现过。）
+            # 冷却判定放在【调用之后】是安全的：被冷却挡下时 event() 不会碰 _last_sent，
+            # 而送出去了的话 ok 已经是 True、根本走不到这一支。
+            may_mark = (ok or not notify_enabled("finished")
+                        or notify_cooldown_active("finished", str(a.id), _cd))
+            if not may_mark:
+                log.info("完结通知没送出去（限流/熔断中/推送失败），本轮不落完结标记，"
+                         "下一轮巡检会重新判、重新通知：%s", display_of(a))
+                continue
+        with get_session() as s:
+            row = s.get(Anime, a.id)
+            # 重取再确认：拿到候选之后可能 await 过一次通知，期间用户随时可能点『继续订阅』。
+            if row is None or row.finished_at is not None or row.finish_optout:
+                continue
+            row.finished_at = now
+            s.add(row)
+            s.commit()
+        done.append(a)
+
+    if backfill:
+        log.info("完结判定：首轮回填 %d 部（不推送，避免把限流额度占满）", len(done))
     if undone:
         log.info("完结判定：%d 部不再集齐，已撤销完结标记（删过文件/失败/总集数变了）", len(undone))
     if done:
@@ -2169,8 +2231,23 @@ def _has_unmovable_files(s, anime_id: int) -> bool:
     )).first() is not None
 
 
-async def enrich_anime(anime_id: int, freeze_empty_path: bool = False) -> bool:
+async def enrich_anime(anime_id: int, freeze_empty_path: bool = False,
+                       keep_binding: bool = False) -> bool:
     """富集某番剧：用它已有的名字 + 最近一条种子回退，重取 bgm 元数据并覆盖。
+
+    keep_binding=True：【已经绑上 bgm 的番只刷元数据，不重新匹配】——按 subject id 直取，
+    不再走按名字投票的那条路。给【批量】入口用（设置页的『重新识别 当季/半年/全部』）。
+    还没绑上的番不受影响，照常尝试识别（那一半只可能变好）。
+
+    【为什么批量入口必须这样】第 19 轮在真库上量过：已有绑定的正确率是 **96/98 = 98.0%**，
+    而把自动路径在今天重跑一遍的绑定错误率是 **4.3%**（99 部里错 4 部）——
+    也就是说点一次『识别全部』，是拿 98% 去换 95.7%，而且改错的那几条还会走下面的身份守卫
+    `_merge_anime`，那一步会【删掉】另一条番记录、没有撤销入口。
+    失败模式是系统性的、不是偶然：`_date_ok` 用"集数倒推首播日"当主判据，对用全系列绝对编号的
+    续季必然指到上一季的首播窗口，于是正确的 subject 被日期闸判否、同系列的另一部被判对
+    （真库 #86/#60/#6/#100 全是这一条）；而 `_name_not_contradicted` 只要一个 2-gram 重合，
+    "北斗"两个字就够让完全不同的作品通过。
+    详情页那个【单番】的『重新识别』不带这个参数——那是用户对着一部番说"我要你重算"。
 
     freeze_empty_path=True 给【不会 relocate 的调用方】用（后台 retry_unmatched、批量重新识别）。
     apply_bgm_meta 的 keep_path 只冻结**已经有值**的路径字段——空值照样会被填上，而
@@ -2197,7 +2274,14 @@ async def enrich_anime(anime_id: int, freeze_empty_path: bool = False) -> bool:
         episode = t.episode if t else None
         bgm_before = a.bangumi_id      # 见下面 await 之后的那道 compare-and-set
 
-    info = await enrich.resolve(names, release_time, episode, info_hash)
+    if keep_binding and bgm_before:
+        # 已经绑上了：按 subject id 直取元数据，完全不碰"这部番是哪个 subject"这个判断。
+        info = await enrich.fetch_by_id(bgm_before)
+        if not info:
+            log.info("刷新元数据失败（bgm 取不到 subject %s），保持原样：%s", bgm_before, names[:1])
+            return True          # 绑定还在、只是这次没刷上，不是"没识别出来"
+    else:
+        info = await enrich.resolve(names, release_time, episode, info_hash)
     with get_session() as s:
         a = s.get(Anime, anime_id)
         if a is None:
@@ -2234,11 +2318,33 @@ async def enrich_anime(anime_id: int, freeze_empty_path: bool = False) -> bool:
                 setattr(a, k, v)      # 连"原本为空"的也还原，见本函数 docstring
         s.add(a)
         s.commit()
-        # 身份守卫：若该 bgm_id 已被别的番占用，合并过来，杜绝同一部番裂成两条
+        # 【身份守卫：只报不合】(E-18，2026-09-01 拍板 + R20 收口)
+        # `_merge_anime` 的最后一步是 `s.delete(loser)`，没有撤销入口。
+        # 合并【只应发生在"用户明确绑定、并且看过回显"之后】——那条路是 bind_anime_bgm，
+        # 它的调用点全部经 layout.require_bind_confirm（先摆出"你要绑的是《X》"、再摆出"会删掉哪条"）。
+        #
+        # 本函数的四个入口没有一个满足那个前提：
+        #   · retry_unmatched / reenrich_scope —— 后台，没有人在看；
+        #   · 详情页与『待识别』列表的『重新识别』—— 虽然是人点的，但它在 resolve 之前
+        #     【根本不知道会绑到哪个 subject】，没法预先回显；用户按下去的意思是
+        #     "帮这一部重算一次"，不是"把另一条记录删掉"。
+        # 第 20 轮的审计端到端复现过：详情页点一次『重新识别』，另一条番整行消失、零提示。
+        #
+        # 留下的两条同 bgm_id 记录由 suspect_duplicate_anime 报到仪表盘，
+        # 用户到详情页走绑定那条路合并（那条带回显）。
         if a.bangumi_id is not None:
-            for other in list(s.exec(select(Anime).where(
-                    Anime.bangumi_id == a.bangumi_id, Anime.id != a.id))):
-                _merge_anime(s, other.id, a.id)
+            dup = list(s.exec(select(Anime).where(
+                Anime.bangumi_id == a.bangumi_id, Anime.id != a.id)))
+            if dup:
+                names = "、".join(f"#{o.id}「{display_of(o)}」" for o in dup)
+                log.warning("识别把 %s 绑到了 bgm %s，而 %s 已经占着这个 bgm —— "
+                            "本路径不合并、不删行（合并只在『绑定 bgm』那条带回显的路上做），"
+                            "请到仪表盘按提示人工核对",
+                            f"#{a.id}「{display_of(a)}」", a.bangumi_id, names)
+                await notify_event(
+                    "backlog", f"{display_of(a)} 与 {names} 绑到了同一个 bgm，"
+                               "识别没有合并（合并会删记录）。去仪表盘核对一下",
+                    key=f"dup:{a.bangumi_id}", cooldown=24 * 3600)
     return bool(info)
 
 
@@ -2350,7 +2456,12 @@ async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
 async def reenrich_scope(seasons: int | None = None) -> int:
     """按季度范围重新识别（bgm）：seasons=1 当季 / 2 近半年 / 4 近1年 / None 全部。返回命中数。
 
-    对范围内的番重跑一次识别——顺带把之前『待识别』(未匹配)的重试、已匹配的刷新元数据。
+    【它做两件事，但都不改已有的绑定】
+      · 已经绑上 bgm 的 → 只按 subject id 刷元数据（封面/评分/总集数/放送日/简介）。
+      · 还没绑上的     → 照常尝试识别一次。
+    也就是说这个按钮【不会】把一部已经绑对的番改绑到别处，也就不会触发身份守卫的合并删行。
+    理由与实测数字见 enrich_anime 的 docstring（真库：已有绑定 98% 对，重跑一遍错 4.3%）。
+    要改某一部的绑定，去它的详情页——那里是对着一部番说"我要你重算"，并且有绑定回显。
     """
     quarters = None
     if seasons:
@@ -2371,7 +2482,9 @@ async def reenrich_scope(seasons: int | None = None) -> int:
         try:
             # freeze_empty_path：本入口是【批量】的，页面上不问"要不要搬迁"（几十部番逐个弹框
             # 不现实），所以它与后台 retry_unmatched 同类——不能让它改已下番的归档目录。
-            if await manual_enrich(aid, freeze_empty_path=True):   # 含清零后台重试计数
+            # keep_binding=True：已绑上的只刷元数据、不重新匹配（理由见 enrich_anime 的 docstring）。
+            # 没绑上的照常尝试识别——这个入口的另一半用途就是"把之前没认出来的再试试"。
+            if await manual_enrich(aid, freeze_empty_path=True, keep_binding=True):
                 n += 1
         except Exception as e:
             log.warning("重新识别失败 anime=%s: %s", aid, e)
@@ -2379,7 +2492,8 @@ async def reenrich_scope(seasons: int | None = None) -> int:
     return n
 
 
-async def manual_enrich(anime_id: int, freeze_empty_path: bool = False) -> bool:
+async def manual_enrich(anime_id: int, freeze_empty_path: bool = False,
+                        keep_binding: bool = False) -> bool:
     """**人工触发的一次重新识别**——所有『重试识别 / 重新识别』按钮都该走这里。
 
     比 enrich_anime 多做一件事：清零 enrich_tries。这一步不是可选的：
@@ -2391,7 +2505,8 @@ async def manual_enrich(anime_id: int, freeze_empty_path: bool = False) -> bool:
     同一个按钮名在两个页面上行为不同，而差别只有在几小时后"它怎么还没识别出来"时才显形。
     """
     reset_enrich_tries(anime_id)
-    return await enrich_anime(anime_id, freeze_empty_path=freeze_empty_path)
+    return await enrich_anime(anime_id, freeze_empty_path=freeze_empty_path,
+                              keep_binding=keep_binding)
 
 
 def reset_enrich_tries(anime_id: int) -> None:

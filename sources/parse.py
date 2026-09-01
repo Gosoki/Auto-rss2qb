@@ -215,6 +215,16 @@ def _find_season(text: str):
     return None
 
 
+# 特典标记。两条判据分工不同，别合并：
+# · _SPECIAL_TAG_RE —— 标记【独占一个方括号】。它【压过】后面抽到的数字集号（见 extract_episode）。
+#   这是字幕组标注特典的通行写法，误伤面小：`[特別篇]` 只可能是特典标记。
+# · _SPECIAL_LOOSE_RE —— 标题里【出现】这些词。它只在【一个数字都抽不到】时当兜底用，
+#   把 -2（未知）细化成 -1（特别篇）。宽松是安全的，因为那一支本来就不会自动下载。
+_SPECIAL_TAG_RE = re.compile(
+    r"[\[【]\s*(?:特[别別]篇|OVA|OAD|SP|Special|映像特典|NCOP|NCED)\s*[\]】]", re.I)
+_SPECIAL_LOOSE_RE = re.compile(r"特[别別]篇|\bOVA\b|\bOAD\b", re.I)
+
+
 def extract_season(text: str) -> int:
     s = _find_season(text)
     if s is not None:
@@ -292,6 +302,20 @@ def extract_episode_abs(text: str) -> int | None:
 def extract_episode(text: str):
     """整数集→int，小数集(11.5)→float，中文数字(第二十三话)→int，特别篇/OVA→-1，无法识别→-2。"""
     text = _EXT_RE.sub("", text)   # 先剥 .mkv/.mp4：'Show - 05.mkv' 的集号段否则锚不到行尾
+    # 【标记独占一个方括号时，它压过后面的数字】`[ANi] 我的英雄學院 FINAL SEASON [特別篇] - 01`
+    # 的 `- 01` 是【这一批特别篇里的第 1 个】，不是正片第 1 集。原来的 特别篇/OVA 判据是
+    # 写在最后当兜底的：只有一个数字都抽不到时才生效，而这种标题抽得到，于是它被当成正片第 1 集
+    # 入库、参与集去重、占住第 1 集的位置，而正片第 1 集来的时候就被去重挡掉了。
+    # 真库 anime#95『我的英雄学院 FINAL SEASON』是唯一一部到今天还没识别出 bgm 的番，
+    # 卡的就是这里（它名下只有这一条种子，而它被当成了正片）。
+    #
+    # 【判据为什么收紧到"独占一个方括号"，而不是"标题里含这几个字"】
+    # 真库 1660 条标题里两种判法命中的都只有这 1 条，差集为 0 —— 也就是说没有任何数据能告诉我
+    # 宽松写法安不安全。而宽松写法的失手方式是明摆着的：番名本身带 OVA/SP 的番
+    # （『はたらく細胞!! OVA』这类）会被整部打成特别篇，一集正片都不下。
+    # 独占方括号是字幕组标注特典的通行写法，也是唯一有实证的那一种。
+    if _SPECIAL_TAG_RE.search(text):
+        return -1
     for pat in _EP_PATTERNS:
         m = pat.search(text)
         if m:
@@ -299,7 +323,7 @@ def extract_episode(text: str):
             if v.replace(".", "").isdigit():
                 return int(v) if "." not in v else float(v)
             return _cn_to_int(v)   # 中文数字集号（第二十三话）
-    return -1 if ("特别篇" in text or "OVA" in text.upper()) else -2
+    return -1 if _SPECIAL_LOOSE_RE.search(text) else -2
 
 
 # 【番名本身就写成【…】的番】`【我推的孩子】`/`【推しの子】`/`【咒术回战】` —— 那对方括号
@@ -430,6 +454,24 @@ def quarter_of(dt: datetime) -> str:
     else:
         q = "D"
     return f"{str(year)[2:]}{q}"
+
+
+def movie_quarter_of(dt: datetime) -> str:
+    """剧场版按【上映那一年】归档，不走 quarter_of 的"12 月归次年冬季"。
+
+    `quarter_of` 那条规则对**番剧**是对的：12 月开播的季播番实际跨 1–3 月播完，
+    整季归次年冬季才不会被劈成两个目录。而**剧场版是一次性上映**——
+    页面上那一栏就叫「年份」、归档目录走 `MOVIE_QUARTER_FMT`（默认 `{yyyy}`），
+    按番剧的规则算就会把 12 月首映的片放进次年。
+
+    真库实证（E-30，2026-09-01 拍板）：70 部里有 5 部这样，
+    『剧场版 间谍过家家 代号：白』2023-12-22 → 落进 `…/Movie/2024/`，
+    另有『窗边的小豆豆』『青春猪头少年不会梦到红书包女孩』等 4 部同形。
+
+    【仍返回季度键而不是年份】`Movie.quarter` 的列名与类型不动（改列要迁移），
+    季母固定 A —— 剧场版不看季，取年份一律走 `core.engine.quarter_year()`。
+    """
+    return f"{str(dt.year)[2:]}A"
 
 
 # ABCD ↔ 季节 / 首月（与 quarter_of 一致：A冬1月 B春4月 C夏7月 D秋10月）

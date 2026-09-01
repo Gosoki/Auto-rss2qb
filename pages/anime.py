@@ -11,7 +11,7 @@ from db.models import AnimeTorrent
 from core import anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail
-from .layout import (busy_action, confirm, confirm_bind_merge, ep_str, expand_collapse_bar,
+from .layout import (busy_action, confirm, require_bind_confirm, ep_str, expand_collapse_bar,
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, recent_table, season_label, source_options,
@@ -282,13 +282,18 @@ def anime_page(t: str = ""):
                 # 【档位跟同类走】上面『补下全部』『立刻刷新』与 /movies 的『立刻刷新』都是
                 # 页头行里的 outline 触发器、都是 btn-sm；R18 里我把这一个改成了 14px，
                 # 于是同一页同一角色出现两种尺寸——正是这轮统一要根除的形状。四个一律 12px。
-                with ui.button("重新识别", icon="sync").props(
-                        "outline color=primary").classes("btn-sm"):
+                _rb = ui.button("刷新资料", icon="sync").props(
+                    "outline color=primary").classes("btn-sm")
+                _rb.tooltip("按 bgm 重新拉封面/评分/总集数/放送日等元数据。"
+                            "【已经绑好的番只刷资料、不会改绑定】——批量重新匹配在真库上实测"
+                            "错误率 4.3%，而已有绑定的正确率是 98%。"
+                            "要改某一部的绑定去它的详情页，那里有绑定回显。")
+                with _rb:
                     with ui.menu():
-                        ui.menu_item("识别当季", on_click=_reident(1))
-                        ui.menu_item("识别半年（近 2 季）", on_click=_reident(2))
-                        ui.menu_item("识别 1 年（近 4 季）", on_click=_reident(4))
-                        ui.menu_item("识别全部", on_click=_reident(None))
+                        ui.menu_item("刷新当季", on_click=_reident(1))
+                        ui.menu_item("刷新半年（近 2 季）", on_click=_reident(2))
+                        ui.menu_item("刷新 1 年（近 4 季）", on_click=_reident(4))
+                        ui.menu_item("刷新全部", on_click=_reident(None))
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 ui.badge("采集开启" if ov["config"]["poll_on"] else "采集暂停").props(
                     f"color={'green' if ov['config']['poll_on'] else 'red'}").tooltip(
@@ -549,6 +554,7 @@ def anime_page(t: str = ""):
                 return
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.source_map()
+            prog_map = anime.episode_progress([a.id for a in animes])   # 一条 SQL，与 source_map 同形
             yrs = max(1, config.ANIME_PAGE_YEARS)  # 防 0（每页 0 季会除零）
             groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], yrs * 4)
             manage_page["n"] = page
@@ -572,7 +578,7 @@ def anime_page(t: str = ""):
                     fl["built"] = True
                     with box:
                         for a in qi:
-                            _anime_row(a, src_map.get(a.id))
+                            _anime_row(a, src_map.get(a.id), prog_map.get(a.id))
 
                 if _open:
                     _fill()
@@ -732,9 +738,9 @@ def anime_page(t: str = ""):
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
-                # 【绑定前回显】与详情页同一道闸（共用 layout.confirm_bind_merge）：
+                # 【绑定前回显】与详情页同一道闸（共用 layout.require_bind_confirm）：
                 # 这里是『待识别』列表里的绑定按钮，同样会触发身份合并、同样会删掉另一条番。
-                if not await confirm_bind_merge(anime_id, bid):
+                if not await require_bind_confirm(anime_id, bid):
                     return
 
                 # 走 busy_action：bind 会调 fetch_by_id（预算 120 秒），期间没有反馈会被连点
@@ -809,17 +815,18 @@ def anime_page(t: str = ""):
                     ui.notify("正在重新识别中，请稍候…", type="info")
                     return
                 scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
-                ui.notify(f"正在重新识别（{scope}）…走 bgm，可能要一会儿", type="info")
+                ui.notify(f"正在刷新元数据（{scope}）…走 bgm，可能要一会儿。"
+                          "已绑好的番只刷资料、不会改绑定；没认出来的会再试一次", type="info")
                 _reident_busy["v"] = True
                 try:
                     cnt = await anime.reenrich_scope(seasons)
                 finally:
                     _reident_busy["v"] = False
                 _refresh_overview(charts=True)   # 重识别改了数据，连图表一起刷
-                ui.notify(f"识别完成：{cnt} 部命中", type="positive")
+                ui.notify(f"完成：{cnt} 部刷到了 bgm 资料", type="positive")
             return h
 
-        def _anime_row(a, sources=None):
+        def _anime_row(a, sources=None, prog=None):
             # 块级容器 + 行内徽标/标题：徽标贴着标题同排，标题过长时标题自己换行（徽标不再被挤到单独一行）。
             # 【display 不在这里定】徽标的 display 由 pages/layout.py 的全局规则一处定成
             # inline-flex（那是"字在框里居中"的布局保证）。这里只负责 vertical-align 与间距。
@@ -836,21 +843,36 @@ def anime_page(t: str = ""):
                     ui.badge("已忽略").props("color=grey").classes("align-middle mr-2")
                 elif not a.confirmed:
                     ui.badge("待确认").props("color=orange").classes("align-middle mr-2")
-                elif a.finished_at:
-                    # 【第三态】开了停订时这部番【不再自动下新集】，而在此之前它在列表里
-                    # 与正常追番中的番长得一模一样（没有任何徽标）——用户唯一能察觉的迹象
-                    # 是"它好久没更新了"，而那与源失效、字幕组断更的表现完全一致。
-                    _unsub = config.ANIME_FINISH_UNSUB
-                    ui.badge("🎊 已完结" + ("·已停订" if _unsub else "")).props(
-                        "color=teal").classes("align-middle mr-2").tooltip(
-                        f"1~{a.total_episodes or '?'} 集全部到手。"
-                        + ("已停止自动下新集（设置页『完结后停止自动下新集』）——"
-                           "若其实还没完（bgm 总集数少记了），进详情页点『继续订阅』。"
-                           if _unsub else "仍在继续自动下新集（只标记不停订）。"))
+                elif a.finished_at and config.ANIME_FINISH_UNSUB:
+                    # 【只在真的会改变行为时才出徽标】"已完结"本身不显示——它的信息量被右边那个
+                    # 『已下/可下』覆盖了（12/12 就是完结）。但开了停订时这部番【不再自动下新集】，
+                    # 那是行为变化不是状态描述：在此之前它在列表里与正常追番的番长得一模一样，
+                    # 用户唯一能察觉的迹象是"它好久没更新了"，而那与源失效、字幕组断更完全同形。
+                    ui.badge("已停订").props("color=teal").classes("align-middle mr-2").tooltip(
+                        "判定为完结并已停止自动下新集（设置页『完结后停止自动下新集』）——"
+                        "若其实还没完（bgm 总集数少记了），进详情页点『继续订阅』。")
                 color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
                 ui.label(name_of(a)).classes(
                     f"text-lg inline align-middle cursor-pointer {color} hover:underline").on(
                     "click", lambda aid=a.id: open_detail(aid))
+                # 【已下/可下】分子＝已发给 qB 的不同正集号数，分母＝库里见过的不同正集号数。
+                # 按【集号】数而不是按种子条数：同一集常有好几个源各一份，按条数数出来的比值没有意义。
+                # 它把两类问题一眼摊开：
+                #   · 分子 < 分母 → 有集号还没到手（锁定源锁太死 / 关键词没匹配上 / 卡在缓冲窗口）
+                #   · 分母 > bgm 记的总集数 → 集号本身就不对（别的季的正片挂到了这条记录下面）
+                if prog:
+                    _have, _seen = prog
+                    _tot = a.total_episodes or 0
+                    _over = bool(_tot and _seen > _tot)
+                    _c = "red" if _over else ("orange" if _have < _seen else "blue-grey")
+                    ui.badge(f"{_have}/{_seen}").props(f"color={_c}").classes(
+                        "align-middle ml-2").tooltip(
+                        f"已下 {_have} 集 / 库里有 {_seen} 集的种子"
+                        + (f"；bgm 记 {_tot} 集" if _tot else "；bgm 未给总集数")
+                        + ("。集号超出 bgm 记载——多半有别的季的正片挂到了这条记录下面，"
+                           "进详情页看『各源的集号范围』" if _over else
+                           ("。还有集号没到手：可能是锁定源锁太死、版本关键词没匹配上，"
+                            "或还在缓冲窗口里" if _have < _seen else "。都到手了")))
                 sl = season_label(a)
                 if sl:
                     ui.badge(sl).props("color=purple").classes("align-middle ml-2")

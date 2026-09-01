@@ -364,3 +364,52 @@ async def test_merge_still_refuses_when_both_sides_downloaded(clean_tables, capl
     assert any(("拒绝合并" in r.getMessage() or "已经下过东西" in r.getMessage())
                for r in caplog.records), \
         f"不合并时必须留下可发现的记录：{[r.getMessage() for r in caplog.records]}"
+
+
+async def test_same_bgm_rows_are_merged_by_the_scan(clean_tables):
+    """扫描遇到【同一个 bgm_id 的两行】时照常合并 —— 这一条不适用番剧侧 E-18 的"自动路径不删行"。
+
+    我试着把 E-18 搬过来，是错的。两者形状不同：
+      · 番剧侧 E-18 防的是"自动识别把 X 【绑错】到 bgm B，然后删掉本来正确地占着 B 的 Y"，
+        错在【绑定】那一步，删掉的是一部完全不同的番。
+      · 这里的 keeper 是【按 bgm_id 查出来的】，守卫命中时两行本来就声称同一个 subject，
+        合并是构造上正确的；而且 _merge_movie 先把种子搬到 keeper 再删行，盘上文件不受影响。
+
+    真正危险的是【摘 mikan_id】那条路（见 test_a_downloaded_orphan_is_never_deleted）：
+    那里两行只是先后引用过同一个 mikan_id，"同一部片"从没被证明过。
+    """
+    with clean_tables.get_session() as s:
+        a = Movie(title="重复行A", quarter="24A", mikan_id="3001", bangumi_id=4242)
+        b = Movie(title="重复行B", quarter="24A", mikan_id="3002", bangumi_id=4242)
+        s.add(a); s.add(b); s.commit(); s.refresh(a); s.refresh(b)
+        a_id, b_id = a.id, b.id
+        s.add(MovieTorrent(movie_id=b_id, raw_title="B 的版本", info_hash="e" * 40,
+                           status="sent", qb_progress=1.0))
+        s.commit()
+
+    M._upsert_movie("3001", "重复行A", 4242, None, "剧场版")
+
+    with clean_tables.get_session() as s:
+        alive = [m.id for m in (s.get(Movie, a_id), s.get(Movie, b_id)) if m is not None]
+        assert len(alive) == 1, f"同 bgm 的重复行没有被合并：{alive}"
+        rows = list(s.exec(select(MovieTorrent)))
+        assert len(rows) == 1 and rows[0].movie_id == alive[0], "种子没跟着搬过去"
+
+
+async def test_manual_movie_bind_still_merges(clean_tables, monkeypatch):
+    """人工路径（详情页『绑定 bgm』）照常合并 —— 那条有回显闸把关。"""
+    from services import enrich
+
+    async def by_id(bid):
+        return {"bangumi_id": bid, "display_name": "同一部片"}
+    monkeypatch.setattr(enrich, "fetch_by_id", by_id)
+    with clean_tables.get_session() as s:
+        a = Movie(title="A", quarter="24A", mikan_id="3101", bangumi_id=5252)
+        b = Movie(title="B", quarter="24A", mikan_id="3102")
+        s.add(a); s.add(b); s.commit(); s.refresh(a); s.refresh(b)
+        a_id, b_id = a.id, b.id
+
+    await M.bind_movie_bgm(b_id, 5252)
+    with clean_tables.get_session() as s:
+        assert s.get(Movie, a_id) is None, "人工路径的合并被一起关掉了"
+        assert s.get(Movie, b_id) is not None

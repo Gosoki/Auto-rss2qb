@@ -211,7 +211,8 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
                  progress=None) -> dict:
     """把业务表从 src 复制到 dst。
 
-    返回 {"moved": {表名: 实际写入行数}, "src_before": {表名: 迁移【开始前】源库行数}}。
+    返回 {"moved": {表名: 实际写入行数}, "src_before": {表名: 迁移【开始前】源库行数},
+          "dst_before": {表名: 迁移【开始前】目标库行数}}。
     src_before 必须带出来给 verify 用——不能让 verify 事后现查源库，那有个自证陷阱：
     万一源和目标其实是同一个库，overwrite 已经把它清空了，现查两边都是 0，反而"校验通过"。
     （别把它塞进 moved 里当一个键：那样 sum(moved.values()) 这种自然写法会当场炸。）
@@ -234,6 +235,12 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
     schema.upgrade(dst_engine, "data")
 
     src_counts = count_rows(src_engine)
+    # 【目标库迁移【前】有多少行，也要带出来】(E-17，2026-09-01 拍板)
+    # verify 原本只比"源==目标"，于是【任何】overwrite 都会被报成"已校验的成功"——
+    # 它从不看目标库原来有什么。空源守卫挡得住"源 0 行"，挡不住更常见的那种：
+    # 切到 MySQL 用了几个月，再点一次『本地 → MySQL』当保险，源是几个月前的陈旧本地库，
+    # verify 名正言顺地通过，而库被回滚了几个月。
+    dst_counts_before = count_rows(dst_engine)
     readable = _readable_source_tables(src_engine)   # 删目标之前先把源库真读一遍，读不动就在这里中止
     # 【同样必须在清空之前】数据宽度不合法时中止，别留半个库（见 _overlong_values）
     too_long = _overlong_values(src_engine, dst_engine)
@@ -304,16 +311,34 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
         _reset_autoincrement(dst_engine, name)
         moved[name] = done
         log.info("数据迁移：%s %d 行", name, done)
-    return {"moved": moved, "src_before": src_counts}
+    return {"moved": moved, "src_before": src_counts, "dst_before": dst_counts_before}
 
 
-def verify(src_engine, dst_engine, src_counts: dict | None = None) -> list:
-    """迁完逐表比行数，返回不一致的说明（空列表=完全一致）。
+def verify(src_engine, dst_engine, src_counts: dict | None = None,
+           dst_before: dict | None = None) -> list:
+    """迁完逐表比行数，返回需要提醒的说明（空列表=一切正常）。
 
     src_counts 传【迁移开始前】的源库行数快照（migrate_data 会一并返回）。
     不传就现查源库——那样有个致命的自证陷阱：万一源和目标其实是同一个库，
     overwrite 已经把它清空了，现查两边都是 0，0==0 反而"校验通过"。
+
+    dst_before 传【迁移开始前】的目标库行数快照。(E-17，2026-09-01 拍板)
+    【为什么必须看它】只比"源==目标"的话，**任何** overwrite 都会被报成"已校验的成功"——
+    verify 从不看目标库原来有什么。空源守卫（同文件上方）挡得住"源 0 行"，
+    挡不住更常见的那一种：切到 MySQL 用了几个月，再点一次『本地 → MySQL』当保险，
+    源是几个月前的陈旧本地库，逐表行数完全一致、verify 名正言顺地通过，
+    而库被回滚了几个月，界面上一句提示都没有。
+    行数【下降】不必然是错的（用户可能真的清理过），所以这里报的是"要你看一眼"而不是"失败"——
+    调用方按有没有返回内容决定用什么颜色的提示。
     """
     a = src_counts if src_counts is not None else count_rows(src_engine)
     b = count_rows(dst_engine)
-    return [f"{k}: 源 {a.get(k, 0)} 行 / 目标 {b[k]} 行" for k in TABLE_ORDER if a.get(k, 0) != b[k]]
+    out = [f"{k}: 源 {a.get(k, 0)} 行 / 目标 {b[k]} 行" for k in TABLE_ORDER if a.get(k, 0) != b[k]]
+    if dst_before:
+        shrunk = [(k, dst_before.get(k, 0), b[k]) for k in TABLE_ORDER
+                  if dst_before.get(k, 0) > b[k]]
+        if shrunk:
+            out.append("⚠ 目标库的行数比迁移前【少了】——如果源库其实比目标旧，这次迁移就是一次回滚：\n  "
+                       + "\n  ".join(f"{k}: {was} → {now}（少 {was - now} 行）"
+                                      for k, was, now in shrunk))
+    return out

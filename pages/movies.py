@@ -12,7 +12,7 @@ import db
 from db.models import MovieTorrent
 from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN, quarter_sort_key
-from .layout import (WEEKDAY_CN, barline, busy_action, confirm, confirm_bind_merge,
+from .layout import (WEEKDAY_CN, barline, busy_action, confirm, require_bind_confirm,
                      require_config_loaded,
                      expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
@@ -183,6 +183,10 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             _rb.tooltip("去 Mikan 重新拉这一部的全部版本（BD 常在首映后半年到一年半才出，"
                         "而发现是按整年扫的）" if cur.mikan_id
                         else "这部片没有 Mikan 番组 id，无法刷新（重新扫描该年份可补上）")
+            ui.button("编辑年份", icon="event", on_click=_edit_year).props(
+                "flat dense").classes("btn-sm").tooltip(
+                "手动改归档年份（下载目录里那一层）。bgm 把 12 月首映的片算成次年时在这里改回来——"
+                "在这个入口之前，剧场版侧唯一的纠正办法是手改数据库")
             if cur.rejected:
                 ui.button("恢复订阅", icon="undo", on_click=_restore).props(
                     "unelevated dense color=primary").classes("btn-sm")
@@ -256,6 +260,50 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             if ok:
                 await _maybe_relocate_movie(movie_id, old_path, _after)
         await busy_action(getattr(e, "sender", None), f"mov-enrich:{movie_id}", _go, fail="识别失败")
+
+    async def _edit_year():
+        """手动改归档年份 (E-33)。与番剧详情页的『编辑季度』对称，只是这里收的是【年份】。
+
+        【为什么这里问年份、而库里存季度键】Movie.quarter 存的是季度键（如 26A），
+        但剧场版实际只用其中的年份：归档目录走 MOVIE_QUARTER_FMT（默认 {yyyy}）、
+        页面上那一栏就叫『年份』。列名与类型不动（改列要迁移），所以 UI 收年份、这里拼成键。
+        """
+        cur_m = mov.get_movie(movie_id)
+        _y = engine.quarter_year(cur_m.quarter) if cur_m else None
+        dlg = ui.dialog()
+        with dlg, ui.card().classes("gap-2"):
+            ui.label("编辑归档年份").classes("font-bold")
+            ui.label("剧场版按年份归档（下载目录里那一层就是它）。bgm 把 12 月首映的片算成次年时，"
+                     "在这里改回来。改后可把已下文件移到新目录。").classes("text-xs text-gray-400")
+            inp = ui.input("年份", value=str(_y or datetime.now().year)).props(
+                "autofocus").classes("w-60 min-w-0 max-sm:w-full")
+            prev = ui.label().classes("text-sm text-blue-400")
+
+            def _pv():
+                v = (inp.value or "").strip()
+                prev.text = (f"归档到 {v} 年" if v.isdigit() and 1900 <= int(v) <= 2099
+                             else "填 4 位年份，如 2023")
+            inp.on_value_change(lambda: _pv())
+            _pv()
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
+                ui.button("保存", icon="save",
+                          on_click=lambda: dlg.submit(inp.value)).props("unelevated color=primary")
+        val = await dlg
+        if val is None:
+            return
+        v = (val or "").strip()
+        if not (v.isdigit() and 1900 <= int(v) <= 2099):
+            ui.notify("年份要填 4 位数字（1900–2099）", type="warning")
+            return
+        old_path = mov.movie_save_path(movie_id)
+        # 季母固定 A：剧场版不看季，取年份一律走 engine.quarter_year()。
+        if not mov.set_quarter(movie_id, f"{int(v) % 100:02d}A"):
+            ui.notify("保存失败（这部片可能已被删除）", type="warning")
+            return
+        _after()
+        ui.notify(f"归档年份已改为 {v}", type="positive")
+        await _maybe_relocate_movie(movie_id, old_path, _after)
 
     async def _refresh_versions(e=None):
         async def _go():
@@ -354,7 +402,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
             return
         # 【绑定前回显】与番剧侧同一道闸：身份守卫 _merge_movie 的最后一步是 s.delete(loser)
-        if not await confirm_bind_merge(movie_id, bid, kind="movie"):
+        if not await require_bind_confirm(movie_id, bid, kind="movie"):
             return
         old_path = mov.movie_save_path(movie_id)
         ok = await mov.bind_movie_bgm(movie_id, bid)
@@ -465,7 +513,7 @@ def movies_page(t: str = ""):
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
                 # 【绑定前回显】同上，这里是『待识别』列表里的绑定按钮
-                if not await confirm_bind_merge(movie_id, bid, kind="movie"):
+                if not await require_bind_confirm(movie_id, bid, kind="movie"):
                     return
                 old_path = mov.movie_save_path(movie_id)
                 ok = await mov.bind_movie_bgm(movie_id, bid)

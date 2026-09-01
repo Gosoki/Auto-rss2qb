@@ -450,3 +450,54 @@ async def test_transient_rows_are_not_archived(clean_tables, torrents, cfg):
     engine.qb.delete = lambda hs, delete_files=False: _async(bool(deleted.extend(hs)) or True)
     n = await engine.archive_old_completed()
     assert n == 0 and deleted == [], "校验中的行被归掉了"
+
+
+async def test_qb_error_state_lands_on_stalled(clean_tables, torrents, qb_returns):
+    """(E-19) qB 回传 state=error 时落 `stalled`，不落 `error`。
+
+    这一行回传的是"qB 侧出错了"，而盘上【有半成品】：种子还在 qB 里占着 save_path。
+    落 error 的后果不是"少下一集"——error ∉ HAVE_STATUSES ⇒ 下一轮 flush 认为这一集还缺，
+    把同集另一个源的第二份放行到【同一个 save_path】，而 qB 那边第一份还在；
+    两份文件落进同一文件夹，而原行**再没有任何 UI 入口能删**（详情页的删除按钮只对 HAVE 里的行出现）。
+
+    stalled 同时满足三件事：∈ HAVE（集去重挡着不下第二份）、∉ TRACKED（同步循环能休眠）、
+    mark_done_by_hash 认它（qB 侧恢复后回调救得回）。
+    """
+    torrents(1)
+    qb_returns(lambda hs: {hs[0]: {"state": "error", "progress": 0.4, "dlspeed": 0, "size": 1}})
+    await engine.sync_qb_status(AnimeTorrent)
+    assert _states(clean_tables)["00"][0] == "stalled", \
+        f"qB 的 error 落成了 {_states(clean_tables)['00'][0]!r}"
+    assert "stalled" in engine.HAVE_STATUSES, "stalled 必须在 HAVE 里，否则会被下第二份"
+    assert "stalled" not in engine.TRACKED_STATUSES, "stalled 必须掉出 TRACKED，否则同步循环空转"
+
+
+def test_the_callback_handler_runs_on_the_event_loop():
+    """(E-12) `/api/qb/done` 必须是 `async def`。
+
+    同步的 `def` 处理器被 Starlette 丢到线程池里跑，于是它曾是全项目【唯一从工作线程写库】
+    的路径 —— 而整套并发假设建立在"单进程、事件循环内原子"之上：交付路径的原子占位
+    （status 从 pending 改成 downloading 那一步）、集去重、in-flight 判定，
+    全都靠"没有别人能在我 await 的间隙插进来"。多一条线程写库，那个不变式就不再成立，
+    而它失效的表现是间歇性的、只在 qB 恰好回调的那一瞬发生。
+
+    也不能改成 `await run.io_bound(...)` —— 那等于把线程写库又装回来。
+    """
+    import ast
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("pages/api.py").read_text(
+        encoding="utf8")
+    tree = ast.parse(src)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "qb_done"),
+              None)
+    assert fn is not None, "找不到 qb_done"
+    assert isinstance(fn, ast.AsyncFunctionDef), \
+        "qb_done 又变回同步 def 了 —— 那会把它丢进线程池，成为唯一的线程写库路径"
+    # 【查真实的调用节点，别对 dump 做字符串匹配】本函数的 docstring 里就写着
+    # "不丢 run.io_bound 正是因为…"，按字符串判会被自己的解释判红。
+    # 这个坑本轮踩到第三次了（前两次在 pages/settings.py 的两条守卫上）。
+    calls = [n for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "io_bound"]
+    assert not calls, "写库被丢回线程池了，等于没改"

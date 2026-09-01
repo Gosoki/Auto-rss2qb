@@ -216,6 +216,11 @@ _TOKENS = {
     "red": "70.4% 0.191 22.216",       # red-400
     "amber": "82.8% 0.189 84.429",     # amber-400
     "grey": "70.7% 0.022 261.325",     # gray-400
+    # 【前景色，不是说明文的灰阶】顶栏站名与下拉菜单项用它 —— 那是【正文/导航】文字，
+    # 与 E-37 的两档说明文灰（gray-400 / gray-500）不是同一件事，别把它读成"第三档灰"。
+    # 它以前是写死的 #d1d5dc（Tailwind gray-300），而写死的十六进制既不受 token 表管、
+    # 也不在 text-gray-* 那条守卫的视野里 —— 第 20 轮的审计正是从这儿找出来的。
+    "ink-soft": "87% 0.008 261",       # ≈ gray-300，柔和前景
 }
 
 
@@ -262,13 +267,14 @@ def warn_banner(text: str) -> None:
 
     需要用户注意的一律用这个块；图标由本函数出，文案里不要再带 ⚠️。
 
-    【关于中性说明文的灰度：这里原来写死"＝text-xs text-gray-500"，而代码从来不是这样】
-    实测 pages/ 下的说明性 label：gray-400 共 60 处、gray-500 共 49 处、gray-300 还有 3 处，
-    五五开——也就是说这条规矩写下之后没人照着做，而它自己也没有守卫。
-    现实里隐约存在的是三级（页面/分区介绍偏 gray-400、行内小提示偏 gray-500），
-    但两边都有例外，不足以直接写成规矩。**要收成几级、往哪边收，是行为变更**，
-    记在 docs/DECISIONS.md E-37 等拍板；在它定下来之前，至少保证
-    【同一处上下相邻、功能对等的说明文用同一个灰】。
+    【灰度只有两档，别再加第三档】（E-37，用户 2026-09-01 拍板"只剩下 2 种灰色就行"）
+      · text-gray-400 —— 说明文、字段名、次要标签。默认用它。
+      · text-gray-500 —— 更弱的附注：页码、原始种子标题、"没有内容"这类占位。
+      · 【正文不着灰】番剧简介、bgm 字段的值、帮助气泡里的正文、INFO 级日志行 ——
+        这些是要读的内容，用默认前景色。它们曾经用 gray-300，那实际上是第三档灰，
+        而"正文"和"说明文"本来就不该在同一个灰阶里排队。
+      · hover 态用 hover:text-white，不要用更亮的灰——那会变相引入第三档。
+    tests/test_ui_badge_style.py 里有守卫钉着这条。
     多行长文（如设置页那两条）图标顶部对齐、只有文字缩进换行。
     """
     with ui.row().classes("items-start gap-2 p-2 rounded w-full no-wrap").style(
@@ -355,8 +361,10 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                             ui.element("div")
                             continue
                         kk, vv = pair
-                        ui.label(kk).classes("text-sm text-gray-400")   # 左侧 key=灰2；右侧值=灰1，跟简介同色
-                        ui.label(str(vv) if vv not in (None, "") else "—").classes("text-sm text-gray-300")
+                        # 左侧字段名＝说明文（gray-400），右侧的值是【正文】——正文不着灰，
+                        # 用默认前景色。全站只保留两档灰，见 warn_banner 的说明。
+                        ui.label(kk).classes("text-sm text-gray-400")
+                        ui.label(str(vv) if vv not in (None, "") else "—").classes("text-sm")
                 if bangumi_id:  # bgm 链接：mt-auto 贴到中列底部；kv 顶满时被顶着往下走
                     ui.link(f"bgm.tv/subject/{bangumi_id}",
                             f"https://bgm.tv/subject/{bangumi_id}").props(
@@ -371,7 +379,7 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                         ui.label(_lab).classes("text-xs text-gray-400")
         if summary:
             ui.separator()
-            ui.label(summary).classes("text-sm text-gray-300 whitespace-pre-wrap")
+            ui.label(summary).classes("text-sm whitespace-pre-wrap")   # 简介是正文，不着灰
 
 
 def name_of(a) -> str:
@@ -517,7 +525,7 @@ def expand_collapse_bar(state: dict, refresh) -> None:
     with ui.row().classes("items-center gap-4 pl-1 pb-2"):
         for text, val in (("全部展开", True), ("全部收起", False)):
             ui.label(text).classes(
-                "cursor-pointer text-sm text-gray-500 hover:text-gray-300 transition-colors").on(
+                "cursor-pointer text-sm text-gray-500 hover:text-white transition-colors").on(
                 "click", lambda v=val: _set(v))
 
 
@@ -588,6 +596,40 @@ async def confirm_bind_merge(anime_id: int, bgm_id: int, kind: str = "anime") ->
                          ok_label="仍然绑定", ok_icon="link")
 
 
+async def require_bind_confirm(obj_id: int, bgm_id: int, kind: str = "anime") -> bool:
+    """绑定 bgm 之前的【两道】闸：先回显要绑到哪一部，再回显会不会删记录。返回 True 表示继续。
+
+    【为什么必须回显番名】(E-13，2026-09-01 拍板) 收紧 `parse_bgm_id` 的正则挡得住
+    "把一段番名/一条 Mikan 链接粘进来"，**挡不住记错一位**——而绑定末尾的身份守卫
+    `_merge_anime` / `_merge_movie` 会删掉另一条记录，没有撤销入口。
+    "你要绑的是《XXX》"这一句是唯一能让人当场发现填错的东西：
+    id 错一位取回的多半是一部完全不相干的作品，名字一摆出来就看出来了。
+
+    两道闸的先后有讲究：先问"是不是这一部"（用户能判断），再问"要不要删那条"（后果更重）。
+    反过来的话，用户是在还不知道自己填错了的情况下去回答那个更重的问题。
+
+    取不到 bgm 资料时【不放行】：那说明这个 id 在 bgm 上不存在，或者此刻网络不通——
+    两种情况下都不该继续往库里写一个我们自己都没核实过的绑定。
+    """
+    from services import enrich
+    info = await enrich.fetch_by_id(bgm_id)
+    if not info:
+        ui.notify(f"bgm 上取不到 subject {bgm_id}（ID 不存在，或此刻连不上 bgm）。"
+                  "没有核实过的绑定不会写进库里。", type="negative")
+        return False
+    name = info.get("display_name") or info.get("jp_name") or "(无名)"
+    meta = " · ".join(x for x in (
+        info.get("air_date") or "", f"{info['total_episodes']} 集" if info.get("total_episodes") else "",
+        info.get("platform") or "") if x)
+    if not await confirm(f"绑定到《{name}》？",
+                         f"bgm {bgm_id}" + (f"\n{meta}" if meta else "")
+                         + "\n\n对不上的话就是 ID 填错了——绑定之后元数据、封面、归档目录都会跟着变，"
+                           "若这个 bgm 已被另一条记录占用还会【删掉】那一条。",
+                         ok_label="就是它", ok_icon="link", ok_color="primary"):
+        return False
+    return await confirm_bind_merge(obj_id, bgm_id, kind=kind)
+
+
 # ---- 恒定 head html（内容与运行时状态无关，提到模块级，frame() 每次渲染直接注入、免重复拼接）----
 # 封面等图不带 Referer 去 bgm 图床：万一 bgm 哪天按 Referer 防盗链也不裂，且不泄露访问者来源
 _HEAD_REFERRER = '<meta name="referrer" content="no-referrer">'
@@ -634,7 +676,7 @@ _HEAD_BASE_CSS = (
     ".jumplist{background:#1b1e24;border:1px solid rgba(255,255,255,.14);border-radius:8px;"
     "overflow:hidden;padding:4px 0;box-shadow:0 8px 24px rgba(0,0,0,.45)}"
     ".jumplist .jitem{display:block;padding:6px 18px;font-size:14px;line-height:1.5;"
-    "color:#d1d5dc;white-space:nowrap;cursor:pointer;transition:background .12s}"
+    f"color:{text_token('ink-soft')};white-space:nowrap;cursor:pointer;transition:background .12s}}"
     ".jumplist .jitem:hover{background:rgba(255,255,255,.08)}"
     ".jumplist .jitem{text-decoration:none}"
     # 顶栏导航：用真链接（<a>）而不是可点的 <div>——键盘 Tab 到得了、能中键/新标签打开、
@@ -874,7 +916,7 @@ def frame(active: str = ""):
             with ui.row().classes("items-center gap-2 mr-2 sm:mr-6 brand-center"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
                 ui.label(config.SITE_NAME or "AutoRSS").classes("text-lg font-bold max-sm:hidden").style(
-                    "color:#d1d5dc;letter-spacing:.5px")   # 站名=灰1(gray-300)；窄屏隐去，只留居中图标
+                    f"color:{text_token('ink-soft')};letter-spacing:.5px")   # 站名用柔和前景；窄屏隐去，只留居中图标
             # 桌面端(≥1024px)：内联导航，绝对定位在顶栏水平居中（不受左侧品牌/右侧按钮宽度影响）。
             # w-max 必须有：绝对元素 left-1/2 的收缩宽度只有父宽 50%，不锁 max-content 会被压缩、把每个项文字挤成两行。
             # flex-nowrap + whitespace-nowrap 双保险，行不换、字不折。
@@ -886,14 +928,14 @@ def frame(active: str = ""):
                     # 接管的却是一串 <div>：键盘用户在桌面宽度下【完全够不着导航】，也没法中键开新标签。
                     cls = "navlink text-sm px-2 transition-colors "
                     cls += ("is-active text-blue-400 font-semibold"
-                            if key == active else "text-gray-400 hover:text-gray-300")
+                            if key == active else "text-gray-400 hover:text-white")
                     ui.link(label, path).classes(cls)
                 # 跳转到：外链下拉（qB后台/Nyaa/Mikan/Bangumi）。自写 CSS『.jumpdd:hover .jumpmenu』控制显隐——
                 # 【鼠标悬浮即显示、移开即收起】，不用点击。不再单独设断点——整条内联导航已是 ≥1024 才出现，
                 # 窄屏时它和导航一起收进汉堡（汉堡菜单里已列了同样的外链），不会出现两边都够不着的空档。
                 with ui.element("div").classes("relative jumpdd"):
                     with ui.row().classes("items-center gap-0.5 text-sm px-2 cursor-pointer "
-                                          "text-gray-400 hover:text-gray-300 transition-colors"):
+                                          "text-gray-400 hover:text-white transition-colors"):
                         ui.label("跳转到")
                         ui.icon("open_in_new").style("font-size:14px")
                     # jumpmenu 默认 display:none，父 .jumpdd:hover 时 display:block；pt-1 透明桥补触发行与菜单的缝。

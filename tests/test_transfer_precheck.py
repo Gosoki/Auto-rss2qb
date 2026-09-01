@@ -171,3 +171,40 @@ def test_empty_source_never_wipes_a_non_empty_target(tmp_path):
     except ValueError as e:
         assert "源库是空的" in str(e)
     assert transfer.count_rows(dst) == before, "目标库被清空了"
+
+
+# ---------------- verify 要看目标库【迁移前】有什么（E-17，R20） ----------------
+
+def test_verify_flags_a_shrinking_target(tmp_path):
+    """(E-17) 只比"源==目标"的话，**任何** overwrite 都会被报成"已校验的成功"。
+
+    空源守卫挡得住"源 0 行"，挡不住更常见的那一种：切到 MySQL 用了几个月，
+    再点一次『本地 → MySQL』当保险，源是几个月前的陈旧本地库，逐表行数完全一致、
+    verify 名正言顺地通过，而库被回滚了几个月，界面上一句提示都没有。
+    """
+    from db import transfer
+    src = {"anime": 10, "animetorrent": 100}
+    # 迁完两边一致 —— 老口径到此为止就"通过"了
+    assert transfer.verify.__defaults__ == (None, None), "verify 的签名变了"
+
+    class _Eng:
+        pass
+
+    # 直接测判据本身：目标迁前 99 部、迁后 10 部 = 少了 89 部
+    out = transfer.verify.__wrapped__ if hasattr(transfer.verify, "__wrapped__") else None
+    assert out is None      # 没有装饰器，下面走真实路径
+
+    import sqlalchemy as sa
+    from sqlmodel import SQLModel
+    a = sa.create_engine(f"sqlite:///{tmp_path}/a.db")
+    b = sa.create_engine(f"sqlite:///{tmp_path}/b.db")
+    SQLModel.metadata.create_all(a)
+    SQLModel.metadata.create_all(b)
+    # 两边都是 0 行 → 逐表一致
+    assert transfer.verify(a, b, {k: 0 for k in transfer.TABLE_ORDER}) == []
+    # 但如果目标库【迁移前】有 99 部番，这次迁完只剩 0 —— 必须提醒
+    bad = transfer.verify(a, b, {k: 0 for k in transfer.TABLE_ORDER},
+                          {**{k: 0 for k in transfer.TABLE_ORDER}, "anime": 99})
+    assert bad and "回滚" in bad[-1], f"目标库被清空却没有任何提醒：{bad}"
+    assert "99 → 0" in bad[-1]
+    a.dispose(); b.dispose()

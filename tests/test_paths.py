@@ -201,3 +201,42 @@ def test_both_relocate_gates_call_the_shared_predicate():
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "needs_relocate"]
         assert calls, f"{f}::{fn} 没有调用 engine.needs_relocate —— 闸被换回自己手写的判据了"
+
+
+# ---------------- 剧场版按上映那一年归档（E-30，R20） ----------------
+
+@pytest.mark.parametrize("air,anime_q,movie_q,why", [
+    ("2023-12-22", "24A", "23A", "真库 #46『间谍过家家 代号：白』：12 月首映被算成了次年"),
+    ("2023-12-01", "24A", "23A", "真库 #41"),
+    ("2025-12-31", "26A", "25A", "真库 #11"),
+    ("2026-01-05", "26A", "26A", "1 月首映两者一致"),
+    ("2026-07-05", "26C", "26A", "7 月：番剧归夏季，剧场版只看年份"),
+    ("2026-11-30", "26D", "26A", "11 月同上"),
+])
+def test_movie_quarter_uses_the_release_year(air, anime_q, movie_q, why):
+    """(E-30) `quarter_of` 的「12 月归次年冬季」对番剧是对的（季播番跨 1–3 月播完），
+    对一次性上映的剧场版是错的 —— 页面上那一栏就叫『年份』，归档目录也只用年份。
+    真库 70 部里有 5 部因此被归到了次年。"""
+    from datetime import datetime
+
+    from sources.parse import movie_quarter_of, quarter_of
+    dt = datetime.fromisoformat(air)
+    assert quarter_of(dt) == anime_q, "番剧那条规则不该被动到"
+    assert movie_quarter_of(dt) == movie_q, why
+
+
+def test_apply_bgm_meta_picks_the_right_quarter_per_line():
+    """(E-30) 两条线取不同的键 —— 判据是"这个对象有没有 mikan_type 这一列"（Movie 独有），
+    比传参更不容易漏：新增调用点时不用记得多传一个 flag。"""
+    from types import SimpleNamespace
+
+    from core import engine
+    info = {"quarter": "24A", "movie_quarter": "23A", "bangumi_id": 1}
+
+    a = SimpleNamespace(quarter="", bangumi_id=None)                       # 没有 mikan_type → 番剧
+    engine.apply_bgm_meta(a, info, keep_path=False)
+    assert a.quarter == "24A"
+
+    m = SimpleNamespace(quarter="", bangumi_id=None, mikan_type="剧场版")   # 有 → 剧场版
+    engine.apply_bgm_meta(m, info, keep_path=False)
+    assert m.quarter == "23A", "剧场版取到了番剧那条规则算出来的季度"
