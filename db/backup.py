@@ -9,12 +9,21 @@ WAL 模式下，最近的写入躺在 `-wal` 文件里、还没合并进主文�
 产物是一个已整理过的独立库文件，且【不需要停写】。SQLite ≥ 3.27 支持，
 Python 3.11 自带的版本远高于它。
 
-业务库切到 MySQL 时这里只备得到本地的配置库（setting 表）——那不是"备份失败"，
-而是范围就到这；调用方要把这件事明确告诉用户，不能让人以为番剧数据也备了。
+【scope 标签只表达"这一刻业务数据在不在这个文件里"，不表达"文件里有几张表"】
+备份动作恒为对 meta_path 整个文件做 VACUUM INTO——切到 MySQL 【不会】删掉本地文件里
+原有的业务表（switch_data_engine 明写"只切连接，不搬数据"）。所以一份标着 meta 的备份
+里通常还躺着切换前的整套番剧数据，只是【旧的】。
+早先这里写的是"只备得到本地的配置库（setting 表）"，那是假话，而且是危险的假话：
+用户照着它以为番剧数据没备到，于是把这份文件当垃圾删掉——那可能是 MySQL 迁移出问题后
+唯一剩下的一份番剧数据。真实内容一律以 _peek() 现场数出来的行数为准，别信标签。
 
-【恢复的顺序不能乱】停服务 → **删掉 autorss.db-wal 与 autorss.db-shm** → 把备份复制成
-autorss.db → 启服务。第二步不能省：只覆盖主文件的话，SQLite 启动时会把【事故现场那份 -wal】
-重放到刚恢复的库上，拿回的是出事【后】的数据，而 `pragma quick_check` 照样返回 ok。
+【恢复的顺序不能乱】停服务 → 把现役的 autorss.db 连同 -wal/-shm 一起【改名留底】→
+把备份复制成 autorss.db → 启服务。
+· 第二步不能只覆盖主文件：SQLite 启动时会把【事故现场那份 -wal】重放到刚恢复的库上，
+  拿回的是出事【后】的数据，而 `pragma quick_check` 照样返回 ok。
+· 但也【不能 rm】：改名留底之后这一步就是可逆的。恢复用的备份可能选错（meta 恢到 full 上
+  是最容易犯的那种），而删掉之后现役库就没了——那是全流程唯一不可逆的一步，
+  换成 mv 不多花一分力气，却把"选错了还能退回去"变成了可能。
 """
 import logging
 import os
@@ -42,6 +51,75 @@ def _sqlite_path(eng) -> str | None:
     if url.get_backend_name() != "sqlite" or not url.database:
         return None
     return url.database
+
+
+# 业务表（判断一份备份里到底有没有番剧数据）。与 db.transfer.TABLE_ORDER 同一批表，
+# 但这里【故意不 import 它】：那边的顺序服务于外键，改动频繁；这里只需要"有没有"。
+_BUSINESS_TABLES = ("anime", "animetorrent", "movie", "movietorrent",
+                    "sourcegroup", "anime_alias")
+
+
+def _peek(path: str) -> dict:
+    """打开一份备份，数一数里面到底有什么。失败返回 {}。
+
+    【为什么不能靠文件名里的 scope 判断】scope 是【导出那一刻的配置】推出来的标签，
+    而导出动作恒为整文件快照。切到 MySQL 之后本地文件里的业务表【不会被删】，
+    于是一份标着 meta 的备份里往往还有整套（旧的）番剧数据。反过来，
+    一个刚 upgrade 出来、还没跑过业务的库标成 full，里面却一行数据都没有。
+    要回答"这份能不能救回我的番"，只能现场数。
+
+    【它挂在页面渲染路径上，所以量过】52 MB / 10.5 万行种子的库上 _peek 耗时 **2 ms**
+    （6 个 count(*)），5 份备份的 list_backups 整体 6~10 ms。不需要 to_thread。
+    对比：同一个文件上 verify() 要 113 ms，那是 quick_check 的开销，与本函数无关。
+    """
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except Exception:
+        return {}
+    try:
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        rows = {}
+        for t in _BUSINESS_TABLES:
+            if t in names:
+                try:
+                    rows[t] = conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                except sqlite3.DatabaseError:
+                    rows[t] = None
+        return {"tables": sorted(names), "rows": rows,
+                "anime": rows.get("anime") or 0, "movie": rows.get("movie") or 0,
+                "torrents": (rows.get("animetorrent") or 0) + (rows.get("movietorrent") or 0)}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def _summarize(pk: dict) -> tuple[str, bool]:
+    """把一次 _peek 的结果翻译成 (一句话, 有没有业务数据)。
+
+    【只此一份，且只 peek 一次】describe_content 与 has_business_data 早先各自调一次 _peek，
+    而 list_backups 会把两者对每份备份都调一遍——同一个文件被打开两次、6 个 count(*) 数两遍，
+    而它就挂在页面渲染路径上（_peek 的 docstring 特意写了"量过"，却量的是单次）。
+    实测 7 份 × 206MB 时冷启 121ms。两个结果本来就来自同一个字典。
+    """
+    if not pk:
+        return "内容读不出来", False
+    has = bool(pk["anime"] or pk["movie"] or pk["torrents"])
+    if not has:
+        return f"{len(pk['tables'])} 张表，【无业务数据】（只有全局设置）", False
+    return (f"{len(pk['tables'])} 张表，番剧 {pk['anime']} 部、剧场版 {pk['movie']} 部、"
+            f"种子 {pk['torrents']} 条"), True
+
+
+def describe_content(path: str) -> str:
+    """一句话说清这份备份【里面有什么】（不是文件名/大小/时间，那些 list_backups 已经给了）。给 note / 页面徽标 / verify 共用，口径只有这一处。"""
+    return _summarize(_peek(path))[0]
+
+
+def has_business_data(path: str) -> bool:
+    """这份备份里有没有番剧/剧场版数据（决定页面徽标的颜色与文案，以及 prune 的救生艇）。"""
+    return _summarize(_peek(path))[1]
 
 
 def backup_now(keep: int = 7) -> dict:
@@ -105,11 +183,22 @@ def backup_now(keep: int = 7) -> dict:
             raise
 
     pruned = prune(keep, protect=out)
-    # 【note 里不能写"源组"】META_TABLES 只有 setting 一张表；sourcegroup 是【业务表】，
-    # 它和番剧、剧场版、种子、番名对照一样都不在这份备份里。
-    note = ("本次备份含【配置 + 全部业务数据】（两者同库）" if same else
-            "业务库不是本地 SQLite，本次【只备了 settings 一张表】（全局设置）——"
-            "番剧、剧场版、种子、源组、番名对照都不在其中，那些要自己给业务库做备份")
+    # 【note 说的是文件里【实际】有什么，不是 scope 标签的字面意思】
+    # 导出动作恒为对本地 meta_path 整文件 VACUUM INTO，而切到 MySQL 不会删掉本地的业务表，
+    # 所以 scope=meta 的那份里通常还有整套【旧的】番剧数据。
+    # 早先这里写死"只备了 settings 一张表"——用户照着删掉它，等于删掉 MySQL 出问题后
+    # 唯一剩下的番剧数据副本。
+    detail = describe_content(str(out))
+    if same:
+        note = f"本次备份含【配置 + 全部业务数据】（两者同库）：{detail}"
+    elif has_business_data(str(out)):
+        note = ("业务数据在 MySQL 上，【本次备的是本地库】：" + detail +
+                " —— 这些是切到 MySQL【之前】留在本地的旧数据，不是 MySQL 上的现状。"
+                "MySQL 那边要自己做备份（mysqldump）")
+    else:
+        note = ("业务数据在 MySQL 上，本次【只备到了全局设置】：" + detail +
+                " —— 番剧、剧场版、种子、源组、番名对照都不在其中，"
+                "那些要自己给 MySQL 做备份（mysqldump）")
     log.info("备份完成：%s（%.1f KB）%s", out.name, out.stat().st_size / 1024,
              f"，清理 {len(pruned)} 份旧备份" if pruned else "")
     return {"path": str(out), "scope": scope, "bytes": out.stat().st_size,
@@ -125,9 +214,13 @@ def list_backups() -> list[dict]:
         if not p.is_file() or not _NAME_RE.match(p.name):
             continue
         st = p.stat()
+        _detail, _has = _summarize(_peek(str(p)))   # 每份只 peek 一次，见 _summarize
         out.append({"name": p.name, "path": str(p), "bytes": st.st_size,
                     "mtime": datetime.fromtimestamp(st.st_mtime),
-                    "scope": p.name.split("-")[1]})
+                    "scope": p.name.split("-")[1],
+                    # 【页面上的徽标要按这个走，不能按 scope】见 _peek 的说明：
+                    # scope 是导出那一刻的配置，回答不了"这份救不救得回我的番"。
+                    "has_data": _has, "detail": _detail})
     # 【按 mtime 排，不能按文件名】文件名是 autorss-{scope}-{stamp}.db —— scope 段排在时间戳【前面】，
     # 而 'm'(meta) > 'f'(full)。于是一份刚做的 full 备份会排在所有旧的 meta 备份【后面】，
     # 被自己这一次 prune 当成"最旧的"删掉，紧接着 backup_now 里的 out.stat() 抛 FileNotFoundError：
@@ -150,8 +243,24 @@ def prune(keep: int, protect: Path | None = None) -> list[str]:
     by_scope: dict = {}
     for d in list_backups():                 # 已按 mtime 降序
         by_scope.setdefault(d["scope"], []).append(d)
+    # 【每种 scope 里"最新的那份真有业务数据的"永不删】——与 protect= 同一个性质的兜底。
+    # R17 把"别信文件名里的 scope、现场数行数"推到了三处【读】的地方（页面徽标、verify 的说明、
+    # backup_now 的 note），却没推到这里——而这里是整个模块唯一会删【已经存在、之前验过】
+    # 的备份的地方，用的偏偏还是 R17 亲自判定为不可信的那个判据。
+    # 后果链是真的：库被误恢复/误清空之后，auto_tick 每天照常产出一份
+    # "可用、quick_check ok、scope=full"的【空】备份并记 BACKUP_LAST，
+    # BACKUP_KEEP 天之后 prune 把唯一那份还救得回数据的当成"最旧的"删掉，留下一整排空的。
+    # （用户机器上此刻就躺着 4 份标着 full、业务数据为 0 的备份，所以这不是假想。）
+    # 保住的只有【一份】：不改 keep 的语义，也不会让备份目录无限增长。
+    lifeboats = set()
+    for items in by_scope.values():
+        for d in items:                      # 已按 mtime 降序，第一份命中的就是最新的
+            if d.get("has_data"):
+                lifeboats.add(d["path"])
+                break
     doomed = [d for items in by_scope.values() for d in items[keep:]
-              if protect is None or Path(d["path"]) != protect]
+              if (protect is None or Path(d["path"]) != protect)
+              and d["path"] not in lifeboats]
     gone = []
     for d in doomed:
         try:
@@ -183,7 +292,10 @@ def verify(path: str) -> tuple[bool, str]:
         return False, f"完整性检查未通过：{ok}"
     if "setting" not in tables:
         return False, "缺少 setting 表（不像是本程序的库）"
-    return True, f"可用（{len(tables)} 张表）"
+    # 【"可用"必须连内容一起说】只报"可用（N 张表）"时，把一份【没有业务数据】的备份
+    # 恢复到一个有 99 部番的库上，这里照样绿灯、quick_check 照样 ok、启动日志照样正常，
+    # 而番全没了。表数量对用户没有任何意义，"番剧 0 部"才有。
+    return True, f"可用（{describe_content(path)}）"
 
 
 def auto_tick() -> bool:

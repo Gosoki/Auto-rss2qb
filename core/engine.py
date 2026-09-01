@@ -660,23 +660,62 @@ def qb_is_local() -> bool:
         return False
 
 
-async def add_to_qb(data: bytes, save_path: str, category: str, tags: str,
-                    info_hash: str = "") -> bool | None:
+def rows_in_wrong_dir(rows, new_path: str) -> list:
+    """这些行里，【盘上文件实际所在的目录】与当前归档目录对不上的那些。
+
+    rows 传 AnimeTorrent / MovieTorrent 列表（本函数只用 status / archived_at / save_path，
+    两张表同名，所以两条线共用这一份）。
+
+    【为什么需要它：搬迁闸问错了问题】番剧与剧场版两侧的 maybe_relocate_* 原本都写着
+    `if new_path == old_path: return`，而四个调用点拿到的 old_path **也是**
+    `*_save_path(id)` —— 同一个纯函数、同一条记录算出来的。于是这道闸问的是
+    「我这次操作把记录改了没有」，而不是「盘上的文件跟当前归档目录对得上没有」。
+    后果：搬迁只要失败或被拒绝一次，之后**再没有任何入口**能补搬 ——
+    后续每一次绑定/重识别/改季度都会算出 old == new 而直接返回，
+    而 engine.relocate 的提示里那个 old_path 还会指向一个根本没有文件的目录。
+    真库实证：anime#96『落语朱音』10 集躺在 `26C\\AKANE On My Mind〜饅頭こわい`（旧的错绑名），
+    记录早已改成 `26B\あかね噺`，界面上没有任何地方还会提出搬它。
+
+    真相就记在行上的 save_path 里，直接问它。空 save_path 不算（老行/没交付过的行）。
+    """
+    return [t for t in rows
+            if t.status in HAVE_STATUSES and not t.archived_at
+            and (t.save_path or "") and t.save_path != new_path]
+
+
+async def add_to_qb(data: bytes | None, save_path: str, category: str, tags: str,
+                    info_hash: str = "", *, magnet: str = "") -> bool | None:
     """把种子加入 qB。True=已交付，False=qB 拒了这一条，【None=连不上 qB（暂时性，别当失败）】。
+
+    传 data=种子字节，或传 magnet=磁力链（二选一，magnet 优先）。两种投递方式的【策略完全相同】，
+    差别只在最后那一下调哪个 qB 接口，所以【共用这一个函数】——
+    早先 core/manual.add_manual 自己直接调 qb.add_torrent/qb.add_url，于是下面两件事它一件都没有：
 
     qB 同机(loopback)时本地预建目录 + chmod（跨用户 qB 需要）；qB 远程时跳过——真正建目录的是 qB 自己
     （实测 qB add 会按 savepath 建目录），本地建只会在错的机器上落空目录。
+    【手动下载最需要这一条】它的默认保存位置是『工作目录/Temp』，那是个谁也不会预先去建的目录。
 
     幂等兜底：qB 对【已存在的 hash】的 add 会返回失败(200 'Fails.')——跨表同 hash / 重复提交 / 重下一个
     qB 里仍在的种子都会撞上。此时若 info_hash 已在 qB，视作交付成功（物理种子确实在，标 error 反而误伤，
-    并使各下载路径注释所称『重复提交也接受』成立）。仅当 qB 在线且确认 hash 存在才兜底；连不上不误判。"""
+    并使各下载路径注释所称『重复提交也接受』成立）。仅当 qB 在线且确认 hash 存在才兜底；连不上不误判。
+    【手动下载同样需要】同一条磁力点两次，第二次本该是"它已经在下了"，
+    而绕过兜底时给用户的是红色的『qB 未接受（种子无效/路径不可写/重复）』。"""
     if qb_is_local():
         try:
+            # 【chmod 只作用在【我们刚建出来的】那个目录上】它的用途是跨用户 qB 写得进去，
+            # 而对象本该是 build_save_path 生成的、位于下载根之下的叶子目录。
+            # 但手动下载的 save_path 是用户在输入框里自由填的（pages/manual.py），
+            # 完全可能指向一个已经存在的媒体库目录——R17 让手动路径统一走本函数时，
+            # 把 chmod 一起带了过去，于是一次手动下载会把那个已有目录改成全局可写。
+            # exists 先探一次，就能把"新建的叶子目录"和"用户已有的目录"分开对待。
+            fresh = not os.path.isdir(save_path)
             os.makedirs(save_path, exist_ok=True)
-            os.chmod(save_path, 0o777)
+            if fresh:
+                os.chmod(save_path, 0o777)
         except OSError:
             pass
-    res = await qb.add_torrent(data, save_path, category, tags)
+    res = (await qb.add_url(magnet, save_path, category, tags) if magnet
+           else await qb.add_torrent(data, save_path, category, tags))
     if res:
         return True
     if not info_hash:

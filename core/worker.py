@@ -205,8 +205,14 @@ async def run_backup() -> None:
 
     刻意独立而不是挂在别的循环上：备份要在【采集/下载都可能正忙】的时候照做，
     而且它不该被采集暂停或 qB 掉线连累——那两种情形恰恰是最需要有备份的时候。
-    数据库停摆时跳过（备的是本地配置库，但此时业务库连接本身就不可信，等它回来再说）。
     每 10 分钟心跳一次，是否真备由 backup.auto_tick 按"距上次多久"判（跨重启不会误重备）。
+
+    【业务库停摆时【照备】】这里原来有一道 `if not db.is_data_down()`，理由写的是
+    "此时业务库连接本身就不可信"。那道门的作用域比它保护的东西大：backup_now 的快照源
+    恒为 meta_engine（db/__init__ 里写死本地 SQLite），VACUUM INTO 全程不碰 data 引擎——
+    业务库连不上，与本地配置库能不能备份【无关】。
+    而后果是反的：MySQL 掉线期间一份备份都不做，且 mark_data_fatal 是不自愈的，
+    于是"业务库出事"这个最需要有备份的时刻，恰好是备份彻底停摆的时刻。
     """
     from db import backup
     log.info("自动备份协程启动（%s，每 %d 小时，保留 %d 份）",
@@ -215,8 +221,7 @@ async def run_backup() -> None:
     while True:
         await asyncio.sleep(600)          # 先睡后做：启动瞬间不抢资源，且刚起来备一份意义不大
         try:
-            if not db.is_data_down():
-                await asyncio.to_thread(backup.auto_tick)   # VACUUM INTO 是同步 IO，别卡事件循环
+            await asyncio.to_thread(backup.auto_tick)   # VACUUM INTO 是同步 IO，别卡事件循环
         except Exception as e:
             log.error("自动备份异常: %s", e)
 

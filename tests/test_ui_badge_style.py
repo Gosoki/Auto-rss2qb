@@ -121,10 +121,13 @@ def test_global_badge_css_defines_size_and_centering():
     from pages.layout import _HEAD_BADGE_CSS
     css = _HEAD_BADGE_CSS.replace(" ", "")
     assert "font-size:14px!important" in css, (
-        "字号没定，或漏了 !important。注意理由：本段在 @layer overrides 里，而 Tailwind 由 "
-        "tailwindcss.min.js 运行时注入、**不属于任何层**；规范里普通声明是『无层级 > 有层级』，"
-        "所以调用点顺手写一个 text-sm 就能顶掉它。（Quasar 反而压得过——它在 layer(quasar)，"
-        "排在 overrides 之前；层是在 @import 那侧指定的，grep 它的 CSS 文件看不到。）")
+        "字号没定。至于 !important —— 它在【今天】其实是多余的：本段在 @layer overrides 里，"
+        "而 Tailwind 的工具类进 @layer utilities（tailwindcss.min.js 内嵌的样式表逐字写着 "
+        "`@import './utilities.css' layer(utilities)`），NiceGUI 模板首先声明的层序把 "
+        "utilities 排在 overrides 【之前】，所以普通声明本来就压得过它；Quasar 在 layer(quasar)，"
+        "更早，同样压得过。这里保留 !important 只是为了挡住万一的行内样式，"
+        "别再拿『否则压不过 Tailwind/Quasar』当理由——那两句话都被实测证伪过。"
+        "详见 pages/layout.py 里那段带 ①②③④ 的说明。")
     assert "line-height:1.45!important" in css, "行高没定或漏了 !important——只定字号就是把同一件事改一半"
     assert "align-items:center!important" in css and "inline-flex!important" in css, (
         "缺垂直居中：Quasar 原样式没有 display 规则、靠 vertical-align:baseline 定位，"
@@ -186,6 +189,10 @@ _WIDGET_DEFAULTS = {
     "textarea": {"dense", "outlined"},
     "select": {"dense", "outlined"},
     "switch": {"dense"},
+    # 【button 也要管】它是唯一还有 85 个调用点的控件，而 no-caps 已是全局默认
+    #（pages/layout.py 的 ui.button.default_props）。漏掉它的后果不是样式错，
+    # 是角色词表里同一个角色出现"带 no-caps"和"不带"两个名字。
+    "button": {"no-caps"},
 }
 
 
@@ -249,3 +256,144 @@ def test_the_global_widget_defaults_are_actually_set():
         assert m, f"ui.{widget} 没有设全局默认 props"
         got = set(m.group(1).split())
         assert defaults <= got, f"ui.{widget} 的全局默认少了 {sorted(defaults - got)}"
+
+
+# ---------------- 按钮的角色词表（R18） ----------------
+#
+# 全站按钮只允许这几种 props 组合，每一种对应一个【角色】。
+# 这不是审美洁癖：同一个角色写成两种样子时，用户学到的"这种按钮是主操作"的规律就断了，
+# 而断在哪儿是随机的（取决于哪个文件先被改）。徽标那一节踩过一模一样的坑
+# （同一个『待确认』在同一屏三种大小），代价是花了两轮才收干净。
+#
+# 【为什么用白名单而不是"检查有没有 unelevated"这类规则】角色是语义，规则是形式。
+# 白名单逼着新增样式的人回答一句"它是什么角色"，而规则只会被绕过。
+_BUTTON_ROLES: dict[str, str] = {
+    # 语法：{形态} {round} {dense} {color}
+    #   形态  flat=无底色 / outline=描边 / unelevated=实心无阴影
+    #   dense 表示【行内】（列表行里的操作），**并且恒等于 12px**（见下面那条守卫）
+    #   no-caps【不在这里】：pages/layout.py 的 ui.button.default_props("no-caps") 已是全局默认，
+    #     调用点再写一遍只会让同一个角色出现两个名字——白名单的立意是"逼人回答这是什么角色"，
+    #     它自己发两个名字正是它要根除的形状。_WIDGET_DEFAULTS 里也加了 button 来守住这一条。
+    # ---- 实心：主操作 ----
+    "unelevated color=primary": "主操作（确认 / 保存 / 绑定 / 恢复订阅）",
+    "unelevated dense color=primary": "行内主操作（详情页元操作行里的『恢复订阅』『继续订阅』）",
+    # ---- 描边：会展开下一层的触发器 ----
+    "outline color=primary": "触发器（下拉菜单 / 批量动作），描边表达『这里还有下一层』",
+    # ---- 无底色：取消与次级 ----
+    "flat": "取消 / 关闭，以及与主操作同一档的次级按钮",
+    "flat color=grey": "次级具名操作（忽略 / 重试识别 / 删除源）",
+    "flat color=primary": "试探性操作（只验证不改状态：测试连接 / 发送测试通知）",
+    "flat color=negative": "危险操作（删除文件）",
+    "flat dense": "行内次级操作（详情页元操作行 / 种子行）",
+    "flat dense color=primary": "行内次级操作，主色",
+    "flat dense color=grey": "行内次级操作，灰",
+    "flat dense color=negative": "行内危险操作（删这一集/这一版本的文件）",
+    # ---- 图标按钮 ----
+    "flat round dense": "面板级图标按钮（关掉整个详情面板）",
+    "flat round dense color=primary": "图标按钮，主色（就地编辑 / 复制）",
+    "flat round dense color=grey": "图标按钮，灰（移除附件 / ? 提示）",
+    "flat round dense color=white": "深色顶栏上的图标按钮",
+}
+
+
+def _button_calls():
+    r"""(文件名, 行号, props 字符串, 该链上全部 .classes() 实参) —— 每个 `ui.button(...)` 链一条。
+
+    【必须用 AST，不能用正则】第一版用的是
+    `ui\.button\(.{0,200}?\)[^\n]*(?:\n[^\n]*){0,2}?\.props\(\s*"([^"]*)"` + re.S，
+    那个惰性量词在回溯次序上排在贪婪的 `[^\n]*` 之后，遇到跨行写法时会跳到【下一行】去找
+    `.props(`，把本行的 props 整段吞掉。实测：pages/ 下共 85 处链式 `ui.button(...).props("…")`，
+    正则只看见 69 处真的 + 2 处幻影（把 N+1 行的 props 记在第 N 行的按钮上）。
+    也就是说白名单声称"全站按钮只允许这几种组合"，实际有 16 处从来没被检查过——
+    一条自称覆盖全站的守卫，覆盖不到的恰好是最容易跑偏的跨行写法。
+
+    实现要点：`ast.walk` 会把 `ui.button(..).props(..).classes(..).tooltip(..)` 这条链上的
+    【每一层】Call 都访问一遍，所以按链根的 id 去重、只保留收集得最全的那一条（最外层）。
+    """
+    import ast
+    by_root: dict = {}
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            cur, props, classes = node, [], []
+            while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute):
+                attr = cur.func.attr
+                if (attr == "button" and isinstance(cur.func.value, ast.Name)
+                        and cur.func.value.id == "ui"):
+                    break                                  # 到达链根 ui.button(
+                a = cur.args[0] if cur.args else None
+                v = a.value if isinstance(a, ast.Constant) and isinstance(a.value, str) else None
+                if v is not None and attr in ("props", "classes"):
+                    (props if attr == "props" else classes).append((v, cur.func.value.end_lineno))
+                cur = cur.func.value
+            else:
+                continue                                   # 这条链的根不是 ui.button
+            key = (path.name, id(cur))
+            if len(props) + len(classes) >= len(by_root.get(key, ((), ()))[0]) + len(by_root.get(key, ((), ()))[1]):
+                by_root[key] = (props, classes)
+    out = []
+    for (fname, _), (props, classes) in by_root.items():
+        for val, ln in props:
+            out.append((fname, ln, val, [c for c, _ in classes]))
+    return out
+
+
+def _button_props():
+    return [(f, ln, p) for f, ln, p, _ in _button_calls()]
+
+
+def test_no_button_sets_its_own_font_size():
+    """按钮不许在调用点写死字号。
+
+    Quasar 的 `size=` 是【行内 font-size】（sm=10px / md=14px），所以
+    `size=sm` + `.style("font-size:12px")` 是两层叠加——曾经因此出现全站唯一一个
+    12px 的文字按钮，而它上下相邻的文字都是 14px。与徽标同一条原则：
+    字号由全局定，调用点只选角色。
+    """
+    import pathlib
+    import re
+    offenders = []
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        src = path.read_text(encoding="utf8")
+        for m in re.finditer(r'ui\.button\(.{0,300}?\.style\(\s*"([^"]*font-size[^"]*)"', src, re.S):
+            offenders.append(f"{path.name}:{src[:m.start()].count(chr(10)) + 1} → {m.group(1)}")
+        # size=sm 只允许出现在图标按钮（round dense）上：文字按钮用它会掉到 10px
+        for m in re.finditer(r'ui\.button\((.{0,200}?)\)[^\n]*(?:\n[^\n]*){0,2}?\.props\(\s*"([^"]*)"', src, re.S):
+            props = m.group(2)
+            if "size=sm" in props and "round" not in props:
+                offenders.append(
+                    f"{path.name}:{src[:m.start()].count(chr(10)) + 1} 文字按钮用了 size=sm（=10px）")
+    assert not offenders, "按钮在调用点定了字号：\n  " + "\n  ".join(offenders)
+
+
+def test_dense_buttons_are_always_the_small_scale():
+    """(R18) `dense` 在本项目的按钮语法里表示【行内】，而行内恒等于 12px。
+
+    没有这条的话 `flat dense` 是个尺寸未定的角色：同一块详情面板里，元操作行三个
+    `flat dense` 是 12px，而下载行里的『补齐该源』『自动补齐』同样写 `flat dense` 却是 14px，
+    全凭哪个调用点先写——这正是 layout.py 那段注释逐字描述过的症状，换了实现机制
+    （缺 .btn-sm 而不是缺 .style）之后原样还在。
+    真要 14px 就别写 dense（那两个按钮已经改成 `flat`，与同一行的『下载该源』一致）。
+
+    round 的图标按钮不在此列：它们分两档是有意的（面板级 vs 行内），见角色词表。
+    """
+    bad = [f"{f}:{ln} props(\"{p}\") classes={cls}" for f, ln, p, cls in _button_calls()
+           if "dense" in p.split() and "round" not in p.split()
+           and "btn-sm" not in " ".join(cls)]
+    assert not bad, ("这些按钮写了 dense（=行内）却没挂 .btn-sm（=12px），"
+                     "同一个角色会出现两种尺寸：\n  " + "\n  ".join(bad))
+
+
+def test_no_button_sizes_itself_with_tailwind():
+    """(R18) 按钮不许用 Tailwind 的 text-* 定字号——那绕开了 .btn-sm 这个唯一开关。
+
+    `test_no_button_sets_its_own_font_size` 只扫 `.style(font-size)` 与 props 里的 `size=sm`，
+    Tailwind 类不在它的视野里，于是 settings.py 那个『应用开始使用日过滤』用 `text-xs` 定了
+    12px 静悄悄地存在。今天没有视觉差异（两条路都得到 12px），风险是 latent：
+    哪天把 .btn-sm 从 12px 调成别的值，这一个按钮不会跟着变——而那正是这条纪律存在的理由。
+    """
+    bad = [f"{f}:{ln} classes={c!r}" for f, ln, _, cls in _button_calls()
+           for c in cls if _METRIC_CLASSES.search(c)]
+    assert not bad, "按钮用 Tailwind 类定了字号，绕开了 .btn-sm：\n  " + "\n  ".join(bad)

@@ -137,3 +137,53 @@ def test_concurrent_upgrades_are_serialised(tmp_path):
         uniq = [r[0] for r in c.execute(sa.text(
             'SELECT name FROM pragma_index_list("movie") WHERE "unique"=1')) if "mikan" in r[0]]
     assert uniq, "版本号到了 head，但唯一索引没建上——这一态永远不会被自动修复"
+
+
+# ---------------- role 闸的广度守卫（R18） ----------------
+
+def test_every_revision_gates_on_role():
+    """每条 revision 的 upgrade() 都必须自己判 role —— 而且**漏写不会报错**，只会静默做错事。
+
+    本项目的迁移是两条 role 分链（`alembic_version_meta` / `alembic_version_data`），
+    **同一个 revision 在两个引擎上各跑一次**，脚本内部靠 `_role()` 决定自己该做哪一半。
+    漏写这道闸时，一条本该只动业务表的迁移会在 meta 引擎上也跑一遍：
+    · 默认布局下两个引擎指着**同一个 SQLite 文件**，所以本地看不出任何异常；
+    · 切了 MySQL 之后，meta 引擎指向本地那个只有 setting 表的库，
+      迁移要么在"表不存在"上炸掉、要么（更糟）安静地把业务表建到配置库里。
+    而无论哪种，**没有任何现有机制会说话**——docs/DECISIONS.md 的 E-1 讨论要不要
+    干脆收成一条链，正是因为"每条新 revision 都要记得手抄这道闸，而漏写拦不住"。
+    E-1 怎么定是另一回事；在它定下来之前，至少让漏写当场变红。
+
+    豁免：确实与 role 无关的 revision（两边都要跑同样的事）在下面登记并写清理由。
+    """
+    import pathlib
+    import re
+
+    # revision id → 为什么这条不需要 role 闸
+    _ROLE_AGNOSTIC: dict[str, str] = {}
+
+    offenders = []
+    for f in sorted(pathlib.Path("alembic/versions").glob("*.py")):
+        src = f.read_text(encoding="utf8")
+        rev = re.search(r"^revision(?::\s*str)?\s*=\s*['\"]([^'\"]+)", src, re.M)
+        rev = rev.group(1) if rev else f.name
+        if rev in _ROLE_AGNOSTIC:
+            continue
+        body = src[src.index("def upgrade("):] if "def upgrade(" in src else ""
+        # 闸的形态：脚本里定义 _role() 并在 upgrade 开头比较，或直接读 x_argument
+        gated = ("_role()" in body or "get_x_argument" in body)
+        if not gated:
+            offenders.append(f"{f.name}（revision {rev}）的 upgrade() 里没有出现 role 判定")
+    assert not offenders, (
+        "这些迁移没有 role 闸，会在【两个引擎上各跑一次】而没人拦得住：\n  "
+        + "\n  ".join(offenders)
+        + "\n若某条确实与 role 无关，把它的 revision id 登记进本用例的 _ROLE_AGNOSTIC 并写清理由。")
+
+
+def test_the_role_gate_guard_is_not_vacuous():
+    """反向守卫：上面那条不能因为"读不到脚本"而空跑成绿。"""
+    import pathlib
+    files = list(pathlib.Path("alembic/versions").glob("*.py"))
+    assert len(files) >= 5, f"只找到 {len(files)} 个 revision 脚本，上面那条守卫可能在空扫"
+    assert any("_role()" in f.read_text(encoding="utf8") for f in files), \
+        "一个脚本都没有 _role()，说明闸的形态变了，守卫的判据要跟着改"

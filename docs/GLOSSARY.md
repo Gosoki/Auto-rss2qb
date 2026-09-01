@@ -55,3 +55,43 @@
 `exclude_torrent`、`unexclude_torrent`、`reset_downloading`、`sync_qb_status` 是**门面**：
 真实现在 `core/engine.py`，两条线各转一层把自己的表带进去（各自 docstring 都写着「实现见 engine.*」）。
 改行为改 engine 那一份；两个包装只负责选表。
+
+
+## 六、容易读成"标签就是内容"的两个字段（r17）
+
+| 名字 | 它到底是什么 |
+|---|---|
+| 备份文件名里的 `scope`（`full` / `meta`） | 是**导出那一刻的配置**推出来的标签（`DB_BACKEND == 'mysql'` 就叫 meta），**不是文件里有什么**。<br>两个方向都会骗人：刚建好还没跑过业务的库标 `full` 而里面一行数据都没有（用户机器上 5 份里有 4 份是这样）；切了 MySQL 之后标 `meta` 的那份里往往还躺着整套（旧的）业务数据——因为导出动作恒为对本地文件整个 `VACUUM INTO`，而 `switch_data_engine` 明写"只切连接，不搬数据"。<br>**要回答"这份救不救得回我的番"，只能用 `backup.has_business_data()` / `describe_content()` 现场数。** |
+| `Movie.quarter` | 列名叫季度，**剧场版只用其中的年份**（归档目录 `MOVIE_QUARTER_FMT` 默认 `{yyyy}`，页面上那一栏就叫『年份』）。<br>而它的值由 `quarter_of()` 算出来，那个函数带着**番剧**的规则「12 月归次年冬季」——对季播番是对的（12 月开播实际跨 1–3 月播完），对一次性上映的剧场版是错的。<br>真库 5/70 部因此归档到次年，见 DECISIONS **E-30**。取年份一律走 `core.engine.quarter_year()`。 |
+
+## 七、本轮新增的名字（r17）
+
+| 名字 | 为什么这么叫 |
+|---|---|
+| `notify._rate_ok` / `_rate_commit` | 【只查】与【记账】拆成两步。桶按**送达**计数（用户口径就是"每小时最多收到几条"），所以 `_rate_commit` 必须在 `await notify()` 返回 True 之后才调。`_state_rate_ok` / `_state_rate_commit` 同理。 |
+| `notify._muted_until` / `_fail_streak` | 连续失败熔断，与限流桶**正交**：桶管"发太多"，熔断管"发不出去还一直试"。`notify()` 串在交付主链路上，地址是黑洞时每条要白等满 `NOTIFY_TIMEOUT`。 |
+| `backup.describe_content` | 特意不叫 `describe`：这个模块里"描述一份备份"最容易被读成文件名/大小/时间（那些 `list_backups` 已经给了），而它说的是**里面有几部番**。 |
+| `anime.sweep_alerts._two_sides` | 番剧与剧场版两边的计数拼成一句话。特意不叫 `_both`——`_both(a, b, unit)` 读不出哪个是哪边。 |
+| `base.warn_if_not_a_feed` | 判据不是 `bozo` 而是 `feed.version`。理由（哪几种"200 但不是 RSS"是 `bozo=False`）写在函数 docstring 里，两条解析路径共用这一份。 |
+
+## 八、设计语言：按钮的角色语法（r18）
+
+按钮的样式**只由角色决定**，写法是 `{形态} {round} {dense} {color} {no-caps}`：
+
+| token | 含义 |
+|---|---|
+| `unelevated` | 实心无阴影 = **主操作**（确认 / 保存 / 绑定） |
+| `outline` | 描边 = **触发器**（点开还有下一层：下拉菜单、批量动作） |
+| `flat` | 无底色 = **取消与次级** |
+| `dense` | **行内**（列表行、元操作行）。**不表示"更小"** |
+| `no-caps` | 只在标签含拉丁字母时需要（Quasar 默认转大写，中文不受影响） |
+
+**尺寸只有一个开关**：默认 14px；加 `.classes("btn-sm")` 得到 12px。
+
+⚠️ **不要用 Quasar 的 `size=`**。它渲染成【行内 font-size】，档位只有 `xs8/sm10/md14/lg20/xl24`，
+本项目要的 12px 不在表里——曾因此出现 23 个按钮写 `size=sm` 再叠 `.style("font-size:12px")`
+把 10 掰回 12，而同一个 `flat dense size=sm` 在两处被掰成 12px 与 14px。
+`tests/test_ui_badge_style.py` 的两条守卫盯着这件事：props 组合必须在角色词表里登记，
+调用点不许写 `font-size`。
+
+与徽标那一节是**同一条原则**：尺度由全局定，调用点只选角色。

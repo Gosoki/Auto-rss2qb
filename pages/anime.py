@@ -196,7 +196,7 @@ def anime_page(t: str = ""):
                 ui.label("种子状态").classes("text-sm font-bold")
                 ui.label("各状态种子计数").classes("text-xs text-gray-400")
                 _dla = ui.button("补下全部", icon="download", on_click=_download_all).props(
-                    "outline color=primary size=sm").style("font-size:12px")
+                    "outline color=primary").classes("btn-sm")
                 _dla.set_enabled(config.QB_ENABLED)
                 _dla.tooltip("订阅中所有待下集立即下" if config.QB_ENABLED
                              else "qB 未启用，去设置页开启后可下载")
@@ -243,7 +243,7 @@ def anime_page(t: str = ""):
                 ui.label("qB 实时下载进度" if _qb_on else "qB 未启用·最后进度").classes(
                     "text-xs text-gray-400")
                 _sync = ui.button("立刻刷新", icon="sync", on_click=_qb_sync_now).props(
-                    "outline color=primary size=sm").style("font-size:12px")
+                    "outline color=primary").classes("btn-sm")
                 _sync.set_enabled(_qb_on)
                 _sync.tooltip("立即向 qB 拉一次最新进度（不必等后台轮询）" if _qb_on
                               else "qB 未启用，去设置页开启后可同步")
@@ -261,7 +261,11 @@ def anime_page(t: str = ""):
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
                 ui.label("采集状态").classes("text-sm font-bold")
                 ui.label("后台采集与识别").classes("text-xs text-gray-400")
-                with ui.button("重新识别", icon="sync").props("outline color=primary size=sm").style("font-size:12px"):
+                # 【字号不在调用点定】原写法是 `size=sm` + `.style("font-size:12px")` 两层叠加：
+                # Quasar 的 size 是行内 font-size（sm=10px、md=14px），所以那句 .style 是在
+                # 把 sm 掰回 12px —— 结果是全站唯一一个 12px 的文字按钮，而它上下都是 14px。
+                # 与徽标那一节同一条原则：字号该由全局定，调用点只选【角色】。
+                with ui.button("重新识别", icon="sync").props("outline color=primary"):
                     with ui.menu():
                         ui.menu_item("识别当季", on_click=_reident(1))
                         ui.menu_item("识别半年（近 2 季）", on_click=_reident(2))
@@ -303,9 +307,13 @@ def anime_page(t: str = ""):
                             with ui.row().classes("items-stretch gap-3 flex-wrap"):
                                 # 预填当前锁定源：这个番可能是【补齐/绑定 bgm 打回来的】、本来就设过锁，
                                 # 下拉恒空会让用户点一下『确认下载』就把锁静默解掉（选中值会被写回）。
-                                sel = ui.select(source_options(srcs, "从哪下：按优先级"),
-                                                value=(a.pref_source or "")).classes("min-w-48")
-                                ui.button("确认下载", on_click=_approve(a.id, sel)).props("color=primary unelevated")
+                                # 与详情页那个【同一个控件】逐字对齐：同样的 source_options、
+                                # 同样绑 pref_source，宽度类与占位文案也该一样。
+                                # min-w-48 是个裸的硬地板（窄屏不收缩也不满宽），是这轮统一漏下的最后一个。
+                                sel = ui.select(source_options(srcs, "下载源：按优先级·多源兜底"),
+                                                value=(a.pref_source or "")).classes(
+                                    "w-full sm:w-auto sm:min-w-52")
+                                ui.button("确认下载", on_click=_approve(a.id, sel)).props("unelevated color=primary")
                                 ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
         @ui.refreshable
@@ -334,7 +342,7 @@ def anime_page(t: str = ""):
                                     "text-xs text-gray-400")
                             with ui.row().classes("items-stretch gap-3 flex-wrap"):
                                 ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
-                                    "color=primary unelevated")
+                                    "unelevated color=primary")
                                 nf = dlmap.get(a.id, 0)
                                 if nf:  # 只有确实下过文件才给『删除文件』
                                     ui.button("删除文件", icon="delete_forever",
@@ -358,7 +366,7 @@ def anime_page(t: str = ""):
                             ui.label(d["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
                             _rb = ui.button("重新下载", icon="download",
                                             on_click=_redownload(d["id"])).props(
-                                "flat dense size=sm color=primary").style("font-size:14px")
+                                "flat dense color=primary").classes("btn-sm")
                             _rb.set_enabled(config.QB_ENABLED)
                             _rb.tooltip("强制重新下这条到原目录（找回删掉的文件）" if config.QB_ENABLED
                                         else "qB 未启用，去设置页开启后可下载")
@@ -378,7 +386,7 @@ def anime_page(t: str = ""):
                             ui.label(f"第{ep_str(x['episode'])}集").classes("shrink-0 text-gray-400")
                             ui.label(x["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
                             ui.button("恢复", icon="undo", on_click=_unexclude(x["id"])).props(
-                                "flat dense size=sm color=primary").style("font-size:14px").tooltip(
+                                "flat dense color=primary").classes("btn-sm").tooltip(
                                 "放回待下，重新参与下载/去重")
 
         @ui.refreshable
@@ -414,7 +422,7 @@ def anime_page(t: str = ""):
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         inp = ui.input(
                             placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").classes("w-96 min-w-0 max-sm:w-full")   # 桌面 384px；手机满卡宽(min-w-0 让 q-input 真能收缩，否则撑破卡片横向溢出)
-                        ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("color=primary unelevated")
+                        ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("unelevated color=primary")
                         ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("flat color=grey")
                         ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
@@ -795,24 +803,28 @@ def anime_page(t: str = ""):
 
         def _anime_row(a, sources=None):
             # 块级容器 + 行内徽标/标题：徽标贴着标题同排，标题过长时标题自己换行（徽标不再被挤到单独一行）。
-            # q-badge 默认 display:inline，这里统一 inline-block+align-middle 才能既随文流动又跟首行文字居中对齐。
+            # 【display 不在这里定】徽标的 display 由 pages/layout.py 的全局规则一处定成
+            # inline-flex（那是"字在框里居中"的布局保证）。这里只负责 vertical-align 与间距。
+            # 早先这 6 处各挂了一个 inline-block，而 !important 的全局规则把它整个顶掉——
+            # 类是死的，注释里"q-badge 默认 display:inline"这句自全局 CSS 落地起就不再成立，
+            # 下一个人照着它在别处"统一"只会重复一遍无效操作。
             with ui.element("div").classes("pl-2 py-2 leading-relaxed"):
                 if sources:   # 源徽标放最前：多源(>1)蓝 / 单源(==1)灰
                     n = len(sources)
                     _lab, _c = (f"多源 {n}", "blue") if n > 1 else (f"单源 {n}", "blue-grey")
                     ui.badge(_lab).props(f"color={_c}").classes(
-                        "inline-block align-middle mr-2").tooltip("来源: " + " · ".join(sources))
+                        "align-middle mr-2").tooltip("来源: " + " · ".join(sources))
                 if a.rejected:                       # 状态徽标（互斥，最多一个）
-                    ui.badge("已忽略").props("color=grey").classes("inline-block align-middle mr-2")
+                    ui.badge("已忽略").props("color=grey").classes("align-middle mr-2")
                 elif not a.confirmed:
-                    ui.badge("待确认").props("color=orange").classes("inline-block align-middle mr-2")
+                    ui.badge("待确认").props("color=orange").classes("align-middle mr-2")
                 elif a.finished_at:
                     # 【第三态】开了停订时这部番【不再自动下新集】，而在此之前它在列表里
                     # 与正常追番中的番长得一模一样（没有任何徽标）——用户唯一能察觉的迹象
                     # 是"它好久没更新了"，而那与源失效、字幕组断更的表现完全一致。
                     _unsub = config.ANIME_FINISH_UNSUB
                     ui.badge("🎊 已完结" + ("·已停订" if _unsub else "")).props(
-                        "color=teal").classes("inline-block align-middle mr-2").tooltip(
+                        "color=teal").classes("align-middle mr-2").tooltip(
                         f"1~{a.total_episodes or '?'} 集全部到手。"
                         + ("已停止自动下新集（设置页『完结后停止自动下新集』）——"
                            "若其实还没完（bgm 总集数少记了），进详情页点『继续订阅』。"
@@ -823,11 +835,11 @@ def anime_page(t: str = ""):
                     "click", lambda aid=a.id: open_detail(aid))
                 sl = season_label(a)
                 if sl:
-                    ui.badge(sl).props("color=purple").classes("inline-block align-middle ml-2")
+                    ui.badge(sl).props("color=purple").classes("align-middle ml-2")
                 p = getattr(a, "platform", None)   # 内联原 platform_badge：bgm 判定非 TV(剧场版/OVA…)紫标，好带上行内排版类
                 if p and p != "TV":
                     ui.badge(p).props("color=deep-purple").classes(
-                        "inline-block align-middle ml-2").tooltip("bgm 判定的类型（非 TV）")
+                        "align-middle ml-2").tooltip("bgm 判定的类型（非 TV）")
 
         # ---- 页面布局 ----
         with ui.tabs().classes("w-full") as tabs:

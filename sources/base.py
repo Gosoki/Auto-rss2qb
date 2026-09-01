@@ -51,6 +51,30 @@ class Source:
         raise NotImplementedError
 
 
+def warn_if_not_a_feed(feed, what: str) -> None:
+    """取回来的东西不像个 feed 就告警。【bozo 一个人不够，必须连 version 一起看】。
+
+    bozo 只说"XML 解析过程出过毛病"。实测 feedparser 6 对几种真实的「HTTP 200 但不是 RSS」：
+      · 纯 HTML 页 / JSON 错误体 / 只有空白  → bozo=1        （这行原本就会响）
+      · 良构的 XHTML 拦截页、良构的 XML 维护页 → bozo=False, version=''    【一声不吭】
+      · 空 body                            → bozo=False, version=None  【一声不吭】
+    Cloudflare 的『Attention Required』与站点维护页恰恰是良构 XHTML——也就是说
+    bozo 漏掉的正是"站点改版/被拦截"这一类，而那是本项目最贵的一种故障：
+    它不报错，表现只是"这个源好几天没有新东西了"，用户看到的是中性的『0 条，没有新的』。
+    version 才是"feedparser 认不认这是个 feed"的答案：真 feed 是 'rss20'/'atom10'/…，
+    不是 feed 就是 '' 或 None。
+
+    【两条解析路径都要调它】RssSource.fetch 与 mikan.fetch_bangumi_torrents。
+    本文件类 docstring 里那句"改通用行为时记得看一眼那边"已经因此漏过一次。
+    """
+    if not feed.get("version"):
+        log.warning("%s 取回的内容【不是 RSS/Atom】（HTTP 200 但站点返回了别的东西——"
+                    "改版、维护页、或被 Cloudflare 一类挡住了）：feedparser 认不出格式，"
+                    "本轮按 0 条处理", what)
+    elif feed.bozo:
+        log.warning("%s Feed 解析异常（bozo），尽力处理已解析条目", what)
+
+
 class RssSource(Source):
     """从一条 RSS feed 抓种子的源。nyaa 与 mikan 共用它。
 
@@ -109,10 +133,9 @@ class RssSource(Source):
             # 裸 client.get + resp.content 既能被涓流响应永久挂住，也能被超大 body 撑爆内存
             content = await _fetch.get_bytes(client, self.rss_url)
         feed = feedparser.parse(content)
-        if feed.bozo:
-            # 【两个源都要告警】以前只有 nyaa 这一半有，mikan 那半静悄悄——
-            # feed 结构坏掉时（站点改版、返回错误页）表现同样是"0 条"，但没人知道为什么。
-            log.warning("%s Feed 解析异常（bozo），尽力处理已解析条目", self.name)
+        # 【两个源都要告警】以前只有 nyaa 这一半有，mikan 那半静悄悄——
+        # feed 结构坏掉时（站点改版、返回错误页）表现同样是"0 条"，但没人知道为什么。
+        warn_if_not_a_feed(feed, self.name)
         out = []
         for entry in feed.entries:
             item = self._parse(entry)

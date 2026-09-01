@@ -126,3 +126,45 @@ def test_absolute_sub_dir_when_no_work_dir(cfg):
     """没有工作目录时，该侧目录就是绝对根（番剧与剧场版可以落在不同盘）。"""
     cfg(DOWN_PATH="", QUARTER_FMT="", ANIME_SEASON_SUBFOLDER=False)
     assert build_save_path("26A", "某番", sub_dir="/mnt/tv") == "/mnt/tv/某番"
+
+
+# ---------------- 搬迁闸问的是"文件在哪"，不是"记录改没改"（R18） ----------------
+
+def test_rows_in_wrong_dir_finds_files_left_behind():
+    """(R18) 搬迁失败/被拒绝一次之后，必须还能被发现。
+
+    两侧的 maybe_relocate_* 原本都写 `if new_path == old_path: return`，而四个调用点拿到的
+    old_path **也是**同一个 `*_save_path(id)` 算出来的——这道闸问的是"我这次操作把记录改了没有"，
+    而不是"盘上的文件跟当前归档目录对得上没有"。于是搬迁只要没成一次，
+    之后【再没有任何入口】能补搬，engine.relocate 的提示还会指向一个没有文件的目录。
+
+    真库实证：anime#96『落语朱音』10 集躺在旧错绑名的目录里，记录早已改对，界面上没有任何地方
+    还会提出搬它。
+    """
+    from types import SimpleNamespace
+
+    from core import engine
+
+    def row(status="sent", path="/new", archived=None):
+        return SimpleNamespace(status=status, save_path=path, archived_at=archived)
+
+    NEW = "/anime/26B/正确的名字"
+    OLD = "/anime/26C/错绑时的名字"
+    assert engine.rows_in_wrong_dir([row(path=NEW)], NEW) == []
+    assert len(engine.rows_in_wrong_dir([row(path=OLD)], NEW)) == 1, "落在旧目录的行没被发现"
+    # 已归档的不算：不在 qB，setLocation 移不动，算进来会出现「说要搬 → 点确认 → 报无需移动」
+    assert engine.rows_in_wrong_dir([row(path=OLD, archived="x")], NEW) == []
+    # 没交付过的不算
+    assert engine.rows_in_wrong_dir([row(status="pending", path=OLD)], NEW) == []
+    # 空 save_path 不算（老行）
+    assert engine.rows_in_wrong_dir([row(path="")], NEW) == []
+
+
+def test_both_relocate_gates_use_the_shared_predicate():
+    """(R18) 番剧与剧场版两侧必须走同一份判据——这正是本项目反复出现的第①种缺陷形状。"""
+    import pathlib
+    for f in ("pages/anime_detail.py", "pages/movies.py"):
+        src = pathlib.Path(f).read_text(encoding="utf8")
+        assert "rows_in_wrong_dir" in src, f"{f} 的搬迁闸没走共用判据"
+        assert "if not new_path or new_path == old_path" not in src, \
+            f"{f} 还留着只比算出来的新旧路径的老闸"

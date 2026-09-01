@@ -89,16 +89,24 @@ async def add_manual(torrent_input: str, torrent_bytes, save_path: str) -> dict:
         return {"ok": False, "error": "没有保存位置（工作目录未设时请手填绝对路径）"}
     inp = (torrent_input or "").strip()
     try:
+        # 【一律走 engine.add_to_qb，不要直接调 qb.add_*】这里原本是三条直连，
+        # 于是番剧/剧场版两条线都有、而手动这条没有的两件事：
+        # ① qB 同机时预建 save_path（手动的默认位置『工作目录/Temp』谁也不会先去建）；
+        # ② 『这个 hash 已经在 qB 里』的幂等兜底——同一条磁力点第二次，
+        #    本该是"它已经在下了"，实际给的是红色『qB 未接受（种子无效/路径不可写/重复）』。
         if torrent_bytes:                                   # 上传的 .torrent 文件
             ih = info_hash_from_torrent(torrent_bytes)
-            ok = await engine.qb.add_torrent(torrent_bytes, save_path, MANUAL_CATEGORY, MANUAL_TAG)
+            ok = await engine.add_to_qb(torrent_bytes, save_path, MANUAL_CATEGORY, MANUAL_TAG,
+                                        info_hash=ih or "")
         elif inp.lower().startswith("magnet:"):             # magnet：交给 qB 抓
             ih = magnet_hash(inp)
-            ok = await engine.qb.add_url(inp, save_path, MANUAL_CATEGORY, MANUAL_TAG)
+            ok = await engine.add_to_qb(None, save_path, MANUAL_CATEGORY, MANUAL_TAG,
+                                        info_hash=ih or "", magnet=inp)
         elif inp.lower().startswith(("http://", "https://")):   # .torrent 链接：本地抓字节(带 SSRF 守卫)再交 qB
             data = await engine.fetch_torrent_bytes(inp)
             ih = info_hash_from_torrent(data)
-            ok = await engine.qb.add_torrent(data, save_path, MANUAL_CATEGORY, MANUAL_TAG)
+            ok = await engine.add_to_qb(data, save_path, MANUAL_CATEGORY, MANUAL_TAG,
+                                        info_hash=ih or "")
         else:
             return {"ok": False, "error": "请填 magnet: / http(s) .torrent 链接，或上传 .torrent 文件"}
     except Exception as e:

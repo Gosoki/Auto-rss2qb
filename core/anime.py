@@ -17,7 +17,7 @@ import config
 from core import engine
 from db import get_session
 from db.dialect import ALIAS_TITLE_LEN
-from db.models import Anime, AnimeTorrent, MovieTorrent, SourceGroup, AnimeAlias
+from db.models import Anime, AnimeTorrent, Movie, MovieTorrent, SourceGroup, AnimeAlias
 from services import enrich
 from services.notify import event as notify_event, state as notify_state
 from sources.parse import (extract_episode_abs, kw_match, parse_title, quarter_of,
@@ -144,15 +144,29 @@ def _episode_cannot_belong(a, item) -> bool:
     ep = getattr(item, "episode", None)
     total = a.total_episodes or 0
     if not isinstance(ep, (int, float)) or ep < 1 or total <= 0:
-        return False
-    if ep <= total:
-        return False
+        return False          # 特别篇(-1)/未知(-2) 不参与：先行特典本来就可能早于首播
     aired = _parse_date(a.air_date)
     rel = getattr(item, "release_time", None)
     if aired is None or rel is None:
         return False          # 判不了就不判（与本项目"宁可不判，绝不误判"的一贯口径一致）
     weeks = (rel.date() - aired).days / 7
-    return weeks > total + _OFF_SEASON_SLACK_WEEKS
+    span = total + _OFF_SEASON_SLACK_WEEKS      # 本季窗口 + 半年余量，两侧共用同一个跨度
+    if ep > total and weeks > span:
+        return True                             # 条件①+②，见上
+    # ③【发布得远早于本季首播】—— 与②对称的另一半，而且【不看集号】。
+    # docstring 里"一季播完很久之后不会再有新集"的镜像同样成立：**一季首播之前不会有本季的集**。
+    # 这一侧此前永远走不到，因为条件① `ep > total` 先把它挡死了：字幕组补发的旧季正片，
+    # 集号天然落在 [1, total] 里（第一季第 3 集就写 03），于是"发布时间比所绑季首播早了两年半"
+    # 这个极强的信号一次都没被看过。
+    # 真库实证：anime#6『超超超超超喜欢你的100个女朋友 第三季』(bgm 首播 2026-07-05, 12 集)
+    # 底下挂着 24 条 `[ANi] 超超超超超喜歡你的 100 個女朋友 - 01..24`——标题不带季标记，
+    # 全是【第一季】的正片，发布时间早 134~143 周，而且已经 sent 进了第三季的目录。
+    # 它们填满了 1..12 这些槽位，于是 sweep_finished 把一部才播 8 周的番判成了完结。
+    # 【余量为什么用同一个 span 而不是更小的数】更小（如 4 周）能多抓一部 anime#8
+    # （21 条【第一季】的种子早 3.6~19.4 周），但真库里 0.3~2.3 周早发的 7 部都是**正常**的
+    # （bgm 记的是电视首播日，而流媒体/抢先场常早几天）——3.6 与 2.3 之间那道缝只有 9 部番的证据，
+    # 太薄，不足以定成永久规则。收紧到几周是行为变更，记在 docs/DECISIONS.md E-34 等拍板。
+    return weeks < -span
 
 
 def binding_looks_wrong(s, a) -> bool:
@@ -1023,11 +1037,22 @@ async def flush_ready_downloads(qb_alive: bool | None = None) -> int:
         # 只自动放行 pending：error 不在这里无限重试（高优先级失败→本组还有 pending 低优先级自然降级；
         # 全 error 则本轮不重试，留给人工补下）。
         # retry_at 未到点的跳过——重试退避全靠这一条落地（人工补下不走这里，不受退避约束）
-        for t in s.exec(select(AnimeTorrent).where(
+        #
+        # 【列投影 + 番过滤下推，与上面 have_eps 那条同口径】本函数一轮有三条对 animetorrent
+        # 的查询，早先只有两条做了投影，漏的偏偏是最大的这一条：它取整行 ORM、且把"这条属不属于
+        # 订阅中的番"放在 Python 里逐行 `if t.anime_id not in auto_ids: continue`。
+        # 上面那条注释担心的增长模型对这条同样成立——pending 会随"发现了但还没到放行条件"
+        # （缓冲窗口内、锁定源不匹配、关键词不匹配、-1/-2 集）持续累积，而它们每轮都要被完整装配一遍。
+        # 真库量过（1649 条种子、59 部订阅中）：这条 SQL 本身 8.68ms→3.16ms，
+        # 取回行数 1092→790（少掉的 302 行属于没在订阅的番，原本白装配一遍再丢掉）。
+        # ORM 整行装配的开销不在这个数里，那部分省得更多。
+        # 循环体不用改：_PLAN_COLS 覆盖了这里用到的全部列（id/anime_id/status/episode/source/
+        # raw_title/priority/created_at/retry_count/retry_at），engine.pick_order 也已经按
+        # "喂进来的可能是 Row"写了 getattr 兜底。
+        for t in s.exec(select(*_PLAN_COLS).where(
                 AnimeTorrent.status == "pending",
+                AnimeTorrent.anime_id.in_(auto_ids),
                 or_(AnimeTorrent.retry_at.is_(None), AnimeTorrent.retry_at <= now))):
-            if t.anime_id not in auto_ids:
-                continue
             lock = pref_map.get(t.anime_id)
             if lock and lock != (t.source or ""):
                 continue  # 锁定源：这部番只收锁定组的种子（硬锁、不兜底）；别的源一律不自动下
@@ -1276,15 +1301,52 @@ def is_finished(a, covered: set) -> bool:
     · 有【集号歧义段】(O<T，见 ambiguous_range) → 不判：那一段上绝对编号与季内编号取值域重叠，
       绝对源的第 O+k 集会在集号维度上冒充季内第 O+k 集，coverage 是【假的】，
       会把只下了半季的番判成完结。
+    · **按周更推算还没播到最后一集** → 不判。理由见下面 `_cannot_have_aired_all`。
     · 其余：要求 1..T 每一集都在手。
       用"覆盖"而不是"计数 ≥ T"：计数会被小数集/特别篇/超界集号灌水。
+
     """
     if a is None or a.finish_optout:
         return False
     t = a.total_episodes or 0
-    if t <= 0 or ambiguous_range(a) is not None:
+    if t <= 0 or ambiguous_range(a) is not None or _cannot_have_aired_all(a):
         return False
     return all(k in covered for k in range(1, t + 1))
+
+
+def _cannot_have_aired_all(a) -> bool:
+    """按周更推算，这部番的最后一集【还没播】——那 coverage 说的"1..T 全在手"必然是假的。
+
+    【为什么需要这一条：ambiguous_range 在最危险的时候恰好沉默】它要求 `a.ep_offset` 非空，
+    也就是只在系统【已经学到 offset】时才说话。而两套编号并存最凶险的情形恰恰是 offset 没学到：
+    那时一条都不折算、不按 (集号,源) 去重，库里生生躺着两套编号，coverage 更假，而它一声不吭。
+
+    真库实证：2026-08-31 06:47 那一轮 sweep 把两部【2026 年 7 月新番】判成了完结——
+    anime#6『超超超超超喜欢你的100个女朋友 第三季』(total=12, ep_offset=None, 手里 1..33 集)、
+    anime#60『北斗神拳 拳王军杂兵们的挽歌 第二季』(total=12, 手里 1..20 集)。
+    两部当时都只播了 8 周左右，1..12 里有一截是别的季的正片被归到了这条记录下面。
+
+    【判据为什么用时间而不是"集号超界"】第一版写的是"coverage 里同时有 >T 和 ≤T 的集号就不判"，
+    当场被本项目自己的用例否掉：`test_extra_episodes_beyond_total_are_fine` 记着
+    "bgm 的总集数少记一集是真实存在的，多出来的集号不该拦"——那条用例是对的，
+    而"超界几集才算两套编号"只能拍一个阈值。时间这条不用拍阈值：
+    **一部 12 集的周更番，首播才过 8 周，它就是不可能已经播完。**
+    全库回扫：这条判据挡下的正好是上面那两部，其余 57 个候选一个都没受影响（零误伤）。
+
+    【已知代价，是有意接受的】非周更（一次性放出整季、双周更、跳周）的番会被推迟判定，
+    最多推迟到"首播 + (T-1) 周"。这是 is_finished 自己 docstring 写的方向——
+    "宁可不判，绝不误判"：晚判几周只是徽标晚出现，而误判会在开了
+    ANIME_FINISH_UNSUB 时【停订一部还在更新的番】。
+    周更这个模型不是这里新引入的，`_episode_cannot_belong`（E-28）用的是同一个。
+
+    air_date 不明 → 不拦（保持原行为）。
+    """
+    d = _parse_date(a.air_date or "")
+    t = a.total_episodes or 0
+    if d is None or t <= 0:
+        return False
+    last_ep_at = datetime.combine(d, datetime.min.time()) + timedelta(weeks=t - 1)
+    return datetime.now() < last_ep_at
 
 
 _FINISH_BACKFILL_KEY = "_FINISH_BACKFILL_DONE"
@@ -1402,11 +1464,28 @@ async def sweep_finished() -> int:
             # qB 里删种、临时 missingFiles、总集数被 bgm 改来改去，都会让它翻。
             # 冷却是进程内的（重启即忘），所以这是【压住抖动】不是【跨重启去重】——
             # 后者的正解是给 Anime 加一列 finish_notified_at，要开 revision，留给下一版。
-            await notify_event("finished", f"{display_of(a)} 全 {a.total_episodes} 集已下齐"
-                                           + ("，已停止自动下新集" if config.ANIME_FINISH_UNSUB else ""),
-                               key=str(a.id), cooldown=7 * 24 * 3600)
+            if not await notify_event(
+                    "finished", f"{display_of(a)} 全 {a.total_episodes} 集已下齐"
+                                + ("，已停止自动下新集" if config.ANIME_FINISH_UNSUB else ""),
+                    key=str(a.id), cooldown=7 * 24 * 3600):
+                # 未订阅/没配 URL 时这里恒为 False，所以只记 info 不记 warning——
+                # 但它是"这条完结通知没发出去"的唯一痕迹，而下一轮不会重来（见上）。
+                log.info("完结通知未发出（未订阅/限流/熔断中/推送失败），不会重发：%s", display_of(a))
             # 完结这条【不】因为通知没发出去就回滚标记：finished_at 是业务状态（它决定停不停订），
             # 不是"通知记账"。通知丢了顶多少一条推送，而详情页的徽标一直在。
+            # 【但要知道代价】上面 1391 行是【整批】commit 完 finished_at 才走到这个循环，
+            # 而候选过滤卡的正是 `finished_at is None`——所以这条通知丢了就是【永久丢】，
+            # 下一轮不会重来。真正的解是给 Anime 加一列 finish_notified_at（与 idle_notified_at 同款），
+            # 要开 revision，记在 docs/DECISIONS.md E-32 等拍板。
+            # 【R17 之后这条风险是【变大】了，不是变小 —— 上一版注释在这里写反了】
+            # 限流桶改成按送达记账确实拆掉了"桶满 → 静默一小时"那条放大路径，
+            # 但同一轮加的**连续失败熔断**换来了一条更硬的：连挂 5 条就保证静默 300 秒，
+            # 而 5 条很容易凑（一轮 flush 串行交付几集撞上一次网络抖动、推送容器重启、
+            # 对端 429 都够，且 _fail_streak 是跨事件类型共享的全局量）。
+            # 那 300 秒里判定出来的完结，finished_at 照落、通知一条不发、下一轮不会重来。
+            # 熔断本身是对的（它挡的是"每条白等一个超时拖垮交付主链路"），
+            # 正确的解法是让完结这条【不依赖当次推送成功】——即 DECISIONS E-32 的落库列。
+            # 在它落地之前，至少把没送出去的这一条记进日志，别只留一个静悄悄的徽标。
     if undone:
         log.info("完结判定：%d 部不再集齐，已撤销完结标记（删过文件/失败/总集数变了）", len(undone))
     if done:
@@ -1539,27 +1618,51 @@ async def sweep_alerts() -> dict:
     程度该去处理了"，而不在"某一条具体失败了"——详情页本来就能看到每一条的 fail_reason。
 
     去重用 (事件, 当前条数) 做 key + 6 小时冷却：条数没变就不重复打扰，变了立刻再说一次。
+
+    【番剧与剧场版两边都要数】早先三条统计全部只 select_from(AnimeTorrent)/Anime，
+    而剧场版侧有一模一样的三种积压（MovieTorrent 的 error/stalled 走的是同一套
+    engine.sync_qb_status 状态机，未识别的剧场版同样堆在『待识别』tab 里）——
+    于是"下载失败"这个事件对剧场版【永远不响】，用户唯一的发现途径是自己想起来去翻页面。
+    这条巡检是全项目唯一会主动说"有事要你处理"的地方，两边不对称就等于剧场版没有告警。
+    【合并成一条而不是各推各的】事件键是存进 settings 表的字面量（见 notify.EVENTS），
+    加键要写迁移、还要用户重新去勾；而"失败了几条"这件事用户关心的是总量与去哪看，
+    一条消息里把两边分别写清就够了。
     """
-    with get_session() as s:
-        errs = s.exec(select(func.count()).select_from(AnimeTorrent)
-                      .where(AnimeTorrent.status == "error")).one()
-        stalls = s.exec(select(func.count()).select_from(AnimeTorrent)
-                        .where(AnimeTorrent.status == "stalled")).one()
-        backlog = s.exec(select(func.count()).select_from(Anime).where(
-            Anime.bangumi_id.is_(None), Anime.rejected.is_not(True))).one()
     six_h = 6 * 3600
-    if errs:
-        await notify_event("failed", f"{errs} 条种子交付失败，去『失败/异常』页看看",
-                           key=str(errs), cooldown=six_h)
-    if stalls:
-        await notify_event("stalled", f"{stalls} 条种子长期无进度（qB 里可能没源了）",
-                           key=str(stalls), cooldown=six_h)
+    with get_session() as s:
+        def _n(model, *where):
+            return s.exec(select(func.count()).select_from(model).where(*where)).one()
+        errs = _n(AnimeTorrent, AnimeTorrent.status == "error")
+        stalls = _n(AnimeTorrent, AnimeTorrent.status == "stalled")
+        backlog = _n(Anime, Anime.bangumi_id.is_(None), Anime.rejected.is_not(True))
+        m_errs = _n(MovieTorrent, MovieTorrent.status == "error")
+        m_stalls = _n(MovieTorrent, MovieTorrent.status == "stalled")
+        m_backlog = _n(Movie, Movie.bangumi_id.is_(None), Movie.rejected.is_not(True))
+
+    def _two_sides(n_anime: int, n_movie: int, unit: str) -> str:
+        """两边都有就写清各自多少，只有一边就别啰嗦。"""
+        if n_anime and n_movie:
+            return f"{n_anime + n_movie} {unit}（番剧 {n_anime}、剧场版 {n_movie}）"
+        return f"{n_anime + n_movie} {unit}" + ("（剧场版）" if n_movie else "")
+
+    if errs or m_errs:
+        # 【key 要含两边的数】只用总数的话，番剧 +1 / 剧场版 −1 会得到同一个 key，
+        # 6 小时内这次变化就静默了。
+        await notify_event("failed",
+                           f"{_two_sides(errs, m_errs, '条种子交付失败')}，去『失败/异常』页看看",
+                           key=f"{errs}+{m_errs}", cooldown=six_h)
+    if stalls or m_stalls:
+        await notify_event("stalled",
+                           f"{_two_sides(stalls, m_stalls, '条种子长期无进度')}（qB 里可能没源了）",
+                           key=f"{stalls}+{m_stalls}", cooldown=six_h)
     # 待识别是状态型：积压【上穿】阈值时说一次，清空时再说一次。
     # ok 文案随实际条数生成：阈值下穿≠清零，6 部降到 4 部时说"已清空"是假话。
-    await notify_state("backlog", backlog >= max(1, config.NOTIFY_BACKLOG_MIN),
-                       f"待识别番已积压 {backlog} 部，去『待识别』页处理",
-                       "待识别已清空" if backlog == 0 else f"待识别降到 {backlog} 部")
-    return {"error": errs, "stalled": stalls, "backlog": backlog}
+    total_backlog = backlog + m_backlog
+    await notify_state("backlog", total_backlog >= max(1, config.NOTIFY_BACKLOG_MIN),
+                       f"待识别已积压 {_two_sides(backlog, m_backlog, '部')}，去『待识别』页处理",
+                       "待识别已清空" if total_backlog == 0 else f"待识别降到 {total_backlog} 部")
+    return {"error": errs, "stalled": stalls, "backlog": backlog,
+            "movie_error": m_errs, "movie_stalled": m_stalls, "movie_backlog": m_backlog}
 
 
 def resubscribe(anime_id: int) -> bool:
@@ -1684,6 +1787,31 @@ def episode_numbering_conflict(anime_id: int) -> list:
     over = sorted(e for e in eps if e > a.total_episodes)
     within = [e for e in eps if e <= a.total_episodes]
     return over if (over and within) else []
+
+
+def episode_ranges_by_source(anime_id: int) -> list[tuple]:
+    """每个源各覆盖了哪些集号：[(源名, 最小集, 最大集, 集数), ...]，按最小集排序。
+
+    `episode_numbering_conflict` 只能回答"存不存在可疑"，回答不了"到底是不是两套编号"——
+    真库实测它 8 次命中里只有 2 次是真的（详情见下）。而这一份【逐源的集号区间】
+    人一眼就能判断：
+
+        ANi 13–19 / Nix-Raws 1–7   → 区间完全错开，两套编号并存，同一集会各下一份
+        ANi 1–33                    → 一个源从 1 连续数到 33，只是跨季累计编号，不重复
+
+    之所以不把这个判断写成代码里的判据：试过四种（集号是否超总集数 / 有没有源横跨总集数 /
+    两源区间是否相交 / 同期发布集号是否差得多），每一种在真库上都有可观的误报——
+    这与 `_foldable` 的 docstring 记载的结论一致（"按源取证"经对抗验证后被否决）。
+    与其给一个 6/8 情况下说假话的断言，不如把事实摆出来让人判断。
+    """
+    with get_session() as s:
+        rows = s.exec(select(AnimeTorrent.source, AnimeTorrent.episode).where(
+            AnimeTorrent.anime_id == anime_id, AnimeTorrent.episode >= 1)).all()
+    by: dict = {}
+    for src, ep in rows:
+        by.setdefault(src or "?", set()).add(ep)
+    return sorted(((src, min(v), max(v), len(v)) for src, v in by.items()),
+                  key=lambda x: (x[1], x[0]))
 
 
 def list_episodes(anime_id: int) -> list[AnimeTorrent]:

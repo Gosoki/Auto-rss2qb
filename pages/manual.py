@@ -4,7 +4,7 @@ from nicegui import ui
 
 import config
 from core import manual
-from .layout import frame
+from .layout import busy_action, frame, text_token, tint
 
 # .torrent 通常 < 1MB；给足余量后封顶，免得整块读进内存（与 core/engine.py 的取种上限同量级）。
 _UPLOAD_CAP = 32 * 1024 * 1024
@@ -23,11 +23,12 @@ def manual_page():
             "<style>"
             ".tmanual-up{border:1px dashed rgba(255,255,255,.22)!important;border-radius:8px;"
             "background:rgba(255,255,255,.02);box-shadow:none!important}"
-            ".tmanual-up .q-uploader__header{background:transparent!important;color:#9ca3af;min-height:56px}"
+            ".tmanual-up .q-uploader__header{background:transparent!important;"
+            f"color:{text_token('grey')};min-height:56px}}"
             ".tmanual-up .q-uploader__title{font-size:14px;line-height:1.35;white-space:normal}"
             ".tmanual-up .q-uploader__subtitle{display:none}"          # 隐藏 0.0B / 0.00%
             ".tmanual-up .q-uploader__list{display:none}"              # 隐藏常空的文件列表区
-            ".tmanual-up .q-uploader__header .q-btn{color:#60a5fa}"    # + 按钮蓝色好认
+            f".tmanual-up .q-uploader__header .q-btn{{color:{text_token('blue')}}}"   # + 按钮蓝色好认
             "</style>")
 
         up = {"bytes": None, "name": ""}
@@ -57,12 +58,12 @@ def manual_page():
                     upbox.refresh()
                     ui.notify(f"已选文件：{f.name}", type="positive")
                 if up["name"]:
-                    with ui.row().classes("items-center gap-2 w-full p-2 rounded").style(
-                            "background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.3)"):
+                    # 与 layout 的另外三个染色块同一个配方（同一批 oklch token @ 12%、无边框）
+                    with ui.row().classes("items-center gap-2 w-full p-2 rounded").style(tint("green")):
                         ui.icon("description").classes("text-green-400")
                         ui.label(up["name"]).classes("text-sm text-green-400 grow break-all min-w-0")
                         ui.button(icon="close", on_click=lambda: (up.update(bytes=None, name=""), upbox.refresh())
-                                  ).props("flat round dense size=sm color=grey").tooltip("移除")
+                                  ).props("flat round dense color=grey").classes("btn-sm").tooltip("移除")
                 else:
                     ui.upload(label="上传 .torrent 文件（点右侧 ＋ 选文件）", auto_upload=True, max_files=1,
                               on_upload=_on_upload,
@@ -92,19 +93,23 @@ def manual_page():
                     ui.notify(f"识别：{r['name']}（{r['quarter']} S{r['season']}）", type="positive")
                     ident.refresh()
 
-                ui.button("识别", icon="search", on_click=_identify).props("color=primary unelevated no-caps")
+                # bgm 往返最长 _RESOLVE_BUDGET（120 秒），期间按钮毫无反应用户会连点 —— 走 busy_action
+                ui.button("识别", icon="search",
+                          on_click=lambda e: busy_action(e.sender, "manual-identify", _identify,
+                                                         fail="识别失败")).props(
+                    "unelevated color=primary")
 
             @ui.refreshable
             def ident():
                 if not st["path"]:
                     return
-                with ui.column().classes("w-full gap-2 p-3 rounded").style("background:rgba(96,165,250,.08)"):
+                with ui.column().classes("w-full gap-2 p-3 rounded").style(tint("blue")):
                     with ui.row().classes("items-center gap-2 w-full min-w-0"):
                         ui.icon("folder").classes("text-blue-400 shrink-0")
                         ui.label(st["path"]).classes("text-sm text-blue-400 break-all min-w-0")
                     ui.button("设为保存位置", icon="drive_file_move", on_click=lambda: (
                         spath.set_value(st["path"]), ui.notify("已把保存位置设为正常目录", type="positive"))).props(
-                        "color=primary unelevated").classes("self-start")
+                        "unelevated color=primary").classes("self-start")
             ident()
 
             ui.separator()
@@ -119,7 +124,7 @@ def manual_page():
                     ui.notify(f"下载失败：{r['error']}", type="negative")
 
             _dl = ui.button("下载", icon="download", on_click=_download).props(
-                "color=primary unelevated").classes("self-start")
+                "unelevated color=primary").classes("self-start")
             _dl.set_enabled(config.QB_ENABLED)
             if not config.QB_ENABLED:
                 _dl.tooltip("qB 未启用，去设置页开启后可下载")

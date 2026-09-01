@@ -252,3 +252,115 @@ async def test_background_reenrich_never_moves_a_downloaded_anime_folder(clean_t
     # 带 relocate 的入口不受影响：它要能把目录修正过来，否则详情页那个按钮就成了摆设
     assert await A.manual_enrich(aid)
     assert A.anime_save_path(aid) != before
+
+
+async def test_stolen_mikan_id_does_not_strand_the_torrents(clean_tables, caplog):
+    """(R17) 被摘走 mikan_id 的【无主行】不能丢在原地：那是一条永久孤儿。
+
+    现有的 test_upsert_steals_mikan_id_from_a_stale_row 用了一行【没有种子】的旧行，
+    恰好绕开了有代价的那一支。真实形状是：某片早期扫进来时 bgm 没识别出来，
+    用户已经手动下过它的版本；后来它被识别出 bgm_id，而库里另有一行挂着那个 bgm。
+    摘掉 mikan_id 之后那行变成"无 mikan_id、无 bgm_id、却挂着种子"——
+    『刷新版本』要 mikan_id 所以被禁用，重扫该年份会把 mikan_id 认到 keeper 身上，
+    孤儿永远等不到自己的那一轮。共用同一个 mikan_id 就意味着是同一个 Mikan 番组，
+    所以正解是把它并进 keeper。
+    """
+    with clean_tables.get_session() as s:
+        old = Movie(title="早期扫进来的", quarter="26A", mikan_id="2001")
+        known = Movie(title="已识别的", quarter="26A", mikan_id="2000", bangumi_id=888)
+        s.add(old)
+        s.add(known)
+        s.commit()
+        old_id, known_id = old.id, known.id
+        s.add(MovieTorrent(movie_id=old_id, raw_title="早就下过的版本",
+                           info_hash="f" * 40, status="pending"))
+        s.commit()
+
+    mid, is_new = M._upsert_movie("2001", "已识别的", 888, None, "剧场版")
+    assert mid == known_id and not is_new
+
+    with clean_tables.get_session() as s:
+        assert s.get(Movie, old_id) is None, "无主的旧行被留在原地了"
+        rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == known_id)))
+        assert [t.raw_title for t in rows] == ["早就下过的版本"], \
+            f"孤儿的种子没跟过来：{[(t.movie_id, t.raw_title) for t in rows]}"
+
+
+async def test_stolen_row_with_a_different_bgm_id_is_left_alone(clean_tables):
+    """被摘的那行【有自己的 bgm_id】时不能合并——那是两部不同的片碰巧共用过一个 Mikan 链接，
+    合并会删掉一整行。失去 Mikan 链接是正确的收场。"""
+    with clean_tables.get_session() as s:
+        other = Movie(title="另一部片", quarter="26A", mikan_id="2101", bangumi_id=111)
+        known = Movie(title="这一部", quarter="26A", mikan_id="2100", bangumi_id=222)
+        s.add(other)
+        s.add(known)
+        s.commit()
+        other_id, known_id = other.id, known.id
+
+    M._upsert_movie("2101", "这一部", 222, None, "剧场版")
+    with clean_tables.get_session() as s:
+        row = s.get(Movie, other_id)
+        assert row is not None, "有自己 bgm_id 的另一部片被合并删掉了"
+        assert row.mikan_id is None and row.bangumi_id == 111
+
+
+async def test_a_downloaded_orphan_is_never_deleted(clean_tables, caplog):
+    """(R18) loser 已下过、keeper 还没下过 —— 这一半绝不能合并，而 _merge_movie 的保险盖不住它。
+
+    _merge_movie 的保险是"**两边都**下过就拒绝"，而摘 mikan_id 这条路径上 keeper 的典型情形
+    恰恰是"刚按 bgm 命中、一份都没下过"，于是保险在这一半上恒为假 —— 而这正是代价最大的一半：
+    合并的最后一步是 s.delete(loser)，丢掉的是 Movie 整行（片名/年份/日文名/全部 bgm 元数据），
+    页面上那部片直接消失、版本挂到另一部名下，不可逆。
+    （种子行会跟过去、save_path 保留，所以盘上文件不打空——丢的是"这是哪部片"这件事。）
+
+    R18 之前这条会静默删行，且日志里一个字都没有。
+    """
+    with clean_tables.get_session() as s:
+        old = Movie(title="早就下完的片", quarter="24D", mikan_id="2301", jp_name="劇場版 前篇")
+        known = Movie(title="刚识别出来的", quarter="26A", mikan_id="2300", bangumi_id=1234)
+        s.add(old)
+        s.add(known)
+        s.commit()
+        old_id, known_id = old.id, known.id
+        s.add(MovieTorrent(movie_id=old_id, raw_title="已下完的版本", info_hash="c" * 40,
+                           status="sent", qb_progress=1.0))
+        s.commit()
+
+    with caplog.at_level("WARNING"):
+        M._upsert_movie("2301", "刚识别出来的", 1234, None, "剧场版")
+
+    with clean_tables.get_session() as s:
+        kept = s.get(Movie, old_id)
+        assert kept is not None, "已经下完的那部片被静默删掉了"
+        assert kept.jp_name == "劇場版 前篇" and kept.quarter == "24D", "元数据没保住"
+        assert kept.mikan_id is None, "Mikan 链接本来就该被摘走"
+        rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == old_id)))
+        assert len(rows) == 1, "它的版本记录不该被搬走"
+    assert any("已经下过东西" in r.getMessage() for r in caplog.records), \
+        f"留下孤儿行时必须留一条可发现的记录：{[r.getMessage() for r in caplog.records]}"
+
+
+async def test_merge_still_refuses_when_both_sides_downloaded(clean_tables, caplog):
+    """两边都已下过东西时仍然拒绝合并——那道保险不能被这条新路径绕过。
+
+    R18 之后这一支其实走不到 _merge_movie 了（上面那条更早的闸先拦住 loser 已下过的情形），
+    但结果必须一样：两行都在、都不删。
+    """
+    with clean_tables.get_session() as s:
+        old = Movie(title="早期扫进来的", quarter="26A", mikan_id="2201")
+        known = Movie(title="已识别的", quarter="26A", mikan_id="2200", bangumi_id=999)
+        s.add(old)
+        s.add(known)
+        s.commit()
+        old_id, known_id = old.id, known.id
+        s.add(MovieTorrent(movie_id=old_id, raw_title="A", info_hash="a" * 40, status="sent"))
+        s.add(MovieTorrent(movie_id=known_id, raw_title="B", info_hash="b" * 40, status="sent"))
+        s.commit()
+
+    with caplog.at_level("WARNING"):
+        M._upsert_movie("2201", "已识别的", 999, None, "剧场版")
+    with clean_tables.get_session() as s:
+        assert s.get(Movie, old_id) is not None, "两边都下过还是被静默合并了"
+    assert any(("拒绝合并" in r.getMessage() or "已经下过东西" in r.getMessage())
+               for r in caplog.records), \
+        f"不合并时必须留下可发现的记录：{[r.getMessage() for r in caplog.records]}"

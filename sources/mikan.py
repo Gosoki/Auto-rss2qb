@@ -20,7 +20,8 @@ import httpx
 
 import config
 from services import fetch
-from sources.base import _HEX40_RE as _BASE_HEX40, ParsedItem, RssSource
+from sources.base import (_HEX40_RE as _BASE_HEX40, ParsedItem, RssSource,
+                          warn_if_not_a_feed)
 from sources.parse import SEASON_CN, candidate_names, clip_title, parse_title, quarter_of
 
 log = logging.getLogger("autorss")
@@ -150,12 +151,11 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
     """
     url = f"{config.MIKAN_BASE}/RSS/Bangumi?bangumiId={mikan_id}"
     feed = feedparser.parse(await fetch.get_bytes(client, url))   # 带上限+总超时，理由同 RssSource.fetch
-    if feed.bozo:
-        # 【与 RssSource.fetch 同口径】feed 结构坏掉（站点改版、返回错误页）时表现同样是"0 条"，
-        # 没有这行告警就没人知道为什么。这是本文件的【第三条】RSS 解析路径——
-        # 番剧那两条已经合并进 RssSource，它因为语义不同（剧场版不过滤、允许 -1/-2 集号）留在这里，
-        # 所以那次合并修好的几件事要手动同步过来。
-        log.warning("Mikan 番组 %s 的种子 Feed 解析异常（bozo），尽力处理已解析条目", mikan_id)
+    # 【与 RssSource.fetch 同口径，判据只此一份】这是本文件的【第三条】RSS 解析路径——
+    # 番剧那两条已经合并进 RssSource，它因为语义不同（剧场版不过滤、允许 -1/-2 集号）留在这里，
+    # 所以那次合并修好的几件事要手动同步过来。判据一旦各写各的就一定会再漂一次，
+    # 故抽成 base.warn_if_not_a_feed（"bozo 不够、要连 version 一起看"的理由写在那里）。
+    warn_if_not_a_feed(feed, f"Mikan 番组 {mikan_id} 的种子 Feed")
     items: list[ParsedItem] = []
     for entry in feed.entries:
         try:

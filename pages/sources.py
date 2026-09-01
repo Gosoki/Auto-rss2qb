@@ -78,7 +78,7 @@ def render_sources() -> None:
                 with ui.row().classes("gap-2"):
                     ui.button("保存", icon="save",
                               on_click=_save(g.id, name, site, policy, priority, enabled, feed, subgroups, tfilter)
-                              ).props("color=primary unelevated")
+                              ).props("unelevated color=primary")
                     ui.button("删除", icon="delete",
                               on_click=_delete(g.id)).props("flat color=grey")
 
@@ -95,7 +95,7 @@ def render_sources() -> None:
             n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").classes("w-full")
             ui.button("添加", icon="add",
                       on_click=_add(n_name, n_site, n_policy, n_priority, n_feed, n_subgroups, n_tfilter)
-                      ).props("color=primary unelevated")
+                      ).props("unelevated color=primary")
 
     def _save(gid, name, site, policy, priority, enabled, feed, subgroups, tfilter):
         def h():

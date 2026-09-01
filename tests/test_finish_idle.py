@@ -111,6 +111,52 @@ def test_ambiguous_range_is_never_judged(clean_tables, make):
     assert A.is_finished(_a(clean_tables, aid), A.episode_coverage([aid]).get(aid, set())) is False
 
 
+def test_still_airing_is_never_judged(clean_tables, make):
+    """(R18) 一部 12 集的周更番，首播才过 8 周，它就是不可能已经播完 —— coverage 说满了也是假的。
+
+    这一条补的是 ambiguous_range 的另一半：那道守卫要求 `a.ep_offset` 非空，
+    也就是只在系统【已经学到 offset】时才说话；而两套编号并存最凶险的情形恰恰是没学到 offset
+    （一条都不折算、不按 (集号,源) 去重，库里生生躺着两套编号）。
+
+    真库实证：2026-08-31 06:47 那一轮 sweep 把两部 2026 年 7 月新番判成了完结——
+    anime#6（total=12、ep_offset=None、手里 1..33 集）与 anime#60（手里 1..20 集），
+    两部都只播了 8 周。加上本判据后全库回扫：挡下的正好就是这两部，其余 57 个候选零影响。
+    """
+    from datetime import date
+    recent = (date.today() - timedelta(weeks=8)).isoformat()
+    aid = make(12, [(i, "sent") for i in range(1, 13)], air_date=recent)
+    assert A.is_finished(_a(clean_tables, aid), A.episode_coverage([aid]).get(aid, set())) is False, \
+        "首播才 8 周的 12 集番被判成了完结"
+
+
+def test_finished_airing_is_still_judged(clean_tables, make):
+    """反向：已经播完的番照常判 —— 这道闸不能顺手把正常的完结判定一起挡了。"""
+    from datetime import date
+    old = (date.today() - timedelta(weeks=30)).isoformat()
+    aid = make(12, [(i, "sent") for i in range(1, 13)], air_date=old)
+    assert A.is_finished(_a(clean_tables, aid), A.episode_coverage([aid]).get(aid, set())) is True
+
+
+def test_unknown_air_date_keeps_the_old_behaviour(clean_tables, make):
+    """air_date 不明时不拦（老番/bgm 没给日期的都属于这一类），保持原行为。"""
+    aid = make(2, [(1, "sent"), (2, "sent")])          # make 不传 air_date
+    assert A.is_finished(_a(clean_tables, aid), A.episode_coverage([aid]).get(aid, set())) is True
+
+
+async def test_wrong_finish_flag_is_revoked(clean_tables, make, cfg):
+    """(R18) 上一版代码误判写下的 finished_at，下一轮巡检自己撤掉，不用人工改库。"""
+    from datetime import date
+    cfg(ANIME_FINISH_ENABLED=True)
+    recent = (date.today() - timedelta(weeks=8)).isoformat()
+    aid = make(12, [(i, "sent") for i in range(1, 13)], air_date=recent)
+    with clean_tables.get_session() as s:
+        s.get(Anime, aid).finished_at = datetime.now()
+        s.commit()
+    await A.sweep_finished()
+    with clean_tables.get_session() as s:
+        assert s.get(Anime, aid).finished_at is None, "误判的完结标记没有被撤销"
+
+
 def test_optout_is_never_judged(clean_tables, make):
     aid = make(2, [(1, "sent"), (2, "sent")], finish_optout=True)
     assert A.is_finished(_a(clean_tables, aid), A.episode_coverage([aid]).get(aid, set())) is False

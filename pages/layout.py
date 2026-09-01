@@ -69,8 +69,10 @@ ui.input.default_props("dense outlined")
 ui.number.default_props("dense outlined")
 ui.textarea.default_props("dense outlined")
 ui.switch.default_props("dense")
-# 按钮：no-caps 让拉丁文标签不被 Quasar 强制大写（中文看不出差别，混排时才显形，
-# 全站只有一处显式写了它 —— 属于"碰巧没人注意到"而不是"有意统一"）。
+# 按钮：no-caps 让拉丁文标签不被 Quasar 强制大写（中文看不出差别，混排时才显形）。
+# 【它是全局默认，调用点不要再写】写了也不会错，但会让角色词表里同一个角色出现两个名字
+#（"unelevated color=primary" 与 "…no-caps" 曾经各占 13 / 5 处，渲染出来一模一样）。
+# tests/test_ui_badge_style.py 的 _WIDGET_DEFAULTS 里登记了 button:{no-caps} 来守住这一条。
 ui.button.default_props("no-caps")
 
 # ---- 全站术语表：改文案前先看这里，UI 上同一个东西只能有一个叫法 ----
@@ -204,6 +206,35 @@ def kpi_cards(cards) -> None:
                         _card(card, grow=True)
 
 
+# 全站色板（Tailwind v4 的 oklch token，与 _HEAD_BADGE_CSS 里那批徽标底色同源）。
+# 【别再手写 sRGB 十六进制或 rgba()】pages/manual.py 曾经用的是 Tailwind **v3** 的老色号
+#（#22c55e / #60a5fa / #9ca3af），与全站 v4 的同名色不是同一个颜色；更别扭的是同一个盒子里
+# 底色用 v3 的绿、图标却用 Tailwind 类 text-green-400（走 v4），两种绿并排。
+_TOKENS = {
+    "blue": "70.7% 0.165 254.624",     # blue-400
+    "green": "72.3% 0.219 149.579",    # green-500
+    "red": "70.4% 0.191 22.216",       # red-400
+    "amber": "82.8% 0.189 84.429",     # amber-400
+    "grey": "70.7% 0.022 261.325",     # gray-400
+}
+
+
+def tint(token: str, alpha: float = 0.12) -> str:
+    """染色提示块的底色，全站唯一配方。
+
+    这个模式（一个带浅色底的圆角块，用来把一段提示从正文里拎出来）站里有 4 个实例，
+    曾经是 3 种配方：amber @ .12（oklch）、red @ .12（oklch）、green @ .10（rgba + 还多一条边框）、
+    blue @ .08（rgba、无边框）。透明度三档、色彩空间两种、边框有无不一 ——
+    同一个"提示块"在四个页面上看着像四个不同的东西。
+    """
+    return f"background:oklch({_TOKENS[token]} / {alpha})"
+
+
+def text_token(token: str) -> str:
+    """同一批 token 的前景色，给需要写死颜色的地方（如 CSS 字符串里）用。"""
+    return f"oklch({_TOKENS[token]})"
+
+
 def warn_banner(text: str) -> None:
     """全站唯一的警告块：amber-400 文字 + 同色 12% 底 + Material warning 图标。
 
@@ -212,7 +243,7 @@ def warn_banner(text: str) -> None:
     多行长文（如设置页那两条）图标顶部对齐、只有文字缩进换行。
     """
     with ui.row().classes("items-start gap-2 p-2 rounded w-full no-wrap").style(
-            "background:oklch(82.8% 0.189 84.429 / .12)"):   # amber-400 @ 12%
+            tint("amber")):
         # 图标压到与 text-sm 同高(20px)并锁行高，才能跟首行文字齐平、也不被长文挤掉
         ui.icon("warning").classes("text-amber-400 shrink-0").style(
             "font-size:20px;line-height:20px")
@@ -548,7 +579,9 @@ _HEAD_BASE_CSS = (
     "body{font-size:14px}"   # 基础字号 14px：没显式定大小的继承文字统一 14；番名单独 text-lg(18px)
     ".q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
     ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}"
-    ".q-table tbody td,.q-table thead th,.q-table .q-badge{font-size:14px}"
+    # 【这里不再列 .q-table .q-badge】徽标字号由下面 _HEAD_BADGE_CSS 里那条 !important 一处定，
+    # 留在这里只会变成"同一件事写在两处"——两处一旦漂开，表格里的徽标会和别处不一样大。
+    ".q-table tbody td,.q-table thead th{font-size:14px}"
     # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
     ".kpi-group{display:grid;gap:.75rem;grid-template-columns:repeat(2,minmax(0,1fr))}"
     "@media(min-width:860px){.kpi-group{grid-template-columns:repeat(var(--kpi-n,4),minmax(0,1fr))}}"
@@ -618,43 +651,53 @@ _HEAD_BADGE_CSS = (
     # 实心按钮同病：ui.colors 把 primary/negative 定成了同一档 blue-400/red-400，白字 2.6:1。
     # 只影响实心（bg-*）；flat/outline 用的是 text-*，不在此列。
     ".q-btn.bg-primary,.q-btn.bg-negative{color:#0b0d10!important}"
-    # 徽标字号统一 14px：此前列表/详情里的徽标是 12px、仪表盘的带 text-sm 是 14px，
-    # 同一个『待确认』在同一屏出现三种大小。字号不该由调用点各写各的。
-    # 【字号与行高必须一起定，只定字号是把同一件事改了一半】Tailwind 的 `text-sm` 同时设
-    # font-size(14px) 与 line-height(20px)：上一次只全局定了字号，于是带 text-sm 的 19 个徽标
-    # 行高 20px、其余 52 个吃 Quasar 的 `line-height:1`(=14px) —— 框高 24px vs 18px，
-    # 同一个『待确认』在同一屏仍是两种高度，只是不再是两种字号。
-    # inline-flex + align-items:center 把"字在框里居中"从"靠字体度量碰运气"变成布局保证：
-    # Quasar 原样式没有 display 规则、靠 vertical-align:baseline 定位，而中日文字形的
-    # ascent+descent 超过 1em，line-height:1 时字会偏低、上下留白不等。
-    # 定死这三条之后，调用点不必（也不该）再各写 text-sm —— 见 tests/test_ui_badge_style.py 的守卫。
-    # 【字号与行高必须一起定，只定字号是把同一件事改了一半】Tailwind 的 `text-sm` 同时设
-    # font-size(14px) 与 line-height(20px)：此前只全局定了字号，于是带 text-sm 的 31 个徽标
-    # 行高 20px、其余 40 个吃 Quasar 的 `line-height:1`(=14px)——框高 24px vs 18px，
-    # 同一个『待确认』在同一屏仍是两种高度，只是不再是两种字号。31 处调用点的 text-sm 已剥净。
+    # 【徽标的字号、行高、居中：三条必须一起定，只定字号是把同一件事改了一半】
+    # 此前列表/详情里的徽标是 12px、仪表盘的带 text-sm 是 14px，同一个『待确认』在同一屏三种大小。
+    # 而 Tailwind 的 `text-sm` 同时设 font-size(14px) 与 line-height(20px)：只全局定字号的那一版，
+    # 带 text-sm 的那批行高 20px、其余的吃 Quasar 的 `line-height:1`(=14px)——框高 24px vs 18px，
+    # 同一屏仍是两种高度，只是不再是两种字号。全站 71 处徽标的 text-sm 已剥净，
+    # 调用点不必（也不该）再各写字号，见 tests/test_ui_badge_style.py 的守卫。
     #
-    # 【!important 的真实理由：压 Tailwind，不是压 Quasar】——这一段曾经写错过，更正如下。
-    # NiceGUI 的 templates/index.html 第 13 行声明了层序：
+    # 【层叠关系：这一段先后写错过两次，第三版逐条实测过，改之前先把实测重跑一遍】
+    # NiceGUI 的 templates/index.html 第 13 行【首先】声明了层序（层序由首次声明决定）：
     #     @layer theme, base, quasar, nicegui, components, utilities, overrides, quasar_importants;
-    # Quasar 的两份 CSS 是通过 `@import ... layer(quasar)` / `layer(quasar_importants)` 进层的
-    # ——**层是在 @import 那一侧指定的**，所以 grep 它的文件内容看不到任何 @layer，
-    # 据此断言"Quasar 不在任何层里"是错的（我错过一次）。
-    # 正确的推论是：
-    #   · 普通声明按层序，`overrides` 在 `quasar` 之后 → 本段【本来就压得过】Quasar 的
-    #     `.q-badge{font-size:12px;line-height:1}`，font-size 那条历来是生效的；
-    #   · !important 声明层序反向（早的层赢），`quasar_importants` 排在最末 = 优先级最低，
-    #     这正是下面那批背景色规则要带 !important 才压得过 Quasar `.bg-*` 的原因；
-    #   · 真正需要 !important 的是 **Tailwind**：它由 tailwindcss.min.js 在运行时注入，
-    #     **不属于任何层**，而无层级的普通声明【压过】所有有层级的。调用点只要写一个
-    #     `inline-block` / `text-sm`，就能把本段的 display / font-size 顶掉。
-    # 所以这四条保留 !important，但理由是"挡住调用点顺手加的 Tailwind 工具类"，
-    # 而不是原先写的"否则压不过 Quasar"。
+    #
+    # ① Quasar 的两份 CSS 通过 `@import ... layer(quasar)` / `layer(quasar_importants)` 进层
+    #    ——**层是在 @import 那一侧指定的**，所以 grep 它的文件内容看不到任何 @layer。
+    #    据此断言"Quasar 不在任何层里"是【错的】（第一版错在这里）。
+    # ② Tailwind 由 tailwindcss.min.js 在运行时注入，而它内嵌的样式表逐字写着
+    #    `@layer theme, base, components, utilities;` + `@import './utilities.css' layer(utilities)`
+    #    ——工具类【进 @layer utilities】。据此断言"Tailwind 不属于任何层、所以压过所有分层规则"
+    #    也是【错的】（第二版错在这里）。它那句重复的层序声明是 no-op，排序以 NiceGUI 那句为准。
+    # ③ 于是普通声明的实际强弱是：utilities(Tailwind) < overrides(本段) —— 也就是说
+    #    **本段的普通声明本来就压得过 Tailwind 工具类和 Quasar 的 .q-badge**，
+    #    下面 .q-badge 那五条 !important 在今天【一条都不需要】。留着无害（也挡得住万一的
+    #    行内样式），但别再拿"否则压不过 XX"当理由——那句话两个版本都是假的。
+    # ④ 真正非要 !important 不可的有两处，理由各不相同：
+    #    · 背景色那批：要压 Quasar 写在 `quasar_importants` 层里的 `.bg-*` !important。
+    #      !important 声明的层序是【反向】的（早声明的层赢），quasar_importants 排在最末＝最弱，
+    #      所以本层的 !important 赢得过它。
+    #    · `.q-btn.btn-sm`：Quasar 的 `size=` 渲染成【元素上的行内 style】，
+    #      而任何分层样式表规则都输给行内非 important 声明——只有 !important 压得住。
     #
     # inline-flex + align-items:center 把"字在框里居中"从"靠字体度量碰运气"变成布局保证：
     # Quasar 原样式没有 display 规则、靠 vertical-align:baseline 定位，而中日文字形的
     # ascent+descent 超过 1em，line-height 接近 1 时字会偏低、上下留白不等。
     ".q-badge{font-size:14px!important;line-height:1.45!important;"
     "display:inline-flex!important;align-items:center!important;justify-content:center!important}"
+    # ---- 按钮只有两档尺度，且【只在这里定】----
+    # 默认 14px（Quasar 的 md）＝面板级与主要操作；.btn-sm 12px ＝行内、密集行、元操作行。
+    #
+    # 【为什么必须是全局 CSS，而不是调用点的 size=sm】Quasar 的 `size=` 渲染成【行内
+    # font-size】（xs8 / sm10 / md14 / lg20 / xl24），而本项目要的 12px 不在这张表里——
+    # 于是 23 个按钮统统写成 `size=sm` 再叠一句 `.style("font-size:12px")` 把 10 掰回 12。
+    # 两层叠加的代价不是难看，是【同一个角色出现两种尺寸】：anime_detail 里同为
+    # `flat dense size=sm` 的按钮，一处被掰到 12px、一处 14px，全凭哪个调用点先写。
+    # 这与徽标那一节是同一条原则、同一次教训：尺度由全局定，调用点只选【角色】。
+    #
+    # !important 的理由也同上：要压的是 Quasar 写在元素上的行内 font-size
+    # （author !important 胜过 inline 非 important），以及调用点顺手加的 Tailwind 工具类。
+    ".q-btn.btn-sm{font-size:12px!important}"
     "}</style>")
 
 
@@ -666,7 +709,7 @@ def _db_down_notice(detail: str = "") -> None:
     """
     why = detail or db.data_down_reason() or "未知原因"
     with ui.column().classes("w-full gap-2 p-3 rounded").style(
-            "background:oklch(70.4% 0.191 22.216 / .12)"):        # red-400 @ 12%
+            tint("red")):
         with ui.row().classes("items-center gap-2 no-wrap"):
             ui.icon("error").classes("text-xl").style("color:oklch(70.4% 0.191 22.216)")
             ui.label("数据库连不上，系统已停摆").classes("text-base font-bold")
@@ -683,10 +726,10 @@ def _db_down_notice(detail: str = "") -> None:
                      "数据库恢复后 30 秒内自动接上，不用重启。").classes("text-xs text-gray-400")
         with ui.row().classes("gap-2 flex-wrap"):
             ui.button("立即重连", icon="refresh", on_click=_db_reconnect).props(
-                "unelevated color=primary no-caps").tooltip("马上探一次；通了就自动恢复并刷新本页")
+                "unelevated color=primary").tooltip("马上探一次；通了就自动恢复并刷新本页")
             ui.button("去设置页改数据库", icon="settings",
                       on_click=lambda: ui.navigate.to("/settings")).props(
-                "flat color=primary no-caps").tooltip(
+                "flat color=primary").tooltip(
                 "改连接参数，或手动『切回本地 SQLite』先用着（那是明确选择，不会悄悄发生）")
 
 
@@ -720,9 +763,18 @@ async def _db_reconnect() -> None:
     ui.navigate.reload()
 
 
-# 长操作的按钮状态：全站唯一一份。
-# 【为什么要收成一份】站里本来有三种各自正确的写法（备份按钮的 loading、『重新激活』的
-# 模块级 busy 标志、『立刻刷新』的 sync_busy 预判），但它们各自只落在一两处，
+# 长操作的按钮状态：全站的【默认写法】，16 个调用点。
+# 【"唯一一份"是句假话，别再这么写】此前这里写的是"全站唯一一份"，而实际另有几种并存，
+# 每种都有自己的理由，但对用户呈现的是"有的按钮会转圈、有的不会"：
+#   · settings『立刻备份』——手写 btn.props("loading") + try/finally（它要在 finally 里
+#     刷新备份列表，且成功/失败的 toast 文案各不相同，收编进来反而绕）；
+#   · settings『重新激活全部任务』/ anime『重新识别(批量)』/ anime_detail『补齐』——
+#     各自一个模块级 busy 字典/集合，去重粒度是【按对象】（按番、按源）而不是按按钮，
+#     busy_action 的单一 key 表达不了；
+#   · movies『立即扫描』——真正的并发保险在服务端 worker._scan_lock（页面级防抖挡不住
+#     后台自动扫描和第二个标签页），但按钮上的 loading 已经补上了。
+# 也就是说：**去重粒度不是"这一个按钮"的场合可以不用它，但 loading 一律要有**。
+# 【为什么当初要收】站里本来有三种各自正确的写法，各自只落在一两处，
 # 而**十二个**同样耗时的按钮一件都没做：最长的是绑定 bgm / 重新识别那几个——
 # _RESOLVE_BUDGET 是 120 秒，期间按钮毫无反应，用户会连点，于是并发跑好几轮、
 # 重复弹搬迁确认框。异常兜底同理：NiceGUI 的 on_click 里逃出去的异常只进服务端日志，

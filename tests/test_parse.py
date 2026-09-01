@@ -541,3 +541,53 @@ def test_ep_fallback_only_excludes_years(raw, name, ep):
 def test_bracket_form_still_excludes_both(raw, ep):
     """括号写法维持原判据：裸写在方括号里的 1080 几乎必是分辨率。"""
     assert parse_title(raw)[3] == ep
+
+
+# ---------------- 「HTTP 200 但不是 RSS」的告警（R17） ----------------
+
+def test_warn_if_not_a_feed_catches_well_formed_non_feeds(caplog):
+    """(R17) bozo 一个人不够：良构的 XHTML 拦截页 / XML 维护页 / 空 body 都是 bozo=False。
+
+    这一类恰恰是最常见的『站点改版、被 Cloudflare 挡住、维护中』——而本项目最贵的一种故障
+    正是它：不报错，表现只是"这个源好几天没有新东西了"。用户看到的是中性的『0 条』。
+    """
+    import feedparser
+
+    from sources.base import warn_if_not_a_feed
+
+    silent_before = [
+        ("XHTML 拦截页", b'<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml">'
+                         b'<head><title>Attention Required</title></head><body>x</body></html>'),
+        ("XML 维护页", b'<?xml version="1.0"?><maintenance><msg>down</msg></maintenance>'),
+        ("空 body", b""),
+    ]
+    for what, body in silent_before:
+        feed = feedparser.parse(body)
+        assert not feed.bozo, f"{what} 的前提变了（bozo 现在会响），这条用例要重写"
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            warn_if_not_a_feed(feed, "某源")
+        assert any("不是 RSS/Atom" in r.getMessage() for r in caplog.records), \
+            f"{what} 一声不吭：{caplog.records}"
+
+
+def test_warn_if_not_a_feed_is_quiet_on_a_real_feed(caplog):
+    import feedparser
+
+    from sources.base import warn_if_not_a_feed
+    feed = feedparser.parse(b'<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>'
+                            b'<item><title>a</title></item></channel></rss>')
+    with caplog.at_level("WARNING"):
+        warn_if_not_a_feed(feed, "某源")
+    assert caplog.records == [], caplog.records
+
+
+def test_both_rss_paths_use_the_shared_predicate():
+    """(R17) 判据只此一份。两条解析路径各写各的 bozo 检查是本项目漂过一次的地方。"""
+    import pathlib
+    for f in ("sources/base.py", "sources/mikan.py"):
+        src = pathlib.Path(f).read_text()
+        assert "feedparser.parse" not in src or "warn_if_not_a_feed" in src, \
+            f"{f} 解析了 feed 却没走共用判据"
+    mikan = pathlib.Path("sources/mikan.py").read_text()
+    assert "feed.bozo" not in mikan, "mikan 又自己写了一份 bozo 判据"

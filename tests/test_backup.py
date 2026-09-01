@@ -241,14 +241,143 @@ def test_scope_is_not_full_when_the_business_db_is_configured_as_mysql(tmp_path,
         f"note 要说清源组也不在备份里：{rep['note']}"
 
 
-def test_meta_note_does_not_claim_source_groups_are_backed_up(tmp_path, monkeypatch):
-    """meta 备份的说明不能把『源组』算进去——sourcegroup 是业务表，不在 META_TABLES 里。"""
+def test_meta_note_does_not_claim_source_groups_are_backed_up(tmp_path, monkeypatch,
+                                                              clean_tables):
+    """(R17) meta 备份的说明必须按【文件里实际有什么】写，不能按 scope 标签写。
+
+    早先写死的是"只备了 settings 一张表"，而备份动作恒为对本地库整文件 VACUUM INTO——
+    切到 MySQL 【不会】删掉本地已有的业务表（switch_data_engine 明写"只切连接，不搬数据"）。
+    于是这句话在"切过 MySQL 的库"上是假话，而且是危险的假话：用户照着它以为番剧数据
+    没备到，把这份文件当垃圾删掉——那可能是 MySQL 迁移出问题后唯一剩下的一份番剧数据。
+    """
     import config
 
     from db import backup as B
 
     monkeypatch.setattr(B, "BACKUP_DIR", tmp_path)
     monkeypatch.setitem(config._v, "DB_BACKEND", "mysql")
+
+    # ① 本地确实没有业务数据：那就照直说，并且要点名源组也不在里面
     note = B.backup_now(keep=3)["note"]
-    assert "只备了 settings" in note
-    assert "源组" in note and note.index("源组") > note.index("不在其中") - 200
+    assert "只备到了全局设置" in note, note
+    assert "源组" in note and "不在其中" in note, note
+
+    # ② 本地还留着业务数据：不许再说"只有全局设置"，要把数目报出来
+    with clean_tables.get_session() as s:
+        s.add(Anime(title="切 MySQL 之前留在本地的番", season=1))
+        s.commit()
+    note2 = B.backup_now(keep=3)["note"]
+    assert "只备到了全局设置" not in note2, f"文件里明明有番，却说只有全局设置：{note2}"
+    assert "番剧 1 部" in note2, note2
+    assert "旧数据" in note2, f"要说清这是切换前的旧数据、不是 MySQL 上的现状：{note2}"
+
+
+# ---------------- 标签不能替代内容（R17 的 P0） ----------------
+
+def test_verify_reports_what_is_inside_not_just_table_count(clean_tables, fresh_backup_dir):
+    """(R17) "可用"这两个字必须连内容一起说。
+
+    最要命的那条路：把一份【没有业务数据】的备份恢复到有 99 部番的库上——
+    verify 说可用、pragma quick_check 说 ok、启动日志正常、is_data_down=False，
+    而番全没了。"N 张表"对用户没有任何意义（空库和满库都是 9 张表），
+    "番剧 0 部"才是唯一能拦住人的那句话。
+    """
+    with clean_tables.get_session() as s:
+        s.add(Anime(title="番", season=1))
+        s.commit()
+    ok, why = B.verify(B.backup_now(keep=3)["path"])
+    assert ok and "番剧 1 部" in why, why
+
+    with clean_tables.get_session() as s:
+        s.delete(s.exec(select(Anime)).one())
+        s.commit()
+    ok2, why2 = B.verify(B.backup_now(keep=3)["path"])
+    assert ok2, why2
+    assert "无业务数据" in why2, f"空库也只说『可用（N 张表）』，拦不住任何人：{why2}"
+
+
+def test_badge_follows_content_not_filename(clean_tables, fresh_backup_dir, monkeypatch):
+    """(R17) 页面徽标的判据是 has_data（现场数出来的），不是文件名里的 scope。
+
+    两个方向都会骗人：
+    · 一个刚建好、还没跑过业务的库标 full，里面一行数据都没有；
+    · 切了 MySQL 之后标 meta 的那份里，往往还躺着整套（旧的）番剧数据。
+    实测在用户自己的机器上就有 4 份标着 full 的备份，业务数据是 0 —— 按 scope 上绿标。
+    """
+    import config
+    empty = B.backup_now(keep=9)                       # 空库 + 本地 SQLite → scope=full
+    assert empty["scope"] == "full"
+    with clean_tables.get_session() as s:
+        s.add(Anime(title="番", season=1))
+        s.commit()
+    monkeypatch.setitem(config._v, "DB_BACKEND", "mysql")
+    withdata = B.backup_now(keep=9)                    # 有数据 + 配置成 MySQL → scope=meta
+    assert withdata["scope"] == "meta"
+
+    by_name = {d["name"]: d for d in B.list_backups()}
+    assert by_name[Path(empty["path"]).name]["has_data"] is False, \
+        "标着 full 的空备份被标成了『配置+业务』——照着它恢复就是清库"
+    assert by_name[Path(withdata["path"]).name]["has_data"] is True, \
+        "标着 meta 的备份里其实有整套番，却被标成『仅配置』——用户会把它当垃圾删掉"
+
+
+def test_peek_survives_a_broken_file(tmp_path):
+    """内容读不出来时不能抛——这几个函数挂在页面渲染路径上。"""
+    junk = tmp_path / "junk.db"
+    junk.write_bytes(b"not a database at all")
+    assert B._peek(str(junk)) == {}
+    assert B.describe_content(str(junk)) == "内容读不出来"
+    assert B.has_business_data(str(junk)) is False
+    assert B.has_business_data(str(tmp_path / "根本不存在.db")) is False
+
+
+def test_prune_never_deletes_the_last_backup_that_has_data(clean_tables, fresh_backup_dir):
+    """(R18) 唯一一份救得回数据的备份不能被"最旧的"这条规则删掉。
+
+    R17 把"别信文件名里的 scope、现场数行数"推到了三处【读】的地方，
+    却没推到 prune —— 而那是整个模块里唯一会删【已经存在、之前验过】的备份的地方。
+    后果链：库被误恢复/误清空之后，auto_tick 每天照常产出一份"可用、quick_check ok、
+    scope=full"的【空】备份并记 BACKUP_LAST，BACKUP_KEEP 天之后 prune 就把唯一那份
+    还救得回数据的当成"最旧的"删掉，留下一整排空的。
+    用户机器上此刻就躺着 4 份标着 full、业务数据为 0 的备份，所以这不是假想。
+    """
+    import os
+    import shutil
+    import time
+
+    from sqlmodel import delete
+
+    def _stamp(src, name, age_days):
+        """把一份备份另存成指定文件名与 mtime。
+
+        【不能连着调 backup_now 靠它自己命名】文件名精确到秒（autorss-{scope}-%Y%m%d-%H%M%S.db），
+        一秒内连做几份会同名、被 os.replace 互相覆盖——写这条用例时就这么栽了一次：
+        『最旧的那份』还在，内容却已经是后来那份空的。
+        """
+        dst = fresh_backup_dir / name
+        shutil.copy(src, dst)
+        os.utime(dst, (time.time() - age_days * 86400,) * 2)
+        return str(dst)
+
+    with clean_tables.get_session() as s:
+        s.add(Anime(title="唯一一份还救得回来的番", season=1))
+        s.commit()
+    src_full = B.backup_now(keep=99)["path"]
+    good = _stamp(src_full, "autorss-full-20260820-090000.db", 9)   # 有数据，且做成最旧的
+
+    with clean_tables.get_session() as s:                            # 库被清空了
+        s.exec(delete(Anime))
+        s.commit()
+    src_empty = B.backup_now(keep=99)["path"]
+    empties = [_stamp(src_empty, f"autorss-full-2026082{i}-09000{i}.db", 8 - i) for i in range(1, 9)]
+    for p in (src_full, src_empty):                                  # 只留下我们摆好的那 9 份
+        Path(p).unlink(missing_ok=True)
+
+    assert B.has_business_data(good) and not any(B.has_business_data(e) for e in empties), \
+        "前提没摆对：救生艇必须是唯一一份有数据的"
+
+    B.prune(keep=3)
+    left = {d["path"]: d for d in B.list_backups()}
+    assert good in left, "唯一一份有数据的备份被 prune 当成『最旧的』删掉了"
+    assert sum(1 for d in left.values() if d["has_data"]) == 1
+    assert len(left) == 4, f"救生艇不该让保留份数失控（keep=3 + 1 艘）：{sorted(left)}"

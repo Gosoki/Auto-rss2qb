@@ -10,6 +10,22 @@ import services.notify as N
 from sqlmodel import select
 
 
+def _fresh():
+    """把模块级状态清成刚 import 的样子。
+
+    【不能用 notify.reset_state()】那是【生产语义】的重置（用户保存设置时调），它【故意】
+    不碰状态记忆与限流账本——理由写在它自己的 docstring 里。用它当测试夹具的话，
+    上一条用例留下的 _state_now 会渗进下一条，而且这两套语义一旦被同一个函数承担，
+    以后谁想收窄生产那边就会被一堆用例挡住。夹具要的是"干净的进程"，直接清就好。
+    """
+    N._last_sent.clear()
+    N._state_now.clear()
+    N._sent_times.clear()
+    N._state_times.clear()
+    N._dropped = 0
+    N._fail_streak, N._muted_until = 0, 0.0
+
+
 @pytest.fixture
 def sent(monkeypatch, cfg):
     box = []
@@ -21,9 +37,9 @@ def sent(monkeypatch, cfg):
     monkeypatch.setattr(N, "notify", fake)
     cfg(NOTIFY_URL="http://push.example/key", NOTIFY_MAX_PER_HOUR=0,
         NOTIFY_EVENTS=list(N.EVENTS))
-    N.reset_state()
+    _fresh()
     yield box
-    N.reset_state()
+    _fresh()
 
 
 # ---------------- 订阅过滤 ----------------
@@ -109,7 +125,7 @@ async def test_rate_limit_drops_and_reports(sent, cfg):
     assert len(sent) == 2, "超过上限的要丢掉"
     cfg(NOTIFY_MAX_PER_HOUR=0)          # 放开后，下一条要带上"你有几条没收到"
     await N.event("delivered", "又一集")
-    assert "被限流丢弃" in sent[-1]
+    assert "没能送到" in sent[-1]
 
 
 async def test_rate_limit_off_by_zero(sent, cfg):
@@ -119,12 +135,44 @@ async def test_rate_limit_off_by_zero(sent, cfg):
     assert len(sent) == 30
 
 
-async def test_reset_state_clears_memory(sent):
-    """用户改完通知设置就该立刻看到效果，而不是等冷却过期或状态再翻转一次。"""
-    await N.state("qb_down", True, "掉线", "恢复")
+async def test_reset_state_clears_cooldown_not_state_memory(sent, cfg):
+    """保存设置 = 清冷却与熔断，【不】清状态记忆与限流账本。
+
+    冷却：用户改完开关就该立刻看到效果，而不是等 6 小时窗口过期。
+    状态记忆：清了它，"坏→好"那次翻转会退化成 state() 里"只记不发"的 None→好 那一支，
+    于是一次不相干的保存就把『qB 已恢复』整条吃掉（边沿要等故障【还在持续】才自愈，
+    保存恰好落在故障刚结束那几秒时就真的没了）。
+    限流账本：桶容量是现读 config 的，改大改小立刻生效；清账本等于"点几次保存就能绕过上限"。
+    """
+    # 冷却清掉了 → 同一条能立刻再发
+    await N.event("failed", "1 条失败", key="k", cooldown=3600)
+    await N.event("failed", "1 条失败", key="k", cooldown=3600)
+    assert len(sent) == 1, "冷却应当挡住第二条"
     N.reset_state()
+    await N.event("failed", "1 条失败", key="k", cooldown=3600)
+    assert len(sent) == 2, "保存设置后冷却应当清掉"
+
+    # 状态记忆留着 → 保存不会把『已恢复』吃掉
+    sent.clear()
     await N.state("qb_down", True, "掉线", "恢复")
-    assert len(sent) == 2
+    assert sent == ["🔌掉线"]
+    N.reset_state()                       # 用户此刻在设置页点了保存
+    await N.state("qb_down", False, "掉线", "恢复")
+    assert sent == ["🔌掉线", "🔌恢复"], f"『已恢复』被一次保存吃掉了：{sent}"
+
+    # 限流账本留着 → 连点保存不能刷额度
+    # 【改配置一律走 cfg 夹具】config 的读取是模块级 __getattr__ → _v；直接 `config.X = v`
+    # 会在模块上创建一个真属性，从此【永久遮蔽】__getattr__，函数末尾改回去也没用——
+    # 后面所有用例的 cfg(X=...) 全部静默失效。写这条用例时就这么踩了一次。
+    sent.clear()
+    N._sent_times.clear()
+    cap = 2
+    cfg(NOTIFY_MAX_PER_HOUR=cap)
+    for i in range(cap):
+        await N.event("delivered", f"第{i}集")
+    N.reset_state()
+    await N.event("delivered", "刷额度")
+    assert len(sent) == cap, f"保存一次设置就把限流额度刷掉了：{sent}"
 
 
 def test_event_keys_are_stable():
@@ -368,3 +416,207 @@ async def test_concurrent_flips_push_only_once(sent, cfg, monkeypatch):
     slow.set()
     await asyncio.gather(t1, t2)
     assert len(sent) == 1, f"同一次翻转推了 {len(sent)} 条"
+
+
+# ---------------- 限流记账的时机 / 黑洞地址熔断（R17） ----------------
+
+async def test_failed_sends_do_not_burn_the_hourly_quota(monkeypatch, cfg):
+    """(R17) 桶按【送达】记账，不按【尝试】记账。
+
+    用户口径就是"每小时最多收到几条"（设置页标签）与"另有 N 条没能送到"（消息尾巴）——
+    两句说的都是收到几条。早先是先 append 再 await：推送服务抖一下、连着失败 N 条，
+    用户一条没收到，一小时的额度却烧光了，接下来真正该送达的告警全被自己的桶挡在门外。
+    """
+    _fresh()
+    box, alive = [], [False]
+
+    async def fake(msg):
+        if not alive[0]:
+            return False              # 推送服务抖动中
+        box.append(msg)
+        return True
+    monkeypatch.setattr(N, "notify", fake)
+    cfg(NOTIFY_URL="http://push.example/key", NOTIFY_MAX_PER_HOUR=3,
+        NOTIFY_EVENTS=list(N.EVENTS))
+    for i in range(3):
+        assert await N.event("delivered", f"抖动期第{i}集") is False
+    alive[0] = True
+    for i in range(3):
+        assert await N.event("delivered", f"恢复后第{i}集") is True, "额度被失败的那几条烧掉了"
+    assert len(box) == 3
+    assert await N.event("delivered", "第4条") is False, "送达 3 条之后桶就该满"
+    _fresh()
+
+
+async def test_dropped_counter_is_restored_whole(monkeypatch, cfg):
+    """(R17) 发送失败时"另有 N 条没能送到"要【原样】还回去，不能塌成 1。
+
+    塌成 1 之后用户看到的是"偶尔漏一条"，于是永远不会想到去调大 NOTIFY_MAX_PER_HOUR，
+    而实际漏的是几十条。低报比不报更有误导性。
+    """
+    _fresh()
+    box, alive = [], [True]
+
+    async def fake(msg):
+        if not alive[0]:
+            return False
+        box.append(msg)
+        return True
+    monkeypatch.setattr(N, "notify", fake)
+    cfg(NOTIFY_URL="http://push.example/key", NOTIFY_MAX_PER_HOUR=1,
+        NOTIFY_EVENTS=list(N.EVENTS))
+    await N.event("delivered", "占掉额度")
+    for i in range(9):
+        await N.event("delivered", f"被丢的第{i}条")
+    assert N._dropped == 9
+    N._sent_times.clear()                 # 一小时过去了，桶空了
+    alive[0] = False
+    assert await N.event("delivered", "这条发失败") is False
+    assert N._dropped == 9, f"失败一次就把 9 条塌成了 {N._dropped} 条"
+    alive[0] = True
+    await N.event("delivered", "这条成功")
+    assert box[-1].endswith("（另有 9 条没能送到）"), box[-1]
+    _fresh()
+
+
+async def test_black_hole_url_stops_being_dialed(monkeypatch, cfg):
+    """(R17) 推送地址变成黑洞时要熔断——否则每条通知都白等满 NOTIFY_TIMEOUT，
+    而 notify() 就串在交付主链路上（每交付一集一条 await），一轮 flush 会被拖成 N × 超时。
+
+    桶救不了这件事：桶只在送达时记账，发不出去的那条一枚令牌都不占。
+    """
+    _fresh()
+    tries = []
+
+    async def fake_send(msg, base=""):
+        tries.append(msg)
+        return False                      # 永远发不出去
+    monkeypatch.setattr(N, "_send_once", fake_send)
+    cfg(NOTIFY_URL="http://black.hole/key", NOTIFY_MAX_PER_HOUR=0,
+        NOTIFY_EVENTS=list(N.EVENTS))
+    for i in range(20):
+        assert await N.notify(f"第{i}条") is False
+    assert len(tries) == N._FAIL_MUTE_AFTER, \
+        f"熔断后还在拨号：发了 {len(tries)} 次网络请求"
+
+    N.reset_state()                       # 用户改完 NOTIFY_URL 点了保存
+    await N.notify("改完地址第一条")
+    assert len(tries) == N._FAIL_MUTE_AFTER + 1, "保存设置应当立刻解除熔断"
+    _fresh()
+
+
+async def test_one_success_clears_the_fail_streak(monkeypatch, cfg):
+    """连续失败的计数要被一次成功清零——否则一天里零星失败 5 次就把推送闭嘴 5 分钟。"""
+    _fresh()
+    alive = [False]
+
+    async def fake_send(msg, base=""):
+        return alive[0]
+    monkeypatch.setattr(N, "_send_once", fake_send)
+    cfg(NOTIFY_URL="http://push.example/key", NOTIFY_MAX_PER_HOUR=0,
+        NOTIFY_EVENTS=list(N.EVENTS))
+    for _ in range(N._FAIL_MUTE_AFTER - 1):
+        await N.notify("失败")
+    alive[0] = True
+    assert await N.notify("成功") is True
+    assert N._fail_streak == 0
+    alive[0] = False
+    for _ in range(N._FAIL_MUTE_AFTER - 1):
+        assert await N.notify("再失败") is False
+    assert N._muted_until == 0.0, "没到连续 %d 次就熔断了" % N._FAIL_MUTE_AFTER
+    _fresh()
+
+
+async def test_state_event_with_no_ok_message_burns_no_token(sent):
+    """"只记不发"的那两支不能扣状态桶的令牌——它们连请求都没发出去。
+
+    扣了的话，一个 ok_msg 为空的状态型事件会靠"一切正常"这件事本身消耗抖动预算。
+    """
+    _fresh()
+    for i in range(N._STATE_CAP_PER_HOUR + 2):
+        await N.state("qb_down", True, "掉线")      # 无 ok_msg
+        await N.state("qb_down", False, "掉线")     # 只记不发
+    assert len(N._state_times.get("qb_down", [])) == len(sent), \
+        "扣的令牌数应当等于真的推出去的条数"
+    _fresh()
+
+
+async def test_muted_messages_are_counted_too(monkeypatch, cfg):
+    """(R18) 熔断期丢掉的条数也要记账，否则它比限流还隐形。
+
+    桶是按【送达】记账的，所以熔断期间 _rate_ok() 恒通过、_dropped 恒为 0 ——
+    用户既收不到通知，也不会在任何一条消息尾巴上看到"有几条没送到"，
+    唯一痕迹是日志里那一行 warning。而通知本来就是给不看日志的人用的。
+    """
+    _fresh()
+    alive = [False]
+    sent = []
+
+    async def fake_send(msg, base=""):
+        if not alive[0]:
+            return False
+        sent.append(msg)
+        return True
+    monkeypatch.setattr(N, "_send_once", fake_send)
+    cfg(NOTIFY_URL="http://black.hole/key", NOTIFY_MAX_PER_HOUR=0, NOTIFY_EVENTS=list(N.EVENTS))
+
+    for i in range(N._FAIL_MUTE_AFTER):                  # 先把熔断烧出来
+        await N.event("delivered", f"失败{i}")
+    assert N._muted_until > 0
+    burned = N._dropped
+    for i in range(7):                                   # 熔断期又来了 7 条
+        assert await N.event("delivered", f"熔断期{i}") is False
+    assert N._dropped == burned + 7, \
+        f"熔断期丢掉的没有记账：{N._dropped} vs {burned + 7}"
+
+    N.reset_state()                                      # 用户改完地址点了保存
+    alive[0] = True
+    await N.event("delivered", "恢复后第一条")
+    assert sent[-1].endswith(f"（另有 {burned + 7} 条没能送到）"), sent[-1]
+    _fresh()
+
+
+async def test_test_button_does_not_touch_cooldowns_or_global_config(monkeypatch, cfg):
+    """(R18) 『发送测试通知』自称"只验证、不改变任何状态"，就得真的做到两件事：
+
+    ① 不清冷却 —— reset_state 会把 failed/stalled 的 6 小时窗口与 finished 的 7 天窗口一起清掉，
+       点一下测试按钮，下一轮巡检就可能把一模一样的告警再推一遍。
+    ② 不改全局 NOTIFY_URL —— 早先是临时换掉、await 完再换回来，而那段窗口最长有
+       NOTIFY_TIMEOUT，期间任何后台协程发出的通知都会被送到这个还没保存、可能填错的地址上。
+    """
+    _fresh()
+    got = []
+
+    async def fake_send(msg, base=""):
+        got.append(base)
+        return True
+    monkeypatch.setattr(N, "_send_once", fake_send)
+    cfg(NOTIFY_URL="http://saved.example/key", NOTIFY_MAX_PER_HOUR=0, NOTIFY_EVENTS=list(N.EVENTS))
+
+    await N.event("failed", "1 条失败", key="k", cooldown=3600)
+    assert len(got) == 1
+
+    N.clear_mute()                                    # 按钮处理器现在只调这一个
+    await N.notify("测试", url_override="http://typed-in-the-box/xyz")
+    assert got[-1] == "http://typed-in-the-box/xyz", "没有用框里那个地址"
+    import config as C
+    assert C.NOTIFY_URL == "http://saved.example/key", "全局 NOTIFY_URL 被改动了"
+
+    n = len(got)
+    await N.event("failed", "1 条失败", key="k", cooldown=3600)
+    assert len(got) == n, "冷却窗口被测试按钮清掉了，同一条告警会重推"
+    _fresh()
+
+
+def test_the_test_button_uses_the_narrow_reset():
+    """守住调用点：设置页那个按钮必须调 clear_mute，不能退回 reset_state。"""
+    import pathlib
+    src = pathlib.Path("pages/settings.py").read_text(encoding="utf8")
+    seg = src[src.index("async def _test_notify"):src.index("async def _test_notify") + 2200]
+    # 【只看代码，不看注释】第一版把注释一起扫了，于是解释"为什么不用 reset_state"的那句话
+    # 自己把用例判红了——静态守卫扫源码时这是最常见的自伤。
+    code = "\n".join(l.split("#", 1)[0] for l in seg.splitlines() if not l.strip().startswith("#"))
+    assert "notify.clear_mute()" in code, "测试按钮没走窄的那个重置"
+    assert "reset_state" not in code, "测试按钮又清掉了冷却窗口"
+    assert "url_override=" in code, "测试按钮又去改全局 NOTIFY_URL 了"
+    assert '_v["NOTIFY_URL"]' not in code

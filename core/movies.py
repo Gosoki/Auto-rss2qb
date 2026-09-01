@@ -93,14 +93,25 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         # 而这个 mikan_id 又可能正挂在一部"早期扫进来、当时没识别出 bgm"的旧行上。
         # 不先摘就是 IntegrityError——加约束之前那只是多一行重复（观感问题），
         # 加约束之后会变成"这部片每一轮扫描都失败"，而日志只有一行『处理剧场版失败』。
-        # 摘掉之后，若两行本就是同一部（同 bgm_id），下面的身份守卫会把它合并掉；
-        # 不是同一部则那行只是失去 Mikan 链接，数据仍在（重扫该年份会重新补上）。
+        # 摘掉之后怎么收场，分两种：
+        # · 被摘的那行有 bgm_id 且与本行相同 → 下面的身份守卫合并掉，没问题。
+        # · 被摘的那行【没有 bgm_id】→ 它就此变成"无 mikan_id、无 bgm_id、却挂着种子"的
+        #   孤儿：『刷新版本』按钮要 mikan_id，被禁用；重扫该年份也捞不回来——重扫会把这个
+        #   mikan_id 认到【keeper】身上，孤儿永远等不到自己的那一轮。
+        #   （这里原本写着"重扫该年份会重新补上"，那是假话。）
+        #   两行先后引用过同一个 mikan_id，说明 Mikan 的这个番组【现在】被认到了 keeper 身上。
+        #   （注意 mikan_id 有唯一约束，两行不可能【同时】持有同一个值，所以"共用"只是先后关系，
+        #   "它们是同一部片"这件事并没有被证明——下面因此只合并"还没下过东西"的那种。）
+        #   合并在 commit 之后做：新建时 movie.id 此刻还是 None，_merge_movie 需要 keeper id。
+        stolen_from: list[int] = []
         for other in list(s.exec(select(Movie).where(Movie.mikan_id == mikan_id))):
             if movie.id is None or other.id != movie.id:
                 # 注意不能写进 SQL 的 Movie.id != movie.id：新建时 movie.id 还是 None，
                 # `id != NULL` 在 SQL 里恒为 NULL，一行都选不出来。
                 other.mikan_id = None
                 s.add(other)
+                if other.bangumi_id is None:
+                    stolen_from.append(other.id)
         s.flush()      # 【先把"摘掉"落下去】否则 flush 顺序不保证，可能先发出本行的 UPDATE
                        # 再发旧行的，中间那一瞬两行同值 —— 唯一索引照样 1062。
         movie.mikan_id = mikan_id
@@ -131,6 +142,30 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
             for other in list(s.exec(select(Movie).where(
                     Movie.bangumi_id == movie.bangumi_id, Movie.id != movie.id))):
                 _merge_movie(s, other.id, movie.id)
+        # 【别把被摘走 mikan_id 的无主行丢在原地】理由见上面摘 mikan_id 那段。
+        # 【但只并"还没下过东西"的那种】——这道限制不能省，我第一版就漏了：
+        # _merge_movie 的保险是"**两边都**下过就拒绝"，而这条新路径上 keeper 的典型情形恰恰是
+        # "刚按 bgm 命中、一份都没下过"，于是保险在 `loser 下过 / keeper 没下过` 这一半上恒为假，
+        # 而那正是代价最大的一半：_merge_movie 最后一步是 s.delete(loser)，
+        # 丢掉的是 Movie 整行（title/quarter/jp_name/display_name 与全部 bgm 元数据），
+        # 页面上那部片直接消失、版本挂到另一部名下，不可逆，且日志里一个字都没有。
+        # （种子行会跟过去、save_path 保留、盘上文件不打空——丢的是"这是哪部片"这件事。）
+        #
+        # 【为什么不改 _merge_movie 而是在这里限制】那道保险服务的是"同 bgm_id 裂成两行"的场景，
+        # 那里两行【确实】是同一部片，loser 有文件时并过去是正确的修复。而这条路径不一样：
+        # 两行只是先后引用过同一个 mikan_id（mikan_id 有唯一约束，不可能同时持有），
+        # "它们是同一部片"这件事没有被证明过。作用域不同的两件事，别共用一道闸。
+        for oid in stolen_from:
+            other = s.get(Movie, oid)
+            if other is None or other.bangumi_id is not None:
+                continue
+            if _has_handled_torrents(s, oid):
+                log.warning("剧场版 %s（%s）的 Mikan 链接被 %s 取走，而它已经下过东西——"
+                            "不合并、保留该行以免删掉你已有的片；它会以『无 Mikan 链接』的样子"
+                            "留在 /movies 上，可到『待识别』手动绑 bgm 后由身份守卫合并",
+                            oid, other.display_name or other.title, movie.id)
+                continue
+            _merge_movie(s, oid, movie.id)
         return movie.id, is_new
 
 
@@ -549,6 +584,7 @@ async def enrich_movie(movie_id: int) -> bool:
                    .order_by(MovieTorrent.created_at.desc())).first()
         names = [n for n in (m.display_name, m.jp_name, m.title) if n]
         info_hash = t.info_hash if t else None
+        bgm_before = m.bangumi_id      # 见下面 await 之后的那道 compare-and-set
     # 【不传 release_time】那是【种子上架日】，不是【首映日】。剧场版的 BD/WEB 版普遍在首映后
     # 6~18 个月才发，把上架日当首映日去做日期校验，会把正确的 subject 判成"日期对不上"而排除，
     # 转而命中同系列的【另一部】（续作/重制版往往就在那个年份）。而下面紧接着就是
@@ -560,6 +596,20 @@ async def enrich_movie(movie_id: int) -> bool:
         m = s.get(Movie, movie_id)
         if m is None:
             return False
+        # 【await 期间别人改了 bangumi_id 就让路】与番剧侧 core.anime.enrich_anime 同一道闸——
+        # 那边修好之后【这边漏了】，是本项目最常见的广度错误（同一件事有两处，只改了一处）。
+        # enrich.resolve 的整体预算是 120 秒，是全项目最长的 await 窗口之一；原来这里只重取了
+        # 一次 m，挡住的是"这条记录在 await 期间被删了"，没挡"绑定在 await 期间变了"——
+        # 而 apply_bgm_meta 对 bangumi_id 是【无条件覆写】的，紧接着下面就是 _merge_movie，
+        # 它的最后一步是 s.delete(loser)：用户在同一个弹窗里点『重新识别』又点『绑定 bgm』填了
+        # 正确的 subject，几十秒后后台回来把它盖掉，还顺手删掉正主那一行（可能是已经下完的那部），
+        # UI 上弹的却是绿色的『识别成功 ✓』。
+        # 判据用 compare-and-set 而不是"有值就不覆盖"：『重新识别』本来就是"我要你重算"，
+        # 它读到的 bgm_before 与回来时相同、照常覆写；只有【第三方在这段窗口里改过】才让路。
+        if m.bangumi_id != bgm_before:
+            log.info("重新识别期间该片的 bgm 绑定已被改动（%s → %s），本次结果作废、以后者为准：%s",
+                     bgm_before, m.bangumi_id, m.display_name or m.title)
+            return m.bangumi_id is not None
         # 手动重识别：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
         engine.apply_bgm_meta(m, info, keep_path=False)
         s.add(m)

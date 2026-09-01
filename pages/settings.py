@@ -100,7 +100,7 @@ _QUARTER_PRESETS = {
 
 def _help(text: str) -> None:
     """标题旁的帮助 ⓘ：点击弹出说明（替代常驻灰色说明文，让页面更清爽）。"""
-    with ui.button(icon="help_outline").props("flat round dense size=sm color=grey"):
+    with ui.button(icon="help_outline").props("flat round dense color=grey").classes("btn-sm"):
         with ui.menu():
             ui.label(text).classes("text-xs text-gray-300 p-3").style(
                 "max-width:26rem;white-space:pre-line;line-height:1.6")
@@ -167,7 +167,8 @@ def _backup_panel(f: dict) -> None:
     """
     _section("自动备份", "整库快照（VACUUM INTO，不是拷文件——本项目的 SQLite 开着 WAL，"
                          "直接拷主文件会拿到一份看着正常、其实缺最近写入的库）。"
-                         "业务库切到 MySQL 时这里只备得到配置，页面会明确标出来。")
+                         "业务库切到 MySQL 时这里备的是【本地库】——里面往往还留着切换前的旧业务数据，"
+                         "下面每一份都按实际数出来的行数标注，不要按文件名猜。")
     with ui.element("div").classes("field-grid w-full"):
         f["BACKUP_ENABLED"] = ui.switch("开启自动备份", value=config.BACKUP_ENABLED)
         _num_into(f, "BACKUP_INTERVAL_HOURS", "间隔（小时）", config.BACKUP_INTERVAL_HOURS)
@@ -183,10 +184,17 @@ def _backup_panel(f: dict) -> None:
         ui.label(f"共 {len(items)} 份 · 目录 {backup.BACKUP_DIR}").classes("text-xs text-gray-400")
         for d in items[:10]:
             with ui.row().classes("items-center gap-2 w-full no-wrap"):
-                ui.badge("配置+业务" if d["scope"] == "full" else "仅配置").props(
-                    "color=green" if d["scope"] == "full" else "color=orange")
-                ui.label(d["name"]).classes("text-xs text-gray-400 grow break-all min-w-0")
-                ui.label(f"{d['bytes'] / 1024:.0f} KB").classes("text-xs text-gray-500")
+                # 【徽标按【文件里实际有什么】走，不按文件名里的 scope】scope 是导出那一刻的
+                # 配置推出来的标签，回答不了"这份救不救得回我的番"：一个刚建好、还没跑过业务的
+                # 库照样标 full，里面一行数据都没有；而切了 MySQL 之后标 meta 的那份里
+                # 往往还躺着整套旧数据。把一份【无业务数据】的备份盖到有 99 部番的库上，
+                # verify 说可用、quick_check 说 ok、启动日志正常，而番全没了——
+                # 这道徽标是那条路上唯一有机会拦住人的地方。
+                ui.badge("配置+业务" if d["has_data"] else "仅配置").props(
+                    "color=green" if d["has_data"] else "color=orange")
+                ui.label(d["name"]).classes("text-xs text-gray-400 shrink-0")
+                ui.label(d["detail"]).classes("text-xs text-gray-500 grow break-all min-w-0")
+                ui.label(f"{d['bytes'] / 1024:.0f} KB").classes("text-xs text-gray-500 shrink-0")
 
     async def _now():
         btn.props("loading")
@@ -203,16 +211,24 @@ def _backup_panel(f: dict) -> None:
             btn.props(remove="loading")
 
     with ui.row().classes("gap-2 items-center mt-2"):
-        btn = ui.button("立刻备份", icon="backup", on_click=_now).props("color=primary unelevated")
+        btn = ui.button("立刻备份", icon="backup", on_click=_now).props("unelevated color=primary")
         _help("恢复步骤（顺序不能乱）：\n"
+              "0. 先看清楚要恢复的那份上面的徽标：写着【仅配置】就说明它里面【没有番剧数据】，"
+              "盖上去等于把现在的番全清空——而之后每一项检查都会是绿的（见下）。\n"
               "1. systemctl stop autorss\n"
-              "2. 【必须】删掉 data/autorss.db-wal 与 data/autorss.db-shm\n"
-              "3. cp data/backups/<选中的那份> data/autorss.db\n"
-              "4. systemctl start autorss\n\n"
-              "第 2 步不能省：本库开着 WAL，最近的写入躺在 -wal 文件里。只覆盖主文件的话，"
-              "SQLite 启动时会把【事故现场那份 -wal】重放到你刚恢复的库上——你拿回的是出事后的数据，"
-              "而 `pragma quick_check` 照样返回 ok，每一步验证都是绿的，根本看不出来。\n\n"
-              "恢复前建议先 `sqlite3 <备份文件> \'pragma quick_check\'` 确认那份能打开。")
+              "2. 现役库【改名留底】，连 -wal/-shm 一起（不是删）：\n"
+              "   cd data && for x in autorss.db autorss.db-wal autorss.db-shm; do "
+              "[ -e \"$x\" ] && mv \"$x\" \"$x.before-restore\"; done\n"
+              "3. cp backups/<选中的那份> data/autorss.db\n"
+              "4. systemctl start autorss —— 打开首页确认番剧数目对，再删那几个 .before-restore\n\n"
+              "第 2 步为什么必须连 -wal 一起挪走：本库开着 WAL，最近的写入躺在 -wal 里。"
+              "只覆盖主文件的话，SQLite 启动时会把【事故现场那份 -wal】重放到你刚恢复的库上——"
+              "你拿回的是出事后的数据，而 `pragma quick_check` 照样返回 ok。\n"
+              "为什么是 mv 不是 rm：这是全流程唯一不可逆的一步，而选错备份是最容易犯的错。"
+              "改名留底之后，第 4 步发现不对就能原样挪回来。\n\n"
+              "【最要命的那种失败】恢复一份没有业务数据的备份，`quick_check` 说 ok、"
+              "程序启动日志正常、页面也打得开，只是一部番都没有了——"
+              "所有自动检查都验不出这件事，只有第 0 步的徽标和第 4 步用眼睛看能挡住。")
     _list()
 
 
@@ -440,7 +456,7 @@ def _db_panel(f: dict) -> None:
         ui.button("测试连接", icon="network_check",
                   on_click=lambda e: busy_action(e.sender, "db-op", _test,
                                                  fail="测试连接失败")).props(
-            "flat color=primary no-caps").tooltip("只连一下看通不通，不改变当前在用的库")
+            "flat color=primary").tooltip("只连一下看通不通，不改变当前在用的库")
         # 【五个按钮共用一个去重键 "db-op"】它们全都动同一个 engine：切库跑到一半时再点迁移，
         # 或者连点两次『切到 MySQL』，都会让连接层与 alembic 在半途互相打断。
         # 共用键 = 天然互斥；而 busy_action 顺带给了 loading（切库与迁移都【没有时间上界】：
@@ -448,7 +464,7 @@ def _db_panel(f: dict) -> None:
         ui.button("创建数据库", icon="add",
                   on_click=lambda e: busy_action(e.sender, "db-op", _create_db,
                                                  fail="创建数据库失败")).props(
-            "flat color=primary no-caps").tooltip(
+            "flat color=primary").tooltip(
             "在 MySQL 服务器上建一个空库（CREATE DATABASE，utf8mb4）。只建库不建表，"
             "表在你『切到 MySQL』时自动建。库已存在则什么都不做。")
 
@@ -461,12 +477,12 @@ def _db_panel(f: dict) -> None:
                   on_click=lambda e: busy_action(e.sender, "db-op",
                                                  lambda: _switch_backend(True),
                                                  fail="切换失败")).props(
-            "color=primary unelevated no-caps")
+            "unelevated color=primary")
         ui.button("切回本地 SQLite", icon="undo",
                   on_click=lambda e: busy_action(e.sender, "db-op",
                                                  lambda: _switch_backend(False),
                                                  fail="切换失败")).props(
-            "flat color=grey no-caps")
+            "flat color=grey")
 
     ui.separator().classes("my-2")
     ui.label("② 迁移数据（复制数据，连接不变）").classes("text-sm font-bold")
@@ -477,11 +493,11 @@ def _db_panel(f: dict) -> None:
         ui.button("本地 SQLite → MySQL", icon="upload",
                   on_click=lambda e: busy_action(e.sender, "db-op", lambda: _migrate(True),
                                                  fail="迁移失败")).props(
-            "color=primary unelevated no-caps")
+            "unelevated color=primary")
         ui.button("MySQL → 本地 SQLite", icon="download",
                   on_click=lambda e: busy_action(e.sender, "db-op", lambda: _migrate(False),
                                                  fail="迁移失败")).props(
-            "flat color=primary no-caps")
+            "flat color=primary")
 
 
 @ui.page("/settings")
@@ -644,7 +660,51 @@ def settings():
                 f["PROXY_URL"].classes(add="col-span-2")   # 代理地址占 1/2（4 列栅格里跨 2 格）
                 _text("PROXY_USER", "代理账号", config.PROXY_USER, "留空=不认证")
                 _password("PROXY_PASS", "代理密码（留空=不改）")
-            _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL)
+            # 【必须给出格式示例】程序发的是 GET {NOTIFY_URL}/💡<消息>（见 services/notify.notify），
+            # 这是 Bark / ntfy 那一类"路径即消息"的约定，与 webhook 的 POST-JSON 完全不同。
+            # 没有示例时最常见的错法是把 Server酱/钉钉的完整接口地址粘进来（那要 POST），
+            # 或者漏掉 https:// —— 后者的报错只出现在日志里，页面上一点提示都没有。
+            _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL,
+                  "https://api.day.app/<你的密钥>  或  https://ntfy.sh/<你的主题>")
+            ui.label("程序会 GET『{上面这个地址}/💡消息正文』——Bark、ntfy 这类"
+                     "『把消息写在 URL 路径里』的服务可以直接用；需要 POST JSON 的"
+                     "（钉钉、企业微信机器人）填在这里不会工作。填完点右边按钮试一条。").classes(
+                "text-xs text-gray-500 -mt-1")
+
+            async def _test_notify():
+                """发一条真的通知，把结果原样说出来。
+
+                【为什么值得有这个按钮】通知是全项目唯一【没有任何页面反馈】的功能：
+                填错地址的表现是"什么都不发生"，而唯一的线索是 data/autorss.log 里
+                一行脱敏过的 warning。用户根本无从判断是"没事发生"还是"配置错了"。
+                这里直接调 notify.notify（不走 event 层）：绕开订阅勾选与限流，
+                测的就是"这个地址通不通"这一件事。
+                """
+                url = (f["NOTIFY_URL"].value or "").strip()
+                if not url:
+                    ui.notify("先填一个通知 URL", type="warning")
+                    return
+                # 【只传参，不改全局】早先是把 config._v["NOTIFY_URL"] 临时换掉、await 完再换回来，
+                # 而那段窗口最长有 NOTIFY_TIMEOUT，期间任何后台协程发出的通知都会被送到
+                # 这个还没保存、可能填错的地址上。
+                # 【只清熔断，不清冷却】reset_state 会连 failed/stalled 的 6 小时窗口一起清掉，
+                # 点一下测试按钮就可能让下一轮巡检把同样的告警再推一遍。
+                notify.clear_mute()                # 上一次填错触发的熔断不该挡住这次重试
+                ok = await notify.notify("Auto-rss2qb 测试通知", url_override=url)
+                ui.notify("已发出，去你的推送 App 里看看收到没有"
+                          if ok else
+                          "没发出去。具体原因看『日志』页最后一条 warning"
+                          "（那里会写清是地址格式不对、连不上、还是对端返回了 4xx/5xx）",
+                          type="positive" if ok else "negative")
+
+            # 与『数据库』分栏的『测试连接』同一个角色（只验证、不改变任何状态），故用同一套写法：
+            # flat + no-caps + tooltip，并走 busy_action（去重键独立，它和 db-op 互不相干）。
+            with ui.row().classes("gap-2 flex-wrap"):
+                ui.button("发送测试通知", icon="send",
+                          on_click=lambda e: busy_action(e.sender, "notify-test", _test_notify,
+                                                         fail="测试通知失败")).props(
+                    "flat color=primary").tooltip(
+                    "用上面输入框里【当前】填的地址发一条，绕开事件勾选与限流——只测这个地址通不通")
             _section("通知事件",
                      "勾了哪些就只收哪些。【留空＝一条都不发】——注意这与『订阅源』页上"
                      "『留空＝不限』（字幕组白名单、标题关键词）的含义相反。\n"
@@ -770,7 +830,7 @@ def settings():
                 _text("ANIME_START_DATE", "开始使用日", config.ANIME_START_DATE, "YYYY-MM-DD，空=不限")
                 f["ANIME_START_DATE"].classes(remove="w-full", add="w-56")   # 收窄到定宽，给右侧按钮腾位
                 ui.button("应用开始使用日过滤", icon="filter_alt", on_click=_apply_filter).props(
-                    "color=primary unelevated no-caps").classes("text-xs")   # 不加 size=sm/dense → 随行拉伸到与输入框等高
+                    "unelevated color=primary").classes("btn-sm")   # 不加 dense → 随行拉伸到与输入框等高
 
             ui.separator()
             _section("Bangumi 重试（识别不到时）",
@@ -968,6 +1028,6 @@ def settings():
                 reactivate_btn.props(remove="loading")
 
         with ui.row().classes("items-center gap-2 mt-2"):
-            ui.button("保存", icon="save", on_click=_save).props("color=primary unelevated")
+            ui.button("保存", icon="save", on_click=_save).props("unelevated color=primary")
             reactivate_btn = ui.button("重新激活全部任务", icon="restart_alt",
                                        on_click=_reactivate).props("flat")

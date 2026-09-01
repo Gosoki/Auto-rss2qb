@@ -278,3 +278,38 @@ def test_rejected_movies_are_sorted_by_real_year(clean_tables):
         s.commit()
     got = [m.quarter for m in M.list_rejected_movies()]
     assert got == ["26C", "25D", "00A", "99D"], f"已忽略页的季度顺序错了：{got}"
+
+
+def test_episode_ranges_by_source_separates_the_two_shapes(clean_tables):
+    """逐源集号区间：区间错开 = 两套编号并存；区间重叠 = 一个源的跨季连续编号。
+
+    这份数据是给人看的，不是给代码判的 —— `episode_numbering_conflict` 试过四种收紧判据
+    （集号是否超总集数 / 有没有源横跨总集数 / 两源区间是否相交 / 同期发布集号是否差得多），
+    每一种在真库上都有可观误报，与 `_foldable` docstring 记载的"按源取证经对抗验证后被否决"
+    同一个结论。所以横幅改成摆事实：这条用例钉住那份事实的形状。
+    """
+    with clean_tables.get_session() as s:
+        # 形状一：两套编号并存（真库 anime#27）
+        a1 = Anime(title="两套编号", season=1, bangumi_id=901, total_episodes=12)
+        # 形状二：一个源跨季连续编号（真库 anime#6）
+        a2 = Anime(title="连续编号", season=1, bangumi_id=902, total_episodes=12)
+        s.add(a1); s.add(a2); s.commit(); s.refresh(a1); s.refresh(a2)
+        h = 0
+        for aid, src, eps in ((a1.id, "ANi", range(13, 20)), (a1.id, "Nix-Raws", range(1, 8)),
+                              (a2.id, "ANi", range(1, 34)), (a2.id, "Nix-Raws", range(28, 34))):
+            for ep in eps:
+                h += 1
+                s.add(AnimeTorrent(info_hash=f"{h:040x}", anime_id=aid, source=src, site="nyaa",
+                                   raw_title="x", season=1, episode=float(ep), status="pending"))
+        s.commit()
+        i1, i2 = a1.id, a2.id
+
+    r1 = A.episode_ranges_by_source(i1)
+    assert [(s_, int(lo), int(hi)) for s_, lo, hi, _ in r1] == [("Nix-Raws", 1, 7), ("ANi", 13, 19)]
+    # 两套编号：区间完全错开
+    assert r1[0][2] < r1[1][1], "错开的两段应当 max(前) < min(后)"
+
+    r2 = A.episode_ranges_by_source(i2)
+    assert [(s_, int(lo), int(hi)) for s_, lo, hi, _ in r2] == [("ANi", 1, 33), ("Nix-Raws", 28, 33)]
+    # 连续编号：区间互相重叠
+    assert r2[1][1] <= r2[0][2], "重叠的两段应当 min(后) <= max(前)"

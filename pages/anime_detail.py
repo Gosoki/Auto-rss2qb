@@ -47,14 +47,20 @@ async def maybe_relocate_anime(anime_id: int, old_path, after=None):
     同一部番裂成两个文件夹。对齐 movies 侧早已模块级的 _maybe_relocate_movie。
     """
     new_path = anime.anime_save_path(anime_id)
-    if not new_path or new_path == old_path:
-        return   # 路径没变，无需移动
+    if not new_path:
+        return
     # 计数必须与 relocate_anime 的选行【同谓词】：HAVE 且【未归档】。
     # 已归档的早已不在 qB、setLocation 移不动，若算进来就会出现
     #『弹窗说要搬 N 集 → 点确认 → 报"无需移动" → 文件静默留在旧目录』。
     _eps = anime.list_episodes(anime_id)
     dl = [t for t in _eps if t.status in engine.HAVE_STATUSES and not t.archived_at]
     arch = [t for t in _eps if t.status in engine.HAVE_STATUSES and t.archived_at]
+    # 【闸的判据是"文件在不在该在的地方"，不是"这次操作改没改记录"】理由见 engine.rows_in_wrong_dir：
+    # old_path 与 new_path 都是同一个纯函数算出来的，只比这两个的话，搬迁失败或被拒绝一次之后
+    # 就【再没有任何入口】能补搬。
+    stale = engine.rows_in_wrong_dir(_eps, new_path)
+    if new_path == old_path and not stale:
+        return   # 路径没变，且盘上文件也都在该在的地方
     if not dl:
         if arch:   # 只有归档文件：搬不了，但必须告诉用户它们留在哪儿
             ui.notify(f"归档目录已更新。但有 {len(arch)} 集已归档（不在 qB，无法代为移动），"
@@ -94,7 +100,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         with ui.row().classes("items-start gap-2 w-full no-wrap"):
             with ui.row().classes("items-center gap-2 flex-wrap grow min-w-0"):
                 ui.label(name_of(cur)).classes("text-2xl font-bold")
-                ui.button(icon="edit", on_click=_bind).props("flat round dense size=sm color=primary").tooltip(
+                ui.button(icon="edit", on_click=_bind).props(
+                    "flat round dense color=primary").classes("btn-sm").tooltip(
                     "认错了？手动绑定正确的 bgm（粘链接或 ID）")
                 _sl = season_label(cur)
                 if _sl:
@@ -120,21 +127,21 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 元操作行：重新识别 / 忽略 —— 放在标题下面（dense 收紧内边距 + -ml-1 抵消残余左边距，跟标题左缘对齐）
         with ui.row().classes("items-center gap-3 flex-wrap -ml-1"):
             ui.button("重新识别", icon="refresh", on_click=_enrich).props(
-                "flat dense size=sm").style("font-size:12px")
+                "flat dense").classes("btn-sm")
             ui.button("编辑季度", icon="event", on_click=_edit_quarter).props(
-                "flat dense size=sm").style("font-size:12px").tooltip(
+                "flat dense").classes("btn-sm").tooltip(
                 "手动改归档季度（bgm 定错/无放送日时兜底）。改后可把已下文件移到新目录。")
             if cur.rejected:
                 ui.button("恢复订阅", icon="undo", on_click=_restore).props(
-                    "dense size=sm color=primary unelevated").style("font-size:12px")
+                    "unelevated dense color=primary").classes("btn-sm")
             else:
                 if cur.finished_at:
                     ui.button("继续订阅", icon="autorenew", on_click=_resubscribe).props(
-                        "dense size=sm color=primary unelevated").style("font-size:12px").tooltip(
+                        "unelevated dense color=primary").classes("btn-sm").tooltip(
                         "清掉完结标记并【不再自动判它完结】。bgm 的总集数少记一集时用这个——"
                         "否则下一轮巡检立刻又会把它判回完结。")
                 ui.button("忽略本番", icon="block", on_click=_reject).props(
-                    "flat dense size=sm color=grey").style("font-size:12px")
+                    "flat dense color=grey").classes("btn-sm")
 
         # 元信息卡（封面 + bgm 元数据 + 简介）
         wd = f"  {WEEKDAY_CN[cur.air_weekday]}" if cur.air_weekday is not None else ""
@@ -168,18 +175,21 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 _kwin.on("blur", lambda: _set_keyword(_kwin.value))
                 _kwin.on("keydown.enter", lambda: _set_keyword(_kwin.value))
             if not cur.rejected and not cur.confirmed:
-                ui.button("确认下载", on_click=_approve).props("color=primary unelevated")
+                ui.button("确认下载", on_click=_approve).props("unelevated color=primary")
             _dln = ui.button("下载该源", icon="download", on_click=_download).props("flat")
             _dln.set_enabled(config.QB_ENABLED)
             _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
                          else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过。"
                               "只下正集——特别篇/未知集要对准下面那一条点『下载』")
+            # 【与同一行的『下载该源』同档】这三个按钮是一组控制条，不是列表行。
+            # dense 在本项目的按钮语法里表示"行内"（＝12px，见 layout.py 的 .btn-sm），
+            # 写在这里会让同一行出现 14px 与 12px 两档。
             _btn_bf_loose = ui.button("补齐该源", icon="playlist_add", on_click=_backfill_loose).props(
-                "flat dense size=sm").style("font-size:14px")
+                "flat")
             _btn_bf_loose.tooltip("去 nyaa/Mikan 按名搜『当前下载源』的种子补漏收（季度过滤，你人工审核）。"
                          "入库后转『待确认』，点『确认下载』才下。")
             _btn_bf_auto = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_auto).props(
-                "flat dense size=sm").style("font-size:14px")
+                "flat")
             _btn_bf_auto.tooltip("同『补齐该源』，但额外用番名近似过滤挡掉同名衍生作/别的季，更少需人工把关。")
 
         # 分集 / 种子（每条可单独强制下载）；标题右侧灰字标注会发送给 qB 的保存目录（按规则算出，全番同一目录）
@@ -203,15 +213,25 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 这里剩下的是推不出、必须人工判断的（同一集会被当成两集，各下一份到同一目录）。
         _conf = anime.episode_numbering_conflict(anime_id)
         if _conf:
+            # 【只陈述事实，不下"这是两套编号"的结论】原文案断言"多半是某个源用绝对集号、
+            # 另一个用季内集号，同一集会被下两份"——真库实测它 8 次命中里只有 2 次成立
+            # （#6/#60/#25/#47/#23 都是【一个源】用跨季连续编号数过了总集数，每集只有一个号）。
+            # 试过四种收紧判据，每种在真库上都有可观误报，与 _foldable 记载的结论一致。
+            # 所以改成把【逐源的集号区间】摆出来：区间完全错开 = 真的两套编号；互相重叠 = 只是连续编号。
+            _rng = anime.episode_ranges_by_source(anime_id)
+            _rng_txt = "；".join(
+                f"{src} 第{ep_str(lo)}集" if lo == hi else f"{src} 第{ep_str(lo)}–{ep_str(hi)}集（{n}集）"
+                for src, lo, hi, n in _rng)
             warn_banner(
-                f"疑似同集不同编号：本番共 {cur.total_episodes} 集，但有种子标着第 "
-                + "、".join(ep_str(e) for e in _conf)
-                + " 集——多半是某个源用了【全系列绝对集号】而另一个用【季内集号】。"
-                  "这两种写法会被当成不同的集，同一集因此会被下两份到同一个目录。"
-                  "请核对后手动排除多余的那份。"
-                + ("本番两套编号的取值范围重叠，系统【不会】自动折算，请手动改集号合并。"
+                f"集号超出 bgm 记载：本番共 {cur.total_episodes} 集，但有种子标着第 "
+                + "、".join(ep_str(e) for e in _conf) + " 集。\n"
+                + f"各源的集号范围：{_rng_txt}\n"
+                + "判断方法：若某两个源的区间【完全错开】（如 A 是 13–19、B 是 1–7），"
+                  "那是两套编号并存，同一集会各下一份到同一目录——锁定其中一个源即可避免。"
+                  "若各源区间互相重叠（如都落在 1–33 内），那只是这个组用了跨季连续编号，不会重复。"
+                + ("\n本番两套编号的取值范围重叠，系统【不会】自动折算，需要合并请手动改集号。"
                    if (cur.ep_offset and cur.total_episodes and cur.ep_offset < cur.total_episodes)
-                   else "若某个源的标题里带 “16(88)” 这类双编号，系统会自动学到偏移量并从此自行折算。"))
+                   else "\n若某个源的标题里带 “16(88)” 这类双编号，系统会自动学到偏移量并从此自行折算。"))
         # 【歧义段】前面各季共 O 集(ep_offset)、本季 T 集：绝对编号取值域 [O+1,O+T] 与季内编号
         # [1,T] 在 O<T 时于 [O+1,T] 上重叠，光看集号分辨不出是哪一套，系统一条都不折
         #（折一半会让同一个源的前后半季撞成同一个去重键、静默漏掉半季，见 core.anime._foldable）。
@@ -335,20 +355,20 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             f"color={SEVERITY_COLOR.get(t.status, 'blue-grey')}")
                     if t.status == "excluded":  # 已排除：给『恢复』放回待下
                         ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
-                            "size=sm flat dense color=primary").style("font-size:12px").tooltip(
+                            "flat dense color=primary").classes("btn-sm").tooltip(
                             "放回待下，重新参与下载/去重")
                     if t.status in engine.DOWNLOADABLE_STATUSES:  # 未下载的才可直接排除
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
-                            "size=sm flat dense color=grey").style("font-size:12px").tooltip(
+                            "flat dense color=grey").classes("btn-sm").tooltip(
                             "不想要这条：从待下直接排除（不删文件，只改状态；可撤销）")
                     if t.status in engine.HAVE_STATUSES:  # 下过/在下/停滞(盘上有文件)都可删（delete 函数亦接受 stalled）
                         ui.button(icon="delete_forever",
                                   on_click=_del_one(t.id, t.archived_at, t.save_path)).props(
-                            "size=sm flat dense color=negative").tooltip(
+                            "flat dense color=negative").classes("btn-sm").tooltip(
                             "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
                             else "删除这一集的文件（qB+硬盘，不可撤销）")
                     _dlb = ui.button("下载", icon="download", on_click=_force(t.id)).props(  # 下载放最后
-                        "size=sm flat dense").style("font-size:12px")
+                        "flat dense").classes("btn-sm")
                     _dlb.set_enabled(config.QB_ENABLED)
                     _dlb.tooltip("强制下这一条到文件夹（无视去重/优先级）" if config.QB_ENABLED
                                  else "qB 未启用，去设置页开启后可下载")
@@ -411,7 +431,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("绑定", icon="link",
-                          on_click=lambda: dlg.submit(inp.value)).props("color=primary unelevated")
+                          on_click=lambda: dlg.submit(inp.value)).props("unelevated color=primary")
         val = await dlg
         if not val:
             return
@@ -455,7 +475,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("保存", icon="save",
-                          on_click=lambda: dlg.submit(inp.value)).props("color=primary")
+                          on_click=lambda: dlg.submit(inp.value)).props("unelevated color=primary")
         val = await dlg
         if val is None:
             return
@@ -603,7 +623,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 num.on("keydown.enter", lambda: dlg.submit(num.value))
                 with ui.row().classes("gap-2 justify-end w-full"):
                     ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
-                    ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("color=primary unelevated")
+                    ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("unelevated color=primary")
             val = await dlg
             if val is None:
                 return

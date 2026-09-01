@@ -99,13 +99,17 @@ def _notify_relocate_movie(rep):
 async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
     """重绑/重识别改了季度后：归档目录变了且有已下版本就问是否搬迁，并按结果提示（对齐番剧）。"""
     new_path = mov.movie_save_path(movie_id)
-    if not new_path or new_path == old_path:
-        return   # 路径没变，无需移动
+    if not new_path:
+        return
     # 与 relocate_movie 选行同谓词：HAVE 且【未归档】（已归档的不在 qB、移不动，
     # 算进来会导致『说要搬 N 个 → 点确认 → 报"无需移动"』）
     _ts = mov.movie_torrents(movie_id)
     dl = [t for t in _ts if t.status in engine.HAVE_STATUSES and not t.archived_at]
     arch = [t for t in _ts if t.status in engine.HAVE_STATUSES and t.archived_at]
+    # 与番剧侧同一道判据、同一份实现，理由见 engine.rows_in_wrong_dir
+    stale = engine.rows_in_wrong_dir(_ts, new_path)
+    if new_path == old_path and not stale:
+        return   # 路径没变，且盘上文件也都在该在的地方
     if not dl:
         if arch:
             ui.notify(f"归档目录已更新。但有 {len(arch)} 个版本已归档（不在 qB，无法代为移动），"
@@ -143,7 +147,8 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         with ui.row().classes("items-start gap-2 w-full no-wrap"):
             with ui.row().classes("items-center gap-2 flex-wrap grow min-w-0"):
                 ui.label(name_of(cur)).classes("text-2xl font-bold")
-                ui.button(icon="edit", on_click=_bind).props("flat round dense size=sm color=primary").tooltip(
+                ui.button(icon="edit", on_click=_bind).props(
+                    "flat round dense color=primary").classes("btn-sm").tooltip(
                     "认错了？手动绑定正确的 bgm（粘链接或 ID）")
                 ui.badge(cur.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定
                 if cur.rejected:
@@ -170,19 +175,19 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
 
         with ui.row().classes("items-center gap-3 flex-wrap"):
             ui.button("重新识别", icon="refresh", on_click=_enrich).props(
-                "flat dense size=sm").style("font-size:12px")
+                "flat dense").classes("btn-sm")
             _rb = ui.button("刷新版本", icon="cloud_download", on_click=_refresh_versions).props(
-                "flat dense size=sm").style("font-size:12px")
+                "flat dense").classes("btn-sm")
             _rb.set_enabled(bool(cur.mikan_id))
             _rb.tooltip("去 Mikan 重新拉这一部的全部版本（BD 常在首映后半年到一年半才出，"
                         "而发现是按整年扫的）" if cur.mikan_id
                         else "这部片没有 Mikan 番组 id，无法刷新（重新扫描该年份可补上）")
             if cur.rejected:
                 ui.button("恢复订阅", icon="undo", on_click=_restore).props(
-                    "dense size=sm color=primary unelevated").style("font-size:12px")
+                    "unelevated dense color=primary").classes("btn-sm")
             else:
                 ui.button("忽略", icon="block", on_click=_reject).props(
-                    "flat dense size=sm color=grey").style("font-size:12px")
+                    "flat dense color=grey").classes("btn-sm")
         ui.label(f"版本 / 种子（{len(ts)}）").classes("text-sm font-bold mt-2")
         if not ts:
             ui.label("（还没有种子）").classes("text-gray-400")
@@ -215,23 +220,23 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                             _b.props("color=orange").tooltip(
                                 f"上次失败：{t.fail_reason}（剧场版不自动重发，要重试就点右边『下载』）")
                     _vdl = ui.button("下载", icon="download", on_click=_force(t.id)).props(
-                        "size=sm flat dense").style("font-size:12px")
+                        "flat dense").classes("btn-sm")
                     _vdl.set_enabled(config.QB_ENABLED)
                     _vdl.tooltip("强制下这一版本到文件夹" if config.QB_ENABLED
                                  else "qB 未启用，去设置页开启后可下载")
                     if t.status in engine.HAVE_STATUSES:  # 下过/在下/停滞(盘上有文件)都可删（delete 函数亦接受 stalled）
                         ui.button(icon="delete_forever",
                                   on_click=_del(t.id, t.archived_at, t.save_path)).props(
-                            "size=sm flat dense color=negative").tooltip(
+                            "flat dense color=negative").classes("btn-sm").tooltip(
                             "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
                             else "删除这一版本的文件（qB+硬盘，不可撤销）")
                     if t.status in engine.DOWNLOADABLE_STATUSES:   # 未下载的可直接排除
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
-                            "size=sm flat dense color=grey").style("font-size:12px").tooltip(
+                            "flat dense color=grey").classes("btn-sm").tooltip(
                             "不想要这版本：从可下排除（不删文件，只改状态；可恢复）")
                     if t.status == "excluded":   # 已排除：给『恢复』放回可下
                         ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
-                            "size=sm flat dense color=primary").style("font-size:12px").tooltip("放回可下")
+                            "flat dense color=primary").classes("btn-sm").tooltip("放回可下")
 
     def _after():
         body.refresh()
@@ -339,7 +344,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("绑定", icon="link",
-                          on_click=lambda: dlg.submit(inp.value)).props("color=primary unelevated")
+                          on_click=lambda: dlg.submit(inp.value)).props("unelevated color=primary")
         val = await dlg
         if not val:
             return
@@ -510,7 +515,7 @@ def movies_page(t: str = ""):
                         with ui.row().classes("items-center gap-2 flex-wrap"):
                             ui.badge(m.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定
                             ui.label(name_of(m)).classes(
-                                "text-lg cursor-pointer text-blue-400 hover:underline font-bold").on(
+                                "text-lg cursor-pointer text-blue-400 hover:underline").on(
                                 "click", lambda mid=m.id: open_detail(mid))
                             if not m.bangumi_id:
                                 ui.badge("待识别").props("color=red").tooltip("bgm 没匹配上，去『待识别』手动绑定")
@@ -522,7 +527,7 @@ def movies_page(t: str = ""):
                     with ui.column().classes("gap-1 items-end shrink-0"):
                         ui.button("下载", icon="download",
                                   on_click=lambda mid=m.id: open_detail(mid)).props(
-                            "color=primary unelevated").tooltip("打开详情，自己挑版本下载")
+                            "unelevated color=primary").tooltip("打开详情，自己挑版本下载")
                         ui.button("忽略", icon="block", on_click=_reject(m.id)).props(
                             "flat color=grey")
 
@@ -593,7 +598,7 @@ def movies_page(t: str = ""):
                 ui.label("qB 实时下载进度" if _qb_on else "qB 未启用·最后进度").classes(
                     "text-xs text-gray-400")
                 _sync = ui.button("立刻刷新", icon="sync", on_click=_qb_sync_now).props(
-                    "outline color=primary size=sm").style("font-size:12px")
+                    "outline color=primary").classes("btn-sm")
                 _sync.set_enabled(_qb_on)
                 _sync.tooltip("立即向 qB 拉一次最新进度（不必等后台轮询）" if _qb_on
                               else "qB 未启用，去设置页开启后可同步")
@@ -756,7 +761,7 @@ def movies_page(t: str = ""):
                         # 窄屏收不下去、必定横向撑破卡片。改成 w-96 + min-w-0（让 q-input 真能收缩）
                         # + max-sm:w-full。剧场版『待识别』恰恰是最常在手机上处理的一页。
                         inp = ui.input(placeholder="bgm 链接或 ID").classes("w-96 min-w-0 max-sm:w-full")
-                        ui.button("绑定", icon="link", on_click=_bind_from_input(m.id, inp)).props("color=primary unelevated")
+                        ui.button("绑定", icon="link", on_click=_bind_from_input(m.id, inp)).props("unelevated color=primary")
                         ui.button("重试识别", icon="refresh", on_click=_refail(m.id)).props("flat color=grey")
                         ui.button("忽略", on_click=_reject(m.id)).props("flat color=grey")
 
@@ -781,7 +786,7 @@ def movies_page(t: str = ""):
                             "text-xs text-gray-400")
                     with ui.row().classes("items-stretch gap-3 flex-wrap"):
                         ui.button("恢复订阅", icon="undo", on_click=_restore(m.id)).props(
-                            "color=primary unelevated")
+                            "unelevated color=primary")
 
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（与番剧侧对称）
             if dels:
@@ -798,7 +803,7 @@ def movies_page(t: str = ""):
                             ui.label(d["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
                             _rb = ui.button("重新下载", icon="download",
                                             on_click=_redownload(d["id"])).props(
-                                "flat dense size=sm color=primary").style("font-size:14px")
+                                "flat dense color=primary").classes("btn-sm")
                             _rb.set_enabled(config.QB_ENABLED)
                             _rb.tooltip("强制重新下这一版本到原目录（找回删掉的文件）" if config.QB_ENABLED
                                         else "qB 未启用，去设置页开启后可下载")
@@ -817,7 +822,7 @@ def movies_page(t: str = ""):
                                 "click", lambda mid=x["movie_id"]: open_detail(mid))
                             ui.label(x["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
                             ui.button("恢复", icon="undo", on_click=_unexclude_mv(x["id"])).props(
-                                "flat dense size=sm color=primary").style("font-size:14px").tooltip(
+                                "flat dense color=primary").classes("btn-sm").tooltip(
                                 "放回可下")
 
         # 手动扫描表单的暂存：本面板会被『保存自动扫描设置』整块 refresh，而那个表单就在同一面板里。
@@ -841,7 +846,7 @@ def movies_page(t: str = ""):
                     f["hours"] = ui.number("扫描间隔（小时）",
                                            value=round(config.MOVIE_SCAN_INTERVAL / 3600, 1),
                                            min=1, format="%g").classes("w-40")
-                    ui.button("保存", icon="save", on_click=lambda: _save_scan(f)).props("color=primary unelevated")
+                    ui.button("保存", icon="save", on_click=lambda: _save_scan(f)).props("unelevated color=primary")
                 last = config.MOVIE_SCAN_LAST or "从未"
                 ui.label(f"上次扫描：{last}").classes("text-xs text-gray-400")
                 ui.label("剧场版桶更新不频繁，间隔别设太小；改动即时生效，到点自动扫。").classes(
@@ -859,8 +864,16 @@ def movies_page(t: str = ""):
                     with ui.row().classes("items-stretch gap-2"):
                         for _k, _v in SEASON_CN.items():
                             _season_toggle_btn(_k, _v, sel_seasons)
+                    # 【走 busy_action】一次全年扫描是几分钟的 Mikan+bgm 串行请求，是全站最长的
+                    # 前台操作之一，而它此前【既没有 loading 也没有本地去重】——用户从数据库那几个
+                    # 会转圈的按钮学到的"转圈=在跑"，恰好在最需要它的地方失效。
+                    # 服务端那把 worker._scan_lock 仍是真正的并发保险（见 _scan 里的说明），
+                    # 这里加的是"点下去看得见"。
                     ui.button("立即扫描", icon="travel_explore",
-                              on_click=lambda: _scan(year, sel_seasons)).props("color=primary unelevated")
+                              on_click=lambda e: busy_action(
+                                  e.sender, "movie-scan",
+                                  lambda: _scan(year, sel_seasons), fail="扫描失败")).props(
+                        "unelevated color=primary")
                 ui.label("想补抓往年的剧场版就改年份手动扫；日常交给上面的自动扫描即可。").classes(
                     "text-xs text-gray-500")
 
