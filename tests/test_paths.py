@@ -160,11 +160,44 @@ def test_rows_in_wrong_dir_finds_files_left_behind():
     assert engine.rows_in_wrong_dir([row(path="")], NEW) == []
 
 
-def test_both_relocate_gates_use_the_shared_predicate():
-    """(R18) 番剧与剧场版两侧必须走同一份判据——这正是本项目反复出现的第①种缺陷形状。"""
+@pytest.mark.parametrize("new,old,paths,want,why", [
+    ("/new", "/new", ["/new"], False, "路径没变、文件也都在该在的地方 → 不打扰"),
+    ("/new", "/old", ["/old"], True, "这次操作改了归档目录"),
+    ("/new", "/new", ["/old"], True, "路径没变，但盘上文件落在别处（R18 补的正是这一支）"),
+    ("/new", "/new", [""], False, "老行没记 save_path，判不了就不判"),
+    ("", "/old", ["/old"], False, "算不出新路径（未配置下载目录）→ 什么都别做"),
+    ("/new", None, ["/new"], True, "调用方没给 old_path 也要当成变了"),
+])
+def test_needs_relocate(new, old, paths, want, why):
+    """(R19) 搬迁闸的判据是纯函数，表驱动地钉住。
+
+    【为什么从"grep 源码"改成这个】上一版守卫只断言两个页面文件里出现过 'rows_in_wrong_dir'
+    这个字符串、且没出现过老闸的逐字写法。第 19 轮的审计实测：把番剧侧的闸整段回退回 R18 之前，
+    只要保留上面那句提到 rows_in_wrong_dir 的【注释】，全套用例一条都不红 ——
+    也就是说 R18 在番剧侧的整个修复可以被完整撤掉而套件毫无察觉，
+    而那条守卫的 docstring 自称守的正是"本项目反复出现的第①种缺陷形状"。
+    """
+    from types import SimpleNamespace
+
+    from core import engine
+    rows = [SimpleNamespace(status="sent", save_path=p, archived_at=None) for p in paths]
+    assert engine.needs_relocate(rows, new, old) is want, why
+
+
+def test_both_relocate_gates_call_the_shared_predicate():
+    """(R19) 两侧的闸必须真的【调用】那个纯函数，而不是只在注释里提到它。
+
+    用 AST 看函数体里有没有 `engine.needs_relocate(...)` 这个调用 —— 注释和字符串都骗不过它。
+    """
+    import ast
     import pathlib
-    for f in ("pages/anime_detail.py", "pages/movies.py"):
-        src = pathlib.Path(f).read_text(encoding="utf8")
-        assert "rows_in_wrong_dir" in src, f"{f} 的搬迁闸没走共用判据"
-        assert "if not new_path or new_path == old_path" not in src, \
-            f"{f} 还留着只比算出来的新旧路径的老闸"
+    for f, fn in (("pages/anime_detail.py", "maybe_relocate_anime"),
+                  ("pages/movies.py", "_maybe_relocate_movie")):
+        tree = ast.parse(pathlib.Path(f).read_text(encoding="utf8"))
+        body = next((n for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn), None)
+        assert body is not None, f"{f} 里找不到 {fn}"
+        calls = [n for n in ast.walk(body)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "needs_relocate"]
+        assert calls, f"{f}::{fn} 没有调用 engine.needs_relocate —— 闸被换回自己手写的判据了"

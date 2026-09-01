@@ -7,7 +7,7 @@ from nicegui import ui
 
 import config
 from sources.parse import candidate_names, is_batch, parse_multibracket, parse_title
-from .layout import ep_str, frame
+from .layout import ep_str, frame, require_config_loaded
 
 # (标签, 标题)——覆盖：大组正常 / 各种集数特例 / 合集 / 多括号四种
 _EXAMPLES = [
@@ -117,6 +117,9 @@ def parse_test_page():
                     ui.label("（无——识别不到会进『待识别』，可手动绑定 bgm）").classes("text-sm text-gray-400")
 
         def _toggle():
+            # 同上：sw 是用 config 渲染的，配置没读出来时它的值是硬编码默认
+            if not require_config_loaded():
+                return
             config.set_many({"ANIME_MULTIBRACKET_PARSE": "true" if sw.value else "false"})
             result.refresh()
             ui.notify(f"多括号捕获已{'开启' if sw.value else '关闭'}（全局生效）",

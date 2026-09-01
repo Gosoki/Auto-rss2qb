@@ -59,7 +59,7 @@ async def maybe_relocate_anime(anime_id: int, old_path, after=None):
     # old_path 与 new_path 都是同一个纯函数算出来的，只比这两个的话，搬迁失败或被拒绝一次之后
     # 就【再没有任何入口】能补搬。
     stale = engine.rows_in_wrong_dir(_eps, new_path)
-    if new_path == old_path and not stale:
+    if not engine.needs_relocate(_eps, new_path, old_path):
         return   # 路径没变，且盘上文件也都在该在的地方
     if not dl:
         if arch:   # 只有归档文件：搬不了，但必须告诉用户它们留在哪儿

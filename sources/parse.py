@@ -226,9 +226,34 @@ def extract_season(text: str) -> int:
     return int(m.group(1)) if m else 1
 
 
+# 罗马数字季标记（『Clevatess II』『幼女戦記Ⅱ』『無職転生Ⅲ』）。全角与半角都收。
+# 【只收 II/III/IV，不收 I】季 1 本来就是默认值，认出它一分收益没有，
+# 而半角的 "I" 在英文名里是人称代词（"I'm …"），认它只会白白多一类误判。
+# 【前后不许挨字母数字】否则会吃到 "AVC"、"IV" 结尾的单词、"S2E11" 里的数字。
+# 【已知边界：紧跟汉字的 II 不排除】"ルイII世"（路易二世）会被读成第 2 季。
+# 不排除是有意的——日语的季标记本来就写作『第Ⅱ期』，把汉字后缀一并排除会把它挡掉，
+# 而两者在这个位置上无法区分。真库 169 个 bgm 名里没有这类，故按"宁可多认"处理；
+# 真出现了，纠正入口是详情页的『编辑季度』。
+_SEASON_ROMAN_RE = re.compile(r"(?<![A-Za-z0-9])(Ⅳ|Ⅲ|Ⅱ|IV|III|II)(?![A-Za-z0-9])")
+_ROMAN_NUM = {"Ⅱ": 2, "Ⅲ": 3, "Ⅳ": 4, "II": 2, "III": 3, "IV": 4}
+
+
 def season_from_name(name: str):
-    """从 bgm 规范名/日文名反推季号（bgm 权威，名字里带『第X季/Season N』时用）。"""
-    return _find_season(name) if name else None
+    """从 bgm 规范名/日文名反推季号（bgm 权威，名字里带『第X季/Season N/Ⅱ』时用）。
+
+    【罗马数字只在这里认，不进 extract_season】本函数的输入只有 bgm 的规范名与日文名，
+    是一个干净、可控的集合；而 extract_season 吃的是字幕组的原始标题，那里 II/IV 出现在
+    编码参数、组名、作品名里的概率高得多，放进去要先在真库 1650 条标题上扫误报。
+    实测：真库 169 个 bgm 名里命中 5 个，其中 4 个与已有 season 一致（等于交叉验证），
+    只有 anime#46『Clevatess II』的 season 从错的 1 纠正成 2。
+    """
+    if not name:
+        return None
+    sn = _find_season(name)
+    if sn is not None:
+        return sn
+    m = _SEASON_ROMAN_RE.search(name)
+    return _ROMAN_NUM[m.group(1)] if m else None
 
 
 def strip_season(title: str) -> str:

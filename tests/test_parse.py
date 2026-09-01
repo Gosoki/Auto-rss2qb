@@ -582,12 +582,55 @@ def test_warn_if_not_a_feed_is_quiet_on_a_real_feed(caplog):
     assert caplog.records == [], caplog.records
 
 
-def test_both_rss_paths_use_the_shared_predicate():
-    """(R17) 判据只此一份。两条解析路径各写各的 bozo 检查是本项目漂过一次的地方。"""
+def test_every_feed_parse_uses_the_shared_predicate():
+    """(R17/R18) 判据只此一份。两条解析路径各写各的 bozo 检查是本项目漂过一次的地方。
+
+    【扫全仓而不是写死两个路径】第一版把 ("sources/base.py", "sources/mikan.py") 硬编码进来，
+    于是第三条解析路径出现在别处它就发现不了；而且相对路径在换个 cwd 跑时会直接 FileNotFoundError。
+    """
     import pathlib
-    for f in ("sources/base.py", "sources/mikan.py"):
-        src = pathlib.Path(f).read_text()
-        assert "feedparser.parse" not in src or "warn_if_not_a_feed" in src, \
-            f"{f} 解析了 feed 却没走共用判据"
-    mikan = pathlib.Path("sources/mikan.py").read_text()
-    assert "feed.bozo" not in mikan, "mikan 又自己写了一份 bozo 判据"
+    root = pathlib.Path(__file__).resolve().parent.parent
+    parsers = [f for f in root.glob("**/*.py")
+               if not {".venv", "__pycache__", "tests"} & set(f.relative_to(root).parts)
+               and "feedparser.parse" in f.read_text(encoding="utf8")]
+    assert len(parsers) >= 2, f"只找到 {len(parsers)} 处 feedparser.parse，扫描逻辑可能失效了"
+    for f in parsers:
+        src = f.read_text(encoding="utf8")
+        assert "warn_if_not_a_feed" in src, f"{f.relative_to(root)} 解析了 feed 却没走共用判据"
+        if "def warn_if_not_a_feed" in src:
+            continue          # 判据的实现本身当然会碰 feed.bozo —— 它就是那一份
+        assert "feed.bozo" not in src, f"{f.relative_to(root)} 又自己写了一份 bozo 判据"
+
+
+# ---------------- bgm 规范名里的罗马数字季标记（R19） ----------------
+
+@pytest.mark.parametrize("name,want,why", [
+    ("Clevatess II-魔兽之王与虚假的勇者传承-", 2, "真库 anime#46：季号本来卡在错的 1"),
+    ("幼女戦記Ⅱ", 2, "全角罗马数字"),
+    ("無職転生Ⅲ ～異世界行ったら本気だす～", 3, "全角 Ⅲ，与已有 season=3 交叉验证"),
+    ("片田舎のおっさん、剣聖になるⅡ", 2, "全角，名字末尾"),
+    ("骸骨騎士様、只今異世界へお出掛け中Ⅱ", 2, "全角，名字末尾"),
+    # 【不收 I】季 1 本来就是默认值，认它一分收益没有，而 "I" 在英文名里是人称代词
+    ("I'm Kodama Kawashiri", None, "半角 I 是人称代词，不能当季标记"),
+    ("Chi I", None, "孤立的 I 也不认"),
+    # 【前后不许挨字母数字】
+    ("Fate/stay night AVC", None, "AVC 里的 V 不成季"),
+    ("S2E11 something", None, "编号里的数字不该被读成罗马数字"),
+    # 既有写法优先，罗马数字只是兜底
+    ("某番 第三季", 3, "中文季名优先"),
+    ("Some Show 2nd Season", 2, "英文季名优先"),
+])
+def test_season_from_bgm_name_reads_roman_numerals(name, want, why):
+    from sources.parse import season_from_name
+    assert season_from_name(name) == want, why
+
+
+def test_roman_numerals_stay_out_of_extract_season():
+    """(R19) 罗马数字【只】在 bgm 规范名上认，不能混进种子标题的解析。
+
+    extract_season 吃的是字幕组原始标题，那里 II/IV 出现在编码参数、组名、作品名里的
+    概率高得多；本函数的输入则是 bgm 的规范名与日文名，是个干净可控的集合。
+    """
+    from sources.parse import extract_season
+    assert extract_season("[某组] Clevatess II - 04 [1080p]") == 1, \
+        "罗马数字渗进了种子标题的季号解析"

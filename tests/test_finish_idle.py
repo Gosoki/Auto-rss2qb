@@ -157,6 +157,35 @@ async def test_wrong_finish_flag_is_revoked(clean_tables, make, cfg):
         assert s.get(Anime, aid).finished_at is None, "误判的完结标记没有被撤销"
 
 
+@pytest.mark.parametrize("total,extra,want,why", [
+    (12, 0, True, "没有超界集号，正常判"),
+    (12, 1, True, "多 1 集 = bgm 少记一集，这是真实存在的，不该拦（项目原有用例的场景）"),
+    (12, 2, True, "多 2 集同上，仍算 bgm 少记"),
+    (12, 3, False, "多 3 集起＝库里并存着两套编号，coverage 数出来的『齐』没有意义"),
+    (12, 8, False, "真库 anime#60 就是这个形状（超界 8 集）"),
+    (12, 21, False, "真库 anime#6（超界 21 集）"),
+])
+def test_two_numberings_make_coverage_meaningless(clean_tables, make, total, extra, want, why):
+    """(R19) 时间闸只是个定时器；这一条不看时间，只看集号分布。
+
+    `_cannot_have_aired_all` 问的是"这一季播完了没有"，答案会随时间变成"播完了"——
+    于是它对一部【集号被污染】的番只保护到最后一集播出为止。真库实测：anime#6 的闸
+    2026-09-20 到期、#60 是 09-21，之后同一份假 coverage 会把两部都重新判成完结，
+    而让 coverage 变假的那批种子一条都没动。第 19 轮审计把这条揪出来——"3 周定时器不是修复"。
+
+    阈值 3 有实证：真库里有超界集号的 5 部，超界集数是 21/8/8/7/3，全部 ≥ 3；
+    而"bgm 少记一集"那个要保护的场景是 1。1~2 这一段在真库上是空的。
+    """
+    from datetime import date
+    old = (date.today() - timedelta(weeks=60)).isoformat()      # 早就播完，把时间闸排除掉
+    eps = [(i, "sent") for i in range(1, total + 1)]
+    eps += [(total + 1 + j, "sent") for j in range(extra)]
+    aid = make(total, eps, air_date=old)
+    a = _a(clean_tables, aid)
+    assert A._cannot_have_aired_all(a) is False, "前提没摆对：这一条要在时间闸失效的前提下测"
+    assert A.is_finished(a, A.episode_coverage([aid]).get(aid, set())) is want, why
+
+
 def test_optout_is_never_judged(clean_tables, make):
     aid = make(2, [(1, "sent"), (2, "sent")], finish_optout=True)
     assert A.is_finished(_a(clean_tables, aid), A.episode_coverage([aid]).get(aid, set())) is False

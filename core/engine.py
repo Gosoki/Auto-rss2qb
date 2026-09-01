@@ -660,6 +660,23 @@ def qb_is_local() -> bool:
         return False
 
 
+def needs_relocate(rows, new_path: str, old_path) -> bool:
+    """要不要弹"搬迁已下文件"的确认框。
+
+    两条都算：
+      · 这次操作把归档目录改了（new_path != old_path），或
+      · 盘上还有文件不在当前归档目录里（rows_in_wrong_dir 非空）。
+
+    【为什么单独抽成纯函数】两侧的页面代码里各写一遍时，守卫只能去 grep 源码字符串，
+    而那种守卫【注释就能满足】：第 19 轮实测把番剧侧的闸整段回退回 R18 之前，
+    只要保留上面那句提到 rows_in_wrong_dir 的注释，全套用例一条都不红。
+    判据抽出来之后就能表驱动地测，页面侧只剩一行调用，回退它会当场变红。
+    """
+    if not new_path:
+        return False
+    return new_path != old_path or bool(rows_in_wrong_dir(rows, new_path))
+
+
 def rows_in_wrong_dir(rows, new_path: str) -> list:
     """这些行里，【盘上文件实际所在的目录】与当前归档目录对不上的那些。
 

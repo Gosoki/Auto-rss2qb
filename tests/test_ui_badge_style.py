@@ -267,31 +267,47 @@ def test_the_global_widget_defaults_are_actually_set():
 #
 # 【为什么用白名单而不是"检查有没有 unelevated"这类规则】角色是语义，规则是形式。
 # 白名单逼着新增样式的人回答一句"它是什么角色"，而规则只会被绕过。
+# 【键 = props + 尺寸档】尺寸不并进来，词表就说不全一个角色：R18 立的论是"同一个角色出现
+# 两种尺寸"，而 .btn-sm 是调用点自己挂的 class、根本不在键里，于是那个症状原样还在
+#（实测当时 3 个 props 组合各有两种尺寸）。键写成 `<props>` 或 `<props> +btn-sm`。
 _BUTTON_ROLES: dict[str, str] = {
-    # 语法：{形态} {round} {dense} {color}
+    # 语法：{形态} {round} {dense} {color}[ +btn-sm]
     #   形态  flat=无底色 / outline=描边 / unelevated=实心无阴影
-    #   dense 表示【行内】（列表行里的操作），**并且恒等于 12px**（见下面那条守卫）
-    #   no-caps【不在这里】：pages/layout.py 的 ui.button.default_props("no-caps") 已是全局默认，
-    #     调用点再写一遍只会让同一个角色出现两个名字——白名单的立意是"逼人回答这是什么角色"，
-    #     它自己发两个名字正是它要根除的形状。_WIDGET_DEFAULTS 里也加了 button 来守住这一条。
-    # ---- 实心：主操作 ----
-    "unelevated color=primary": "主操作（确认 / 保存 / 绑定 / 恢复订阅）",
-    "unelevated dense color=primary": "行内主操作（详情页元操作行里的『恢复订阅』『继续订阅』）",
-    # ---- 描边：会展开下一层的触发器 ----
-    "outline color=primary": "触发器（下拉菜单 / 批量动作），描边表达『这里还有下一层』",
-    # ---- 无底色：取消与次级 ----
-    "flat": "取消 / 关闭，以及与主操作同一档的次级按钮",
+    #   dense 收内边距（行内、密集行用）
+    #   +btn-sm 是尺寸档：12px；不带就是默认 14px
+    #   no-caps【不写】：pages/layout.py 的 ui.button.default_props("no-caps") 已是全局默认，
+    #     调用点再写一遍只会让同一个角色出现两个名字。_WIDGET_DEFAULTS 里登记了 button 守这条。
+    #
+    # 排版上只有两条硬规矩，其余交给这张表：
+    #   ① 一屏里 unelevated 最多一个（主操作）
+    #   ② 同一行里的按钮尺寸档必须一致
+
+    # ── 实心：主操作 ──────────────────────────────────────────────
+    "unelevated color=primary": "主操作（确认下载 / 保存 / 绑定 / 恢复订阅 / 立刻备份）",
+    # 【这一档是有意的，不是漏改】它与一个输入框同行，14px 的行高会比输入框胖一圈；
+    # 不写 dense 是因为 dense 收的是内边距，而这里要的是"跟着行走"。全站只有这一处。
+    "unelevated color=primary +btn-sm": "与输入框同行的主操作（设置页『应用开始使用日过滤』）",
+    "unelevated dense color=primary +btn-sm": "行内主操作（详情页元操作行的『恢复订阅』『继续订阅』）",
+
+    # ── 描边：会展开下一层的触发器 ────────────────────────────────
+    "outline color=primary +btn-sm": "页头行里的触发器（『补下全部』『立刻刷新』『重新识别』下拉）",
+
+    # ── 无底色：取消与次级 ────────────────────────────────────────
+    "flat": "取消 / 关闭，以及与主操作同一档的次级按钮（『下载该源』『补齐该源』）",
     "flat color=grey": "次级具名操作（忽略 / 重试识别 / 删除源）",
-    "flat color=primary": "试探性操作（只验证不改状态：测试连接 / 发送测试通知）",
+    # 【别读成"只验证不改状态"】用它的 6 个按钮里有 3 个会改状态（创建数据库、两个方向的迁移）。
+    # 破坏性在本项目里由【确认框】把关，不由按钮权重表达 —— 权重表达的是"这是不是这一屏的主线"。
+    "flat color=primary": "次级操作（测试连接 / 发送测试通知 / 创建数据库 / 对等操作的另一个方向）",
     "flat color=negative": "危险操作（删除文件）",
-    "flat dense": "行内次级操作（详情页元操作行 / 种子行）",
-    "flat dense color=primary": "行内次级操作，主色",
-    "flat dense color=grey": "行内次级操作，灰",
-    "flat dense color=negative": "行内危险操作（删这一集/这一版本的文件）",
-    # ---- 图标按钮 ----
-    "flat round dense": "面板级图标按钮（关掉整个详情面板）",
-    "flat round dense color=primary": "图标按钮，主色（就地编辑 / 复制）",
-    "flat round dense color=grey": "图标按钮，灰（移除附件 / ? 提示）",
+    "flat dense +btn-sm": "行内次级操作（详情页元操作行 / 种子行）",
+    "flat dense color=primary +btn-sm": "行内次级操作，主色（重新下载 / 恢复 / 下载这一条）",
+    "flat dense color=grey +btn-sm": "行内次级操作，灰（忽略 / 排除）",
+    "flat dense color=negative +btn-sm": "行内危险操作（删这一集 / 这一版本的文件）",
+
+    # ── 图标按钮 ─────────────────────────────────────────────────
+    "flat round dense": "面板级图标按钮（关掉整个详情面板）—— 与行内那档有意分两级",
+    "flat round dense color=primary +btn-sm": "行内图标按钮，主色（就地编辑 / 复制命令）",
+    "flat round dense color=grey +btn-sm": "行内图标按钮，灰（移除附件 / ? 提示）",
     "flat round dense color=white": "深色顶栏上的图标按钮",
 }
 
@@ -340,8 +356,57 @@ def _button_calls():
     return out
 
 
+def _role_key(props: str, classes) -> str:
+    """角色词表的键：props 加上尺寸档（12px 的按钮带 ` +btn-sm` 后缀）。"""
+    return props + (" +btn-sm" if "btn-sm" in " ".join(classes) else "")
+
+
 def _button_props():
     return [(f, ln, p) for f, ln, p, _ in _button_calls()]
+
+
+def test_every_button_uses_a_registered_role():
+    """每个按钮的 (props, 尺寸档) 组合都得在角色词表里登记。
+
+    加一种新样式不是错，**不写清它是什么角色**才是。登记时顺手就会发现
+    "这和已有的某个角色其实是同一件事"——那正是这条用例想让人停下来想的一秒。
+
+    【用白名单而不是"检查有没有 unelevated"这类规则】角色是语义，规则是形式。
+    白名单逼着加新样式的人回答一句"它是什么角色"，而规则只会被绕过。
+
+    ⚠️ 这条用例被删过一次：R18 里我重写取样函数时，用「从 A 函数的 def 行切到 B 用例的 def 行」
+    整段替换，而它正好夹在 A 和 B 中间，于是连同它一起被换掉了 ——
+    从那一刻起 `_BUTTON_ROLES` 成了一本没人读的死字典，而 R18 的文档还写着"新增两条"。
+    第 19 轮的审计把它揪了出来。**切片替换会静默吞掉区间里的别的东西，别再这么改文件。**
+    """
+    rows = _button_calls()
+    assert len(rows) >= 60, f"只扫到 {len(rows)} 个按钮，取样逻辑大概是失效了"
+    unknown = [f'{f}:{ln} → "{k}"' for f, ln, k in
+               ((f, ln, _role_key(p, cls)) for f, ln, p, cls in rows)
+               if k not in _BUTTON_ROLES]
+    assert not unknown, (
+        "这些按钮的样式不在角色词表里，全站按钮会开始分裂：\n  " + "\n  ".join(unknown)
+        + "\n若确实是个新角色，把它连同一句话的说明加进 _BUTTON_ROLES。")
+
+
+def test_no_role_has_two_sizes_by_accident():
+    """(R19) 同一个 props 组合出现两种尺寸时，两种都必须在词表里各自登记。
+
+    R18 的立论就是"同一个角色出现两种尺寸"，而当时的词表只按 props 建键、尺寸在键之外，
+    所以立论修完症状还在：实测 `flat round dense color=primary`、`outline color=primary`、
+    `unelevated color=primary` 三个组合各有两档。前两个是漏改（已补齐），
+    第三个是真的有意（与输入框同行），于是它以 `+btn-sm` 单独占一行。
+    """
+    import collections
+    sizes = collections.defaultdict(set)
+    for _, _, p, cls in _button_calls():
+        sizes[p].add("btn-sm" if "btn-sm" in " ".join(cls) else "")
+    split = {p: s for p, s in sizes.items() if len(s) > 1}
+    for p in split:
+        for suffix in ("", " +btn-sm"):
+            assert (p + suffix) in _BUTTON_ROLES, (
+                f'props "{p}" 同时用了两种尺寸，但词表里没有 "{p}{suffix}" 这一条——'
+                "要么是漏挂 .btn-sm，要么就把这一档登记清楚（写明什么时候用哪一档）")
 
 
 def test_no_button_sets_its_own_font_size():

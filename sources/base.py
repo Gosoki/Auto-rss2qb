@@ -54,13 +54,23 @@ class Source:
 def warn_if_not_a_feed(feed, what: str) -> None:
     """取回来的东西不像个 feed 就告警。【bozo 一个人不够，必须连 version 一起看】。
 
-    bozo 只说"XML 解析过程出过毛病"。实测 feedparser 6 对几种真实的「HTTP 200 但不是 RSS」：
-      · 纯 HTML 页 / JSON 错误体 / 只有空白  → bozo=1        （这行原本就会响）
-      · 良构的 XHTML 拦截页、良构的 XML 维护页 → bozo=False, version=''    【一声不吭】
-      · 空 body                            → bozo=False, version=None  【一声不吭】
-    Cloudflare 的『Attention Required』与站点维护页恰恰是良构 XHTML——也就是说
-    bozo 漏掉的正是"站点改版/被拦截"这一类，而那是本项目最贵的一种故障：
-    它不报错，表现只是"这个源好几天没有新东西了"，用户看到的是中性的『0 条，没有新的』。
+    bozo 只说"XML 解析过程出过毛病"，也就是【良构与否】，而不是【是不是一个 feed】。
+    实测 feedparser 6.0.14（这段先后写错过两版，第三版是我自己逐条跑出来的，改之前请重跑）：
+
+      bozo=1（旧的那行告警**会**响，这些不是漏网的）：
+        · 真实的 Cloudflare 拦截页（含未自闭合的 meta/link）、nginx 502 页
+        · 带裸 `&` 或 `&nbsp;` 的 HTML —— 现实里的错误页几乎都属于这一类
+        · JSON 错误体、只有空白
+      bozo=False 且 version 为空（**一声不吭**，这才是漏网的）：
+        · 良构的 XHTML（`<?xml?>` + 正确自闭合的最简页面）
+        · 良构的 XML 维护页 `<maintenance><msg>down</msg></maintenance>`
+        · 空 body（version 是 None 而不是 ''）
+
+    所以准确的说法不是"HTML 页 bozo 不响"（那是错的，第二版就错在这里），而是：
+    **bozo 漏掉的是"良构但不是 feed"的那一类**——站点返回一份规规矩矩的 XML/XHTML
+    错误页或维护页时，它一个字都不说。而那恰是本项目最贵的一种故障：
+    不报错，表现只是"这个源好几天没有新东西了"，用户看到的是中性的『0 条，没有新的』。
+
     version 才是"feedparser 认不认这是个 feed"的答案：真 feed 是 'rss20'/'atom10'/…，
     不是 feed 就是 '' 或 None。
 

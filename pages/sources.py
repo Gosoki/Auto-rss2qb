@@ -47,9 +47,11 @@ def render_sources() -> None:
     ui.label("每个组 = feed（nyaa 用户名或完整 RSS URL）+ 策略 + 优先级。"
              "多源同一集只下一份，按优先级选高的；改完下一轮生效。").classes(
         "text-xs text-gray-400")
+    # 与上面那段功能对等（都是本页开头的介绍），灰度必须一样 —— 早先一段 gray-400、
+    # 一段 gray-500，同一页开头连着两段两种灰。全站到底该分几级见 docs/DECISIONS.md E-37。
     ui.label("① 字幕组白名单：只比对 []/【】 里的组名。 "
              "② 标题关键词：比对整条标题（如按语言 繁日/简日）。 两者可叠加(AND)。").classes(
-        "text-xs text-gray-500 mb-2")
+        "text-xs text-gray-400 mb-2")
 
     @ui.refreshable
     def group_list():

@@ -84,6 +84,21 @@ def anime_page(t: str = ""):
             if not ov["config"]["qb"]:
                 warn_banner("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）")
 
+            # ── 疑似同一部番被拆成两条 ──
+            # 【只提示、不自动合】绑到不同 bgm subject 的两条，程序判不出哪条是对的；
+            # 自动合并会删行且不可逆（剧场版那边已经为此付过一次学费）。
+            # 而它又必须被看见：真库里那一对的其中一条被判了超期忽略，
+            # 挂在它下面的 5 集【永远不会被下】，而现有的身份守卫只认 bangumi_id 相同、看不到它。
+            for _d in anime.suspect_duplicate_anime():
+                _tail = ("；其中『%s』已被忽略，它下面的集不会下载"
+                         % (_d["a_name"] if _d["a_rejected"] else _d["b_name"])
+                         if (_d["a_rejected"] or _d["b_rejected"]) else "")
+                warn_banner(
+                    f"『{_d['a_name']}』(#{_d['a']}，bgm {_d['a_bgm']}) 与 "
+                    f"『{_d['b_name']}』(#{_d['b']}，bgm {_d['b_bgm']}) 共用番名 "
+                    f"「{'、'.join(_d['shared'])}」，多半是同一部番被拆成了两条{_tail}。"
+                    "去详情页核对 bgm 绑定：把错的那条改绑成对的 bgm，身份守卫会自动把它们合并。")
+
             # ── 订阅源组 ──
             ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
@@ -262,10 +277,13 @@ def anime_page(t: str = ""):
                 ui.label("采集状态").classes("text-sm font-bold")
                 ui.label("后台采集与识别").classes("text-xs text-gray-400")
                 # 【字号不在调用点定】原写法是 `size=sm` + `.style("font-size:12px")` 两层叠加：
-                # Quasar 的 size 是行内 font-size（sm=10px、md=14px），所以那句 .style 是在
-                # 把 sm 掰回 12px —— 结果是全站唯一一个 12px 的文字按钮，而它上下都是 14px。
-                # 与徽标那一节同一条原则：字号该由全局定，调用点只选【角色】。
-                with ui.button("重新识别", icon="sync").props("outline color=primary"):
+                # Quasar 的 size 是行内 font-size（sm=10px、md=14px），那句 .style 是在把 sm 掰回 12px。
+                # 与徽标那一节同一条原则：字号该由全局定，调用点只选【角色 + 档位】。
+                # 【档位跟同类走】上面『补下全部』『立刻刷新』与 /movies 的『立刻刷新』都是
+                # 页头行里的 outline 触发器、都是 btn-sm；R18 里我把这一个改成了 14px，
+                # 于是同一页同一角色出现两种尺寸——正是这轮统一要根除的形状。四个一律 12px。
+                with ui.button("重新识别", icon="sync").props(
+                        "outline color=primary").classes("btn-sm"):
                     with ui.menu():
                         ui.menu_item("识别当季", on_click=_reident(1))
                         ui.menu_item("识别半年（近 2 季）", on_click=_reident(2))

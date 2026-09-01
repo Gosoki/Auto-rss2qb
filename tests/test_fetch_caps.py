@@ -142,13 +142,31 @@ async def test_get_text_decodes_and_caps():
         assert await get_text(c, "http://x/") == "中文内容"
 
 
-async def test_bogus_charset_does_not_raise():
-    """字符集名来自第三方响应头，编造一个不存在的就能让 decode 抛 LookupError——
-    它不属 httpx 异常族，会从各调用点的 except 里漏出去打断整轮采集。"""
+@pytest.mark.parametrize("charset,body,exc,why", [
+    ("not-a-charset", b"hi", "LookupError", "编造一个不存在的编码名"),
+    ("bz2_codec", b"hi", "LookupError", "存在但是二进制编解码器（Python 明确抛 not a text encoding）"),
+    ("hex_codec", b"hi", "LookupError", "同上"),
+    # 【只接 LookupError 是不够的】这两个是【存在、也是文本编码、但拒绝 errors='replace'】：
+    #   b"…".decode("idna", "replace")     → UnicodeError: Unsupported error handling
+    #   b"…".decode("punycode", "replace") → UnicodeDecodeError（内部 ascii 解码，无视 errors）
+    # 上一版用例喂的编码名正好只覆盖会抛 LookupError 的那一半 ——
+    # "用例只测了自己传进去的那一类"，而漏掉的那一类照样能打断整轮采集。
+    ("idna", b"hi", "UnicodeError", "存在、是文本编码，但拒绝 errors='replace'"),
+    # punycode 对 ASCII 能解出来，要非 ASCII 字节才抛 —— 而"响应体是二进制"恰恰是常态
+    ("punycode", b"\xff\xfe", "UnicodeDecodeError", "内部 ascii 解码，无视 errors 参数"),
+])
+async def test_bogus_charset_does_not_raise(charset, body, exc, why):
+    """字符集名来自第三方响应头，是不可信输入；decode 抛的异常不属 httpx 异常族，
+    会从各调用点的 except httpx.HTTPError 里漏出去打断整轮采集。"""
+    # 先确认这个编码在本机确实会抛报告里说的那一类，否则这条用例是空跑
+    with pytest.raises(Exception) as ei:
+        body.decode(charset, "replace")
+    assert type(ei.value).__name__ == exc, f"前提变了：{charset} 现在抛 {type(ei.value).__name__}"
+
     def h(r):
-        return _resp(b"hi", headers={"content-type": "text/html; charset=not-a-charset"})
+        return _resp(body, headers={"content-type": f"text/html; charset={charset}"})
     async with _client(h) as c:
-        assert await get_text(c, "http://x/") == "hi"
+        assert await get_text(c, "http://x/") == body.decode("utf-8", "replace"), why
 
 
 async def test_http_errors_still_raise():

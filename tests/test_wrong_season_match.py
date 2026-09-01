@@ -5,7 +5,7 @@ season=1 → 两个候选名【一致】命中 bgm 140001『第一季』(2016-04
 直接绑上 → air_date 2016 早于开始使用日 → 整部番被判『超期忽略』，一集不下，
 而界面上它和用户手动拒绝的番长得一模一样。正确答案是『第四季 夺还篇』(绝对第 78 集 = 该季第 1 集)。
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -53,6 +53,17 @@ def _item(ep, release, **kw):
     (12, "2026-07-07", 1, datetime(2026, 6, 21), False, "真库 anime#52：早 2.3 周，正常"),
     (13, "2026-07-05", 12, datetime(2026, 6, 10), False, "真库 anime#8：早 3.6 周，本轮余量下【不判】(见 E-34)"),
     (12, "2026-07-05", -1, datetime(2023, 10, 8), False, "先行特典本来就可能早于首播，不参与"),
+    # 【把余量的常数项与斜率都钉死】span = total + _OFF_SEASON_SLACK_WEEKS(26)。
+    # 不钉的话这个正在等拍板的参数落在守卫盲区里：第 19 轮实测把 -span 换成 E-34 里的另一个
+    # 候选 -4，全套用例照样全绿——拍板结果落地时不会有任何用例告诉你"你确实改了它"。
+    (12, "2026-07-05", 1, datetime(2026, 7, 5) - timedelta(weeks=38, days=1), True,
+     "12 集番：早于首播 38 周(=12+26) 再多一天 → 判"),
+    (12, "2026-07-05", 1, datetime(2026, 7, 5) - timedelta(weeks=38) + timedelta(days=1), False,
+     "同上，差一天不到 38 周 → 不判"),
+    (26, "2026-07-05", 1, datetime(2026, 7, 5) - timedelta(weeks=52, days=1), True,
+     "26 集番的门槛是 52 周(=26+26)——斜率也要钉，否则只钉住了常数项"),
+    (26, "2026-07-05", 1, datetime(2026, 7, 5) - timedelta(weeks=40), False,
+     "26 集番早 40 周还不到它的 52 周门槛 → 不判（同样的 40 周在 12 集番上会判）"),
 ])
 def test_episode_cannot_belong(total, air, ep, rel, want, why):
     assert A._episode_cannot_belong(_anime(total, air), _item(ep, rel)) is want, why
@@ -434,3 +445,94 @@ def test_a_genuine_one_episode_work_is_not_suspect(clean_tables):
                                site="nyaa", raw_title="y", season=1, episode=1.0, status="pending"))
         s.commit()
         assert A.binding_looks_wrong(s, a) is False
+
+
+# ---------------- 同一部番被拆成两条、且绑到不同 bgm（R19） ----------------
+
+def test_suspect_duplicate_is_found_when_bgm_differs(clean_tables):
+    """(R19) 全项目"一部番不该有两条记录"的判据只有 `bangumi_id 相同 → _merge_anime` 一种，
+    而分裂的真实成因往往是【两条绑到了不同的 subject】—— 那时守卫恒不成立，界面上零提示。
+
+    真库实证：anime#60『北斗神拳 拳王军杂兵们的挽歌 第二季』(bgm 637339) 与
+    anime#86『北斗神拳 -FIST OF THE NORTH STAR-』(bgm 454438，2026-04 的另一部重制)。
+    ANi 的标题带 `Animatica「…」` 前缀、别的源不带 → 第三个别名键 → 新建一部 →
+    绑到别的 subject → 被判超期忽略，它下面的第 16~20 集**永远不会被下**。
+    """
+    from db.models import AnimeAlias
+    with clean_tables.get_session() as s:
+        a = Anime(title="北斗神拳拳王军杂兵们的挽歌", season=2, confirmed=True, bangumi_id=637339)
+        b = Anime(title="北斗之拳拳王军杂兵们的挽歌", season=1, bangumi_id=454438, rejected=True)
+        s.add(a); s.add(b); s.commit(); s.refresh(a); s.refresh(b)
+        # 季号照抄真库：三条别名的 season 都是 1（ANi 的标题里没有季标记，
+        # 『第二季』是 bgm 规范名带来的、只写进 Anime.season，不进别名键）
+        s.add(AnimeAlias(title="Animatica「北斗之拳拳王军杂兵们的挽歌」", season=1, anime_id=a.id))
+        s.add(AnimeAlias(title="北斗神拳拳王军杂兵们的挽歌", season=1, anime_id=a.id))
+        s.add(AnimeAlias(title="北斗之拳拳王军杂兵们的挽歌", season=1, anime_id=b.id))
+        s.commit()
+        aid, bid = a.id, b.id
+
+    hits = A.suspect_duplicate_anime()
+    assert len(hits) == 1, f"没认出这一对：{hits}"
+    d = hits[0]
+    assert {d["a"], d["b"]} == {aid, bid}
+    assert d["shared"] == ["北斗之拳拳王军杂兵们的挽歌"]
+    assert d["a_rejected"] or d["b_rejected"]
+
+
+def test_same_bgm_pairs_are_not_reported(clean_tables):
+    """绑到同一个 subject 的两条由身份守卫自己合并，报出来是噪声。"""
+    from db.models import AnimeAlias
+    with clean_tables.get_session() as s:
+        a = Anime(title="某番", season=1, bangumi_id=111)
+        b = Anime(title="某番别写法", season=1, bangumi_id=111)
+        s.add(a); s.add(b); s.commit(); s.refresh(a); s.refresh(b)
+        s.add(AnimeAlias(title="XYZ「某番」", season=1, anime_id=a.id))
+        s.add(AnimeAlias(title="某番", season=1, anime_id=b.id))
+        s.commit()
+    assert A.suspect_duplicate_anime() == []
+
+
+def test_a_title_that_starts_with_its_own_bracket_is_not_stripped(clean_tables):
+    """(R19) 番名自带方头括号的不能被当成"制作公司前缀"剥掉 —— 本项目在 `【我推的孩子】` 上踩过一次。
+
+    真库里含方头/直角括号的番名只有两个：`Animatica「…」`（该剥）与
+    `『你们先走我断后』，于是10年后我成为了传说`（不该剥）。
+    """
+    assert A.canonical_alias("Animatica「北斗之拳拳王军杂兵们的挽歌」") == "北斗之拳拳王军杂兵们的挽歌"
+    for keep in ("『你们先走我断后』，于是10年后我成为了传说", "【我推的孩子】",
+                 "「不是前缀」后面还有正文"):
+        assert A.canonical_alias(keep) == keep, f"不该剥的被剥了：{keep}"
+
+
+def test_same_title_different_season_is_not_a_duplicate(clean_tables):
+    """(R19) 同名不同季的两条【不是】重复 —— 别名表的唯一键就是 (title, season)。
+
+    只按标题求交集的话，S1 与 S2 会被报成"多半是同一部番被拆成了两条"，
+    而横幅给的指引是"把错的那条改绑成对的 bgm，身份守卫会自动合并" ——
+    用户照做就是 `_merge_anime` 删掉一整行。
+    真库里同一个别名标题挂多个 season 的已经有 3 组（『超超超超超喜欢你的100个女朋友』{1,3} 等），
+    只是它们目前都指向同一个 anime_id 所以还没炸。
+    """
+    from db.models import AnimeAlias
+    with clean_tables.get_session() as s:
+        s1 = Anime(title="某番", season=1, bangumi_id=111)
+        s2 = Anime(title="某番", season=2, bangumi_id=222)
+        s.add(s1); s.add(s2); s.commit(); s.refresh(s1); s.refresh(s2)
+        s.add(AnimeAlias(title="某番", season=1, anime_id=s1.id))
+        s.add(AnimeAlias(title="某番", season=2, anime_id=s2.id))
+        s.commit()
+    assert A.suspect_duplicate_anime() == [], "同名不同季被报成了重复番"
+
+
+def test_two_unbound_rows_sharing_a_name_are_reported(clean_tables):
+    """(R19) 两边 bangumi_id 都是 None 时【要报】——身份守卫全都要求 bangumi_id 非空，
+    这一对没有任何人会去合，恰恰是最该被看见的。原来那句短路对它恒成立，把它静默跳过了。"""
+    from db.models import AnimeAlias
+    with clean_tables.get_session() as s:
+        x = Anime(title="没认出来的番", season=1)
+        y = Anime(title="没认出来的番别写法", season=1)
+        s.add(x); s.add(y); s.commit(); s.refresh(x); s.refresh(y)
+        s.add(AnimeAlias(title="ABC「没认出来的番」", season=1, anime_id=x.id))
+        s.add(AnimeAlias(title="没认出来的番", season=1, anime_id=y.id))
+        s.commit()
+    assert len(A.suspect_duplicate_anime()) == 1, "两条都没绑 bgm 的重复番被静默跳过了"

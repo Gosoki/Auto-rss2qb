@@ -13,6 +13,7 @@ from db.models import MovieTorrent
 from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN, quarter_sort_key
 from .layout import (WEEKDAY_CN, barline, busy_action, confirm, confirm_bind_merge,
+                     require_config_loaded,
                      expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
                      name_of, paginate, parse_bgm_id, qb_live_text,
@@ -108,7 +109,7 @@ async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
     arch = [t for t in _ts if t.status in engine.HAVE_STATUSES and t.archived_at]
     # 与番剧侧同一道判据、同一份实现，理由见 engine.rows_in_wrong_dir
     stale = engine.rows_in_wrong_dir(_ts, new_path)
-    if new_path == old_path and not stale:
+    if not engine.needs_relocate(_ts, new_path, old_path):
         return   # 路径没变，且盘上文件也都在该在的地方
     if not dl:
         if arch:
@@ -487,6 +488,10 @@ def movies_page(t: str = ""):
             return h
 
         def _save_scan(f):
+            # 与设置页『保存』同一道闸：值取自用 config.* 渲染的控件，配置没读出来时它们是硬编码默认，
+            # 写下去就是把库里已有的扫描设置覆盖成默认，而且会弹一句绿色的成功提示。
+            if not require_config_loaded():
+                return
             try:
                 secs = max(3600, int(float(f["hours"].value or 12) * 3600))
             except (ValueError, TypeError):

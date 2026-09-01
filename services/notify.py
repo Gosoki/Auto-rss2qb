@@ -62,8 +62,15 @@ _fail_streak = 0
 _muted_until = 0.0
 
 
-def _safe_host() -> str:
-    """NOTIFY_URL 里可以安全写进日志的那一段：只留主机名。
+def _safe_host(url: str = "") -> str:
+    """这次请求的地址里可以安全写进日志的那一段：只留主机名。
+
+    【必须收参数】不收的话它恒读 config.NOTIFY_URL，而设置页的『发送测试通知』走的是
+    url_override —— 于是报错行里的主机名跟这次真正发过去的地址【无关】。
+    这台机器 NOTIFY_URL 是空的，实测输出正是
+    `通知发送失败：ConnectError: All connection attempts failed（(未配置)）`——
+    R17 自己在文档里把「(未配置) 与同行报错自相矛盾」列为真问题，又被 R17 新加的按钮原样重造了一遍。
+    已保存过地址时更糟：报的是【已保存】的那个主机名，是错误归因而不只是空信息。
 
     Bark / Server酱 / ntfy 这类服务把推送密钥放在 URL 【路径】里
     （如 https://api.day.app/<密钥>/消息），所以日志里绝不能出现完整 URL。
@@ -78,7 +85,7 @@ def _safe_host() -> str:
     """
     from urllib.parse import urlsplit
     try:
-        p = urlsplit(config.NOTIFY_URL or "")
+        p = urlsplit(url or config.NOTIFY_URL or "")
         host = p.hostname or ""
         return (f"{host}:{p.port}" if p.port else host) or "(未配置)"
     except ValueError:
@@ -133,7 +140,7 @@ async def notify(message: str, *, url_override: str = "") -> bool:
         _muted_until = time.monotonic() + _FAIL_MUTE_SECONDS
         log.warning("通知连续失败 %d 条，暂停推送 %d 秒（%s）——期间的通知直接丢弃，"
                     "改完地址在设置页点『保存』可立刻恢复",
-                    _fail_streak, _FAIL_MUTE_SECONDS, _safe_host())
+                    _fail_streak, _FAIL_MUTE_SECONDS, _safe_host(base))
     return False
 
 
@@ -158,7 +165,7 @@ async def _send_once(message: str, base: str = "") -> bool:
         # 推送密钥放在 URL【路径】里——原样记下去就落进 data/autorss.log 与 /logs 页，
         # 用户用一键下载把日志贴进 issue 时密钥就公开了。
         if e.response.status_code >= 400:
-            log.warning("通知发送失败：HTTP %s（%s）", e.response.status_code, _safe_host())
+            log.warning("通知发送失败：HTTP %s（%s）", e.response.status_code, _safe_host(base))
             return False
         return True   # 3xx：有些推送服务受理后就是 302 到状态页，那也是送到了
     except Exception as e:
@@ -166,7 +173,7 @@ async def _send_once(message: str, base: str = "") -> bool:
         # 而这条兜底以前是裸 str(e)[:80]：services/fetch.py 造的异常消息正是以完整 URL 结尾，
         # 而 notify 的 url 含 Bark/Server酱 的路径密钥。截断也救不了——22 位密钥能塞进 80 字符。
         log.warning("通知发送失败：%s: %s（%s）", type(e).__name__,
-                    fetch.redact(e)[:120], _safe_host())
+                    fetch.redact(e)[:120], _safe_host(base))
         return False
 
 

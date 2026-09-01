@@ -16,7 +16,7 @@ from db import backup
 from services import notify
 from db.dialect import BINARY_COLLATION
 from sources.parse import format_quarter
-from .layout import busy_action, confirm, frame, warn_banner
+from .layout import busy_action, confirm, frame, require_config_loaded, warn_banner
 
 _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "NOTIFY_MAX_PER_HOUR", "NOTIFY_BACKLOG_MIN", "ANIME_IDLE_DAYS", "SWEEP_INTERVAL_MIN",
@@ -478,11 +478,15 @@ def _db_panel(f: dict) -> None:
                                                  lambda: _switch_backend(True),
                                                  fail="切换失败")).props(
             "unelevated color=primary")
+        # 【两个方向用同一个次级角色】它们是对等操作（本节标题就写着"切错了再切回来即可"）。
+        # 早先这个用 flat color=grey，而词表里 grey 是"忽略 / 重试识别 / 删除源"那一档 ——
+        # 拿到那个权重的偏偏是往【本地库】走的方向，读起来像"这条路不太正经"。
+        # 下面『迁移』那一对同理，两个方向也用同一个角色。
         ui.button("切回本地 SQLite", icon="undo",
                   on_click=lambda e: busy_action(e.sender, "db-op",
                                                  lambda: _switch_backend(False),
                                                  fail="切换失败")).props(
-            "flat color=grey")
+            "flat color=primary")
 
     ui.separator().classes("my-2")
     ui.label("② 迁移数据（复制数据，连接不变）").classes("text-sm font-bold")
@@ -619,8 +623,9 @@ def settings():
                         with ui.row().classes("items-center gap-2 w-full no-wrap"):
                             ui.input(value=cmd).props("readonly").classes(
                                 "grow font-mono min-w-0").style("font-size:12px")
+                            # 与 anime_detail / movies 里那两个同 props 的行内编辑图标同档（12px）
                             ui.button(icon="content_copy", on_click=_copy).props(
-                                "flat round dense color=primary").tooltip("复制命令")
+                                "flat round dense color=primary").classes("btn-sm").tooltip("复制命令")
 
                     _cb_cmd()
                     f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 改则命令跟着变
@@ -641,7 +646,14 @@ def settings():
                             "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。")
             _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
                              "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的下载文件夹命名。",
-                             config.QUARTER_FMT_UI, empty_hint="留空＝跟随番剧下载文件夹命名", tpl_label="季度模板")
+                             # 【渲染原始值，不是派生值】config.QUARTER_FMT_UI 走 __getattr__，
+                             # 返回的是 `_v["QUARTER_FMT_UI"] or _v["QUARTER_FMT"]` —— 也就是说
+                             # "跟随"这个状态（原始值为空串）在框里被渲染成 QUARTER_FMT 当下的字面量，
+                             # 而保存链路又原样把框里的值写回原始键：读派生、写原始，两端不对称，
+                             # 一次保存就把"跟随"塌缩成"钉死在当时那个字面量"。
+                             # 之后用户改『下载文件夹命名』，目录跟着变、页面上的季度标题却不动。
+                             config.raw("QUARTER_FMT_UI"),
+                             empty_hint="留空＝跟随番剧下载文件夹命名", tpl_label="季度模板")
 
             ui.separator()
             _section("网络 / 通知",
@@ -812,6 +824,15 @@ def settings():
                      "反悔：把开始日清空（或调很早）再点『应用』，就把超期忽略的番全放回待确认。")
 
             async def _apply_filter():   # 应用：先存下输入框里的开始日（免得还得先去点下面『保存』），再按它重算
+                # 【与『保存』同一道闸】那道闸的理由是"配置没从库里读出来时表单上全是硬编码默认值，
+                # 一按就把库里已有配置整体改写成默认，全程零报错还弹一句绿色的『已保存』"——
+                # 而这个按钮做的是一模一样的事：它写 ANIME_START_DATE，值取自一个用
+                # config.ANIME_START_DATE 渲染的框（读不出来时就是默认的空串）。
+                # 于是页面顶部正红着那条 banner、用户点保存被拦下，点这个按钮却能把库里真实的
+                # '2026-04-01' 覆盖成 ''，紧接着 apply_start_date_filter 把全部超期忽略的番
+                # 放回待确认，最后弹一条【绿色】的『已保存并应用』。闸只装在 _save 一处是不够的。
+                if not require_config_loaded():
+                    return
                 sd = (f["ANIME_START_DATE"].value or "").strip()
                 if sd and anime._parse_date(sd) is None:   # 空=不限（合法）；非空则须能解析
                     ui.notify("开始使用日格式不对（应为 YYYY-MM-DD，如 2026-07-01）", type="negative")
@@ -958,7 +979,16 @@ def settings():
                 ui.notify("开始使用日格式不对（应为 YYYY-MM-DD，如 2026-07-01），已取消保存", type="negative")
                 return
             db_updates = {k: v for k, v in updates.items() if k not in _RESTART_ONLY}
-            env_updates = {k: v for k, v in updates.items() if k in _RESTART_ONLY}
+            # 【只收【真的变了】的那几项】表单收的是全量而不是差量，而 WEB_HOST/WEB_PORT 的控件
+            # 恒存在于 f 里，所以按"在不在 _RESTART_ONLY 里"筛出来的 env_updates 【永远非空】。
+            # 两个后果：① 改个站点名也要把 .env 整个重写一遍（mkstemp + fsync + os.replace）；
+            # ② 成功提示尾巴上那句「（Web 绑定地址/端口改动需重启）」恒出现，
+            #    而它本来是用来提醒"你刚改的这一项要重启才生效"的——每次都出现就等于把它训练成噪声，
+            #    真的改了端口那一次用户也不会多看一眼。
+            # 顺带把 ③ 缩小了：update_env 排在 set_many 之后，.env 不可写时异常会在配置
+            # 【已经写进库】之后抛出，页面上什么都不会显示——现在只有真改绑定地址/端口才可能撞上。
+            env_updates = {k: v for k, v in updates.items()
+                           if k in _RESTART_ONLY and v != (_env_now.get(k) or "")}
             if db_updates:
                 sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
                 qb_was_on = config.QB_ENABLED

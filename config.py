@@ -193,6 +193,17 @@ def _to_raw(kind, default) -> str:
 _v = {k: _coerce(kind, default) for k, (kind, default) in _SPEC.items()}
 
 
+def raw(name: str):
+    """取【原始】配置值，不走 __getattr__ 的派生。
+
+    派生项（PROXY / QUARTER_FMT_UI）在读的时候会替你回落到别的键，那对使用方是对的，
+    但对【设置页的输入框】是错的：框里要能表达"这一项留空"这个状态本身，
+    而派生值会把空串渲染成它回落到的那个字面量——读派生、写原始，一次保存就把
+    "跟随"塌缩成"钉死在当时那个值"。要渲染可编辑的原始值就用它。
+    """
+    return _v[name]
+
+
 def __getattr__(name):
     """动态读当前配置值：config.QB_ENABLED 等；PROXY / QUARTER_FMT_UI 为派生项。"""
     if name == "PROXY":
@@ -299,17 +310,37 @@ def load_from_db() -> None:
     from db.models import Setting
     # 【走 meta 会话】配置恒存本地 SQLite，与业务库是否切到 MySQL 无关——
     # 否则连不上 MySQL 时就读不到"该怎么连 MySQL"，先有鸡还是先有蛋。
-    with get_meta_session() as s:
-        have = {r.key: r.value for r in s.exec(select(Setting))}
-        fresh = not have  # settings 表原本为空 = 全新库首启
-        for k, (kind, default) in _SPEC.items():
-            if k not in have:
+    # 【幂等写 + 撞了重跑一次】这个循环会 INSERT（Setting.key 是主键），
+    # 而它和下面 _merge_new_notify_events 面对的是【同一个】并发风险，
+    # 却只有后者被整段兜住——那正是本项目第①种缺陷形状（同一件事两处，只护了一处）。
+    # 触发窗口就是那段注释自己列的："升级后第一次启动"（_SPEC 加了新键、库里还没有）
+    # 叠上两个进程同时起：service 还跑着又手动试跑一次、deploy.sh 重启期间新旧进程重叠。
+    # 两边的 SELECT 拿到同一份"缺这些键"的快照，各自 INSERT，后 commit 的那个直接
+    # IntegrityError —— 而它会穿透 load_from_db → main.py 的启动 try → mark_data_fatal，
+    # 一次并发启动就能让整台机器停在那里。
+    def _fill_missing() -> dict:
+        with get_meta_session() as s:
+            have = {r.key: r.value for r in s.exec(select(Setting))}
+            fresh = not have  # settings 表原本为空 = 全新库首启
+            for k, (kind, default) in _SPEC.items():
+                if k in have:
+                    continue
                 if fresh and k in _FRESH_OFF:
                     have[k] = "false"          # 全新库首启：配置好前先别自动采集
                 else:
                     have[k] = _to_raw(kind, default)
-                s.add(Setting(key=k, value=have[k]))
-        s.commit()
+                if s.get(Setting, k) is None:  # 幂等：赢家可能已经插好了
+                    s.add(Setting(key=k, value=have[k]))
+            s.commit()
+            return have
+
+    try:
+        have = _fill_missing()
+    except Exception as e:
+        # 重跑一次：这一次那些键已经被赢家插好，走的是"没有缺键"的空路径，必成功。
+        # 【不能只 except 不重跑】have 是下面读配置用的，吞掉异常会让它未定义。
+        log.warning("补齐配置键时撞车（多半是并发启动），重试一次：%s: %s", type(e).__name__, e)
+        have = _fill_missing()
     for k in _SPEC:
         _v[k] = _coerce(_SPEC[k][0], have[k])
     loaded_from_db = True

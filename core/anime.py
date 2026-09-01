@@ -393,6 +393,80 @@ def alias_key(title: str) -> str:
     return (title or "")[:ALIAS_TITLE_LEN]
 
 
+# 制作公司/发行方前缀：`Animatica「番名」`。ANi 的部分标题带这一层，别的源不带，
+# 于是同一部番在别名表里多出一个键。只在【比对】时剥，不改番名本身（见 canonical_alias）。
+# 【规则收得很紧，且量过】要求整个名字就是「拉丁前缀 + 「…」」这一个形状：
+# 真库 169 个番名里含方头/直角括号的只有 2 个，这条规则精确命中该命中的那一个，
+# 而 `『你们先走我断后』，于是10年后我成为了传说`（括号在最前但后面还有正文）不受影响。
+# 本项目在 `【我推的孩子】` 这类"番名自带括号"上踩过一次坑，所以宁可窄。
+_STUDIO_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\s.\-]{0,20}「([^」]+)」\s*$")
+
+
+def canonical_alias(title: str) -> str:
+    """把别名键再归一一步，【只用于"这两条是不是同一部番"的比对】，不写库。
+
+    比 alias_key 更激进：剥掉制作公司前缀。不拿它当存储键，是因为归一得越狠、
+    把两部【不同】的番并到一起的风险越大——而存储键一旦并错，种子就会挂到错的番上，
+    不可逆；比对错了只是多提示一次，用户看一眼就否掉。
+    """
+    t = (title or "").strip()
+    m = _STUDIO_PREFIX_RE.match(t)
+    return (m.group(1) if m else t).strip()
+
+
+def suspect_duplicate_anime() -> list[dict]:
+    """疑似"同一部番被拆成了两条记录"的配对（只读，不改任何东西）。
+
+    【为什么现有的守卫看不到它】全项目"一部番不该有两条记录"的判据只有一种形态：
+    `Anime.bangumi_id 相同 → _merge_anime`。而分裂的真实成因往往是【两条绑到了不同的
+    bgm subject】——那时守卫恒不成立，界面上也没有任何提示。
+
+    真库实证：anime#60『北斗神拳 拳王军杂兵们的挽歌 第二季』(bgm 637339) 与
+    anime#86『北斗神拳 -FIST OF THE NORTH STAR-』(bgm 454438，2026-04 的另一部重制)。
+    ANi 的标题带 `Animatica「…」` 前缀、别的源不带，于是产生了第三个别名键，
+    第三个键没命中任何已有别名 → 新建一部 → 它绑到了别的 subject → 被判超期忽略，
+    挂在它下面的 5 集（第 16~20 集）**永远不会被下**。
+
+    【只报不合】绑到不同 subject 的两条，程序判不出哪条是对的；自动合并会删行且不可逆，
+    而 `_merge_movie` 那边已经因为"两边都下过就拒绝"付过一次学费。这里只把配对交给用户，
+    合并走详情页现成的绑定回显（bind_preview / confirm_bind_merge）。
+
+    判据：两条番的别名在 canonical_alias 归一后有交集，且【bgm 绑定不同】
+    （相同的那种已经被身份守卫合掉了，报出来是噪声）。
+    """
+    with get_session() as s:
+        rows = list(s.exec(select(AnimeAlias)))
+        by_anime: dict = {}
+        for r in rows:
+            # 【必须带上 season】别名表的唯一键就是 (title, season)，季号被剥进单独一列正是这张表的设计。
+            # 只按标题求交集的话，同名不同季的两条会被报成"多半是同一部番"——而横幅给的指引是
+            # "把错的那条改绑成对的 bgm，身份守卫会自动合并"，用户照做就是 _merge_anime 删掉一整行。
+            # 真库里同一个别名标题挂着多个 season 的已经有 3 组（『超超超超超喜欢你的100个女朋友』{1,3}、
+            # 『相反的你和我』{1,2}、『GRANDBLUE碧蓝之海3』{1,3}），只是它们目前都指向同一个 anime_id
+            # 所以还没炸；哪一季的 bgm 解析结果一不同（那正是 #60/#86 的成因）就会误报。
+            by_anime.setdefault(r.anime_id, set()).add((canonical_alias(r.title), r.season))
+        animes = {a.id: a for a in s.exec(select(Anime))}
+    out, ids = [], sorted(by_anime)
+    for i, x in enumerate(ids):
+        for y in ids[i + 1:]:
+            shared = by_anime[x] & by_anime[y]
+            if not shared:
+                continue
+            ax, ay = animes.get(x), animes.get(y)
+            if ax is None or ay is None:
+                continue
+            # 【要判非空】身份守卫（_resolve_anime 建番处、enrich_anime 末尾）全都要求
+            # bangumi_id is not None，所以"两边都是 None"这一对【没有任何人会去合】——
+            # 而原来那个等式对它恒成立，等于把最该报的一类静默跳过了。
+            if ax.bangumi_id is not None and ax.bangumi_id == ay.bangumi_id:
+                continue     # 同 bgm 的两条身份守卫会自己合，报出来是噪声
+            out.append({"a": x, "b": y, "shared": sorted(t for t, _ in shared),
+                        "a_name": display_of(ax), "b_name": display_of(ay),
+                        "a_bgm": ax.bangumi_id, "b_bgm": ay.bangumi_id,
+                        "a_rejected": bool(ax.rejected), "b_rejected": bool(ay.rejected)})
+    return out
+
+
 def auto_downloadable_ep(ep) -> bool:
     """这个集号能不能被【自动/批量】下载。用户拍板：特别篇(-1) 与 未知集/疑似批量(-2) 一律不自动下。
 
@@ -1311,7 +1385,38 @@ def is_finished(a, covered: set) -> bool:
     t = a.total_episodes or 0
     if t <= 0 or ambiguous_range(a) is not None or _cannot_have_aired_all(a):
         return False
+    if _coverage_has_two_numberings(covered, t):
+        return False
     return all(k in covered for k in range(1, t + 1))
+
+
+# 【多出几集算"bgm 少记"，几集算"两套编号"】1~2 集是前者，3 集起是后者。
+# 真库实证（有超界集号的 5 部）：超界集数分别是 21 / 8 / 8 / 7 / 3 —— 全部 ≥ 3；
+# 而项目自己那条 test_extra_episodes_beyond_total_are_fine 保护的场景（bgm 少记一集）是 1。
+# 1~2 这一段在真库上是空的，所以 3 不是拍脑袋，是数据里那道缝。
+_OVER_EPS_MEANS_TWO_NUMBERINGS = 3
+
+
+def _coverage_has_two_numberings(covered, total: int) -> bool:
+    """这份 coverage 里是不是同时躺着两套编号 —— 那样"1..T 全在手"就是假的。
+
+    【为什么需要它：_cannot_have_aired_all 只是个定时器】那道闸问的是"这一季播完了没有"，
+    答案会随时间变成"播完了"，于是它对一部【集号被污染】的番只提供到最后一集播出为止的保护。
+    真库实测：anime#6 的闸 2026-09-20 到期、#60 是 09-21，之后同一份假 coverage
+    会把两部都重新判成完结，而让 coverage 变假的那批种子一条都没动。
+    第 19 轮的审计把这条揪了出来——"3 周定时器不是修复"。
+
+    这一条不看时间，只看分布：超出总集数的集号有 ≥3 个、同时 1..T 里也有货，
+    就说明库里并存着"季内编号"和"跨季绝对编号"两套，coverage 数出来的那个"齐"没有意义。
+
+    【为什么不复用 episode_numbering_conflict】那个函数按【全部种子】算并且要查库，
+    而这里要问的是"我马上要信的这份 coverage 干不干净"，还没到手的种子污染不了它；
+    本函数是纯函数，sweep_finished 对每个候选各调一次（真库 59 个），不能带查询。
+    """
+    if total <= 0:
+        return False
+    over = [e for e in covered if e > total]
+    return len(over) >= _OVER_EPS_MEANS_TWO_NUMBERINGS and any(1 <= e <= total for e in covered)
 
 
 def _cannot_have_aired_all(a) -> bool:
