@@ -196,6 +196,8 @@ def _backup_panel(f: dict) -> None:
     恢复是一次性、要停服、要看清楚的操作，做成一个网页按钮反而危险（点错了就把现在的库盖了）。
     页面上直接给出恢复用的命令，人照着敲一次即可。
     """
+    import db          # 局部导入：本模块用的是 `from db import backup, ...`，
+                       # 没有 db 这个名字（settings_page 里那处也是这么写的）
     _section("自动备份", "整库快照（VACUUM INTO，不是拷文件——本项目的 SQLite 开着 WAL，"
                          "直接拷主文件会拿到一份看着正常、其实缺最近写入的库）。"
                          "业务库切到 MySQL 时这里备的是【本地库】——里面往往还留着切换前的旧业务数据，"
@@ -223,6 +225,20 @@ def _backup_panel(f: dict) -> None:
                 # 这道徽标是那条路上唯一有机会拦住人的地方。
                 ui.badge("配置+业务" if d["has_data"] else "仅配置").props(
                     "color=green" if d["has_data"] else "color=orange")
+                # 【这份备份把业务库指向哪】(R28) 备份是对本地文件整个快照，`setting` 表
+                # 原样进去 —— **DB_BACKEND 与 DB_MYSQL_* 都在里面**。恢复一份切库【之前】
+                # 做的备份，重启后 apply_configured_backend 读到的就是 DB_BACKEND=sqlite：
+                # 系统静默跑在另一份数据集上，MySQL 上的真数据既看不见也不再更新。
+                # 而上面那个绿徽标只数【本地文件里】的行数，切 MySQL 并不会删掉本地旧表 ——
+                # 于是 MySQL 用户的每一份备份都是绿的，恰恰把人往那份旧备份上引。
+                # 指向与当前不一致时降级成警告色：这是唯一能让人当场看出来的东西。
+                _bk = d.get("backend")
+                if _bk:
+                    _same = _bk == db.data_backend()
+                    ui.badge("→ " + (d.get("mysql_db") or "本地 SQLite")).props(
+                        f"color={'blue-grey' if _same else 'orange'}").tooltip(
+                        "恢复这份之后，业务库会指向这里"
+                        + ("" if _same else "——与你【现在】用的那个不是同一个库！"))
                 ui.label(d["name"]).classes("text-xs text-gray-400 shrink-0")
                 ui.label(d["detail"]).classes("text-xs text-gray-500 grow break-all min-w-0")
                 ui.label(f"{d['bytes'] / 1024:.0f} KB").classes("text-xs text-gray-500 shrink-0")
@@ -244,8 +260,14 @@ def _backup_panel(f: dict) -> None:
     with ui.row().classes("gap-2 items-center mt-2"):
         btn = ui.button("立刻备份", icon="backup", on_click=_now).props("unelevated color=primary")
         _help("恢复步骤（顺序不能乱）：\n"
-              "0. 先看清楚要恢复的那份上面的徽标：写着【仅配置】就说明它里面【没有番剧数据】，"
-              "盖上去等于把现在的番全清空——而之后每一项检查都会是绿的（见下）。\n"
+              "0. 先看清楚要恢复的那份上面的【两个】徽标：\n"
+              "   · 写着【仅配置】＝它里面【没有番剧数据】，盖上去等于把现在的番全清空——"
+              "而之后每一项检查都会是绿的（见下）；\n"
+              "   · 第二个徽标是【业务库指向】。备份里含 DB_BACKEND 与 MySQL 连接参数，"
+              "恢复一份切库【之前】做的备份，会把业务库指回它当时那个库——"
+              "你现在 MySQL 上的数据既看不见也不再更新，而页面照常打开、显示的是切换前的旧番剧。"
+              "橙色就表示它与你现在用的不是同一个库。恢复后第一件事是回设置页确认"
+              "『当前业务数据库』是不是你要的那个。\n"
               "1. systemctl stop autorss\n"
               "2. 现役库【改名留底】，连 -wal/-shm 一起（不是删）：\n"
               "   cd data && for x in autorss.db autorss.db-wal autorss.db-shm; do "
@@ -424,7 +446,16 @@ def _db_panel(f: dict) -> None:
         #     否则它一直挂着，而 run_db_watch 的 was_down 也仍是 True，下一次 30 秒心跳探通时会补做
         #     一次复位——那已是系统恢复运行【之后】，采集/UI 都可能有交付在途，正好踩中上面那个坑。
         try:
-            worker.init_business_state(reset_leftovers=worker._startup_reset_pending)
+            # 【必须走 io_bound】(R27) 此刻 db.engine 已经指向新库，而这个函数做的全是
+            # 同步库往返：seed_source_groups（SELECT + 可能的两次 INSERT）、
+            # backfill_legacy_progress_once（对两张种子表各一次全表扫 + 逐行 UPDATE）。
+            # 裸调用会把整个事件循环冻到它跑完 —— 界面、交付协程、qB 同步一起停。
+            # 真库规模（1679+569 行、局域网 MySQL）实测 78ms，但 sent 是只增不减的终态、
+            # 行数随挂机线性长；真正的风险是刚切过去的 MySQL 立刻变慢/不可达，
+            # 业务引擎带 read_timeout=15 + connect_timeout=5，最坏能把整站冻几十秒。
+            # 上面那句 switch_data_engine 早就是 io_bound 了 —— 同一个处理器里
+            # 一句包了、下一句没包，正是 E-36 那条守卫要防的事（守卫为什么没报，见用例）。
+            await run.io_bound(worker.init_business_state, worker._startup_reset_pending)
         except Exception as e:
             ui.notify(f"已切库，但业务初始化失败（源组可能为空）：{type(e).__name__}: {str(e)[:120]}",
                       type="warning")
@@ -682,6 +713,16 @@ def settings():
                     _text("QB_URL", "qB 地址", config.QB_URL)
                     _text("QB_USERNAME", "qB 用户名", config.QB_USERNAME)
                     _password("QB_PASSWORD", "qB 密码（留空=不修改）")
+                    # 分类名：三条投递路径各一个。只影响【之后】发出去的种子，
+                    # qB 里已有的老种子保留老分类（本项目从不按分类回查 qB，回查一律按 info_hash）。
+                    _section("qB 分类名",
+                             "发到 qB 时打的分类，用来在 qB 里归大类；标签另有含义（番剧=季度、"
+                             "剧场版=年份、手动=Manual），不随这里改。"
+                             "只影响之后发的种子，qB 里已有的保持原样。留空=不设分类。")
+                    with ui.element("div").classes("field-grid w-full"):
+                        _text("QB_CATEGORY_ANIME", "番剧分类", config.QB_CATEGORY_ANIME)
+                        _text("QB_CATEGORY_MOVIE", "剧场版分类", config.QB_CATEGORY_MOVIE)
+                        _text("QB_CATEGORY_MANUAL", "手动下载分类", config.QB_CATEGORY_MANUAL)
                 with ui.column().classes("gap-2 min-w-0"):   # 右列：完成回调（可选兜底）
                     _section("完成回调（可选·精确兜底）",
                              "可选兜底：慢速种子在休眠期间下完、又被 qB『完成即删种』删掉，会被误标『失败』；"

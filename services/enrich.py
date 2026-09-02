@@ -8,6 +8,7 @@
 全程尽力而为，拿不到返回 None，绝不阻断主下载链路。
 """
 import asyncio
+import json
 import logging
 import re
 from contextvars import ContextVar
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
+from services import fetch
 from sources.parse import movie_quarter_of, quarter_of
 
 log = logging.getLogger("autorss")
@@ -36,6 +38,36 @@ _RESOLVE_BUDGET = 120
 _MAX_CANDIDATE_NAMES = 3
 # 声优抓取自己的上限：它是【可选】字段，不该占用整体预算，更不该让一次已成功的识别作废。
 _CAST_TIMEOUT = 20
+
+
+async def _capped(client, method: str, url: str, **kw) -> tuple[int, bytes]:
+    """本模块**全部**第三方出站的唯一出口：走 `services.fetch` 的四道闸。(R32)
+
+    【为什么必须走它】此前这 6 处是裸的 `client.get/post` + `.text`/`.json()`，
+    httpx 默认带 `Accept-Encoding: gzip`，会把**整个解压后的 body** 一次性读进内存 ——
+    `services/fetch` 的四道闸（请求 identity / 线上原始字节封顶 /
+    `decompressobj(max_length=)` 增量解压 / 多重编码拒收）一条都没生效。
+    实测：一个 **255 KB** 的 gzip 响应（压缩比 1029:1）让进程 RSS 涨 **540 MB**；
+    同一份响应交给 `fetch.get_text` 是 **+0 MB**（当场拦下）。
+    而 `_mikan_bridge` 串在采集主链路上（`worker.poll_once → process_item → _resolve_anime`），
+    `MIKAN_BASE` / `BGM_API` 又都是设置页可改的第三方地址。
+    这个进程同时是 Web UI、qB 同步、交付协程与看守协程 —— 被 OOM 杀掉就是全没。
+    对照：`sources/mikan.fetch_detail` 抓的是**同一台主机的同一个端点**，走 `fetch.get_text`
+    就当场被 16 MB 上限拦下。同一件事在两个模块里两种待遇。
+
+    【TooLarge 的归一只做这一处】`fetch.TooLarge` 不是 `httpx.HTTPError`，
+    而本模块**每一个**调用点接的都是 `except httpx.HTTPError`
+    （`_search_one` / `_mikan_bridge` / `_fetch_cast` / `fetch_by_id` / `resolve`）——
+    让它逃出去就把"尽力而为、拿不到返回 None"的契约变成崩溃。
+    在 5 个调用点各写一遍 `except (httpx.HTTPError, fetch.TooLarge)` 正是本项目
+    第①号缺陷形状的温床，所以归一收在这一个函数里。
+    选 `DecodingError` 而不是别的：它是 `HTTPError`（调用点接得住），
+    又**不在** `_retryable` 的重试元组里 —— 压缩炸弹重试 3 次没有意义。
+    """
+    try:
+        return await fetch.request_capped(client, method, url, **kw)
+    except fetch.TooLarge as e:
+        raise httpx.DecodingError(str(e)) from e
 
 
 async def _retryable(make_request):
@@ -141,17 +173,17 @@ def _name_not_contradicted(query: str, subject: dict) -> bool:
 async def _search_one(client, name, est, release):
     """用一个名字搜 bgm，返回第一个通过日期+名字校验的 subject（bgm 按相关性排序）。"""
     try:
-        r = await _retryable(lambda: client.post(
-            f"{config.BGM_API}/v0/search/subjects", headers=_UA,
+        code, raw = await _retryable(lambda: _capped(
+            client, "POST", f"{config.BGM_API}/v0/search/subjects", headers=_UA,
             json={"keyword": name, "filter": {"type": [2]}},
         ))
-        if r.status_code != 200:
+        if code != 200:
             # 429（限流）与 5xx 同样是【没问成】——而它们恰恰是最可能整批发生、
             # 最该退款的一类。4xx 里除 429 之外算"问到了但对方说不行"，不计。
-            if r.status_code == 429 or r.status_code >= 500:
+            if code == 429 or code >= 500:
                 _note_bgm_fail()
             return None
-        body = r.json()
+        body = json.loads(raw)
         # bgm 正常返回 {"data": [...]}；防它返回数组/非对象/data 非列表导致 AttributeError 逃逸
         data = body.get("data") if isinstance(body, dict) else None
         results = data if isinstance(data, list) else []
@@ -176,16 +208,18 @@ async def _mikan_bridge(client, info_hash):
     if not re.fullmatch(r"[0-9a-f]{40}", info_hash or ""):
         return None  # 只把 40 位 hex 拼进 URL：防非法 hash 造成路径穿越/请求注入
     try:
-        ep = await _retryable(lambda: client.get(f"{config.MIKAN_BASE}/Home/Episode/{info_hash}"))
-        if ep.status_code != 200:
+        code1, body1 = await _retryable(lambda: _capped(
+            client, "GET", f"{config.MIKAN_BASE}/Home/Episode/{info_hash}"))
+        if code1 != 200:
             return None
-        m = _MIKAN_BANGUMI_RE.search(ep.text)
+        m = _MIKAN_BANGUMI_RE.search(body1.decode("utf-8", "replace"))
         if not m:
             return None
-        bg = await _retryable(lambda: client.get(f"{config.MIKAN_BASE}/Home/Bangumi/{m.group(1)}"))
-        if bg.status_code != 200:
+        code2, body2 = await _retryable(lambda: _capped(
+            client, "GET", f"{config.MIKAN_BASE}/Home/Bangumi/{m.group(1)}"))
+        if code2 != 200:
             return None
-        sm = _BGM_SUBJECT_RE.search(bg.text)
+        sm = _BGM_SUBJECT_RE.search(body2.decode("utf-8", "replace"))
         return int(sm.group(1)) if sm else None
     except httpx.HTTPError:
         # 【不记 bgm 的账】这是 Mikan，不是 bgm。混在一起会让"Mikan 打不开"被判成
@@ -215,11 +249,11 @@ async def _fetch_cast(client, bgm_id, limit=8) -> str | None:
     try:
         # 与其它 bgm 调用一致走 _retryable（瞬时超时/连接/读错误按 ENRICH_RETRY_TIMES 指数退避）——
         # 否则声优抓取遇一次瞬时超时即丢 cast，而规范名/放送日等字段会重试，口径不一（B8）。
-        r = await _retryable(lambda: client.get(
-            f"{config.BGM_API}/v0/subjects/{bgm_id}/characters", headers=_UA))
-        if r.status_code != 200:
+        code, raw = await _retryable(lambda: _capped(
+            client, "GET", f"{config.BGM_API}/v0/subjects/{bgm_id}/characters", headers=_UA))
+        if code != 200:
             return None
-        data = r.json()
+        data = json.loads(raw)
     except (httpx.HTTPError, ValueError):
         return None
     if not isinstance(data, list):
@@ -295,10 +329,11 @@ async def _fetch_by_id_inner(bgm_id: int) -> dict | None:
         # BGM_API 是设置页可改的地址，指向局域网自建镜像是正当用法。(R21 补，此前 7 处只传了 5 处)
         async with httpx.AsyncClient(**config.http_client_kwargs(
                 max(1, config.ENRICH_TIMEOUT), url=config.BGM_API)) as client:
-            r = await _retryable(lambda: client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
-            if r.status_code != 200:
+            code, raw = await _retryable(lambda: _capped(
+                client, "GET", f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
+            if code != 200:
                 return None
-            j = r.json()
+            j = json.loads(raw)
             # 【声优要自己的小超时，不能裸调】与 _resolve_inner 里那段【同一个理由】：
             # 一个涓流的 /characters 会把 3 次重试各拖满 _ATTEMPT_TIMEOUT(90s)≈270s，
             # 撑破外层 _RESOLVE_BUDGET(120s)，于是一次【已经拿到 subject 的成功取数】被整份丢掉。
@@ -453,9 +488,10 @@ async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
             cast = None
             if bgm_id is not None:
                 try:
-                    r = await _retryable(lambda: client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
-                    if r.status_code == 200:
-                        j = r.json()
+                    code, raw = await _retryable(lambda: _capped(
+                        client, "GET", f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
+                    if code == 200:
+                        j = json.loads(raw)
                         meta = j if isinstance(j, dict) else {}  # 防 bgm 返回数组/非对象
                 except httpx.HTTPError:
                     _note_bgm_fail()   # 详情取不到（502/限流/超时）同样是【没问成 bgm】

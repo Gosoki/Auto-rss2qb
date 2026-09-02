@@ -223,3 +223,96 @@ def test_every_periodic_timer_skips_while_the_db_is_down():
                 offenders.append(f"{path.name}:{n.lineno} {name}() 没有停摆闸")
     assert not offenders, ("这些周期性定时器会在库停摆/维护时照撞不误：\n  "
                            + "\n  ".join(offenders))
+
+
+def test_every_bgm_bind_entry_wraps_the_confirm_gate_too():
+    """(R27) 四个绑定入口的 `require_bind_confirm` 必须**在 busy_action 里面**。
+
+    它第一句就是 `enrich.fetch_by_id`（`_RESOLVE_BUDGET` = 120 秒），后面 `bind_*_bgm`
+    还有第二次同样预算的往返。把回显闸留在外面，等于这道防抖只覆盖了后一半：
+    bgm 慢或不通时按钮不 loading、也没有去重键，用户连点就会叠出两个
+    「绑定到《X》？」确认框，两条协程各自跑一遍 bind —— 而末尾的身份守卫
+    `_merge_anime` / `_merge_movie` 最后一步是 `s.delete(loser)`，**没有撤销入口**。
+
+    剧场版侧三个入口（`_bind` / `_bind_from_input` / `_refail`）原来**整条都没有**
+    busy_action，最长约 240 秒零反馈。
+
+    判据按 AST：每一处 `require_bind_confirm(...)` 调用，都必须落在某个
+    被 `busy_action(...)` 当参数传出去的内层函数体内。
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offenders, seen = [], 0
+    for rel in ("pages/anime.py", "pages/anime_detail.py", "pages/movies.py"):
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        # 收集"被 busy_action 当参数传出去的函数名"
+        wrapped = set()
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call)
+                    and getattr(n.func, "id", getattr(n.func, "attr", "")) == "busy_action"):
+                for arg in n.args:
+                    if isinstance(arg, ast.Name):
+                        wrapped.add(arg.id)
+        # 每个 require_bind_confirm 调用，找它最内层的 def
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            inner = {d.name for d in ast.walk(fn)
+                     if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)) and d is not fn}
+            for c in ast.walk(fn):
+                if (isinstance(c, ast.Call)
+                        and getattr(c.func, "id", "") == "require_bind_confirm"):
+                    # 只在【最内层】那个 def 上判（外层函数会把它一起 walk 到）
+                    if any(isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef))
+                           and d is not fn and c in list(ast.walk(d)) for d in ast.walk(fn)):
+                        continue
+                    seen += 1
+                    if fn.name not in wrapped:
+                        offenders.append(f"{rel}:{c.lineno} 在 {fn.name}() 里，"
+                                         "而它没有被 busy_action 包住")
+                    del inner
+    assert seen >= 4, f"只找到 {seen} 处 require_bind_confirm 调用（应有 4 处）—— 守卫的前提坏了"
+    assert not offenders, ("这些绑定入口的回显闸不在防抖里：\n  " + "\n  ".join(offenders))
+
+
+def test_switches_behind_the_config_gate_roll_themselves_back():
+    """(R27) 过 `require_config_loaded()` 那道闸的**开关**，被拦下时必须把自己拨回去。
+
+    全站过这道闸的另外三个处理器（设置页 `_save` / `_apply_filter`、movies 的
+    `_save_scan`）都是**按钮**，没有可见状态需要回滚。只有 /parse 的
+    『多括号回退捕获』是 `ui.switch`：`on_value_change` 触发时值**已经**变成用户
+    刚拨到的那个了，早退等于界面显示"开"、`config.ANIME_MULTIBRACKET_PARSE` 一点没变、
+    而下面的判定结果仍按"关"算 —— 用户会以为解析逻辑坏了。
+
+    判据：pages/ 里凡是被 `.on_value_change(...)` 接上的处理器，
+    只要它里面出现 `require_config_loaded`，就必须也出现 `set_value`（把控件拨回真值）。
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offenders, checked = [], 0
+    for path in sorted((root / "pages").glob("*.py")):
+        src = path.read_text(encoding="utf8")
+        tree = ast.parse(src)
+        # 被 on_value_change 接上的处理器名
+        hooked = {a.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "on_value_change"
+                  for a in n.args if isinstance(a, ast.Name)}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name not in hooked:
+                continue
+            body = ast.dump(node)
+            if "require_config_loaded" not in body:
+                continue
+            checked += 1
+            if "set_value" not in body:
+                offenders.append(f"{path.name}:{node.lineno} {node.name}()")
+    assert checked >= 1, "一个『开关 + 配置闸』的处理器都没找到 —— 这条守卫的前提坏了"
+    assert not offenders, (
+        "这些开关被配置闸拦下后没把自己拨回去，界面与实际配置会相反：\n  "
+        + "\n  ".join(offenders))

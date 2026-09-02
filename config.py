@@ -73,6 +73,14 @@ _SPEC = {
     "QB_URL": (str, "http://127.0.0.1:8080"),
     "QB_USERNAME": (str, ""),
     "QB_PASSWORD": (str, ""),
+    # 【qB 分类名，三条投递路径各一个】(R27) 原来是三处写死的字面量。
+    # 分类在本项目里是【只写不读】的：没有任何一处按分类回查 qB（回查一律按 info_hash），
+    # 所以改名不会让已下的种子失联——qB 里的老种子保留老分类，新种子进新分类，两边都好使。
+    # 默认值就是改之前那三个字面量，不填等于什么都没变。
+    # 空串＝不设分类（qB 收下但不归类），这是合法用法，故【不做非空校验】。
+    "QB_CATEGORY_ANIME": (str, "AutoRSS-Anime"),
+    "QB_CATEGORY_MOVIE": (str, "AutoRSS-Movie"),
+    "QB_CATEGORY_MANUAL": (str, "AutoRSS-Manual"),
     # 【默认空，不是 /home】空 = build_save_path 返回 None = 拒绝下载并报"未配置下载目录"。
     # 曾默认 /home：那是系统目录，而首配链路上【没有任何一处会拦】——设置页的防呆判的是
     # "两个根不能都为空"，预填的 /home 恒满足它，于是新用户装完直接点保存，番就下进了

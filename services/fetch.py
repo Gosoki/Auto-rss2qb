@@ -168,6 +168,27 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
     return bytes(out)
 
 
+async def request_capped(client: httpx.AsyncClient, method: str, url: str, *,
+                         cap: int = FEED_CAP, timeout: int = TOTAL_TIMEOUT,
+                         **kw) -> tuple[int, bytes]:
+    """通用版：任意方法、**不** raise_for_status，回 (status_code, 封顶后的响应体)。
+
+    【为什么要这个形态】(R32) `services/enrich` 的 6 处出站原本走裸 `client.get/post`，
+    四道闸（identity 请求 / 线上原始字节封顶 / decompressobj 增量解压 / 多重编码拒收）
+    一条都没生效 —— 实测一个 255 KB 的 gzip 响应让进程 RSS 涨 **540 MB**
+    （压缩比 1029:1），而 `_mikan_bridge` 就串在采集主链路上；
+    这个进程同时是 Web UI、qB 同步、交付协程与看守协程，被 OOM 杀掉就是全没。
+    可它们又都要**自己看 status_code**（429/5xx 要退款、404 要静默），
+    所以不能用会 `raise_for_status()` 的 `get_bytes`。
+
+    POST 也走这里：bgm 的搜索接口是 POST，而它同样是第三方响应。
+    """
+    _with_identity(kw)
+    async with asyncio.timeout(timeout):
+        async with client.stream(method, url, **kw) as resp:
+            return resp.status_code, await _read_capped(resp, cap, url)
+
+
 async def get_bytes(client: httpx.AsyncClient, url: str, *,
                     cap: int = FEED_CAP, timeout: int = TOTAL_TIMEOUT, **kw) -> bytes:
     """流式取回并封顶。超限抛 TooLarge，超时抛 TimeoutError，HTTP 错误照常抛。"""

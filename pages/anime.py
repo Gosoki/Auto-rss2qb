@@ -20,6 +20,18 @@ from .layout import (busy_action, confirm, require_bind_confirm, ep_str, expand_
 from .sources import render_sources
 
 
+def _kw_hit(a, kw: str) -> bool:
+    """番剧表搜索框的匹配判据：大小写不敏感子串，命中中文名/解析名/日文名/bgm ID 任一。
+
+    【为什么四个字段都要看】UI 显示的是 `display_name or title`，但同一部番在别处
+    露出的是另外两个：日文名是**下载目录名**（用户从磁盘上看到的就是它），
+    bgm ID 是详情页与外站链接上的身份键。只匹配显示名的话，
+    "我在硬盘上看到这个目录，回来搜一下是哪部"这个最常见的用法直接搜不到。
+    """
+    return any(kw in str(v).lower()
+               for v in (a.display_name, a.title, a.jp_name, a.bangumi_id) if v)
+
+
 def _state_rank(a):
     """管理页组内排序：追番中(0) < 待确认(1) < 已拒绝(2)——后两者垫底。"""
     if a.rejected:
@@ -42,10 +54,50 @@ def anime_page(t: str = ""):
     """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。
     默认空串：顶栏导航进来（无 ?t=）时留给下面按 ANIME_DEFAULT_TAB 决定默认停哪个 tab。"""
     with frame("manage"):  # 本页用 tab + 30s 定时刷新，不往顶栏右侧放自定义动作
-        manage_page = {"n": 1, "expand": None}  # 番剧表：分页页码 + 一键展开/收起意图（None=按默认）
+        # 番剧表：分页页码 + 一键展开/收起意图（None=按默认）+ 搜索词。
+        # 【搜索词必须存在这里、不能只留在输入框控件上】面板是 @ui.refreshable，
+        # 翻页/展开/详情弹窗关闭都会整体重建它，控件上的值会跟着没。
+        manage_page = {"n": 1, "expand": None, "kw": ""}
 
         def _manage_goto(e):
             manage_page["n"] = int(e.value)
+            manage_panel.refresh()
+
+        # 搜索框与命中计数【建在 refreshable 之外】(R27 修) —— 它们必须活过 manage_panel 的重建。
+        # 第一版把搜索框建在 manage_panel 里面，而 on_change 最后一句就是
+        # `manage_panel.refresh()`：refresh 会 container.clear() 把这个输入框一起删掉再新建一个，
+        # 于是**每打完一段字停顿 300ms（debounce），焦点和光标就没了** ——
+        # 用户搜「葬送」停一下想补「的芙莉莲」，后面一个字都打不进去。
+        # 计数文案改成给稳定的 label 赋 .text（同 logs.py 的写法），不参与重建。
+        _match_lbl: dict = {}
+
+        def _set_match_count(hit: int, total: int) -> None:
+            el = _match_lbl.get("el")
+            if el is not None:
+                el.text = f"匹配 {hit} / {total} 部" if total else ""
+
+        def _build_manage_tab() -> None:
+            """番剧表 tab：先建一次稳定的搜索行，再建可刷新的面板本体。"""
+            with ui.row().classes("items-center gap-3 pl-1 pt-1 flex-wrap"):
+                # 纯前端过滤，不打库：过滤的是 list_all_anime() 本来就要取的那一份。
+                # 【为什么贴着表放】它作用的对象是下面这张番剧表，与"全部展开/收起""分页"
+                # 是同一组表控件，放到页面顶部会让人以为它管的是整页六个 tab。
+                ui.input(placeholder="搜索番名 / bgm ID", value=manage_page["kw"],
+                         on_change=_manage_search).props(
+                    "clearable debounce=300").classes(
+                    "w-56 min-w-0 max-sm:w-full").mark("anime-search")
+                _match_lbl["el"] = ui.label().classes("text-xs text-gray-500")
+            manage_panel()
+
+        def _manage_search(e):
+            # clearable 的叉号把值置成 None，不是空串。
+            new = (e.value or "").strip()
+            if new == manage_page["kw"]:
+                return          # debounce 期间的重复回调：不重建，免得打断正在输入的人
+            manage_page["kw"] = new
+            # 回第一页：paginate 本身会把越界页码夹回合法范围，所以不重置也不会出空页——
+            # 但那样是"夹到结果集的最后一页"，搜完落在最后一页上，人以为没搜到。
+            manage_page["n"] = 1
             manage_panel.refresh()
 
         # ---- 刷新（页面局部，闭包内共享）----
@@ -99,6 +151,20 @@ def anime_page(t: str = ""):
                     f"『{_d['b_name']}』(#{_d['b']}，bgm {_d['b_bgm']}) 共用番名 "
                     f"「{'、'.join(_d['shared'])}」，多半是同一部番被拆成了两条{_tail}。"
                     "去详情页核对 bgm 绑定：把错的那条改绑成对的 bgm，身份守卫会自动把它们合并。")
+
+            # ── 同一个 bgm subject 同时是一部番和一部剧场版 ──(R30)
+            # 拿真库反查不变量时发现的：`info_hash` 在两张种子表里各出现一次
+            # （两张表各有唯一约束、**跨表没有**）。今天那两条 anime 都是"超期忽略"、
+            # 不会自动下；可用户在『已忽略』页点一下『恢复订阅』，两边就会交付同一个 hash：
+            # qB 对已存在的 hash 返回失败 → 幂等兜底查到"它确实在 qB 里"判成功 →
+            # **两条记录都说自己已交付，而文件只落在其中一个目录**。
+            for _m in anime.suspect_movie_as_anime():
+                warn_banner(
+                    f"『{_m['a_name']}』(bgm {_m['bgm']}) 在番剧表(#{_m['a']}，{_m['a_state']}，"
+                    f"{_m['an']} 条种子)和剧场版(#{_m['m']}，{_m['mn']} 条)里**各有一条记录**。"
+                    "剧场版那条通常才是对的。别去点『恢复订阅』——两边会交付同一个种子，"
+                    "而 qB 只收一次：两条记录都会显示『已交付』，文件却只落在其中一个目录。"
+                    "去番剧表把这一条删掉，或确认它确实是电视版。")
 
             # 【绑定可疑：与"番被拆成两条"同一个位置、同一种处理】(R26)
             # `binding_looks_wrong` 全项目 4 个调用点全是"不让番【进入】追番中"的闸，
@@ -573,23 +639,33 @@ def anime_page(t: str = ""):
                 if not a.confirmed:
                     return config.ANIME_SHOW_PENDING
                 return True
-            animes = [a for a in anime.list_all_anime() if _visible(a)]
-            if not animes:
+            all_animes = [a for a in anime.list_all_anime() if _visible(a)]
+            if not all_animes:
+                _set_match_count(0, 0)
                 ui.label("（还没有番剧，等采集）").classes("text-gray-500 p-4")
                 return
+            kw = (manage_page["kw"] or "").strip().lower()
+            animes = [a for a in all_animes if _kw_hit(a, kw)] if kw else all_animes
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.source_map()
             prog_map = anime.episode_progress([a.id for a in animes])   # 一条 SQL，与 source_map 同形
             yrs = max(1, config.ANIME_PAGE_YEARS)  # 防 0（每页 0 季会除零）
             groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], yrs * 4)
             manage_page["n"] = page
+            _set_match_count(len(animes), len(all_animes) if kw else 0)
             with ui.row().classes("items-center gap-3 pl-1 pb-1 flex-wrap"):
                 expand_collapse_bar(manage_page, manage_panel.refresh)
                 if total_pages > 1:
                     ui.pagination(1, total_pages, direction_links=True, value=page,
                                   on_change=_manage_goto)
                     ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
+            if not animes:
+                ui.label(f"（没有匹配「{manage_page['kw']}」的番剧）").classes("text-gray-500 p-4")
+                return
+            # 搜索态下强制展开：命中的番散在各季，全收着等于搜完还要一季季点开。
             exp = manage_page["expand"]  # None=各季按默认(仅最新季开)；True/False=一键全展开/收起(跨页一致)
+            if kw and exp is None:
+                exp = True
             for i, (q, items) in enumerate(groups):
                 _open = exp if exp is not None else i == 0
                 # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
@@ -633,14 +709,25 @@ def anime_page(t: str = ""):
             recent_panel.refresh()
 
         def _refresh_live(tab):
-            # 刷新某 tab 的只读实时区：overview 的实时状态/新入库、reject 列表。其余 tab 无实时区，不动。
-            # 不含 confirm/fail——它们有用户正在输入的绑定框/源下拉，重建会清空半途输入。
+            """刷新某 tab 的只读实时区。只有仪表盘有实时区，其余 tab 一律不动。
+
+            【不含 confirm/fail】它们有用户正在输入的绑定框/源下拉，重建会清空半途输入。
+
+            【R27 把 reject 也摘了】那一支原来每 30 秒重建一次『已忽略』面板，而面板里
+            每个 `ui.expansion` 都是 `value=(i == 0)` 硬编码重建、没有任何持久化的展开意图
+            （对比 `manage_page["expand"]`）。于是用户刚展开的折叠块每 30 秒自动收起一次、
+            滚动位置一起丢 —— 最难受的正是底部那个『已删除的种子』，它恰恰是用户展开去找条目
+            点『重新下载』的地方：展开 → 找 → 还没点到就合上了。
+            摘掉它不丢任何东西：本页的操作走 `refresh_dynamic()`（那里点名刷了 reject_panel），
+            而后台改动 rejected 的只有『开始使用日超期忽略』那条批量重算 ——
+            那不是 30 秒尺度的实时量。顺带省掉每 30 秒一次事件循环上的同步查询
+            （list_rejected_anime + deleted/excluded_torrent_rows + downloaded_counts，
+            真库快照上整页构建 127ms）。
+            """
             if tab == "overview":
                 _refresh_overview(charts=False)   # 30s 定时器不碰图表，环图交互态不被打断
                 inflight_panel.refresh()
                 recent_panel.refresh()
-            elif tab == "reject":
-                reject_panel.refresh()
 
         def refresh_timer():
             # 30s 定时器：只刷『当前可见 tab』的实时区，隐藏 tab 不动（省 CPU、消除每 30s 的周期性卡顿）。
@@ -771,13 +858,15 @@ def anime_page(t: str = ""):
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
-                # 【绑定前回显】与详情页同一道闸（共用 layout.require_bind_confirm）：
-                # 这里是『待识别』列表里的绑定按钮，同样会触发身份合并、同样会删掉另一条番。
-                if not await require_bind_confirm(anime_id, bid):
-                    return
-
-                # 走 busy_action：bind 会调 fetch_by_id（预算 120 秒），期间没有反馈会被连点
+                # 走 busy_action：**从回显闸就开始包**。(R27) 原来只包了下半段，
+                # 而 `require_bind_confirm` 第一句就是 `enrich.fetch_by_id`（预算 120 秒）——
+                # bgm 慢或不通时那 120 秒里按钮不 loading、也没有去重键，用户连点就会
+                # 叠出两个「绑定到《X》？」确认框、两条协程各跑一遍 fetch。
                 async def _go():
+                    # 【绑定前回显】与详情页同一道闸（共用 layout.require_bind_confirm）：
+                    # 这里是『待识别』列表里的绑定按钮，同样会触发身份合并、同样会删掉另一条番。
+                    if not await require_bind_confirm(anime_id, bid):
+                        return
                     # 【必须在识别之前记下旧目录】待识别的番 jp_name/display_name 都是空的，
                     # apply_bgm_meta 的 keep_path 只冻结【已有值】的字段，挡不住它们被 bgm 名整体写入
                     # → 归档目录当场就变了。不问搬迁的话，之前下好的集会被静默遗弃在旧目录，
@@ -936,7 +1025,7 @@ def anime_page(t: str = ""):
             "overview": lambda: (_ov_snap.clear(), overview_head(), charts_panel(),
                                  overview_tail(), inflight_panel(), recent_panel(),
                                  _ov_snap.clear()),
-            "manage": manage_panel, "confirm": confirm_panel,
+            "manage": _build_manage_tab, "confirm": confirm_panel,
             "fail": fail_panel, "reject": reject_panel, "sources": render_sources,
         }
         _slots: dict = {}

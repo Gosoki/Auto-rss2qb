@@ -214,6 +214,55 @@ def data_identity(eng=None) -> str:
     return f"{u.get_backend_name()}:{(u.host or '').lower()}:{u.port or 3306}/{u.database}"
 
 
+def scoped_flag(key: str) -> str:
+    """把当前业务库的身份拼进一次性标记的键名。(R26/R27)
+
+    这些标记住在 **meta 库**（恒本地），判的却是**业务库**做过没有 —— 理由见
+    `data_identity`。三处标记（`_FINISH_BACKFILL_DONE` / `_idle_backfilled` /
+    `_QB_PROGRESS_BACKFILLED`）共用这一份实现：两处在 `core/anime`、一处在 `core/engine`，
+    而 engine 是 anime 的下层，让它反过来 import anime 是层级倒置，所以共用的这半份住在这里。
+    """
+    return f"{key}@{data_identity()}"
+
+
+def adopt_legacy_flag(key: str) -> bool:
+    """存量安装的**旧全局键**认领：有旧键就把它认成"当前这个业务库做过了"。
+
+    【为什么必须有这一步】(R27) R26 把三个一次性回填的标记从全局键改成了
+    `<键>@<业务库身份>`，**却没有迁移旧键** —— 而每一台已经在跑的安装，
+    meta 库里存的都是旧名。升上 R26 之后新键读不到 ⇒ 三条一次性回填全部**重跑一遍**：
+      · `_QB_PROGRESS_BACKFILLED` 是一条【改数据】的迁移，重跑会把所有
+        `status='sent' 且 qb_progress<1.0` 的行写成 1.0 —— 那批正是**正在下载**的种子。
+        它们从此掉出 `_inflight_where`、`qb_state` 又不在补查名单里，
+        没有任何路径能改回来，而 `sent ∈ HAVE_STATUSES` 让集去重认定这一集已到手。
+      · 另外两条会让存量番在某一轮被整批当成"首轮回填"而静默，一条通知都不发。
+    真库实测：setting 表里就是 `_QB_PROGRESS_BACKFILLED / _idle_backfilled /
+    _FINISH_BACKFILL_DONE` 三个旧名，一个带身份的新名都没有。
+
+    **认领是一次性的**：认到旧键就写下当前身份的新键并把旧键删掉。
+    删掉这一步不能省 —— 留着旧键的话，以后切到另一个业务库时它又会被认领一次，
+    而那个库确实【从来没有】回填过，R26 想修的问题原样回来。
+
+    返回是否认领成功。任何异常都当作"没认领"（调用方自己有兜底口径）。
+    """
+    from .models import Setting
+    try:
+        with get_meta_session() as s:
+            old = s.get(Setting, key)
+            if old is None:
+                return False
+            if s.get(Setting, scoped_flag(key)) is None:
+                s.add(Setting(key=scoped_flag(key), value=old.value or "1"))
+            s.delete(old)
+            s.commit()
+            log.info("认领旧的一次性回填标记 %s → %s（存量安装升级，不再重跑那次回填）",
+                     key, scoped_flag(key))
+            return True
+    except Exception as e:
+        log.warning("认领旧回填标记 %s 失败（可能会重跑一次回填）：%s", key, e)
+        return False
+
+
 def data_backend() -> str:
     """当前业务数据落在哪：'sqlite' | 'mysql'。"""
     return "mysql" if is_mysql(engine) else "sqlite"

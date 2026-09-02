@@ -824,6 +824,127 @@ def test_both_delivery_paths_register_and_unregister():
         assert pub in fns and inner in fns, f"{mod} 少了包装或内层"
         outer = ast.dump(fns[pub])
         assert "discard" in outer and "_delivering" in outer, f"{mod}::{pub} 没注销交付登记"
+        # 【必须把 discard 钉在 finally 体上】(R28) 原来的两条断言是分开的：
+        # "outer 里有 discard" + "outer 里有带 finalbody 的 Try" —— 两条各自成立，
+        # 却**没有任何一条把它们绑在一起**。实测变异：把
+        # `try: return await _inner(...) / finally: discard(...)` 改成
+        # `try: _r = await _inner(...); discard(...); return _r / finally: pass`，
+        # 四条断言逐条仍然成立，全量 1197 一条红都没有 —— 而异常路径从此不注销，
+        # 交付回写撞上 OperationalError 时那一行永远留在 `_delivering` 里：
+        # `sweep_stale_delivering()` 因 `is_delivering()` 为真永远跳过它（行永久停在
+        # downloading、∈HAVE_STATUSES、集去重认定已有一份），`maintenance_blockers()`
+        # 又永远数到它 —— 切库/迁移被**永久**拒死。正是 R25 §一③ 那条 P1。
         tries = [n for n in ast.walk(fns[pub]) if isinstance(n, ast.Try) and n.finalbody]
-        assert tries, f"{mod}::{pub} 的注销不在 finally 里 —— 异常路径上会漏"
+        assert tries, f"{mod}::{pub} 没有 try/finally"
+        in_finally = any("discard" in ast.dump(node)
+                         for t in tries for node in t.finalbody)
+        assert in_finally, (
+            f"{mod}::{pub} 的 discard 不在 finally 体里 —— 异常路径上不会注销，"
+            "那一行会被永久当成『正在交付中』")
         assert "_delivering" in ast.dump(fns[inner]), f"{mod}::{inner} 没登记交付"
+
+
+async def test_the_archive_and_sweep_rounds_block_maintenance():
+    """(R27) 归档轮与巡检轮在跑的时候，在途闸必须说话。
+
+    这两条与另外五条是同一种形状：**跨 await 持业务库的整数主键**。
+      · 归档：读 `(id, info_hash)` → `await qb.delete()`（单次上限 45 秒）
+              → 出 await 后 `s.get(model_cls, tid)` 按主键写 `archived_at`；
+      · 巡检：读 `Anime.id` → `await notify_event()`（每条上限 NOTIFY_TIMEOUT）
+              → 回来 `s.get(Anime, a.id)` 写 `finished_at`。
+    而 `db/transfer.py` **保留主键**：维护窗口横在中间时，回写落进另一个库的另一行。
+
+    【为什么现成的守卫抓不到】`test_the_blocker_list_covers_every_lock_that_spans_an_await`
+    的判据是"每一把模块级轮次锁都必须被闸看见" —— 而这两条线以前**一把锁都没有**，
+    于是既不在闸里、也不在守卫的视野里。约束的作用域比验证的作用域小（第②种形状）。
+    """
+    from core import engine as ce
+    from core import worker as W
+
+    assert ce.maintenance_blockers() == [], "起点就不干净，下面的断言说明不了任何事"
+    async with W._archive_lock:
+        assert any("归档" in r for r in ce.maintenance_blockers()), \
+            "归档轮在跑，闸却说可以切库"
+    assert ce.maintenance_blockers() == [], "归档轮结束后闸没跟着放开"
+    async with W._sweep_lock:
+        assert any("巡检" in r for r in ce.maintenance_blockers()), \
+            "巡检轮在跑，闸却说可以切库"
+    assert ce.maintenance_blockers() == [], "巡检轮结束后闸没跟着放开"
+
+
+async def test_the_archive_round_actually_holds_its_lock(monkeypatch):
+    """光有锁不够：驱动它的那条后台线得**真的**拿着它跑。
+
+    这条用例在 `archive_old_completed` 里面问闸 —— 拿不到锁就等于没加。
+    只断言"锁存在"或"闸认识这把锁"是测不到这一层的：把 `async with _archive_lock:`
+    整行删掉，上一条用例照样全绿。
+    """
+    from core import engine as ce
+    from core import worker as W
+
+    seen = {}
+
+    async def fake_archive():
+        seen["blockers"] = ce.maintenance_blockers()
+        return 0
+
+    monkeypatch.setattr(W.engine, "archive_old_completed", fake_archive)
+    await W.archive_round()
+    assert seen.get("blockers"), "归档跑起来了，闸却是空的 —— 锁没被真的持住"
+    assert any("归档" in r for r in seen["blockers"]), seen["blockers"]
+
+
+async def test_the_sweep_round_actually_holds_its_lock(monkeypatch):
+    """巡检轮同理：得在**轮子里面**问一次闸。"""
+    from core import engine as ce
+    from core import worker as W
+
+    seen = {}
+
+    def probe():
+        seen["blockers"] = ce.maintenance_blockers()
+        return 0
+
+    monkeypatch.setattr(W.engine, "sweep_stale_delivering", probe)
+    monkeypatch.setattr(W.anime, "sweep_finished", probe)
+    monkeypatch.setattr(W.anime, "sweep_idle", probe)
+    monkeypatch.setattr(W.anime, "sweep_alerts", probe)
+    await W.sweep_round()
+    assert seen.get("blockers"), "巡检跑起来了，闸却是空的 —— 锁没被真的持住"
+    assert any("巡检" in r for r in seen["blockers"]), seen["blockers"]
+
+
+async def test_a_crashing_delivery_still_unregisters(monkeypatch, clean_tables):
+    """行为面：交付协程抛异常时，交付登记必须被摘掉，残骸清扫才能把那一行救回来。
+
+    (R28) 上面那条静态守卫的第一版没把 `discard` 与 `finally` 绑在一起，
+    变异后全量 1197 全绿 —— 所以这里再钉一次**行为**：内层必抛，
+    断言 ① `_delivering` 空了；② `sweep_stale_delivering()` 真的把那一行复位成 pending。
+    静态判据能被"换个写法"绕过，这一条不能。
+    """
+    from sqlmodel import select
+
+    from core import anime as A
+    from core import engine as ce
+    from db.models import AnimeTorrent
+
+    with clean_tables.get_session() as s:
+        t = AnimeTorrent(anime_id=1, info_hash="7" * 40, raw_title="x - 01", episode=1.0,
+                         status="downloading")
+        s.add(t); s.commit(); s.refresh(t)
+        tid = t.id
+
+    async def boom(torrent_id, force=False):
+        ce._delivering.add(("AnimeTorrent", int(torrent_id)))   # 内层进锁时做的那一下
+        raise RuntimeError("回写撞上库抖动")
+
+    monkeypatch.setattr(A, "_download_anime_torrent_inner", boom)
+    try:
+        await A.download_anime_torrent(tid)
+    except RuntimeError:
+        pass
+    assert ("AnimeTorrent", int(tid)) not in ce._delivering, \
+        "协程抛异常之后交付登记还留着 —— 这一行会被永久当成『正在交付中』"
+    assert ce.sweep_stale_delivering() == 1, "残骸清扫救不回它"
+    with clean_tables.get_session() as s:
+        assert s.exec(select(AnimeTorrent)).one().status == "pending"

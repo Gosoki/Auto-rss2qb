@@ -381,3 +381,83 @@ def test_prune_never_deletes_the_last_backup_that_has_data(clean_tables, fresh_b
     assert good in left, "唯一一份有数据的备份被 prune 当成『最旧的』删掉了"
     assert sum(1 for d in left.values() if d["has_data"]) == 1
     assert len(left) == 4, f"救生艇不该让保留份数失控（keep=3 + 1 艘）：{sorted(left)}"
+
+
+@pytest.mark.nicegui_main_file("tests/render_main.py")
+async def test_the_backup_row_renders_even_on_a_machine_with_no_backups(user, monkeypatch):
+    """(R28) 备份**列表行**必须被真的构建一次 —— 否则那段代码在 CI 上零覆盖。
+
+    `_backup_panel` 里那个 `for d in items:` 只在 `backups/` 真有文件时才跑。
+    开发机上恰好有几份，于是它一直被顺带覆盖着；换一台干净的机器（或 CI），
+    `list_backups()` 返回空列表，**整段行渲染一次都不执行**。
+    R28 给每行加『业务库指向』徽标时漏了一句 `import db`，
+    `tests/test_pages_render.py` 只是因为本机有 6 份真备份才红的 ——
+    换个环境就是"全绿地把 NameError 发出去"。
+
+    这里把 `list_backups` 打成桩，两种指向各造一行，行渲染就与机器状态无关了。
+    """
+    from datetime import datetime
+
+    from db import backup as B
+
+    rows = [
+        {"name": "autorss-full-20260101-000000.db", "path": "/x/a.db", "bytes": 1024,
+         "mtime": datetime(2026, 1, 1), "scope": "full", "has_data": True,
+         "detail": "7 张表，番剧 9 部、剧场版 1 部、种子 20 条",
+         "backend": "sqlite", "mysql_db": None},
+        {"name": "autorss-meta-20260102-000000.db", "path": "/x/b.db", "bytes": 2048,
+         "mtime": datetime(2026, 1, 2), "scope": "meta", "has_data": False,
+         "detail": "1 张表，【无业务数据】（只有全局设置）",
+         "backend": "mysql", "mysql_db": "10.0.0.9/autorss"},
+    ]
+    monkeypatch.setattr(B, "list_backups", lambda: rows)
+
+    await user.open("/settings")
+    tree = str(user.current_layout)
+    # 【断言落在徽标上，不落在文件名上】`current_layout` 的 dump 会把长文本截成
+    # `autorss-full-2026010...`，按完整文件名断言会红在截断上而不是红在缺陷上。
+    assert "共 2 份" in tree, "备份列表行没被构建出来（那段代码在没有备份的机器上零覆盖）"
+    assert "配置+业务" in tree and "仅配置" in tree
+    # 『业务库指向』：本地那份显示"本地 SQLite"，MySQL 那份显示 host/db
+    assert "→ 本地 SQLite" in tree, "没有把『恢复后业务库指向哪』标出来"
+    assert "→ 10.0.0.9/autorss" in tree, "MySQL 那份的指向没显示"
+
+
+@pytest.mark.parametrize("rows,want_backend,want_db", [
+    ([("DB_BACKEND", "mysql"), ("DB_MYSQL_HOST", "10.0.0.9"), ("DB_MYSQL_NAME", "autorss")],
+     "mysql", "10.0.0.9/autorss"),
+    ([("DB_BACKEND", "sqlite")], "sqlite", None),
+    ([], "sqlite", None),                      # 没写过这个键 = 默认本地
+])
+def test_peek_reads_which_database_the_backup_points_at(tmp_path, rows, want_backend, want_db):
+    """(R28) `_peek` 必须把备份里的『业务库指向』读出来。
+
+    备份是对本地文件整个 `VACUUM INTO`，`setting` 表原样进快照 ——
+    **`DB_BACKEND` 与 `DB_MYSQL_*` 都在里面**。恢复一份切库【之前】做的备份，
+    重启后 `apply_configured_backend()` 读到的就是 `DB_BACKEND=sqlite`：
+    系统静默跑在**另一份数据集**上，MySQL 上的真数据既看不见也不再更新，
+    而页面照常打开、显示的是切换前的旧番剧，全程零告警。
+
+    页面上那个『配置+业务』绿徽标救不了这件事：它只数**本地文件里**的业务表行数，
+    而切到 MySQL 并不会删掉本地那套旧表 —— 于是 MySQL 用户的每一份备份都是绿的，
+    恰恰把人往那份旧备份上引。指向是唯一能让人当场看出来的东西。
+
+    【这条与上面那条渲染用例是两半】那一条打了 `list_backups` 的桩，
+    验的是"页面把指向画出来了"；这一条验的是"指向真的从文件里读得出来"。
+    只写其中一半时，另一半的变异是全绿的（实测）。
+    """
+    import sqlite3 as _sq
+
+    from db import backup as B
+
+    p = tmp_path / "snap.db"
+    conn = _sq.connect(p)
+    conn.execute("CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT)")
+    conn.executemany("INSERT INTO setting VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+    pk = B._peek(str(p))
+    assert pk, "备份读不出来"
+    assert pk["backend"] == want_backend
+    assert pk["mysql_db"] == want_db

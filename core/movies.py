@@ -355,12 +355,21 @@ def overview() -> dict:
         dl_ids = set(s.exec(select(MovieTorrent.movie_id)
                             .where(MovieTorrent.status == "sent").distinct()))
     active = [m for m in all_m if not m.rejected]
-    q_of = {m.id: (m.quarter or "未知") for m in active}   # 键域即 active 的 id 集，成员判断复用它
-    total_by_q = Counter(q_of[m.id] for m in active)
-    dl_by_q = Counter(q_of[mid] for mid in dl_ids if mid in q_of)
-    # 【按四位年排】季度键的年份只有两位，纯字符串比较下 '99D' > '26C'，
-    # 1999 年的番会排到当季前面（仪表盘的季度分布条同样中招，不只是番剧列表）。
-    qs = sorted((q for q in total_by_q if q != "未知"), key=quarter_sort_key, reverse=True)
+    # 【剧场版按【年】分布，不按季度】(R31) E-30 已经拍板"剧场版按年归档"、
+    # `movie_quarter_of` 从此恒返回 `<yy>A`；而这里一直按**季度键**分组 ——
+    # 于是存量那 53 条带着旧规则算出的 B/C/D 季母，真库 6 个年份被劈成 **15 根柱**
+    # （例：`('25D',9) ('25C',9) ('25B',5) ('25A',3)` 全是 2025 年），
+    # 而今后新入库的片一律落进 `<yy>A`：同一年的新旧片分在不同柱上。
+    # 季母对剧场版没有意义（页面上那一栏本来就叫『年份』，编辑框也是），所以这里直接按年聚。
+    # 这样 E-47（存量季母回填）就只剩"库里好看一点"，不再是显示正确的前提。
+    def _year_of(m):
+        y = engine.quarter_year(m.quarter or "")
+        return str(y) if y is not None else "未知"
+
+    y_of = {m.id: _year_of(m) for m in active}   # 键域即 active 的 id 集，成员判断复用它
+    total_by_q = Counter(y_of[m.id] for m in active)
+    dl_by_q = Counter(y_of[mid] for mid in dl_ids if mid in y_of)
+    qs = sorted((y for y in total_by_q if y != "未知"), key=lambda y: -int(y))
     if "未知" in total_by_q:
         qs.append("未知")
     return {
@@ -371,7 +380,8 @@ def overview() -> dict:
             "rejected": sum(1 for m in all_m if m.rejected),
             "versions": versions,
         },
-        "by_quarter": [(q, total_by_q.get(q, 0), dl_by_q.get(q, 0)) for q in qs],
+        # 键名叫 by_year 不叫 by_quarter：它装的是【四位年】，不是季度键。见上面 _year_of。
+        "by_year": [(y, total_by_q.get(y, 0), dl_by_q.get(y, 0)) for y in qs],
         # 八种应用侧 status 全列（含 deleted/excluded），与番剧侧同口径：仪表盘『种子数』号称"各状态之和"
         # 八状态【全集】取自 engine，别再手抄：仪表盘对用户承诺"种子数 = 各状态之和"，
         # 将来加第 9 个状态时漏改这里，页面数字就会静默对不上（且不报错）
@@ -917,8 +927,9 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
         return False
     try:
         data = await engine.fetch_torrent_bytes(url)
-        # 分类固定不带后缀；标签只放【年份】(不带季度)。format_quarter 解析不出时原样回退（如 unknown）
-        ok = await engine.add_to_qb(data, save_path, "AutoRSS-Movie",
+        # 分类不带后缀（可在设置页改名，见 config.QB_CATEGORY_MOVIE）；标签只放【年份】(不带季度)。
+        # format_quarter 解析不出时原样回退（如 unknown）
+        ok = await engine.add_to_qb(data, save_path, config.QB_CATEGORY_MOVIE,
                                     format_quarter(quarter, "{yyyy}"), info_hash=info_hash)
     except asyncio.CancelledError:
         _fail(reason="关停中断")

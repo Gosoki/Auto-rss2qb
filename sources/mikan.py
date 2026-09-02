@@ -31,7 +31,22 @@ log = logging.getLogger("autorss")
 # 季度浏览页里『非星期』块的标签关键词 → 视作剧场版/OVA 桶
 _MOVIE_LABELS = ("剧场", "劇場", "OVA", "OAD", "OAV", "特别", "スペシャル", "SP")
 _DOW_SPLIT_RE = re.compile(r'<div class="sk-bangumi" data-dayofweek="\d+">')
-_ROW_LABEL_RE = re.compile(r'id="data-row-\d+"[^>]*>\s*(.*?)\s*</div>', re.S)
+# 【只找起点，收尾用 str.find —— 别让正则去找 `</div>`】(R32)
+# 原来是 `id="data-row-\d+"[^>]*>\s*(.*?)\s*</div>` 带 re.S：块里没有 `</div>` 时，
+# **每一个** `id="data-row-` 起点都要让 `.*?` 一路扫到块尾才判失败，再退回下一个起点重来
+# —— O(起点数 × 块长度)。实测（畸形块，块内无 `</div>`）：
+#     2000 个起点 / 37 KB  →  2.57 秒
+#     8000 个起点          →  24.4 秒
+# 而页面大小仍在 `fetch.get_text` 的 16 MB 上限之内，两道现有的闸都不覆盖这种形状；
+# `_parse_movie_bucket` 又是**跑在事件循环上的同步函数** —— 冻住期间 Web UI 不响应、
+# qB 同步不跑、交付协程不动、看守协程探不了库。
+#
+# 【为什么不是把 `(.*?)` 收窄成 `([^<]*?)`】实测**没用**：外层每个起点仍要重试一遍
+# （8000 起点上 24.4 秒 → 38.7 秒，反而更慢），而且它会让
+# `<div id="data-row-5"><span>剧场版</span></div>` 这种带内层标签的写法从"取到"变成"取不到"。
+# 改成"正则只找起点、`str.find` 找收尾"：两步都是线性，且捕获内容与旧写法**逐字相同**
+# （包括内层标签那种），行为零变化。
+_ROW_START_RE = re.compile(r'id="data-row-\d+"[^>]*>')
 _BANGUMI_RE = re.compile(r'/Home/Bangumi/(\d+)"[^>]*?title="([^"]*)"')
 _BGM_RE = re.compile(r'bgm\.tv/subject/(\d+)')
 _HASH_FROM_LINK_RE = re.compile(r'/Home/Episode/([0-9a-f]{40})')
@@ -116,8 +131,7 @@ def _parse_movie_bucket(htm: str) -> list[tuple[str, str, str]]:
     """
     out, seen = [], set()
     for blk in _DOW_SPLIT_RE.split(htm)[1:]:
-        lm = _ROW_LABEL_RE.search(blk)
-        label = html.unescape(lm.group(1)).strip() if lm else ""
+        label = _row_label(blk)
         if not any(k in label for k in _MOVIE_LABELS):
             continue
         for m in _BANGUMI_RE.finditer(blk):
@@ -126,6 +140,17 @@ def _parse_movie_bucket(htm: str) -> list[tuple[str, str, str]]:
                 seen.add(mid)
                 out.append((mid, html.unescape(m.group(2)).strip(), label))
     return out
+
+
+def _row_label(blk: str) -> str:
+    """块里第一个 `id="data-row-N"` 元素的文本（取不到回空串）。理由见 `_ROW_START_RE`。"""
+    m = _ROW_START_RE.search(blk)
+    if not m:
+        return ""
+    end = blk.find("</div>", m.end())
+    if end < 0:
+        return ""
+    return html.unescape(blk[m.end():end]).strip()
 
 
 async def discover_movie_bucket(client, year: int, season_letter: str) -> list[tuple[str, str, str]]:

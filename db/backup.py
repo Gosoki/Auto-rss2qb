@@ -86,9 +86,32 @@ def _peek(path: str) -> dict:
                     rows[t] = conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
                 except sqlite3.DatabaseError:
                     rows[t] = None
+        # 【顺手把"这份备份把业务库指向哪"读出来】(R28) 备份是对 meta_path 整文件做
+        # VACUUM INTO，`setting` 表原样进快照 —— **包括 DB_BACKEND 与 DB_MYSQL_***。
+        # 恢复一份【切到 MySQL 之前】做的备份，重启后 `apply_configured_backend()`
+        # 读到的就是 `DB_BACKEND=sqlite`：系统静默跑在**另一份数据集**上，
+        # 页面显示切换前的旧番剧，后台采集/交付往本地 SQLite 写，MySQL 上的真数据
+        # 既看不见也不再更新，全程零告警。这正是 db/__init__.py 的 `_data_down` 注释
+        # 判定为"比直接停摆危险得多"的那种静默回退。
+        # 而页面上那个绿色徽标只数**本地文件里**的业务表行数，切到 MySQL 并不会删掉
+        # 本地那套旧表 —— 于是 MySQL 用户的每一份备份都显示"配置+业务"，
+        # 恰恰把人往那份旧备份上引。所以这里必须把指向也读出来、写到页面上。
+        backend = mysql_db = None
+        if "setting" in names:
+            try:
+                got = dict(conn.execute(
+                    "SELECT key, value FROM setting WHERE key IN "
+                    "('DB_BACKEND','DB_MYSQL_HOST','DB_MYSQL_NAME')").fetchall())
+                backend = (got.get("DB_BACKEND") or "sqlite").strip().lower()
+                if backend == "mysql":
+                    mysql_db = f"{(got.get('DB_MYSQL_HOST') or '?').strip()}/" \
+                               f"{(got.get('DB_MYSQL_NAME') or '?').strip()}"
+            except sqlite3.DatabaseError:
+                pass
         return {"tables": sorted(names), "rows": rows,
                 "anime": rows.get("anime") or 0, "movie": rows.get("movie") or 0,
-                "torrents": (rows.get("animetorrent") or 0) + (rows.get("movietorrent") or 0)}
+                "torrents": (rows.get("animetorrent") or 0) + (rows.get("movietorrent") or 0),
+                "backend": backend, "mysql_db": mysql_db}
     except Exception:
         return {}
     finally:
@@ -214,10 +237,13 @@ def list_backups() -> list[dict]:
         if not p.is_file() or not _NAME_RE.match(p.name):
             continue
         st = p.stat()
-        _detail, _has = _summarize(_peek(str(p)))   # 每份只 peek 一次，见 _summarize
+        _pk = _peek(str(p))                        # 每份只 peek 一次，见 _summarize
+        _detail, _has = _summarize(_pk)
         out.append({"name": p.name, "path": str(p), "bytes": st.st_size,
                     "mtime": datetime.fromtimestamp(st.st_mtime),
                     "scope": p.name.split("-")[1],
+                    # 这份备份里的『业务库指向』——恢复它就会把系统切到这个库上，见 _peek
+                    "backend": _pk.get("backend"), "mysql_db": _pk.get("mysql_db"),
                     # 【页面上的徽标要按这个走，不能按 scope】见 _peek 的说明：
                     # scope 是导出那一刻的配置，回答不了"这份救不救得回我的番"。
                     "has_data": _has, "detail": _detail})

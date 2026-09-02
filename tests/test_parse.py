@@ -235,10 +235,29 @@ def test_episode_regex_has_no_catastrophic_backtracking():
     # 180 个空格截完仍是 192 字符、'x' 还在：实测旧写法 38ms、新写法 0.9ms。
     evil = clip_title("[组] 某番 - 12" + " " * 180 + "x")
     assert evil.endswith("x"), "用例前提不成立：evil 串的触发尾巴被 clip_title 截掉了"
-    t0 = time.perf_counter()
-    search_query_names(evil)
-    cost = time.perf_counter() - t0
-    assert cost < 0.005, f"畸形标题解析耗时 {cost * 1000:.1f}ms，正则有回溯问题"
+    # 【判据是"相对同长度良性串的倍数"，不是绝对毫秒】(R26)
+    # 原来写的是 `cost < 0.005` —— 一个 5 毫秒的**硬墙钟预算**。它在空闲机器上稳过，
+    # 但全量并发跑（本项目 1150+ 条，且这台机器上还有用户自己的 autorss 在跑）时会假红：
+    # 实测在全量里红过一次、单跑连绿三次。
+    # 一个会因为"机器忙"而变红的守卫，很快就会被当成噪声无视 —— 那比没有守卫更糟。
+    # 灾难性回溯的特征是**数量级**差异（实测旧写法 38ms / 新写法 0.9ms，42 倍），
+    # 所以拿同长度的良性串当基准比倍数，机器快慢与负载都被约掉。
+    # 取多次的**最小值**：计时的噪声只会让它变大，min 是这里唯一稳的统计量。
+    benign = clip_title("[组] 某番 - 12" + "x" * 180)
+
+    def best(fn, arg, n=5):
+        out = []
+        for _ in range(n):
+            t0 = time.perf_counter()
+            fn(arg)
+            out.append(time.perf_counter() - t0)
+        return min(out)
+
+    base = max(best(search_query_names, benign), 1e-5)   # 下界防止除零/极小值放大噪声
+    cost = best(search_query_names, evil)
+    assert cost / base < 10, (
+        f"畸形标题解析耗时是同长度良性串的 {cost / base:.0f} 倍"
+        f"（{cost * 1000:.2f}ms vs {base * 1000:.2f}ms）——正则有回溯问题")
 
 
 @pytest.mark.parametrize("raw,want", [
@@ -660,3 +679,167 @@ def test_roman_numerals_stay_out_of_extract_season():
 def test_special_tag_overrides_the_number(title, want, why):
     from sources.parse import extract_episode
     assert extract_episode(title) == want, why
+
+
+# ---------------- (R27) 合集守卫的位数上界不能比集号抽取的窄 ----------------
+
+def test_batch_guards_are_at_least_as_wide_as_episode_extraction():
+    """"能抽出 N 位集号"的地方，"判它是不是合集"的地方也得认 N 位。
+
+    这条纪律在本文件里已经**踩过两次**：
+      · `_BATCH_RE` 的 EP 区间条留在 3 位 → `EP1001-1100` 被抽成"第 1001 集"（已修，注释在那儿）；
+      · `_BARE_RANGE_RE` 与 `_EP_END` 的负向前瞻仍留在 3 位 → `番名 - 1156-1170`
+        （四位连续集合集包）两道判据同时失效：`-` 被当成合法分隔符抽出第 1156 集，
+        而裸区间那条又要求"抽不出集号"才判合集。后果是一个几十 GB 的合集包以单集入库、
+        被自动下回来，还占死去重键 (番, 1156) —— 真正的第 1156 集来时被写成 skipped，
+        而 `info_hash` 已被占死、不可逆。（R27 修）
+
+    判据不看行为看**位数**：从各条正则的源码里把 `\\d{a,b}` 的上界抠出来比大小。
+    这样下次再放宽集号时，忘了同步的那一条会当场变红，而不是等某部长番播到第 1000 集。
+    """
+    import re as _re
+
+    from sources import parse as P
+
+    def _spans(src: str):
+        """抠出源码里所有 `\\d{a,b}` 的 (下界, 上界)。"""
+        return [(int(m.group(1)), int(m.group(2)))
+                for m in _re.finditer(r"\\d\{(\d+),(\d+)\}", src)]
+
+    ex = _spans("".join(p.pattern for p in P._EP_PATTERNS))
+    assert ex, "集号抽取里一个位数区间都没有，这条守卫的前提坏了"
+    lo_ex, hi_ex = min(a for a, _ in ex), max(b for _, b in ex)
+    assert (lo_ex, hi_ex) == (1, 4), f"集号抽取的位数区间变了（{lo_ex}~{hi_ex}），来复核这条守卫"
+
+    for name in ("_BARE_RANGE_RE", "_BATCH_RE", "_EP_END"):
+        obj = getattr(P, name)
+        src = obj.pattern if hasattr(obj, "pattern") else obj
+        sp = _spans(src)
+        assert sp, f"{name} 里没有位数区间，判据对不上了"
+        lo, hi = min(a for a, _ in sp), max(b for _, b in sp)
+        # 【要比的是"区间覆盖"，不是"上界够大"】(R31) 上一版只断言上界 ——
+        # 于是 R28 把 `\\d{1,3}` 换成 `\\d{2,4}` 时，上界从 3 涨到 4（守卫满意），
+        # **下界却从 1 抬到了 2**，`- 1-9` 这种右端未补零的区间当场从"合集"退化成"第 1 集"，
+        # 而守卫全绿。位数区间必须【两头都】覆盖抽取侧。
+        assert lo <= lo_ex and hi >= hi_ex, (
+            f"{name} 的位数区间是 {lo}~{hi}，而集号抽取是 {lo_ex}~{hi_ex} —— "
+            "没被覆盖到的那一头，合集包会被当成单集抽出来自动下载")
+
+
+def test_a_four_digit_range_is_a_batch_not_episode_1156():
+    """行为面：四位连续集合集包必须判成合集，且抽不出集号。"""
+    from sources.parse import extract_episode, is_batch
+
+    t = "[ANi] 某长番 - 1156-1170 [1080P][Baha][WEB-DL][AAC AVC][CHT]"
+    assert is_batch(t) is True, "四位区间的合集包没被判成合集"
+    assert extract_episode(t) < 0, "它还被抽出了集号 —— 会以单集入库并占死去重键"
+
+    # 反向：真的单集、以及"集号后面还有一个分隔符"的写法都不许被误伤
+    for ok, ep in (("[ANi] Show - 1174 [1080P][Baha]", 1174.0),
+                   ("[组] 番名 - 05 - [简日内嵌][AVC 8bit 1080P]", 5.0),
+                   ("[组] Show - 05 - 1080P AVC", 5.0),
+                   ("[组] Show - 24 (最終回 23-24 総集編)", 24.0)):
+        assert is_batch(ok) is False, f"单集被误判成合集：{ok}"
+        assert extract_episode(ok) == ep, f"单集的集号被改了：{ok}"
+
+
+def test_every_episode_form_the_extractor_knows_is_also_stripped_from_the_name():
+    """(R28) 集号认得出来，就要从番名里洗得掉 —— 这是 `_EP_MARK` 上方注释自己立的规矩。
+
+    实测漏过两种写法：
+      · `第11.5话`：抽取侧带 `(?:\\.\\d+)?`，剥离侧没有 → 番名 `某番第11.5话`；
+      · `Episode 07`：抽取侧是 `(?:EP|Episode)`，剥离侧只有 `EP` → 番名 `ShowEpisode07`。
+    后果不是"名字难看"：`alias_key` 就是番的身份键 —— 每个小数集号各建一部垃圾番，
+    正片那部收不到这一集；搜索词同样脏（`_SEARCH_STRIP_PATTERNS` 复用同一份 `_EP_MARK`），
+    bgm 搜不到、永久停在『待识别』。
+
+    判据是**行为**而不是正则字面：拿一组覆盖各条写法的样例串跑一遍，
+    凡是抽得出集号的，番名里就不许再残留数字集号。
+    """
+    from sources.parse import parse_title
+
+    forms = [
+        "[组] 某番 - 07 [1080p]",
+        "[组] 某番 - 08.5 [1080p]",
+        "[组] 某番 S02E07 [1080p]",
+        "[组] 某番 第07话 [1080p]",
+        "[组] 某番 第11.5话 [1080p]",
+        "[组] 某番 第二十三话 [1080p]",
+        "[组] 某番 [07] [1080p]",
+        "[组] 某番 EP07 [1080p]",
+        "[组] 某番 Episode 07 [1080p]",
+        "[组] 某番 EP1174 [1080p]",
+    ]
+    dirty = []
+    for t in forms:
+        _g, name, _se, ep = parse_title(t)
+        if ep is None or ep < 0:
+            continue                      # 抽不出集号的不在本条守卫的范围里
+        if name != "某番":
+            dirty.append(f"{t!r} → 集号 {ep} 抽出来了，番名却是 {name!r}")
+    assert not dirty, (
+        "这些写法集号认得出来、番名却没洗干净（alias_key 会脏成一个新身份）：\n  "
+        + "\n  ".join(dirty))
+
+
+def test_episode_zero_is_a_real_episode_not_an_error_code():
+    """(R30) 第0話/前导集解析成 0，而 0 是**正片序列上的一集**，会被自动下载。
+
+    `db/models.py` 的注释原来只写了「-1特别篇 -2未知」三种取值，把 0 漏了 ——
+    而它今天是可达的（六种写法都产出 0），并且 `auto_downloadable_ep` 的判据
+    就是 `ep >= 0`。漏记一个可达取值的后果是：下一个人看到库里的 0
+    会以为是脏数据，顺手"修"成 -2 或过滤掉，那些前导集就再也下不来。
+
+    这条同时钉住那个**有意的不对称**：能不能自动下用 `>= 0`，
+    算不算"已下 N 集"用 `>= 1`（bgm 的 total_episodes 从 1 数起）。
+    """
+    from core.anime import auto_downloadable_ep
+    from sources.parse import extract_episode
+
+    for t in ("[组] Show - 00 [1080p]", "[组] Show 第0话 [1080p]", "[组] Show [00] [1080p]",
+              "[组] Show EP00 [1080p]", "[组] Show S01E00 [1080p]", "[组] Show - 00v2 [1080p]"):
+        assert extract_episode(t) == 0, f"{t!r} 不再解析成第 0 集了"
+
+    assert auto_downloadable_ep(0) is True, "第 0 集不自动下了 —— 它在周更序列上"
+    assert auto_downloadable_ep(-1) is False and auto_downloadable_ep(-2) is False
+    assert auto_downloadable_ep(0.5) is True, "小数集也在序列上"
+
+
+def test_the_model_comment_lists_every_reachable_episode_value():
+    """反向：模型注释必须把 0 也写出来。
+
+    注释是这一列唯一的词表来源（没有枚举类型），漏一个取值就等于给下一个人埋雷。
+    """
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("db/models.py").read_text(
+        encoding="utf-8")
+    i = src.index("episode: float = Field(default=-2)")
+    head = src[max(0, i - 1400):i]
+    for token in ("0", "-1", "-2"):
+        assert token in head, f"集号词表里没写 {token}"
+    assert "auto_downloadable_ep" in head, \
+        "词表没点名那个真正决定'能不能自动下'的判据 —— 读的人会去猜"
+
+
+@pytest.mark.parametrize("title", [
+    "[LoliHouse] 某番 - 1-9 [WebRip 1080p HEVC-10bit AAC][简繁外挂字幕]",
+    "[Nekomoe kissaten] Show - 1-6 [1080p]",
+    "[组] 某番 - 10-2 [1080p]",
+])
+def test_a_range_with_an_unpadded_side_is_still_a_batch(title):
+    """(R31) 右端未补零的连续集区间（`- 1-9`）同样是合集包。
+
+    R28 修"四位合集包"时把 `_EP_END` 的前瞻由 `\\d{1,3}` 换成 `\\d{2,4}` ——
+    上界 3→4 是要修的，**下界 1→2 是顺带改的**。于是 `- 1-9` 不再被前瞻挡住：
+    `-` 重新成了合法的集号收尾锚，整包被抽成**第 1 集**，
+    而 `_BARE_RANGE_RE` 两侧也要求 ≥2 位、`1-9` 匹配不上 ——
+    与 R28 那条 P1 逐字同形的"两道判据同时失效"，只是换到另一个角落。
+
+    补零写法不受影响，所以真库 2248 条当时 0 条命中：**潜伏的回归**。
+    这也是为什么上面那条结构守卫要比"区间覆盖"而不是"上界够大"。
+    """
+    from sources.parse import extract_episode, is_batch
+
+    assert is_batch(title) is True, "未补零的区间没被判成合集"
+    assert extract_episode(title) < 0, "它还被抽出了集号 —— 会以单集入库并被自动下载"

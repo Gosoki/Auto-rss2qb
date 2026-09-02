@@ -25,14 +25,37 @@ import httpx
 import config
 
 
+# 【运营商级 NAT / Tailscale 的整段】(R27) RFC 6598 的共享地址段。
+# 它必须**显式**写出来，不能靠 `is_private`：CPython gh-113171（**3.12.4 起**）把
+# 100.64.0.0/10 的 `is_private` 从 True 改成了 False —— 于是这一整段在一次
+# **Python 升级**之后静默地从判据里掉了出去，仓库里一行代码都没动过。
+# 而它恰恰是最该防的一段：Tailscale 给每个节点分的就是这里，CGNAT 家宽同理，
+# 本机到那些地址是通的。被投毒的 feed 只要给出
+# `http://100.64.x.y:8080/api/v2/torrents/delete?hashes=all`，
+# 常驻的采集/交付协程就会替它发出这个可控 GET。
+_SHARED_V4 = ipaddress.ip_network("100.64.0.0/10")
+
+
 def ip_is_internal(ip) -> bool:
     """ipaddress 对象是否属内网/环回/链路本地/保留等不可路由到公网的范围。
-    IPv4-mapped IPv6（::ffff:127.0.0.1）先归一到内嵌 IPv4 再判，防映射写法绕过。"""
+    IPv4-mapped IPv6（::ffff:127.0.0.1）先归一到内嵌 IPv4 再判，防映射写法绕过。
+
+    【判据是"并集"，不是换一套】(R27) 除了原来那六条，再并上
+      · 显式的 100.64.0.0/10（理由见 `_SHARED_V4`）；
+      · `not ip.is_global` —— 兜住其余"不可路由到公网"的特殊段，
+        以后 CPython 再改哪一条 `is_private` 也不会让它整段掉出去。
+    **不能拿 `not is_global` 去【替换】原来那串**：组播 `224.0.0.1` 的
+    `is_global` 是 **True**（实测），换过去等于把组播放行；
+    NAT64 的 `64:ff9b::/96` 同理会从"拒"变成"放"。并集只会更严，不会更松。
+    """
     mapped = getattr(ip, "ipv4_mapped", None)
     if mapped is not None:
         ip = mapped
+    if ip.version == 4 and ip in _SHARED_V4:
+        return True
     return (ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+            or not ip.is_global)
 
 
 # 代理软件的 fake-ip 池。clash-meta 默认 `fake-ip-range: 198.18.0.1/16`，

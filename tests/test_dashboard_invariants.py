@@ -153,6 +153,10 @@ def test_internal_marker_names_actually_exist_in_production_code():
 
     # 反向：键必须**带上业务库身份**，否则切库后标记与库不匹配（见 db.data_identity 的说明）。
     # 三处标记同一个决定 —— 这条钉住三处都带了。
+    # 【判据从"数 f-string"改成"数调用"】(R27) 原判据认的是
+    # `f"..{data_identity()}"` 这种拼法或 `_scoped(...)` 调用，而实现收敛到
+    # `db.scoped_flag` 之后 engine 那一处就不再是 f-string —— 门槛 2 却仍然过得去
+    # （anime 一家就有 3 处）。少数一处不报错，正是这种守卫最容易烂掉的方式。
     import ast
     scoped = 0
     for d in ("core/anime.py", "core/engine.py"):
@@ -160,10 +164,12 @@ def test_internal_marker_names_actually_exist_in_production_code():
         for n in ast.walk(tree):
             if isinstance(n, ast.JoinedStr) and "data_identity" in ast.dump(n):
                 scoped += 1
-            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                    and n.func.id == "_scoped"):
-                scoped += 1
-    assert scoped >= 2, (
+            if isinstance(n, ast.Call):
+                name = (n.func.attr if isinstance(n.func, ast.Attribute)
+                        else n.func.id if isinstance(n.func, ast.Name) else "")
+                if name in ("_scoped", "scoped_flag"):
+                    scoped += 1
+    assert scoped >= 3, (
         f"只有 {scoped} 处标记带上了业务库身份 —— 没带的那些切库之后会读到别的库的结论")
 
 
@@ -269,17 +275,23 @@ def test_dashboard_quarter_bars_put_1999_last(clean_tables):
     assert got[-1] == "99D", f"1999 应垫底，实际 {got}"
 
 
-def test_movie_dashboard_quarter_bars_put_1999_last(clean_tables):
-    """剧场版仪表盘同款——两条线各有一份 sorted，必须一起成立。"""
+def test_movie_dashboard_year_bars_put_1999_last(clean_tables):
+    """剧场版仪表盘同款——两条线各有一份 sorted，必须一起成立。
+
+    【R31 改成按年】剧场版按年归档（E-30），仪表盘分布从季度键换成四位年
+    （键名也从 `by_quarter` 换成 `by_year` —— 它装的是年，旧名字会骗人）。
+    要守的性质**一点没变**：两位年的季度键做字符串比较时 `'99D' > '26C'`，
+    1999 年的片会排到当年之上；换成四位年之后按 `-int(y)` 排，天然正确。
+    这条用例跟着换键名，不是"因为改了实现就把守卫删掉"。
+    """
     from core import movies as M
     from db.models import Movie
     with clean_tables.get_session() as s:
         for i, q in enumerate(["26C", "25D", "99D"]):
             s.add(Movie(title=f"片{i}", quarter=q, bangumi_id=2000 + i))
         s.commit()
-    got = [q for q, *_ in M.overview()["by_quarter"]]
-    assert got[0] == "26C", f"当季应排最前，实际 {got}"
-    assert got[-1] == "99D", f"1999 应垫底，实际 {got}"
+    got = [y for y, *_ in M.overview()["by_year"]]
+    assert got == ["2026", "2025", "1999"], f"年份没有按四位年倒序，实际 {got}"
 
 
 def test_rejected_movies_are_sorted_by_real_year(clean_tables):
@@ -331,3 +343,35 @@ def test_episode_ranges_by_source_separates_the_two_shapes(clean_tables):
     assert [(s_, int(lo), int(hi)) for s_, lo, hi, _ in r2] == [("ANi", 1, 33), ("Nix-Raws", 28, 33)]
     # 连续编号：区间互相重叠
     assert r2[1][1] <= r2[0][2], "重叠的两段应当 min(后) <= max(前)"
+
+
+def test_the_thirty_second_timer_only_refreshes_the_dashboard():
+    """(R27) 30 秒定时器不许重建带【用户交互态】的面板。
+
+    `reject_panel` 里每个 `ui.expansion` 都是 `value=(i == 0)` 硬编码重建、
+    没有持久化的展开意图（对比 `manage_page["expand"]`）——被定时刷新一次，
+    用户刚展开的折叠块就自动收起、滚动位置一起丢。最难受的是底部那个
+    『已删除的种子』：它恰恰是用户展开去找条目点『重新下载』的地方。
+    confirm/fail 也不许进来（它们有用户正在输入的绑定框/源下拉）。
+
+    判据按 AST 数 `_refresh_live` 函数体里出现的 `<panel>.refresh()` 调用名。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("pages/anime.py").read_text(
+        encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_refresh_live")
+    refreshed = set()
+    for n in ast.walk(fn):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "refresh" and isinstance(n.func.value, ast.Name)):
+            refreshed.add(n.func.value.id)
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            refreshed.add(n.func.id)          # _refresh_overview(...) 这种
+    forbidden = refreshed & {"reject_panel", "confirm_panel", "fail_panel", "manage_panel"}
+    assert not forbidden, (
+        f"这些面板被 30 秒定时器重建了：{sorted(forbidden)} —— "
+        "它们带着用户的展开态/半途输入，重建一次就没了")
+    assert "inflight_panel" in refreshed, "仪表盘的实时区反而不刷了？这条守卫的前提坏了"

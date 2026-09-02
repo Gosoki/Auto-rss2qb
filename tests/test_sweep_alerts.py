@@ -168,3 +168,120 @@ async def test_an_unchanged_batch_still_does_not_repeat(alerts, clean_tables):
     await A.sweep_alerts()
     await A.sweep_alerts()
     assert len(alerts) == 1, f"同一批被重复推送了 {len(alerts)} 次"
+
+
+# ---------------- (R26) 绑定可疑：只报不改 ----------------
+
+async def test_a_confirmed_anime_with_impossible_episodes_is_reported(alerts, clean_tables):
+    """先确认、之后才收到矛盾种子的番，必须被报出来 —— 而且**不许自动改状态**。
+
+    `binding_looks_wrong` 全项目 4 个调用点**全是"不让番【进入】追番中"的闸**
+    （建番、自动升确认、批量重算超期、合并前），没有任何一处对已 confirmed 的番重算，
+    三条巡检也都不看它，页面上一次都没引用过。
+    于是这样的番永久停在错状态，而它仍显示"追番中"、集去重照常生效 ——
+    那批不属于本季的种子会一直占着去重键，**挡住真正的本季集**。
+
+    真库实证：anime#6（第 3 季、bgm 记 12 集）下面挂着 24 条第一季的正片，
+    `binding_looks_wrong` 返回 True，而它 `confirmed=True / rejected=False`。
+
+    **只报不改**：自动置 `confirmed=False` 会让整部番掉出 `subscribed_where()`、
+    停掉自动下载，而判据本身有 bgm 数据质量的残留风险。
+    """
+    from datetime import datetime, timedelta
+
+    from db.models import Anime, AnimeTorrent
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="某番 第三季", display_name="某番 第三季", season=3, quarter="26C",
+                  confirmed=True, rejected=False, bangumi_id=598058,
+                  total_episodes=12, air_date="2026-07-05")
+        s.add(a); s.commit(); s.refresh(a)
+        # 第一季的正片：发布时间比本季首播早两年多
+        for i in range(3):
+            s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{i:040x}", raw_title=f"x - {i+1:02d}",
+                               season=3, episode=float(i + 1), status="pending",
+                               release_time=datetime(2026, 7, 5) - timedelta(weeks=130)))
+        s.commit()
+        aid = a.id
+
+    from core import anime as A
+    hits = A.suspect_wrong_binding()
+    assert [h["id"] for h in hits] == [aid], f"没报出来：{hits}"
+    assert hits[0]["bad"] == 3 and hits[0]["eps"] == [1, 2, 3]
+
+    res = await A.sweep_alerts()
+    assert res["wrong_binding"] == 1
+    assert any("绑定看着不对" in m for m in alerts), f"巡检没推送：{alerts}"
+
+    with clean_tables.get_session() as s:
+        got = s.get(Anime, aid)
+    assert got.confirmed is True and got.rejected is not True, \
+        "只该报，不该自动改状态 —— 置 confirmed=False 会停掉整部番的自动下载"
+
+
+async def test_a_healthy_anime_is_not_reported(alerts, clean_tables):
+    """反向：绑定正常的番不该被报 —— 误报会让用户学会无视这条横幅。"""
+    from datetime import datetime
+
+    from core import anime as A
+    from db.models import Anime, AnimeTorrent
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="正常番", season=1, quarter="26C", confirmed=True,
+                  bangumi_id=111, total_episodes=12, air_date="2026-07-05")
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="9" * 40, raw_title="x - 03",
+                           season=1, episode=3.0, status="pending",
+                           release_time=datetime(2026, 7, 19)))
+        s.commit()
+    assert A.suspect_wrong_binding() == []
+
+
+async def test_the_scan_does_not_grow_one_query_per_anime(clean_tables):
+    """(R27) 全库扫的查询次数不能随番数增长。
+
+    它挂在仪表盘的**同步构建路径**上（`pages/anime.py` 的 warn_banner），
+    每次渲染 + 每 30 秒的定时刷新各跑一遍。R26 刚加它的时候是 N+1（判据里查一次种子、
+    取 bad 明细再查一次），真库 99 部番实测 120~155ms —— 事件循环被同步冻住那么久。
+
+    这条用例数的是**真正发到数据库的语句条数**：番数从 3 部涨到 30 部，
+    语句数必须一条不涨。退回逐部番查的写法时它会从 2 涨到 60+。
+    """
+    from datetime import datetime, timedelta
+
+    import sqlalchemy as sa
+
+    from core import anime as A
+    from db.models import Anime, AnimeTorrent
+
+    def _seed(n, offset):
+        with clean_tables.get_session() as s:
+            for k in range(n):
+                a = Anime(title=f"番{offset + k}", season=3, quarter="26C", confirmed=True,
+                          rejected=False, bangumi_id=900000 + offset + k,
+                          total_episodes=12, air_date="2026-07-05")
+                s.add(a); s.commit(); s.refresh(a)
+                s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{offset + k:040x}",
+                                   raw_title="x - 01", season=3, episode=1.0, status="pending",
+                                   release_time=datetime(2026, 7, 5) - timedelta(weeks=130)))
+                s.commit()
+
+    def _count():
+        n = [0]
+        eng = clean_tables.engine
+
+        def _tick(*a, **k):
+            n[0] += 1
+        sa.event.listen(eng, "before_cursor_execute", _tick)
+        try:
+            A.suspect_wrong_binding()
+        finally:
+            sa.event.remove(eng, "before_cursor_execute", _tick)
+        return n[0]
+
+    _seed(3, 0)
+    few = _count()
+    _seed(27, 100)
+    many = _count()
+    assert len(A.suspect_wrong_binding()) == 30, "先确认这 30 部真的都被扫到了"
+    assert many == few, f"查询数随番数涨了：3 部 {few} 条 → 30 部 {many} 条（N+1 又回来了）"

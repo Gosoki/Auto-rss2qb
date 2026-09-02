@@ -117,7 +117,18 @@ class AnimeTorrent(SQLModel, table=True):
     anime_title: str = Field(default="")        # 该种子解析出的原始番名（展示/调试）
     raw_title: str = Field(default="")          # 原始种子完整标题（含语言/画质标签，用于区分同集不同版本）
     season: int = Field(default=1)
-    episode: float = Field(default=-2)          # 支持 .5；-1特别篇 -2未知
+    # 集号词表（四种，**别只记三种**）：
+    #   >=1  正片（支持 .5 这种插入话）
+    #   0    第0話/前导集 —— 它在周更序列上，`auto_downloadable_ep` 的判据就是 `ep >= 0`，
+    #        所以它**会被自动下载**。真库里有 2 行（历史遗留的剧场版误入），
+    #        而 `- 00` / `第0话` / `[00]` / `EP00` / `S01E00` 六种写法今天都仍解析成 0。
+    #   -1   特别篇   -2 未知/疑似批量  —— 这两类不自动下（见 auto_downloadable_ep）
+    # 【`>=0` 与 `>=1` 两个阈值是【有意】不同的，别去"对齐"】
+    #   · 能不能自动下：`>= 0`（0 是正片序列上的一集）；
+    #   · 算不算"已下 N 集"/完结覆盖：`>= 1`（bgm 的 total_episodes 从 1 数起，
+    #     把 0 计进去会让分子比分母多）。
+    # flush 的 have_eps **不设阈值**（按 HAVE 状态整批取），所以 0 也参与集去重、不会重复下。
+    episode: float = Field(default=-2)
     quarter: str = Field(default="")                  # 入库时的解析快照，【不权威】：
     # 决定实际保存目录的是 Anime.quarter（同名但语义不同）；这里只在番还没识别出来时
     # 作为路径回退用。历史上按种子行的 quarter 归拢，曾把同一部番劈成两个季度卡。

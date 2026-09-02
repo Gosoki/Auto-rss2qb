@@ -291,3 +291,66 @@ def test_fake_ip_pool_is_exempt_only_when_it_came_from_dns(ip, monkeypatch):
 def test_real_internal_addresses_stay_blocked_even_with_fake_ip_allowance(ip):
     """豁免只针对 fake-ip 那一段，真正的环回/局域网/链路本地照拒。"""
     assert asyncio.run(ssrf.safe_ip_for(ip, allow_fake_ip=True)) is None, f"{ip} 被放行了"
+
+
+# ---------------- (R27) 一次 Python 升级把整段 CGNAT 放了出去 ----------------
+
+def test_cgnat_and_tailscale_range_is_internal():
+    """100.64.0.0/10（RFC 6598 共享地址段）必须判成内网。
+
+    Tailscale 给每个节点分的就是这一段，CGNAT 家宽同理 —— 本机到那些地址是通的。
+    被投毒的 feed 给出 `http://100.64.x.y:8080/api/v2/torrents/delete?hashes=all`，
+    常驻的采集/交付协程就会替它发出这个可控 GET（本模块 docstring 举的正是这个例子）。
+    """
+    import ipaddress
+
+    from core import ssrf
+
+    for a in ("100.64.0.1", "100.100.100.100", "100.127.255.254"):
+        assert ssrf.ip_is_internal(ipaddress.ip_address(a)) is True, f"{a} 被放行了"
+        assert ssrf.ip_is_internal(ipaddress.ip_address("::ffff:" + a)) is True, \
+            f"::ffff:{a} 的映射写法被放行了"
+    # 相邻的公网地址不受影响（判据是 /10，别顺手把 100.128.x 也圈进去）
+    assert ssrf.ip_is_internal(ipaddress.ip_address("100.128.0.1")) is False
+    assert ssrf.ip_is_internal(ipaddress.ip_address("99.255.255.255")) is False
+
+
+def test_the_cpython_premise_that_made_this_a_silent_regression():
+    """把 CPython 的语义变化【钉在用例里】—— 这条不是测我们的代码，是测前提。
+
+    gh-113171（**3.12.4 起**）把 100.64.0.0/10 的 `is_private` 从 True 改成 False。
+    仓库里一行代码都没动，判据却因为一次 **Python 升级**静默地少了一整段。
+    这条用例的作用是：哪天这个前提又变了（比如上游改回去、或再改别的段），
+    它会红一次，提醒人来看 `ip_is_internal` 的并集还对不对 —— 而不是等下一次审计。
+    """
+    import ipaddress
+
+    ip = ipaddress.ip_address("100.64.0.1")
+    assert ip.is_private is False, (
+        "这个 Python 又把 100.64.0.0/10 判成 private 了 —— "
+        "去核对 core/ssrf._SHARED_V4 那段注释里的结论还成不成立")
+    assert ip.is_global is False, "100.64/10 的 is_global 变了，兜底那一条要重新想"
+    # 反向：组播的 is_global 是 True，所以 `not is_global` **不能**拿去替换原来那串判据
+    assert ipaddress.ip_address("224.0.0.1").is_global is True, \
+        "组播的 is_global 变了 —— ip_is_internal 里那句'不能替换只能并集'的理由要重写"
+
+
+def test_documentation_and_protocol_ranges_stay_blocked():
+    """文档/协议段（192.0.2/24、198.51.100/24、203.0.113/24、240/4…）必须一直是内网。
+
+    【这条**不是**在测 `not is_global` 那条兜底】—— 实测这几段今天的 `is_private`
+    全是 True，旧判据就已经拦住了它们；把它写成"兜底的用例"是句假话。
+    它是一条**回归守卫**：这些段与 100.64/10 同属"CPython 可能哪天改口径"的那一类，
+    改了就在这里红一次。
+    真正把两条机制分开钉住的做法要各删一半来验，而实测两条**互为冗余**
+    （只留任一条，CGNAT 那条用例都绿）—— 冗余是有意的，理由写在 `ip_is_internal` 的 docstring 里，
+    所以这里只钉**行为**：这些地址一律拒、公网地址一律放。
+    """
+    import ipaddress
+
+    from core import ssrf
+
+    for a in ("192.0.0.1", "192.0.2.1", "198.51.100.1", "203.0.113.1", "240.0.0.1"):
+        assert ssrf.ip_is_internal(ipaddress.ip_address(a)) is True, f"{a} 被放行了"
+    for a in ("8.8.8.8", "1.1.1.1", "104.21.1.1"):
+        assert ssrf.ip_is_internal(ipaddress.ip_address(a)) is False, f"{a} 被误拦"

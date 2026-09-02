@@ -330,23 +330,102 @@ def test_the_settings_page_never_touches_mysql_on_the_event_loop():
     """
     import ast
     import pathlib
-    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("pages/settings.py").read_text(
-        encoding="utf8")
-    tree = ast.parse(src)
-    offenders = []
-    # 【只看 async 处理器】它们才是跑在事件循环上的那一层。被 run.io_bound 包住的内层
-    # 同步小函数（_probe / _ping）正是该同步的 —— 按它们判会把正确的写法报成违规。
-    for node in ast.walk(tree):
+    # 【扫的是一张清单，不是一个文件】(R28) R27 只扫 pages/settings.py，
+    # 而 `init_business_state` 有【三个】调用点：设置页、顶栏『立即重连』、
+    # 以及 `core/worker.run_db_watch` 的恢复边沿 —— 最后那个当时还是裸的同步调用，
+    # 守卫看不见它（约束的作用域比验证的小，第②种形状）。
+    # 新增碰库的异步处理器时，把文件加进这张表。
+    _SCAN = ("pages/settings.py", "pages/layout.py", "core/worker.py")
+    root = pathlib.Path(__file__).resolve().parent.parent
+    src = "\n".join((root / f).read_text(encoding="utf8") for f in _SCAN)
+    tree = ast.parse("")   # 占位，下面按文件逐个 parse
+    # 【判据从"整棵子树里出现过 io_bound"改成"逐个调用点"】(R27)
+    # 老判据是子树级的字符串包含：只要处理器里**有一句**包了 io_bound，
+    # 同一个处理器里其余的同步库调用就永远报不出来。`_switch_backend` 正中此形状 ——
+    # `switch_data_engine` 包了，紧接着的 `worker.init_business_state` 是裸的同步调用，
+    # 而那时 db.engine 已经指向 MySQL（seed_source_groups + 两张种子表的全表扫回填）。
+    # 逐个调用点判之后，同一个处理器里再加第二条也漏不掉。
+    # 【`make_mysql_engine` 不在这张表里，它是"标记"不是"违规"】create_engine 是**惰性**的，
+    # 不建连接（所以 `_migrate` 才要另外写一个 `_ping()` 丢进线程去真连一次）。
+    # 它的作用是标出"这个处理器会碰 MySQL"，由下面那半条子树级判据用。
+    # 第一版把它当成必须上线程的调用，于是把 `_migrate` 里正确的写法报成了违规。
+    ON_THREAD_ONLY = {"switch_data_engine", "init_business_state", "probe_data_engine"}
+    TOUCHES_MYSQL = {"make_mysql_engine", "switch_data_engine"}
+
+    def _call_name(n):
+        f = n.func
+        return f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+
+    def _direct_calls(node):
+        """处理器**自己身体里**的调用（不下钻内层 def —— 那些正是要被 io_bound 拎去线程的）。"""
+        out = []
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(n, ast.Call):
+                out.append(n)
+            stack.extend(ast.iter_child_nodes(n))
+        return out
+
+    trees = {f: ast.parse((root / f).read_text(encoding="utf8")) for f in _SCAN}
+    offenders, scanned = [], []
+    for _f, _t in trees.items():
+      for node in ast.walk(_t):
         if not isinstance(node, ast.AsyncFunctionDef):
             continue
-        sub = ast.dump(node)                     # 整棵子树，含内层的同步小函数
-        if "make_mysql_engine" not in sub and "switch_data_engine" not in sub:
-            continue
-        if "io_bound" not in sub:
-            offenders.append(f"settings.py:{node.lineno} {node.name}()")
-    assert offenders == [], ("这些处理器在事件循环上同步碰 MySQL：\n  " + "\n  ".join(offenders))
-    # 反向：确认扫描确实看见了那几个处理器，别因为改名而空跑成绿
+        for c in _direct_calls(node):
+            name = _call_name(c)
+            if name in ON_THREAD_ONLY:
+                scanned.append(name)
+                offenders.append(f"{_f}:{c.lineno} {node.name}() 里直接调了 {name}()")
+            elif name in ("io_bound", "to_thread"):
+                scanned.extend(_call_name(a) if isinstance(a, ast.Call)
+                               else a.attr if isinstance(a, ast.Attribute)
+                               else a.id if isinstance(a, ast.Name) else ""
+                               for a in c.args[:1])
+    assert offenders == [], ("这些调用在事件循环上同步碰库：\n  " + "\n  ".join(offenders)
+                            + "\n改成 `await run.io_bound(fn, *args)`")
+    # 反向：确认扫描确实看见了那几个该上线程的名字，别因为改名而空跑成绿
+    hit = ON_THREAD_ONLY & set(scanned)
+    assert {"switch_data_engine", "init_business_state"} <= hit, (
+        f"扫描没看见预期的调用（只看见 {sorted(hit)}）—— 判据大概率已经失效")
+
+    # 【第二半：子树级的兜底】(原判据) 一个碰 MySQL 的处理器里**一句 io_bound 都没有**，
+    # 说明它整条路都在事件循环上 —— 上面逐调用点那一半只认得出名单里的函数名，
+    # 认不出"随手一条 session 查询"，这半条兜的是那种。
+    loose = []
+    for _f, _t in trees.items():
+        if _f != "pages/settings.py":
+            continue          # 这半条只对设置页成立：另外两个文件用的是 asyncio.to_thread
+        for node in ast.walk(_t):
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            sub = ast.dump(node)
+            if any(t in sub for t in TOUCHES_MYSQL) and "io_bound" not in sub:
+                loose.append(f"{_f}:{node.lineno} {node.name}()")
+    assert loose == [], ("这些处理器整条路都在事件循环上碰 MySQL：\n  " + "\n  ".join(loose))
     assert src.count("make_mysql_engine") >= 2 and "switch_data_engine" in src
+
+    # 【第三半：内层同步小函数不许被直接调】(R27) `_ping` / `_probe` 这种嵌套 def
+    # 存在的唯一理由就是"被 io_bound 拎到线程里去"，在处理器体内直接调它
+    # 等于把它又搬回事件循环上 —— 而上面两半都看不见这种改法
+    # （名字不在名单里；处理器里别处仍有 io_bound，子树判据照样绿。实测变异确认）。
+    # 只认【身体里真的碰库】的那些嵌套 def，免得把普通的 UI 回调误报。
+    _DB_ISH = ("connect", "get_session", "count_rows", "make_mysql_engine",
+               "switch_data_engine", "migrate", "verify")
+    inline = []
+    for node in ast.walk(trees["pages/settings.py"]):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        threaded = {d.name for d in ast.walk(node)
+                    if isinstance(d, ast.FunctionDef) and any(t in ast.dump(d) for t in _DB_ISH)}
+        for c in _direct_calls(node):
+            if isinstance(c.func, ast.Name) and c.func.id in threaded:
+                inline.append(f"pages/settings.py:{c.lineno} {node.name}() 直接调了内层的 {c.func.id}()")
+    assert inline == [], ("这些碰库的内层小函数被直接调用了（本该走 run.io_bound）：\n  "
+                          + "\n  ".join(inline))
 
 
 def test_no_function_references_an_undefined_global():

@@ -18,7 +18,10 @@ log = logging.getLogger("autorss")
 _BTIH_RE = re.compile(r"xt=urn:btih:([0-9A-Fa-f]{40}|[A-Za-z2-7]{32})")
 _BGM_ID_RE = re.compile(r"subject/(\d+)")
 
-MANUAL_CATEGORY = "AutoRSS-Manual"   # qB 分类：与番剧 AutoRSS-Anime / 剧场版 AutoRSS-Movie 并列，均不带后缀
+# 【分类名搬进配置了】(R27) 三条投递路径的分类名现在都在设置页可改，
+# 见 config.QB_CATEGORY_MANUAL（默认仍是 "AutoRSS-Manual"，与改之前逐字相同）。
+# 这里【不再留模块级常量】：留着就会有人接着用它，于是"分类可配"这个决定又只落到两处
+# —— 本项目反复出现的第①种缺陷形状。
 MANUAL_TAG = "Manual"                # qB 标签：只放后缀（番剧放季度、剧场版放年份，手动固定 Manual）
 
 
@@ -109,18 +112,18 @@ async def add_manual(torrent_input: str, torrent_bytes, save_path: str) -> dict:
         #    本该是"它已经在下了"，实际给的是红色『qB 未接受（种子无效/路径不可写/重复）』。
         if torrent_bytes:                                   # 上传的 .torrent 文件
             ih = info_hash_from_torrent(torrent_bytes)
-            ok = await engine.add_to_qb(torrent_bytes, save_path, MANUAL_CATEGORY, MANUAL_TAG,
+            ok = await engine.add_to_qb(torrent_bytes, save_path, config.QB_CATEGORY_MANUAL, MANUAL_TAG,
                                         info_hash=ih or "")
         elif inp.lower().startswith("magnet:"):             # magnet：交给 qB 抓
             ih = magnet_hash(inp)
-            ok = await engine.add_to_qb(None, save_path, MANUAL_CATEGORY, MANUAL_TAG,
+            ok = await engine.add_to_qb(None, save_path, config.QB_CATEGORY_MANUAL, MANUAL_TAG,
                                         info_hash=ih or "", magnet=inp)
         elif inp.lower().startswith(("http://", "https://")):   # .torrent 链接：本地抓字节(带 SSRF 守卫)再交 qB
             # strict=False：首跳放行、重定向后的每一跳仍强制判内网（与 D-05 同口径，见 E-21）。
             # 这个地址是用户自己在输入框里打的，"内网私站/局域网镜像取种"是正当用法。
             data = await engine.fetch_torrent_bytes(inp, strict=False)
             ih = info_hash_from_torrent(data)
-            ok = await engine.add_to_qb(data, save_path, MANUAL_CATEGORY, MANUAL_TAG,
+            ok = await engine.add_to_qb(data, save_path, config.QB_CATEGORY_MANUAL, MANUAL_TAG,
                                         info_hash=ih or "")
         else:
             return {"ok": False, "error": "请填 magnet: / http(s) .torrent 链接，或上传 .torrent 文件"}

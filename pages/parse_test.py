@@ -9,6 +9,12 @@ import config
 from sources.parse import candidate_names, is_batch, parse_multibracket, parse_title
 from .layout import ep_str, frame, require_config_loaded
 
+# 判定横幅的色号：与全站同名色对齐（绿是 green-500，其余是 -400；见 layout._TOKENS
+# 与 _HEAD_BADGE_CSS 里那批 .q-badge.bg-* 的底色）。图标与文字共用同一个值 ——
+# 同一行两种深浅是 R27 从这一页翻出来的毛病。
+_VERDICT_SHADE = {"green": "text-green-500", "red": "text-red-400",
+                  "blue": "text-blue-400", "orange": "text-orange-400"}
+
 # (标签, 标题)——覆盖：大组正常 / 各种集数特例 / 合集 / 多括号四种
 _EXAMPLES = [
     ("大组·正常", "[ANi] 葬送的芙莉莲 - 07 [1080P][Baha][WEB-DL][AAC AVC][CHT][MP4]"),
@@ -89,9 +95,13 @@ def parse_test_page():
 
             with ui.card().classes("w-full gap-3"):
                 # 判定横幅：图标 + 采集判定
+                # 【图标与文字必须同一个色号】(R27) 原来是 -400 配 -300，同一行两种深浅；
+                # 而绿这一档还写成 green-400，与全站的绿（token 表与 .q-badge.bg-green 都是
+                # green-500）不是同一个颜色。色号从 layout 那张表取，别在这儿拼 Tailwind 类名。
+                _hue = _VERDICT_SHADE[color]
                 with ui.row().classes("items-start gap-2 no-wrap"):
-                    ui.icon(icon).classes(f"text-{color}-400 text-2xl shrink-0")
-                    ui.label(verdict).classes(f"text-sm font-bold text-{color}-300 min-w-0")
+                    ui.icon(icon).classes(f"{_hue} text-2xl shrink-0")
+                    ui.label(verdict).classes(f"text-sm font-bold {_hue} min-w-0")
                 ui.separator()
                 # 番名（醒目）+ 合集/单集
                 with ui.row().classes("items-center gap-2 flex-wrap"):
@@ -119,6 +129,11 @@ def parse_test_page():
         def _toggle():
             # 同上：sw 是用 config 渲染的，配置没读出来时它的值是硬编码默认
             if not require_config_loaded():
+                # 【拦下之后要把开关拨回去】(R27) 全站过这道闸的另外三个处理器都是**按钮**，
+                # 没有可见状态需要回滚；只有这一处是开关：不回拨的话，界面显示"开"、
+                # 而 config 一点没变、下面的判定结果仍按"关"算 —— 用户会以为解析逻辑坏了。
+                # 用 config 的真值回填（不是取反：取反在重入时会漂）。
+                sw.set_value(config.ANIME_MULTIBRACKET_PARSE)
                 return
             config.set_many({"ANIME_MULTIBRACKET_PARSE": "true" if sw.value else "false"})
             result.refresh()

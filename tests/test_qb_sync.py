@@ -1053,3 +1053,54 @@ async def test_missing_files_still_keeps_its_state(clean_tables, torrents, qb_re
     with clean_tables.get_session() as s:
         assert s.exec(select(AnimeTorrent)).one().qb_state == "missingFiles", \
             "『文件缺失』这个诊断被抹掉了"
+
+
+# ---------------- (R32) in-flight 查询必须选得中 partial index ----------------
+
+def test_inflight_query_inlines_the_status_list_so_the_index_is_usable(clean_tables):
+    """`status IN (...)` 必须以**字面量**发出去，否则 `ix_*_inflight` 一次都用不上。
+
+    SQLite 要能【静态证明】查询条件蕴含索引谓词才会选 partial index，
+    而绑定参数 `?` 做不到这个证明 —— 这不是"索引没建好"，是"查询写法让它选不中"。
+    逐项实测（20148 行）：只把 status 换成绑定参数，计划就从 `SEARCH ... USING INDEX`
+    退回 `SCAN`；耗时 0.008 ms → 6.270 ms（in-flight 为 0 的常态）。
+
+    这条用例抓的是**真正发给 sqlite3 的那条语句**，不是 SQLAlchemy 编译前的形态 ——
+    后者里 IN 列表是 `__[POSTCOMPILE_...]` 占位符，看不出最终是字面量还是 `?`。
+    """
+    import sqlalchemy as sa
+
+    from core import engine as ce
+
+    cap = []
+
+    def _grab(conn, cur, stmt, params, ctx, many):
+        cap.append(stmt)
+
+    sa.event.listen(clean_tables.engine, "before_cursor_execute", _grab)
+    try:
+        ce.has_inflight()
+    finally:
+        sa.event.remove(clean_tables.engine, "before_cursor_execute", _grab)
+
+    assert cap, "一条语句都没发出去，用例是空跑的"
+    sql = " ".join(cap[0].split())
+    assert "status IN ('sent', 'downloading')" in sql, (
+        f"status 没有被内联成字面量，partial index 会选不中：{sql[:160]}")
+
+
+def test_the_inlined_status_values_are_safe_to_inline(clean_tables):
+    """反向：内联的前提是那些值来自**模块级常量**且只含 ASCII 标识符。
+
+    `literal_execute=True` 由 SQLAlchemy 自己内联（不是字符串拼接），
+    但"值从哪来"这件事得有人钉住 —— 哪天有人把用户输入接到 TRACKED_STATUSES 上，
+    这条会当场变红。
+    """
+    import re
+
+    from core import engine as ce
+
+    assert isinstance(ce.TRACKED_STATUSES, tuple), "它必须是不可变的模块级常量"
+    for v in ce.TRACKED_STATUSES:
+        assert isinstance(v, str) and re.fullmatch(r"[a-z_]+", v), \
+            f"待内联的状态值形状可疑：{v!r} —— 内联只对代码里的常量成立"

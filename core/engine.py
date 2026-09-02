@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import sqlalchemy as sa
 from sqlmodel import func, or_, select
 
 import config
@@ -167,7 +168,14 @@ def maintenance_blockers() -> list[str]:
     # 所以这里按"有几条跨 await 持主键的线"逐条列全，新增一条就往这儿加一行。
     for lock, what in ((_w._poll_lock, "采集轮"),
                        (_w._scan_lock, "剧场版扫描轮"),
-                       (_a._enrich_lock, "延迟重识别/批量刷新资料")):
+                       (_a._enrich_lock, "延迟重识别/批量刷新资料"),
+                       # 【第六、七条，R27 补】上面那段写着"新增一条就往这儿加一行"，
+                       # 而这两条从一开始就在，只是**连锁都没有**，于是 R23 那条
+                       # "每把轮次锁都要被闸看见"的守卫也看不见它们（判据只覆盖已有锁的线）。
+                       # · 归档：读 (id, hash) → await qb.delete(45s 上限) → 按 id 写回 archived_at
+                       # · 巡检：读 Anime.id → await notify_event(每条 NOTIFY_TIMEOUT) → 按 id 写 finished_at
+                       (_w._archive_lock, "完成归档轮"),
+                       (_w._sweep_lock, "完结/断更/积压巡检轮")):
         if lock.locked():
             reasons.append(f"{what}正在跑（它跨 await 持着业务库主键）")
     return reasons
@@ -1039,21 +1047,41 @@ def qb_is_downloading(state: str) -> bool:
     return state in _QB_DOWNLOADING
 
 
+# `status IN (...)` 的**字面量**绑定：让 SQLite 选得中 ix_*_inflight 那个 partial index。
+# `literal_execute=True` 由 SQLAlchemy 在执行期把值内联进 SQL —— 不是字符串拼接。
+# 值恒为模块级常量 TRACKED_STATUSES（不是用户输入），守卫在 tests/test_qb_sync.py。
+_TRACKED_LITERAL = sa.bindparam("tracked_status", value=list(TRACKED_STATUSES),
+                                expanding=True, literal_execute=True)
+
+
 def _inflight_where(model_cls):
     """『在下的种子』筛选条件（sync 查询与 has_inflight 共用，口径一致）：
     已交付(sent/downloading) 且 进度<100% 且 qB 态未落定(非做种/非文件缺失)。
     进度满/做种(已完成)/文件缺失 都算落定 → 不再轮询，qB 压力只随『当前在下数』走。
 
-    【别以为 ix_*_inflight 那个 partial index 在起作用】它建出来了，但运行时用不上：
-    SQLAlchemy 把 status 列表发成绑定参数(?)，而 SQLite 要能【静态证明】查询条件蕴含索引谓词
-    才会选 partial index，占位符做不到这个证明。实测（9672 行）：
-        绑定参数 → SCAN animetorrent，0.79ms
-        字面量   → SEARCH ... USING COVERING INDEX，0.02ms
-    但整个 has_inflight() 也才 1.26ms，而它每 30 秒~2 小时才调一次，
-    所以【有意保持现状】：把状态内联成字面量能快 40 倍，却要在 SQL 里拼字符串、
-    给后人留一个看着像注入的写法，不值当。真到了几十万行再说。"""
+    【status 必须内联成字面量，否则 ix_*_inflight 那个 partial index 一次都用不上】(R32)
+    SQLite 要能【静态证明】查询条件蕴含索引谓词才会选 partial index，而绑定参数 `?`
+    做不到这个证明 —— 这不是"索引没建好"，是"查询写法让它选不中"。
+    逐项实测（20148 行的真库副本，四种写法只差绑定方式）：
+        ① status/progress 全字面量                → SEARCH ... USING COVERING INDEX
+        ② 再加上 coalesce NOT IN，仍全字面量        → SEARCH ... USING INDEX   ← NOT IN 那项无辜
+        ③ **只把 status 换成绑定参数**             → SCAN                    ← 元凶就是它
+        ④ 全绑定参数（改这行之前的生产写法）          → SCAN
+    耗时（20148 行、in-flight 为 0 的常态）：**6.270 ms → 0.008 ms**。
+    这正是这个索引存在的理由 —— baseline 那条 revision 写着
+    "in-flight 集合天然极小，常态『无在下』时不必全表扫两表才能确认为空"。
+
+    【为什么现在做、当初不做】这段注释此前写着"有意保持现状：内联能快 40 倍，
+    却要在 SQL 里拼字符串、给后人留一个看着像注入的写法，不值当"。
+    那个理由**今天不成立了**：`bindparam(..., literal_execute=True)` 是 SQLAlchemy 的
+    一等 API，由它自己在执行期内联，**没有任何字符串拼接**。
+    安全性由 `TRACKED_STATUSES` 是模块级常量兜底（不是用户输入），
+    并有一条守卫钉着它只含 ASCII 标识符。
+
+    （`_recheck_where` 用不上同一招：它要求 `progress >= 1 或已落定`，
+    与 partial index 的谓词 `progress < 1.0` 互斥，内联了也选不中。）"""
     return (
-        model_cls.status.in_(TRACKED_STATUSES),
+        model_cls.status.in_(_TRACKED_LITERAL),
         model_cls.qb_progress < 1.0,
         func.coalesce(model_cls.qb_state, "").not_in(_QB_SETTLED_LIST),
     )
@@ -1202,22 +1230,56 @@ def backfill_legacy_progress_once() -> None:
     用户只会觉得"好几天没更新了"。标记位读写走 meta，业务行更新走 data，两段分开。
     """
     # 【标记要带业务库身份】(R26) 它判的是"**这个业务库**回填过没有"，而标记存在 meta 库、
-    # 不随业务库走。第三处同款标记，理由与 core/anime.py 的 `_scoped` 逐字相同 ——
+    # 不随业务库走。第三处同款标记，实现共用 `db.scoped_flag` ——
     # 三处标记同一个决定，之前只有零处落到（第①号形状）。
-    from db import data_identity
-    flag = f"_QB_PROGRESS_BACKFILLED@{data_identity()}"
+    from db import scoped_flag
+    base = "_QB_PROGRESS_BACKFILLED"
+    flag = scoped_flag(base)
     n = 0
     with get_meta_session() as ms:            # 标记位：本地 SQLite
         if ms.get(Setting, flag) is not None:
             return
+    # 【存量安装的旧全局键要先认领】(R27) R26 只改了键名、没迁移旧键，
+    # 而每一台在跑的安装存的都是旧名 —— 于是升级后的第一次启动会把这条
+    # **改数据**的一次性迁移重跑一遍，把正在下载（sent 且 progress<1）的种子
+    # 全部写成 1.0、永久脱轨。认领逻辑与另外两个标记共用一份，见 db.adopt_legacy_flag。
+    from db import adopt_legacy_flag
+    if adopt_legacy_flag(base):
+        return
     with get_session() as s:                  # 业务行：当前业务库（可能是 MySQL）
-        for model_cls in (AnimeTorrent, MovieTorrent):
-            for t in s.exec(select(model_cls).where(
-                    model_cls.status == "sent", model_cls.qb_progress < 1.0)):
-                t.qb_progress = 1.0
-                s.add(t)
-                n += 1
-        s.commit()
+        # 【标记之外还要一道【数据本身】的判据】(R27) 上面那个标记按业务库分作用域，
+        # 于是"换一个业务库"＝标记读不到＝这条**改数据**的迁移原地重跑。
+        # 而换库是个正常操作：设置页『迁移数据』把含在下种子的库整个搬到 MySQL、
+        # 紧接着『切到 MySQL』→ init_business_state → 本函数。新库里那些**正在下载**的行
+        # （sent 且 progress<1）会被一把写成 1.0，从此掉出 `_inflight_where`、
+        # `qb_state` 又不在补查名单里，而 `sent ∈ HAVE_STATUSES` 让集去重认定这一集已到手 ——
+        # 没有任何在线路径能改回来，UI 显示 100%、盘上是半成品，全程零告警。
+        #
+        # 判据要能回答的是「这个库里的 sent 行是不是**本功能上线之前**留下的」，
+        # 而那是个关于数据的事实，不是关于标记的：**上线前的库从来没写过 qb_synced_at**
+        # （那一列与 qb_progress 是同一批加的，只有同步循环会写它）。
+        # 所以只要库里存在任何一条 `qb_synced_at IS NOT NULL`，就说明实时态跟踪
+        # 在这个库上已经跑过 —— 此时的 `sent 且 progress<1` 是**真的在下**，不是历史行。
+        # 反向的漏判是安全方向：历史行留在 progress=0 上会被同步循环当成在下的去查一次，
+        # qB 查不到 → 现成的 `_QB_ABSENT` 那套会把它收敛掉。
+        # 【判据的作用域是"这个库"，不是"这张表"】(R28 修) R27 第一版把这句探测写在
+        # `for model_cls` **循环体内**逐表判 —— 而立论说的是"实时态跟踪在这个**业务库**上
+        # 跑过没有"。一张表只要从来没有一行被 qB 同步过，逐表写法对它就恒不成立。
+        # 真库快照实测正是这种形状：`animetorrent` 1679 行里 527 行有 qb_synced_at，
+        # 而 `movietorrent` 569 行**一条都没有**（剧场版逐版本人工点下，很多库里根本没交付过）。
+        # 于是切库之后，剧场版那张表里正在下的版本会被整表写成 1.0 ——
+        # R27 自己定为 P1 的那件事，换一张表原样重现。
+        tracked = any(
+            s.exec(select(m.id).where(m.qb_synced_at.is_not(None)).limit(1)).first() is not None
+            for m in (AnimeTorrent, MovieTorrent))
+        if not tracked:
+            for model_cls in (AnimeTorrent, MovieTorrent):
+                for t in s.exec(select(model_cls).where(
+                        model_cls.status == "sent", model_cls.qb_progress < 1.0)):
+                    t.qb_progress = 1.0
+                    s.add(t)
+                    n += 1
+            s.commit()
     with get_meta_session() as ms:
         ms.add(Setting(key=flag, value="1"))
         ms.commit()

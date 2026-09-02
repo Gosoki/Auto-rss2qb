@@ -942,3 +942,116 @@ def test_every_empty_state_uses_the_weaker_grey():
             if "text-gray-500" not in seg:
                 bad.append(f"{path.name}:{n.lineno} {v[:24]}")
     assert not bad, "这些空状态占位没用更弱的那一档灰：\n  " + "\n  ".join(bad)
+
+
+# ---------------- (R27) 有彩色的那几档：一个色相只准有一个色号 ----------------
+
+# 全站文字用到的 Tailwind 有彩色类，与它们在 Tailwind v4 里的 oklch 值。
+# 【这张表不是随便写的】下面那条用例会拿每个值去 `_HEAD_BADGE_CSS` 里比对：
+# 文字用的那个绿，必须与徽标底色 `.q-badge.bg-green` 是同一个绿。
+# 加新色号要先在这里登记，登记的值对不上徽标 CSS 就会红——
+# 于是"改色板"这件事没法只改一半。
+_TAILWIND_OKLCH = {
+    ("blue", "400"): "70.7% 0.165 254.624",
+    ("green", "500"): "72.3% 0.219 149.579",
+    ("red", "400"): "70.4% 0.191 22.216",
+    ("amber", "400"): "82.8% 0.189 84.429",
+    ("orange", "400"): "75% 0.183 55.934",
+}
+
+
+def test_each_hue_has_exactly_one_shade():
+    """一个色相只准出现一个色号，且必须与同名徽标底色是同一个颜色。
+
+    实测出来的毛病：`tint("green")` 的底色是 green-500（徽标 `.q-badge.bg-green` 也是它），
+    而 pages/manual.py 那个盒子里的图标与文字写的是 `text-green-400` ——
+    同一个盒子里两种绿并排。layout.py 的注释里早写着这个毛病，
+    但那次只把**底色**搬进了 token 表，前景那一半没跟上（第①种缺陷形状）。
+
+    灰阶不在这条用例里（两档灰有自己的规矩，见 test_only_two_greys_exist）。
+    """
+    from pages.layout import _HEAD_BADGE_CSS, _TOKENS
+
+    pat = re.compile(r"\b(?:hover:)?text-(blue|green|red|amber|orange|purple|pink|teal|indigo)-(\d{3})\b")
+    used: dict[str, set[str]] = {}
+    where: list[str] = []
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        for ln, line in enumerate(path.read_text(encoding="utf8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue                      # 注释里提到某个色号不算
+            for m in pat.finditer(line):
+                hue, shade = m.group(1), m.group(2)
+                used.setdefault(hue, set()).add(shade)
+                where.append(f"{path.name}:{ln} {m.group(0)}")
+
+    split = {h: sorted(s) for h, s in used.items() if len(s) > 1}
+    assert not split, (
+        "同一个色相用了两个色号，同一屏上会是两种颜色：\n  "
+        + "\n  ".join(f"{h}: {'/'.join(s)}" for h, s in split.items())
+        + "\n出现位置：\n  " + "\n  ".join(where))
+
+    unknown = [(h, next(iter(s))) for h, s in used.items()
+               if (h, next(iter(s))) not in _TAILWIND_OKLCH]
+    assert not unknown, (
+        f"用了没在 _TAILWIND_OKLCH 里登记的色号：{unknown}。"
+        "先登记它的 oklch 值，让下面那条比对能验到它。")
+
+    # 【按规则取值，不能按前缀字面量匹配】蓝那条的选择器是分组写法
+    # `.q-badge.bg-blue,.q-badge.bg-primary{...}`，前缀匹配会漏掉它 ——
+    # 这条用例的第一版就栽在这儿，报了一个并不存在的"两种蓝"。
+    rules = re.findall(r"([^{}]+)\{background:oklch\(([^)]+)\)", _HEAD_BADGE_CSS)
+    badge_bg = {sel.strip(): val for sels, val in rules for sel in sels.split(",")}
+    # 【f-string 拼出来的色相也要管】(R27) 上面那段扫的是**字面**的 text-<色相>-<色号>，
+    # 而 /parse 的判定横幅写的是 `f"text-{color}-400"` 与 `f"text-{color}-300"` ——
+    # 同一行两种深浅，且绿那一档是 green-400、与全站的 green-500 不同色。
+    # 判据：**动态色相 + 写死色号** 一律不许（`f"text-{hi}-{shade}"` 这种色号也算出来的不算，
+    # 那是 kpi_cards 里"绿 500 其余 400"那条规则的正确写法）。
+    dyn = re.compile(r'text-\{[A-Za-z_][A-Za-z_0-9]*\}-\d{3}')
+    bad_dyn = []
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        for ln, line in enumerate(path.read_text(encoding="utf8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if dyn.search(line):
+                bad_dyn.append(f"{path.name}:{ln} {line.strip()[:70]}")
+    assert not bad_dyn, (
+        "这些地方用 f-string 拼了『动态色相 + 写死色号』，色号一旦与色相不匹配就是两种色：\n  "
+        + "\n  ".join(bad_dyn) + "\n（色号要么跟着色相一起从一张表取，要么按规则算出来）")
+
+    for hue, shades in used.items():
+        val = _TAILWIND_OKLCH[(hue, next(iter(shades)))]
+        got = badge_bg.get(f".q-badge.bg-{hue}")
+        assert got is not None, f"徽标 CSS 里没有 .q-badge.bg-{hue} 这条规则，比对不了"
+        assert got == val, (
+            f"文字用的 text-{hue}-{next(iter(shades))}（oklch {val}）"
+            f"与徽标底色 .q-badge.bg-{hue}（oklch {got}）不是同一个颜色 —— 同名色两种值")
+        if hue in _TOKENS:
+            assert _TOKENS[hue] == val, (
+                f"token 表里的 {hue} 是 oklch({_TOKENS[hue]})，"
+                f"而文字用的 text-{hue}-{next(iter(shades))} 是 oklch({val})："
+                "tint() 的底色与它上面的字会是两种颜色")
+
+
+def test_no_input_sets_its_own_font_size():
+    """(R27) 输入框不许自己定字号 —— 与徽标、按钮、分页同一条纪律。
+
+    形态由 `pages/layout.py` 的 `ui.input.default_props("dense outlined")` 一处定，
+    调用点只选"放在哪、多宽"。自己加一档字号（Tailwind 的 `text-sm` 或
+    Quasar 的 `input-class=text-sm`）就会让同一屏出现两种输入框，
+    而且**不会报错**——正是徽标那 31 处 `text-sm` 当年的形状。
+    R27 新加番剧表搜索框时随手带了一个 `input-class=text-sm`，就是被这条挡下来的。
+    """
+    pat = re.compile(r"(?:input-class=|\b)text-(?:xs|sm|base|lg|xl|\d+xl)\b")
+    offenders = []
+    for path in sorted((_ROOT / "pages").rglob("*.py")):
+        src = path.read_text(encoding="utf8")
+        for widget in ("input", "number", "textarea", "select"):
+            for off, chain in _widget_chains(src, widget):
+                for m in re.finditer(r'\.(?:props|classes)\(\s*f?"([^"]*)"', chain):
+                    hit = pat.search(m.group(1))
+                    if hit:
+                        line = src[:off].count(chr(10)) + 1
+                        offenders.append(f"{path.name}:{line} ui.{widget} 自己定了字号 {hit.group(0)}")
+    assert not offenders, (
+        "这些输入类控件自己定了字号，同一屏会出现两种大小：\n  " + "\n  ".join(offenders)
+        + "\n（尺寸由 pages/layout.py 的 default_props 一处定）")

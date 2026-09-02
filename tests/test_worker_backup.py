@@ -318,3 +318,64 @@ async def test_the_sweep_loop_actually_clears_delivery_wreckage(clean_tables, mo
     with clean_tables.get_session() as s:
         assert s.exec(select(AnimeTorrent)).one().status == "pending", \
             "巡检轮跑完了残骸还在 —— 清扫没被调到"
+
+
+async def test_the_qb_sync_loop_drives_archiving_through_the_lock(clean_tables, monkeypatch, cfg):
+    """(R28) qB 同步轮必须经 `archive_round()` 归档，不能绕过去直接调 `archive_old_completed`。
+
+    R27 把归档抽成模块级 `archive_round()`（`async with _archive_lock:`），
+    理由是那条线**跨 await 持业务库主键**：读 `(id, info_hash)` → `await qb.delete()`
+    （单次上限 45 秒）→ 出 await 后 `s.get(model_cls, tid)` 按主键写 `archived_at`，
+    而 `db/transfer.py` 保留主键 —— 维护窗口横在中间时写回落进另一个库的另一行。
+
+    但当时只测了"直接调 `archive_round()` 时锁被持住"，**没测生产驱动者会不会走它**：
+    把 `_maybe_archive` 里的 `await archive_round()` 换回 `await engine.archive_old_completed()`，
+    全量 1197 一条红都没有（实测）。巡检那一侧有同款驱动者级用例，两侧的覆盖不对称。
+
+    这里在**归档函数内部**问一次在途闸：走 `archive_round` 时闸里必有『归档』。
+    """
+    import asyncio
+
+    from core import engine as E
+    from core import worker as W
+
+    seen = {}
+
+    async def probe():
+        seen["blockers"] = E.maintenance_blockers()
+        return 0
+
+    async def fake_info(hashes):
+        return {}
+
+    async def yes():
+        return True
+
+    monkeypatch.setattr(E, "archive_old_completed", probe)
+    monkeypatch.setattr(E.qb, "torrents_info", fake_info)
+    monkeypatch.setattr(E.qb, "reachable", yes)
+    monkeypatch.setattr(E, "qb_kick", asyncio.Event())
+    monkeypatch.setattr(W, "_ARCHIVE_EVERY", 0)
+    cfg(QB_ENABLED=True, QB_SYNC_STATUS=True)
+    _real_sleep = asyncio.sleep
+
+    async def fast(_):
+        await _real_sleep(0)
+    monkeypatch.setattr(W.asyncio, "sleep", fast)
+
+    task = asyncio.create_task(W.run_qb_sync())
+    E.qb_kick.set()
+    for _ in range(60):
+        await asyncio.sleep(0.01)
+        if "blockers" in seen:
+            break
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert "blockers" in seen, "同步轮一次归档都没驱动到 —— 这条用例是空跑的"
+    assert any("归档" in r for r in seen["blockers"]), (
+        f"归档跑起来了，在途闸却没看见它：{seen['blockers']} —— "
+        "驱动者绕过了 archive_round()，R27 补那把锁的理由当场作废")

@@ -60,8 +60,12 @@ def manual_page():
                 if up["name"]:
                     # 与 layout 的另外三个染色块同一个配方（同一批 oklch token @ 12%、无边框）
                     with ui.row().classes("items-center gap-2 w-full p-2 rounded").style(tint("green")):
-                        ui.icon("description").classes("text-green-400")
-                        ui.label(up["name"]).classes("text-sm text-green-400 grow break-all min-w-0")
+                        # 前景与上面 tint("green") 的底色必须是【同一个绿】：全站绿取 green-500
+                        # （徽标 .q-badge.bg-green 也是它）。这两行原来写的是 green-400 ——
+                        # 同一个盒子里底色 green-500、图标与文字 green-400，两种绿并排，
+                        # 而 layout.py 那条注释里说的正是这个毛病、只修好了底色那一半。
+                        ui.icon("description").classes("text-green-500")
+                        ui.label(up["name"]).classes("text-sm text-green-500 grow break-all min-w-0")
                         ui.button(icon="close", on_click=lambda: (up.update(bytes=None, name=""), upbox.refresh())
                                   ).props("flat round dense color=grey").classes("btn-sm").tooltip("移除")
                 else:

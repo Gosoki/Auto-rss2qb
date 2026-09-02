@@ -16,6 +16,7 @@
 """
 import logging
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 # 【必须在 import alembic 之前】alembic 那堆 "setup plugin …" / "Context impl …" 是 INFO 级，
@@ -50,7 +51,46 @@ _INI = _ROOT / "alembic.ini"
 _LOCK = threading.Lock()
 
 
-def _config(engine, role: str) -> Config:
+@contextmanager
+def _ddl_engine(engine):
+    """跑 DDL 用的引擎 —— 交给 alembic，别让它自己建一个。(R27)
+
+    【为什么要管这件事】`alembic/env.py` 在拿不到 `config.attributes["connection"]` 时
+    会用 `engine_from_config(...)` 自己建一个引擎，那个引擎**只有一个 URL**、
+    没有任何 `connect_args`。于是 `db.make_mysql_engine` 精心设的两道上界
+    （`connect_timeout=5` / `read_timeout=15`）对**真正执行 DDL 的那条连接**一条都不生效。
+
+    后果不是"慢一点"：`schema.upgrade()` 的调用点全都包在 `db.maintenance()` 里，
+    而 `maintenance()` 的 `finally` 要等它返回才执行。对着一台**关机**的 MySQL 升级时，
+    建连接会挂到操作系统的 TCP 超时（分钟级），这期间：
+      · `_maintenance` 非空 ⇒ `get_session()` 对全站恒抛 `DatabaseBusy`，七个页面
+        全部停在"数据库维护中"，四条后台循环每轮跳过；
+      · 本模块的进程级 `_LOCK` 被那个线程占着 ⇒ 『切回本地 SQLite』这条**自救出口**
+        也拿不到锁，`busy_action` 的 `_BUSY['db-op']` 同样永不复位。
+    两个出口同时死掉，只能重启进程。
+
+    **`query_timeout=False` 是有意的**：`read_timeout` 是每次 socket 读写的上界，
+    而一条 DDL（大表加索引）合法地跑几分钟很正常，套上它会把正常的迁移拦腰切断
+    —— 那正是"已经改了一半表结构"最不能被打断的地方，与 `_migrate` 那条整库复制同理。
+    这里要的只是**握手有上界**：连不上就快点失败，别把整站拖进维护态。
+    （"DDL 被 MySQL 的元数据锁挡住"是另一件事，见 DECISIONS 的 E-50。）
+
+    SQLite 直接用调用方的引擎：本地文件，没有握手这回事，而它的 busy_timeout
+    已经在 `_sqlite_engine` 里设过了。
+    """
+    if engine.url.get_backend_name() != "mysql":
+        yield engine
+        return
+    from . import make_mysql_engine
+    eng = make_mysql_engine(engine.url.render_as_string(hide_password=False),
+                            query_timeout=False)
+    try:
+        yield eng
+    finally:
+        eng.dispose()      # 用完即弃：升级是低频动作，不值得占着一个池
+
+
+def _config(engine, role: str, ddl_engine=None) -> Config:
     # attributes 里塞个 configure_logger=False：否则 alembic 会按 alembic.ini 的 [loggers] 段
     # 重配【全局】logging，把自己那堆 "setup plugin …" / "Context impl …" 灌进 data/autorss.log，
     # 还会顺手改掉本项目 core.logsetup 已经配好的处理器。
@@ -60,6 +100,10 @@ def _config(engine, role: str) -> Config:
     # 且 render_as_string 要带密码，否则 MySQL 连不上。
     cfg.cmd_opts = type("O", (), {"x": [f"role={role}",
                                         f"url={engine.url.render_as_string(hide_password=False)}"]})()
+    if ddl_engine is not None:
+        # env.py 认这个键（`config.attributes.get("connection")`），认到就不再自己建引擎。
+        # 传的是 **Engine** 不是 Connection —— env.py 那边写的是 `connectable.connect()`。
+        cfg.attributes["connection"] = ddl_engine
     return cfg
 
 
@@ -87,11 +131,13 @@ def upgrade(engine, role: str, target: str = "head") -> None:
         cur = current_revision(engine, role)
         if cur == (head_revision() if target == "head" else target):
             return
-        command.upgrade(_config(engine, role), target)
+        with _ddl_engine(engine) as ddl:
+            command.upgrade(_config(engine, role, ddl), target)
         log.info("数据库版本升级[%s]：%s → %s", role, cur or "空库", current_revision(engine, role))
 
 
 def stamp_head(engine, role: str) -> None:
     """只打版本戳、不执行任何 DDL。给"表已经建好了但没有版本记录"的库补票用。"""
     with _LOCK:      # 同 upgrade：alembic 的模块代理是进程级的，不能有两个同时在跑
-        command.stamp(_config(engine, role), "head")
+        with _ddl_engine(engine) as ddl:
+            command.stamp(_config(engine, role, ddl), "head")

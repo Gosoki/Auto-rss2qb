@@ -554,3 +554,56 @@ def test_the_save_handler_actually_calls_that_check():
         "_save 里 _bad_proxy 的返回值没有进控制流 —— 校验形同虚设："
         "用户把代理填成 `127.0.0.1:7890` 会保存成功，"
         "而 httpx 在建 client 那一步抛 ValueError，取源/识别/通知/qB 全线断")
+
+
+# ---------------- (R32) services/enrich 的出站也必须过这四道闸 ----------------
+
+async def test_enrich_outbound_is_capped_like_the_rest():
+    """`services/enrich` 的第三方出站必须走 `services.fetch`，否则压缩炸弹直接进内存。
+
+    此前那 6 处是裸的 `client.get/post` + `.text`/`.json()`：httpx 默认带
+    `Accept-Encoding: gzip`，会把**整个解压后的 body** 一次性读进内存，
+    四道闸一条都没生效。实测一个 **255 KB** 的 gzip 响应（压缩比 1029:1）
+    让进程 RSS 涨 **540 MB**；同一份交给 `fetch.get_text` 是 **+0 MB**。
+    而 `_mikan_bridge` 串在采集主链路上，这个进程同时是 Web UI / qB 同步 /
+    交付协程 / 看守协程 —— 被 OOM 杀掉就是全没。
+
+    这条钉**行为**：给 `_search_one` 喂一个超限的响应，它必须走"没问成"那条路
+    （返回 None 且记一次 bgm 失败），而不是把几百 MB 读进来。
+    """
+    import gzip
+
+    from services import enrich as E
+
+    bomb = gzip.compress(b"A" * (fetch.FEED_CAP * 2), 1)
+    assert len(bomb) < 200_000, "构造的炸弹本身不该很大，否则测的是别的东西"
+
+    before = E.net_failures()
+    async with _client(lambda r: _resp(bomb, headers={"content-encoding": "gzip"})) as c:
+        got = await E._search_one(c, "某番", None, None)
+    assert got is None, "超限的响应必须当成『没问成』，不能把它读进来"
+    assert E.net_failures() == before + 1, (
+        "超限应算『没问成 bgm』——它与 429/5xx 同类（对方给的东西我们用不了），"
+        "要退款，否则退避阶梯被白白消耗")
+
+
+def test_no_raw_http_call_remains_in_enrich():
+    """反向结构守卫：`services/enrich` 里不许再出现裸的 `client.get/post`。
+
+    行为用例只覆盖 `_search_one` 这一条；而这里有 **6** 处出站，
+    "同一个决定落到 N 处、只落到 1 处"正是本项目的第①号缺陷形状。
+    判据按 AST 数调用，不是字符串匹配（注释里提一嘴不算）。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath(
+        "services/enrich.py").read_text(encoding="utf-8")
+    bad = []
+    for n in ast.walk(ast.parse(src)):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr in ("get", "post", "put", "delete", "request", "send")
+                and isinstance(n.func.value, ast.Name) and n.func.value.id == "client"):
+            bad.append(f"services/enrich.py:{n.lineno} client.{n.func.attr}()")
+    assert not bad, ("这些出站绕过了 services.fetch 的四道闸：\n  " + "\n  ".join(bad)
+                     + "\n（统一走本模块的 _capped）")

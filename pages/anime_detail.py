@@ -439,12 +439,15 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if not bid:
             ui.notify("没认出 bgm ID（粘 bgm.tv/subject/数字 或纯数字）", type="warning")
             return
-        # 【绑定前回显】可能删掉另一条番记录 —— 闸门与列表页共用一份，见 layout.require_bind_confirm
-        if not await require_bind_confirm(anime_id, bid):
-            return
         # 【弹窗关掉之后这一段才是长操作】bind 会走 fetch_by_id（预算 120 秒），
         # 期间页面没有任何反馈，用户会以为没点上而再点一次。走 busy_action 去重。
+        # 【回显闸也在里面】(R27) `require_bind_confirm` 第一句就是同一个
+        # `fetch_by_id`（同样 120 秒预算），把它留在 busy_action 外面等于这道防抖
+        # 只覆盖了整条链路的后一半。
         async def _go():
+            # 【绑定前回显】可能删掉另一条番记录 —— 闸门与列表页共用一份，见 layout.require_bind_confirm
+            if not await require_bind_confirm(anime_id, bid):
+                return
             old_path = anime.anime_save_path(anime_id)   # 重绑前的归档路径（bind 可能改名/季度/季号）
             _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
             ok = await anime.bind_anime_bgm(anime_id, bid, report=_rep)
@@ -518,9 +521,39 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                   else "已继续订阅（此后不再自动判它完结）", type="positive")
 
     async def _download():
+        """『下载该源』/『补下全部』：把这部番下的 pending/error 补一遍。
+
+        【0 集不能报绿】(R31) `download_pending_for_anime` 第一行就是
+        `if not is_subscribed(a): return 0` —— 而这一页对**待确认**的番照样把 error 行
+        标成橙色『失败·可补下』（标注侧用的 `download_plan` 只排除 rejected、
+        **不看 confirmed**，那是 D9 记录在案的契约，不在这里改）。
+        于是用户按提示点下去，什么都没发生，却收到一句绿色的"已触发下载 0 集"。
+        全站的口径是"提示只描述【已经发生的事实】"，所以这里要说清楚**为什么**是 0。
+        """
         n = await anime.download_pending_for_anime(anime_id)
         _after()
-        ui.notify(f"已触发下载 {n} 集", type="positive")
+        if n:
+            ui.notify(f"已触发下载 {n} 集", type="positive")
+            return
+        cur = anime.get_anime(anime_id)
+        if cur is not None and not anime.is_subscribed(cur):
+            why = ("这部番还在【待确认】，批量补下只对已确认的番生效 —— "
+                   "先点『确认』，或对准某一条点右边的『下载』（单条下载不受此限）"
+                   if not cur.confirmed else
+                   "这部番已被【忽略】，先『恢复订阅』"
+                   if cur.rejected else
+                   "这部番已判【完结】且开着停订，先点『继续订阅』")
+            ui.notify(f"没有触发下载：{why}", type="warning")
+        elif anime.download_plan(anime_id, for_backfill=True):
+            # 【0 集还有第三种成因，别都说成"没得下"】(R31) 闸没挡住、候选也确实存在，
+            # 那就是这一轮没放行 —— 最常见的是 qB 连不上
+            # （`download_pending_for_anime` 那边会写一行 WARNING）。
+            # 说成"该下的都下过了"是假话，而用户看不到日志。
+            ui.notify("有待补的集，但这一轮一条都没放行 —— 多半是 qB 此刻连不上，"
+                      "去 /logs 看最近一条 WARNING；qB 恢复后会自动继续", type="warning")
+        else:
+            ui.notify("没有可补下的集（该下的都下过了，或都被锁定源/版本关键词挡住）",
+                      type="info")
 
     async def _run_backfill(name_filter):
         # 防抖挂在【番 id】上而不是弹窗闭包里：闭包随详情弹窗重建而重置，关掉再打开就绕过去了，

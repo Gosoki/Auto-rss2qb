@@ -31,6 +31,20 @@ log = logging.getLogger("autorss")
 # 后台协程【等】自己那把锁（本来就在定时循环里，晚一点无所谓）；手动入口【不等】，直接回报"已有一轮在跑"。
 _poll_lock = asyncio.Lock()    # 采集一轮：抓所有源 + 放行到点的下载
 _scan_lock = asyncio.Lock()    # 剧场版整年扫描
+# 【下面这两把是 R27 补的，补的不是并发、是"在途闸看得见"】
+# `engine.maintenance_blockers()` 逐条列出"跨 await 持业务库主键"的后台线，
+# 而 R23 那条守卫的判据是"每一把模块级轮次锁都必须被闸看见" ——
+# 判据只看得见【已经有锁】的线。归档与巡检这两条**一把锁都没有**，
+# 于是它们既不在闸里、也不会被守卫报出来：约束的作用域比验证的作用域小（第②种形状）。
+# 加锁之后，那条现成的守卫自动把它们纳进来，以后新增一条也一样。
+#
+# · 归档：`archive_old_completed` 把 (id, info_hash) 读成列表 → `await qb.delete()`
+#   （单次上限 _QB_TOTAL_TIMEOUT=45 秒）→ 出 await 后 `s.get(model_cls, tid)` 按主键写回。
+# · 巡检：`sweep_finished` / `sweep_idle` 拿着 `Anime.id` 去 `await notify_event()`
+#   （每条上限 NOTIFY_TIMEOUT）→ 回来 `s.get(Anime, a.id)` 写 finished_at / 通知记账。
+# 两条都在 `db/transfer.py` 保留主键的前提下会把回写落进【另一个库的另一行】。
+_archive_lock = asyncio.Lock()   # 完成归档一轮
+_sweep_lock = asyncio.Lock()     # 完结/断更/积压巡检一轮（含交付残骸清扫）
 
 
 def build_sources() -> list:
@@ -204,7 +218,17 @@ async def run_db_watch() -> None:
                 # 补跑停摆期间漏掉的初始化。是否复位遗留的 downloading 看本进程欠不欠那一次：
                 # 【启动时就停摆】→ 欠（main.py 跳过了初始化，且此刻不可能有交付协程在跑）；
                 # 【运行中掉线又回来】→ 不欠（可能有协程正卡在 await，打回 pending 会重复下载）。
-                init_business_state(reset_leftovers=_startup_reset_pending)
+                #
+                # 【必须上线程】(R28) 这个函数做的全是同步库往返（seed_source_groups /
+                # reset_downloading×2 / backfill_legacy_progress_once），而此刻 db.engine
+                # 可能指向 MySQL。上一行的 `probe_data_engine` 早就 `to_thread` 了，
+                # 另外两个调用点（设置页『切到 MySQL』、顶栏『立即重连』）也都上了线程 ——
+                # **只有这一条是裸的**：R27 修的是同一件事，只落到 pages/settings.py 一处，
+                # 而守卫也只读那一个文件（第②种形状：约束的作用域比验证的小）。
+                # 这条路径还偏偏跑在"MySQL 刚回来、可能立刻又抖回去"那一刻：
+                # pool_pre_ping 重连 5 秒、慢查询 15 秒才切断，事件循环整段冻住，
+                # 而且它是**无人值守**的（另外两处是用户点了按钮在等）。
+                await asyncio.to_thread(init_business_state, _startup_reset_pending)
             was_down = now_down
         except Exception as e:          # 探测自己出岔子也别让看守协程死掉，否则永远发现不了恢复
             loop_error("数据库看守", e)
@@ -270,6 +294,47 @@ async def run_backup() -> None:
             loop_error("自动备份", e)
 
 
+async def archive_round() -> None:
+    """跑一轮完成归档，全程持 `_archive_lock`。
+
+    【锁必须盖住整个区间】`archive_old_completed` 是『读 (id, hash) → await qb.delete()
+    → 出 await 后按主键写回 archived_at』，而在途闸只挡"开始维护"——
+    锁没盖住的那一段等于不设防。抽成模块级函数（原来是 `run_qb_sync` 里的闭包）
+    正是为了让用例能在**函数内部**问一次闸：光断言"闸认识这把锁"是测不到
+    "这条线真的拿着它跑"的，把 `async with` 删掉那种断言照样绿。
+    """
+    async with _archive_lock:
+        await engine.archive_old_completed()
+
+
+async def sweep_round() -> None:
+    """跑一轮完结/断更/积压巡检（含交付残骸清扫），全程持 `_sweep_lock`。
+
+    【四段各自 try】它们互不相干：sweep_finished 抛一次异常不该让断更提醒与
+    失败/停滞/积压告警整轮不跑——而后两者恰恰是"出事了要有人知道"的那一类。
+
+    【交付残骸的清扫挂在这里】(R24) `status=downloading` 但本进程并没有协程在管的行
+    是交付途中库抖了一下留下的残骸：sync 显式跳过它、集去重认定该集已有一份、
+    看守协程的恢复边沿也不复位它 —— 以前只有重启进程才清得掉，
+    而它还会把设置页的切库/迁移永久拒死。放在巡检轮上：有界、周期性、不碰在途的那些。
+
+    【锁盖整轮】(R27) 完结判定与断更提醒都是"拿着 Anime.id 去 await 通知、
+    回来按同一个主键写回"，锁只盖住其中一段等于没盖。整轮持锁的代价是维护要多等一轮巡检
+    （默认 3 小时一轮、一轮几十秒），而闸只挡"开始维护"、不打断已经在跑的，用户重试即可。
+    """
+    async with _sweep_lock:
+        for name, fn in (("交付残骸清扫", engine.sweep_stale_delivering),
+                         ("完结判定", anime.sweep_finished),
+                         ("断更提醒", anime.sweep_idle),
+                         ("积压告警", anime.sweep_alerts)):
+            try:
+                r = fn()
+                if asyncio.iscoroutine(r):    # 清扫是同步的（一条 SQL），其余三段是协程
+                    await r
+            except Exception as e:
+                loop_error(f"巡检·{name} ", e, exc_info=True)
+
+
 async def run_sweep() -> None:
     """独立协程：定期巡检『完结』与『断更』（开关在设置页）。
 
@@ -291,22 +356,7 @@ async def run_sweep() -> None:
             # [10800, 30, 10800, 10800]：库在 3 小时时恢复，第一次巡检落在 6 小时。
             await asyncio.sleep(30)
             continue
-        # 【三段各自 try】它们互不相干：sweep_finished 抛一次异常不该让断更提醒与
-        # 失败/停滞/积压告警整轮不跑——而后两者恰恰是"出事了要有人知道"的那一类。
-        # 【交付残骸的清扫挂在这里】(R24) `status=downloading` 但本进程并没有协程在管的行
-        # 是交付途中库抖了一下留下的残骸：sync 显式跳过它、集去重认定该集已有一份、
-        # 看守协程的恢复边沿也不复位它 —— 以前只有重启进程才清得掉，
-        # 而它还会把设置页的切库/迁移永久拒死。放在巡检轮上：有界、周期性、不碰在途的那些。
-        for name, fn in (("交付残骸清扫", engine.sweep_stale_delivering),
-                         ("完结判定", anime.sweep_finished),
-                         ("断更提醒", anime.sweep_idle),
-                         ("积压告警", anime.sweep_alerts)):
-            try:
-                r = fn()
-                if asyncio.iscoroutine(r):    # 清扫是同步的（一条 SQL），其余三段是协程
-                    await r
-            except Exception as e:
-                loop_error(f"巡检·{name} ", e, exc_info=True)
+        await sweep_round()          # 一轮的内容与"为什么四段各自 try"写在它的 docstring 里
         await asyncio.sleep(max(300, config.SWEEP_INTERVAL_MIN * 60))   # 做完再睡到下一轮
 
 
@@ -395,7 +445,7 @@ async def run_qb_sync() -> None:
                 return
             last_archive = now
             try:
-                await engine.archive_old_completed()
+                await archive_round()
             except Exception as e:
                 loop_error("完成归档（忽略，下轮再来）", e)
 

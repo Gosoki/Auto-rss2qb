@@ -336,8 +336,13 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
     tbl.add_slot("body-cell-name", f'''
         <q-td :props="props">
             {name_top}
-            <div class="text-gray-400"
-                 style="font-size:10px;white-space:normal;word-break:break-all">
+            <!-- 【字号不在这儿定】(R27) 这一处原来写死 10px + gray-400，是全站唯一一档 10px
+                 （其余只有 12/14/18），而同一份内容（原始种子标题）在别的五处全是
+                 text-xs(12px)/gray-500 —— 按钮、徽标、分页、输入框的尺寸刚被逐条收成
+                 "只在一处定"，唯独这一处漏在 Vue 插槽字符串里、谁也扫不到。
+                 warn_banner 的注释也把"原始种子标题"明确列在 gray-500 那一档。 -->
+            <div class="text-xs text-gray-500"
+                 style="white-space:normal;word-break:break-all">
                 {{{{ props.row.raw }}}}
             </div>
         </q-td>

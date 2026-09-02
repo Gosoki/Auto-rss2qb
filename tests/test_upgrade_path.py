@@ -304,3 +304,73 @@ def test_trim_alias_keeps_the_row_its_docstring_promises(upgrade_from):
     assert len(rows) == 1, f"截断后应只剩一条，实际 {rows}"
     assert rows[0][1] == 3, (
         f"活下来的别名指向 anime_id={rows[0][1]}，而 docstring 承诺的是 anime_id 较小的那条(3)")
+
+
+def test_alembic_never_builds_its_own_engine(tmp_path, monkeypatch):
+    """(R27) 跑 DDL 的连接必须是**我们建的**那个引擎，不能让 alembic 自己建。
+
+    `alembic/env.py` 在拿不到 `config.attributes["connection"]` 时会
+    `engine_from_config(...)` 自己建一个 —— 那个引擎**只有一个 URL**，
+    `db.make_mysql_engine` 设的 `connect_timeout=5` 一条都不生效。
+
+    后果不是"慢一点"：`schema.upgrade()` 的调用点全包在 `db.maintenance()` 里，
+    对着一台**关机**的 MySQL 升级时，建连接会挂到操作系统的 TCP 超时（分钟级），
+    这期间 `get_session()` 对全站恒抛 `DatabaseBusy`（七个页面停在"数据库维护中"），
+    而本模块的进程级 `_LOCK` 又被那个线程占着 —— 『切回本地 SQLite』这条自救出口
+    同样拿不到锁。两个出口一起死，只能重启进程。
+    """
+    from alembic import command
+
+    seen = {}
+    real = command.upgrade
+
+    def spy(cfg, target, **kw):
+        seen["conn"] = cfg.attributes.get("connection")
+        return real(cfg, target, **kw)
+
+    monkeypatch.setattr(command, "upgrade", spy)
+    eng = sa.create_engine(f"sqlite:///{tmp_path / 'fresh.db'}")
+    schema.upgrade(eng, "data")
+    assert seen.get("conn") is not None, \
+        "没把引擎交给 alembic —— 它会自己建一个不带任何超时参数的"
+    assert hasattr(seen["conn"], "connect"), \
+        "env.py 写的是 `connectable.connect()`，传进去的必须是 Engine 不是 Connection"
+    eng.dispose()
+
+
+def test_the_ddl_engine_for_mysql_has_a_connect_timeout_but_no_query_timeout(monkeypatch):
+    """MySQL 的 DDL 引擎：握手要有上界，查询**不能**有。
+
+    `read_timeout` 是每次 socket 读写的上界，而一条 DDL（大表加索引）合法地跑几分钟
+    很正常 —— 套上它会把正常迁移拦腰切断，那正是"表结构已经改了一半"最不能被打断的地方
+    （与整库迁移用 `query_timeout=False` 同理）。这里要的只是连不上时快点失败。
+    """
+    from db import schema as S
+
+    calls = []
+
+    class _FakeEng:
+        def dispose(self):
+            pass
+
+    def fake_make(url, query_timeout=True):
+        calls.append(query_timeout)
+        return _FakeEng()
+
+    monkeypatch.setattr("db.make_mysql_engine", fake_make)
+    fake_url = sa.engine.url.make_url(
+        "mysql+pymysql://u:p@127.0.0.1:3306/x")
+    holder = type("E", (), {"url": fake_url})()
+    with S._ddl_engine(holder) as e:
+        assert isinstance(e, _FakeEng), "MySQL 分支没有另建 DDL 引擎"
+    assert calls == [False], f"DDL 引擎的 query_timeout 参数不对：{calls}"
+
+
+def test_sqlite_reuses_the_callers_engine(tmp_path):
+    """SQLite 不另建：本地文件没有握手这回事，busy_timeout 已经在 `_sqlite_engine` 里设过。"""
+    from db import schema as S
+
+    eng = sa.create_engine(f"sqlite:///{tmp_path / 'x.db'}")
+    with S._ddl_engine(eng) as e:
+        assert e is eng
+    eng.dispose()

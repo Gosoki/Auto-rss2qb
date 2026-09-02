@@ -9,6 +9,7 @@ import logging
 import re
 from collections import Counter
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 from sqlalchemy.exc import DatabaseError, IntegrityError
 from sqlmodel import func, or_, select
@@ -131,6 +132,16 @@ def _aired_before_start(air_date) -> bool:
 _OFF_SEASON_SLACK_WEEKS = 26
 
 
+class _EpRow(NamedTuple):
+    """`_episode_cannot_belong` / `_binding_looks_wrong_rows` 需要的最小种子行。
+
+    判据只读 `episode` 与 `release_time` 两个属性，所以全库扫的时候按列投影成它，
+    不去建整行的 ORM 实体。字段名必须与 AnimeTorrent 一致——判据是同一份代码。
+    """
+    episode: float | None
+    release_time: object
+
+
 def _episode_cannot_belong(a, item) -> bool:
     """这条种子的集号【不可能】属于 a 所绑的那一季 —— 即 bgm 多半匹配错了季。
 
@@ -201,6 +212,21 @@ def binding_looks_wrong(s, a) -> bool:
     if a is None or a.bangumi_id is None:
         return False
     rows = s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == a.id)).all()
+    return _binding_looks_wrong_rows(a, rows)
+
+
+def _binding_looks_wrong_rows(a, rows) -> bool:
+    """`binding_looks_wrong` 的判据本体，只是种子行【已经取好了】。
+
+    【为什么要分成两个函数】判据本身要在两种场合用：
+      · 单部番（4 个闸 + 详情页）——手上只有一部番，顺手查一次它的种子最简单；
+      · 全库扫（`suspect_wrong_binding`，挂在仪表盘上每次渲染都跑）——
+        逐部番各查一次是 N+1：真库 99 部番实测 120~155ms，而它跑在
+        **同步的页面构建路径**上，30 秒的定时刷新还会再来一遍。
+    判据只有这一份实现，两个形态都指向它——别把判据抄第二遍（见 tests/test_single_definition.py）。
+    """
+    if a is None or a.bangumi_id is None:
+        return False
     if any(_episode_cannot_belong(a, t) for t in rows):
         return True
     # 【第二条判据：单集条目收到了多集正片】bgm 上一部作品常拆成很多条目——正片、
@@ -444,19 +470,84 @@ def suspect_wrong_binding() -> list[dict]:
     """
     out = []
     with get_session() as s:
-        for a in s.exec(select(Anime).where(
-                Anime.confirmed == True, Anime.rejected.is_not(True),        # noqa: E712
-                Anime.bangumi_id.is_not(None))):
-            if not binding_looks_wrong(s, a):
+        animes = list(s.exec(select(Anime).where(
+            Anime.confirmed == True, Anime.rejected.is_not(True),            # noqa: E712
+            Anime.bangumi_id.is_not(None))))
+        if not animes:
+            return out
+        # 【一次取齐，不逐部番查】原来的写法是 N+1（而且是 2N+：判据里查一次、
+        # 取 bad 明细又查一次），99 部番实测 120~155ms —— 而这个函数挂在仪表盘的
+        # **同步构建路径**上，每次渲染 + 每 30 秒的定时刷新各跑一遍，直接冻事件循环。
+        # 判据只用到 episode / release_time 两列，所以按列投影、不建 ORM 实体：
+        # 19k 条种子的库上，这个差别是"几万个对象"和"几万个元组"。
+        # 不加 anime_id IN (...) 过滤是有意的：番数上千时 IN 会撞 SQLite 的 999 变量上限，
+        # 而这里本来就要扫全表，交给下面的 `if aid in wanted` 在 Python 侧筛更稳。
+        wanted = {a.id for a in animes}
+        by_anime: dict = {}
+        for aid, ep, rel in s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode,
+                                          AnimeTorrent.release_time)):
+            if aid in wanted:
+                by_anime.setdefault(aid, []).append(_EpRow(ep, rel))
+        for a in animes:
+            rows = by_anime.get(a.id, ())
+            if not _binding_looks_wrong_rows(a, rows):
                 continue
-            bad = [t for t in s.exec(select(AnimeTorrent).where(
-                AnimeTorrent.anime_id == a.id)) if _episode_cannot_belong(a, t)]
+            bad = [t for t in rows if _episode_cannot_belong(a, t)]
             out.append({"id": a.id, "name": display_of(a), "bgm": a.bangumi_id,
                         "season": a.season, "total": a.total_episodes,
                         "bad": len(bad),
                         "eps": sorted({int(t.episode) for t in bad
                                        if isinstance(t.episode, (int, float))
                                        and t.episode >= 1})[:8]})
+    return out
+
+
+def suspect_movie_as_anime() -> list[dict]:
+    """同一个 bgm subject **同时**是一部番和一部剧场版（只读，不改任何东西）。(R30)
+
+    【怎么发现的】拿真库反查不变量时发现 `info_hash` 在两张种子表里各出现一次
+    —— 而两张表各自有唯一约束、**跨表没有**。顺着查到根因：
+    同一条 bgm subject 在 `Anime` 与 `Movie` 里各有一行，同一条种子被两边都收了。
+
+    真库实证（正好 2 对，且恰好就是 anime 表里仅有的两条 `platform='剧场版'`）：
+      anime#71『剧场版 暗杀教室 大家的时间』(bgm 583746) ↔ movie#20
+      anime#91『剧场版 鬼灭之刃 无限城篇 第一章 猗窝座再袭』(bgm 501958) ↔ movie#69
+
+    【为什么现有的三条检测都看不到它】
+      · `_merge_anime` 只按 `Anime.bangumi_id` 相同合并 —— 对面那条在**另一张表**里；
+      · `suspect_duplicate_anime` 比的是 `AnimeAlias` 的交集，剧场版根本没有别名表；
+      · `platform_badge` 只是把 bgm 判定的类型标出来（紫标），不比对两张表。
+
+    【今天不会出事，但一点就出事】这两条 anime 现在都是"超期忽略"（rejected=1, confirmed=0），
+    不在 `subscribed_where()` 里、不会自动下。可用户在『已忽略』页点一下『恢复订阅』，
+    两边就会各自交付**同一个 info_hash**：qB 对已存在的 hash 返回失败，
+    `add_to_qb` 的幂等兜底查到"它确实在 qB 里"于是判成功 ——
+    于是**两条记录都说自己已交付，而文件只落在其中一个目录**，另一条指向一个空目录。
+
+    **只报不改**：程序判不出该留哪一条（剧场版那条通常才是对的，但番剧那条底下可能已经下过东西）。
+    与另外两条 `suspect_*` 同一个位置、同一种处理：报到仪表盘，用户自己决定删哪条。
+    """
+    out = []
+    with get_session() as s:
+        movies = {m.bangumi_id: m for m in s.exec(
+            select(Movie).where(Movie.bangumi_id.is_not(None)))}
+        if not movies:
+            return out
+        for a in s.exec(select(Anime).where(Anime.bangumi_id.is_not(None))):
+            m = movies.get(a.bangumi_id)
+            if m is None:
+                continue
+            out.append({
+                "a": a.id, "a_name": display_of(a), "bgm": a.bangumi_id,
+                "a_state": ("追番中" if (a.confirmed and not a.rejected)
+                            else "人工拒绝" if (a.confirmed and a.rejected)
+                            else "超期忽略/待确认"),
+                "m": m.id, "m_name": m.display_name or m.title,
+                "an": len(s.exec(select(AnimeTorrent.id).where(
+                    AnimeTorrent.anime_id == a.id)).all()),
+                "mn": len(s.exec(select(MovieTorrent.id).where(
+                    MovieTorrent.movie_id == m.id)).all()),
+            })
     return out
 
 
@@ -996,8 +1087,10 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
     try:
         data = await engine.fetch_torrent_bytes(url)
         stage = "交付"
-        # 分类固定不带后缀，标签只放季度（qB 里按分类归大类、按标签筛季度）
-        ok = await engine.add_to_qb(data, save_path, "AutoRSS-Anime", quarter, info_hash=info_hash)
+        # 分类不带后缀（可在设置页改名，见 config.QB_CATEGORY_ANIME），标签只放季度
+        # （qB 里按分类归大类、按标签筛季度）
+        ok = await engine.add_to_qb(data, save_path, config.QB_CATEGORY_ANIME, quarter,
+                                    info_hash=info_hash)
     except asyncio.CancelledError:
         # 被取消（关停等）→ 复位，别永久卡 downloading。走 _retry 而不是写死 pending：
         # 从 deleted/excluded 强制重下时若正好被取消，写 pending 会让该集不再含任何"已处理"状态，
@@ -1556,20 +1649,28 @@ _IDLE_BACKFILL_KEY = "_idle_backfilled"
 
 
 def _scoped(key: str) -> str:
-    """把"哪个业务库"拼进标记名。(R26) 理由见 `db.data_identity`。"""
+    """把"哪个业务库"拼进标记名。(R26) 理由见 `db.data_identity`。
+
+    实现只此一份，在 `db.scoped_flag` —— 一次性回填的标记有三处（两处在本模块、
+    一处在 core/engine），而 `core/engine` 是本模块的**下层**（anime import engine），
+    让它反过来 import anime 是层级倒置。共用的那半份住在 db 里，两层都够得着。
+    """
     import db as _db
-    return f"{key}@{_db.data_identity()}"
+    return _db.scoped_flag(key)
 
 
 def _backfilled(key: str) -> bool:
     from db import get_meta_session
     from db.models import Setting
-    key = _scoped(key)
+    scoped = _scoped(key)
     try:
         with get_meta_session() as s:
-            return s.get(Setting, key) is not None
+            if s.get(Setting, scoped) is not None:
+                return True
     except Exception:
         return True     # 读不到就当作"做过"——宁可少发一批通知，也别在库有问题时刷屏
+    import db as _db
+    return _db.adopt_legacy_flag(key)
 
 
 def _mark_backfilled(key: str) -> None:

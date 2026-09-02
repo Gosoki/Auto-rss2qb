@@ -180,3 +180,74 @@ R21 里我自己写的守卫就中了两次（索引一致性、分页尺寸）�
 | `db.data_down_reason()` vs `db.maintenance_reason()` | 两个平级的"原因" | 前者**包含**后者（维护也算"此刻不能用"） | 不建议改名，但两处 docstring 要互相点名（已补）。改名会牵动 8 个调用点，收益不抵风险 |
 | `_QB_NEEDS_RECHECK` | "需要补查的态" | "需要补查的态，**但两个来源的搭车条件不同**"（missingFiles 搭车、过渡态无条件） | 拆成两个常量更准，但 R21 已经把差异写进 `_recheck_where` 的 docstring，先留着 |
 | `existing_hashes(model_cls, hashes)` | 可能被读成"取出全部已有 hash" | "这批里哪些**已经在库里**" | 名字够准，只是第一个参数是表、第二个才是待查集合，调用时容易写反 —— 已由类型天然挡住（传反会 AttributeError） |
+
+## 十一、本轮新增的名字（r27）
+
+| 名字 | 为什么这么叫 |
+|---|---|
+| `pages/anime._kw_hit(a, kw)` | 番剧表搜索框的匹配判据。特意**不叫 `_match`**——本项目里 `match` 已经被"番名 → 番"的绑定链占满了（`resolve` / `bind_*` / `_merge_*`），再来一个 `_match` 会被读成"把这个词匹配到某部番上"，而它只是个**大小写不敏感的子串命中**，不产生任何绑定。`kw` 与 `Anime.pref_keyword`、`SourceGroup.title_filter` 同一个词根，都是"用户自己填的一段过滤文本"。 |
+| `core/anime._binding_looks_wrong_rows(a, rows)` | `binding_looks_wrong(s, a)` 的**判据本体**，只是种子行已经取好了。名字里带 `_rows` 就是在说"差别只在参数形态，判据是同一份"。两个形态并存的理由：单部番的 4 个闸顺手查一次最简单，而全库扫逐部番查是 N+1（真库 99 部实测 120→26ms）。**判据只有这一份实现**，别抄第二遍。 |
+| `core/anime._EpRow` | 全库扫时按列投影出来的最小种子行（只有 `episode` / `release_time`）。字段名必须与 `AnimeTorrent` 逐字相同——判据是同一份代码，靠鸭子类型对上。取名 `_EpRow` 而不是 `_TorrentRow`：它**不是**一条种子的全部，只是"判集号归属"要的那两列，叫全名会让人以为可以拿它当种子用。 |
+| `config.QB_CATEGORY_ANIME` / `_MOVIE` / `_MANUAL` | qB 分类名。**不叫 `QB_TAG_*`**：本项目的 tag 带的是语义（季度/年份/`Manual`），category 才是归大类的标签。三个键分开而不是一个模板，因为三条投递路径的用户心智本来就是分开的（"番剧下到哪一堆"和"我手点的下到哪一堆"是两件事）。 |
+
+### 这一轮**没有**新增的歧义名
+
+`suspect_wrong_binding` / `suspect_duplicate_anime` 这一对（r26 加的）复查过：
+`suspect_` 前缀在本项目里恒定表示"**只读检测、只报不改**"，两处都兑现了。
+再加同族函数时沿用这个前缀，别用 `check_` / `detect_`——那两个词在本项目里
+已经被"会改状态的闸"（`apply_start_date_filter`、`sweep_*`）占着了。
+
+## 十二、R28 新增/澄清的几个名字
+
+| 名字 | 为什么这么叫 |
+|---|---|
+| `core/ssrf._SHARED_V4` | RFC 6598 的"共享地址段" 100.64.0.0/10。**不叫 `_CGNAT`**：Tailscale 用它、运营商级 NAT 用它、别的东西也可能用它，按 RFC 的名字命名才不会让人以为"我没用 CGNAT 就跟我无关"。它必须显式写出来，因为 CPython 3.12.4 起把这一段的 `is_private` 改成了 False —— 判据一旦只写"语义"就会随解释器版本漂。 |
+| `pages/anime._build_manage_tab` | 番剧表 tab 的**外壳**：先建一次稳定的搜索行，再建可刷新的 `manage_panel`。特意不叫 `manage_tab`（那读起来像"这个 tab 的全部内容"）——它的职责恰恰是"哪些东西**不**跟着刷新走"。 |
+| `pages/parse_test._VERDICT_SHADE` | 判定横幅的色号表。取名带 `_SHADE` 是在说：这里存的是**色号**（`text-green-500`），不是色相名 —— 上一版正是把色相拿来拼 `f"text-{color}-400"`，色号写死在拼接里，于是绿那一档与全站的绿不是同一个颜色。 |
+| `busy_action` 的键前缀 `mov-` | 剧场版侧的防抖键（`mov-bind:` / `mov-refail:`）。`busy_action` 的去重键是**模块级**的，番剧与剧场版的 id 空间各自独立 —— 不加前缀的话 `bind:7` 会让"番剧 #7"和"剧场版 #7"互相挡住。 |
+
+### 一条**没改**的歧义名（记着）
+
+`sources/parse._EP_END` 读起来像"集号的结束位置"，实际是**右界锚点**（行尾 / 标签块起始 /
+当分隔符用的连字符），而且它内部还藏着一条"后面不能紧跟裸集号"的负向前瞻 ——
+那条前瞻才是判"这是不是连续集区间"的**第三道**判据（另两道在 `_BATCH_RE` / `_BARE_RANGE_RE`）。
+R28 那条 P1 正是因为这三道判据的位数上界不一致。
+改名（如 `_EP_RIGHT_BOUND`）会牵动三条同族正则的注释，收益不大；
+现已由 `test_batch_guards_are_at_least_as_wide_as_episode_extraction` 把三者绑在一起。
+
+## 十三、R29 的两条命名笔记
+
+| 名字 | 为什么这么叫 |
+|---|---|
+| `db/backup._peek` 里新增的 `backend` / `mysql_db` | 回答的是「**恢复这份之后**业务库会指向哪」，不是「这份备份是从哪个库导出来的」。两者在本项目里恰好同义（备份恒是对本地 meta 文件的整文件快照），但语义方向不同 —— 页面文案统一按前者写（『→ 本地 SQLite』/『→ host/db』），因为用户在那一刻要做的决定是"要不要恢复它"。 |
+| `worker.archive_round` / `worker.sweep_round` | R27 抽出来的两个模块级轮次函数。`_round` 后缀在本项目里恒表示「一整轮、且**全程持着那一轮的锁**」—— 驱动者必须调它、不许绕过去直接调里面的 `engine.*`（R29 补了驱动者级用例钉这一条）。 |
+
+### 这一轮确认过、**没改**的一处
+
+`db/backup.py` 里 `scope`（文件名里的 `full`/`meta`）与新增的 `backend` 是两件事，
+容易被读成同一件：前者是**导出那一刻的配置标签**（`_peek` 的 docstring 早写明它会骗人），
+后者是**文件里 setting 表的实际值**。页面上两者并排显示、颜色规则不同
+（`has_data` 绿/橙看内容，`backend` 蓝灰/橙看是否与当前一致），已在 `_peek` 处写清。
+
+## 十四、R30：一个**从没写下来过**的词表
+
+`AnimeTorrent.episode` 有**四**种取值，而模型注释原来只写了三种：
+
+| 取值 | 含义 | `auto_downloadable_ep`（能不能自动下） | `episode_coverage` / `episode_progress`（算不算已下） | `flush` 的 `have_eps`（参不参与集去重） |
+|---|---|---|---|---|
+| `>=1` | 正片，含 `.5` 插入话 | ✓ (`ep >= 0`) | ✓ (`>= 1`) | ✓（不设阈值） |
+| **`0`** | **第0話 / 前导集** | **✓** | **✗** | ✓ |
+| `-1` | 特别篇 | ✗ | ✗ | ✓ |
+| `-2` | 未知 / 疑似批量 | ✗ | ✗ | ✓ |
+
+**三个阈值不同是有意的，别去"对齐"**：
+- 能不能下用 `>= 0` —— 第 0 集在周更序列上；
+- 算不算覆盖用 `>= 1` —— bgm 的 `total_episodes` 从 1 数起，把 0 计进分子会让"已下"超过总数；
+- 集去重**不设阈值** —— 否则 0/-1/-2 的行不参与去重，同一条会被重复下。
+
+守卫：`tests/test_parse.py::test_episode_zero_is_a_real_episode_not_an_error_code`
+与 `::test_the_model_comment_lists_every_reachable_episode_value`。
+
+| 名字 | 为什么这么叫 |
+|---|---|
+| `core/anime.suspect_movie_as_anime` | 沿用 `suspect_` 前缀（本项目里恒表示"只读检测、只报不改"）。方向写在名字里：**movie as anime** —— 报的是"一部剧场版在番剧表里也有一条"，而不是反过来。反过来那种（一部 TV 番在剧场版表里）今天不存在，真要出现应当另起一个名字，别把两件事塞进一个函数。 |

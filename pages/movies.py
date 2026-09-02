@@ -170,7 +170,9 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         meta_card(cur.cover_url, [
             ("日文名", cur.jp_name),
             ("片长", cur.duration),
-            ("季度", engine.quarter_label(cur.quarter) if cur.quarter else "—"),
+            # 【叫年份，不叫季度】(R31) 剧场版按年归档（E-30），而编辑那一栏本来就叫『年份』——
+            # 同一页两个名字指同一个东西是最容易读错的一种。
+            ("年份", (lambda y: f"{y} 年" if y else "—")(engine.quarter_year(cur.quarter or ""))),
             ("放送", f"{cur.air_date or '—'}{wd}"),
             ("类型", cur.platform),
             ("原作", cur.author),
@@ -407,19 +409,27 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         if bid is None:
             ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
             return
-        # 【绑定前回显】与番剧侧同一道闸：身份守卫 _merge_movie 的最后一步是 s.delete(loser)
-        if not await require_bind_confirm(movie_id, bid, kind="movie"):
-            return
-        old_path = mov.movie_save_path(movie_id)
-        _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
-        ok = await mov.bind_movie_bgm(movie_id, bid, report=_rep)
-        _after()
-        _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
-                else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen") else "已绑定并识别 ✓"))
-        ui.notify(_msg, type=("negative" if not ok
-                              else "warning" if _rep.get("frozen") else "positive"))
-        if ok:
-            await _maybe_relocate_movie(movie_id, old_path, _after)
+        # 【整条包进 busy_action】(R27) 剧场版这三个入口原来**一处都没有** ——
+        # 而这条链路上有【两次】各 120 秒预算的 bgm 往返（`require_bind_confirm` 里的
+        # `fetch_by_id` + `bind_movie_bgm` 里的那次），最长约 240 秒完全没有任何视觉反馈、
+        # 按钮也不禁用。用户连点之后会叠出两个「绑定到《X》？」确认框，两条协程各自往下走一遍
+        # `bind_movie_bgm`，而它末尾的身份守卫 `_merge_movie` 最后一步是 `s.delete(loser)`，
+        # **没有撤销入口**。键与番剧侧分开（mov-bind:）：busy_action 的键是模块级的。
+        async def _go():
+            # 【绑定前回显】与番剧侧同一道闸：身份守卫 _merge_movie 的最后一步是 s.delete(loser)
+            if not await require_bind_confirm(movie_id, bid, kind="movie"):
+                return
+            old_path = mov.movie_save_path(movie_id)
+            _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
+            ok = await mov.bind_movie_bgm(movie_id, bid, report=_rep)
+            _after()
+            _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
+                    else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen") else "已绑定并识别 ✓"))
+            ui.notify(_msg, type=("negative" if not ok
+                                  else "warning" if _rep.get("frozen") else "positive"))
+            if ok:
+                await _maybe_relocate_movie(movie_id, old_path, _after)
+        await busy_action(None, f"mov-bind:{movie_id}", _go, fail="绑定失败")
 
     body()
 
@@ -516,35 +526,44 @@ def movies_page(t: str = ""):
             return h
 
         def _bind_from_input(movie_id, inp):
-            async def h():
+            async def h(e=None):
                 bid = parse_bgm_id(inp.value or "")
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
                     return
-                # 【绑定前回显】同上，这里是『待识别』列表里的绑定按钮
-                if not await require_bind_confirm(movie_id, bid, kind="movie"):
-                    return
-                old_path = mov.movie_save_path(movie_id)
-                _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
-                ok = await mov.bind_movie_bgm(movie_id, bid, report=_rep)
-                refresh_all()
-                _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
-                        else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen") else "已绑定并识别 ✓"))
-                ui.notify(_msg, type=("negative" if not ok
-                                      else "warning" if _rep.get("frozen") else "positive"))
-                if ok:
-                    await _maybe_relocate_movie(movie_id, old_path, refresh_all)
+
+                async def _go():
+                    # 【绑定前回显】同上，这里是『待识别』列表里的绑定按钮
+                    if not await require_bind_confirm(movie_id, bid, kind="movie"):
+                        return
+                    old_path = mov.movie_save_path(movie_id)
+                    _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
+                    ok = await mov.bind_movie_bgm(movie_id, bid, report=_rep)
+                    refresh_all()
+                    _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
+                            else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen") else "已绑定并识别 ✓"))
+                    ui.notify(_msg, type=("negative" if not ok
+                                          else "warning" if _rep.get("frozen") else "positive"))
+                    if ok:
+                        await _maybe_relocate_movie(movie_id, old_path, refresh_all)
+                await busy_action(getattr(e, "sender", None), f"mov-bind:{movie_id}", _go,
+                                  fail="绑定失败")
             return h
 
         def _refail(movie_id):
-            async def h():
-                old_path = mov.movie_save_path(movie_id)
-                ok = await mov.enrich_movie(movie_id)
-                refresh_all()
-                ui.notify("识别成功 ✓" if ok else "还是没识别到（可粘贴 bgm 链接绑定）",
-                          type="positive" if ok else "warning")
-                if ok:
-                    await _maybe_relocate_movie(movie_id, old_path, refresh_all)
+            async def h(e=None):
+                # 与番剧侧的『重新识别』同一个形状：enrich_movie 走 bgm，同样是 120 秒预算，
+                # 同样会改名字/季度并可能触发搬迁确认。剧场版这边原来整条都没有防抖。
+                async def _go():
+                    old_path = mov.movie_save_path(movie_id)
+                    ok = await mov.enrich_movie(movie_id)
+                    refresh_all()
+                    ui.notify("识别成功 ✓" if ok else "还是没识别到（可粘贴 bgm 链接绑定）",
+                              type="positive" if ok else "warning")
+                    if ok:
+                        await _maybe_relocate_movie(movie_id, old_path, refresh_all)
+                await busy_action(getattr(e, "sender", None), f"mov-refail:{movie_id}", _go,
+                                  fail="重新识别失败")
             return h
 
         def _save_scan(f):
@@ -618,14 +637,16 @@ def movies_page(t: str = ""):
             if not ov["config"]["qb"]:
                 warn_banner("qB 未启用：剧场版也只采集不下载（设置页开 QB_ENABLED 后生效）")
 
-            # ── 各季度（剧场版数）──
-            ui.label(f"各季度（剧场版数）· {len(ov['by_quarter'])}").classes("text-sm font-bold mt-3 pl-1")
+            # ── 各年份（剧场版数）──(R31) 剧场版按【年】归档（E-30），季母对它没有意义：
+            # 按季度分会把同一年劈成最多 4 根柱，而新入库的片一律落进 `<yy>A`。
+            ui.label(f"各年份（剧场版数）· {len(ov['by_year'])}").classes("text-sm font-bold mt-3 pl-1")
             with ui.column().classes("w-full gap-0 pl-1"):
-                maxv = max((tot for _, tot, _ in ov["by_quarter"]), default=1) or 1
-                if not ov["by_quarter"]:
+                maxv = max((tot for _, tot, _ in ov["by_year"]), default=1) or 1
+                if not ov["by_year"]:
                     ui.label("—").classes("text-gray-500 text-sm")
-                for qk, tot, _ in ov["by_quarter"]:
-                    barline(engine.quarter_label(qk), tot, maxv, lw="w-36", text=f"{tot}")
+                for yk, tot, _ in ov["by_year"]:
+                    barline("未知年份" if yk == "未知" else f"{yk} 年",
+                            tot, maxv, lw="w-36", text=f"{tot}")
 
             # ── 种子状态 ──（剧场版逐版本人工下，无待确认/首选/备用概念，只列库态计数）
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
@@ -798,9 +819,11 @@ def movies_page(t: str = ""):
                         return
                     fl["built"] = True
                     with box:
-                        for q, grp in qs:
-                            ui.label(f"{engine.quarter_label(q)}   ·   {len(grp)} 部").classes(
-                                "text-sm font-bold text-gray-400 mt-3 mb-1 pl-1")  # 二级季度小标题(不可折叠)
+                        # 【不再分二级季度小标题】(R31) 剧场版按年归档（E-30），季母对它没有意义：
+                        # 存量那 53 条带着旧规则算出的 B/C/D，而新片一律 `<yy>A` ——
+                        # 同一年被劈成最多 4 段小标题，且新旧片分在不同段里。
+                        # 年这一级本来就是分组，二级只剩噪声。
+                        for _q, grp in qs:
                             for m in grp:
                                 _movie_card(m, tmap.get(m.id, []))
 

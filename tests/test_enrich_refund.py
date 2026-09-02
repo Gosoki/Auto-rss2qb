@@ -4,13 +4,33 @@
 但退款判据写错的代价更大：**候选池里常驻的恰恰是 bgm 搜不到的番**，
 按"一部都没命中"退款等于把阶梯整个废掉——enrich_tries 永远回到 0、每个节拍重打一遍 bgm。
 """
+import json
 from datetime import datetime, timedelta
 
+import httpx
 import pytest
 from sqlmodel import select
 
 from core import anime as A
 from db.models import Anime
+
+
+class _Stream(httpx.AsyncByteStream):
+    """异步字节流。(R32) `services/enrich` 的出站改走 `services.fetch.request_capped`
+    之后是**流式**读取，而 `httpx.Response(200, json=...)` 造出来的是"已经读完"的响应，
+    `aiter_raw()` 会抛 `StreamConsumed` —— 那是 MockTransport 的构造方式所致，
+    与真实网络无关（真实响应恒是流式）。写法与 tests/test_fetch_caps.py 的 `_resp` 同源。
+    """
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def __aiter__(self):
+        yield self._data
+
+
+def _stream_resp(content: bytes, status: int = 200, headers=None):
+    return httpx.Response(status, stream=_Stream(content), headers=headers or {})
 
 
 @pytest.fixture
@@ -133,7 +153,7 @@ async def test_rate_limited_bgm_counts_as_unreachable():
     for code in (429, 500, 503):
         before = E.net_failures()
         async with httpx.AsyncClient(
-                transport=httpx.MockTransport(lambda r, c=code: httpx.Response(c))) as c:
+                transport=httpx.MockTransport(lambda r, c=code: _stream_resp(b"", c))) as c:
             await E._search_one(c, "某番", None, None)
         assert E.net_failures() == before + 1, f"HTTP {code} 应算没问成"
 
@@ -145,7 +165,7 @@ async def test_normal_miss_does_not_count():
     from services import enrich as E
     before = E.net_failures()
     async with httpx.AsyncClient(transport=httpx.MockTransport(
-            lambda r: httpx.Response(200, json={"data": []}))) as c:
+            lambda r: _stream_resp(b'{"data": []}'))) as c:
         await E._search_one(c, "某番", None, None)
     assert E.net_failures() == before
 
@@ -224,15 +244,12 @@ def _stub_search(mapping):
 async def _resolve_with(monkeypatch, mapping, names, *, episode=1174, release_time=None):
     from services import enrich as E
 
-    class _Resp:
-        status_code = 200
-
-        def json(self):
-            return {"id": 975, "name": "ONE PIECE", "name_cn": "航海王",
-                    "date": "1999-10-20", "eps": 1191}
+    # (R32) `_capped` 现在回的是 `(status_code, 原始字节)`，不再是 Response 对象
+    _SUBJECT = json.dumps({"id": 975, "name": "ONE PIECE", "name_cn": "航海王",
+                           "date": "1999-10-20", "eps": 1191}).encode()
 
     async def _retryable(fn):
-        return _Resp()
+        return 200, _SUBJECT
 
     async def _no_cast(client, bid):
         return None
