@@ -652,3 +652,146 @@ async def test_explicit_bind_still_merges(clean_tables, monkeypatch, cfg):
     with clean_tables.get_session() as s:
         assert s.get(Anime, old_id) is None, "带回显的绑定路径的合并被一起关掉了"
         assert s.get(Anime, new_id) is not None
+
+
+# ---------------- (R21) 同一条规矩的【剧场版那一半】 ----------------
+
+async def test_movie_enrich_never_deletes_a_row(clean_tables, monkeypatch, cfg):
+    """(R21) 剧场版的识别路径同样【不合并、不删行】。
+
+    R20 只收口了番剧侧，`enrich_movie` 原样保留 `_merge_movie` —— 同一件事有两处、
+    只改了一处，本项目第①号形状。`_merge_movie` 的最后一步也是 `s.delete(loser)`。
+
+    ⚠️ R20 曾**回退过** `_upsert_movie` 那一处的同款改动，理由是"那里的 keeper 是按
+    bgm_id 查出来的、合并是构造上正确的"。那个判断对 `_upsert_movie` 成立，
+    **但这里不是那条路**：`enrich_movie` 的 bgm_id 来自一次全新的 `enrich.resolve`，
+    两行"是同一部"从没被证明过。剧场版的续作/重制/总集编彼此极像，
+    而"上架日当首映日"的日期校验对它们系统性地判错（那段风险 core/movies.py 自己写着）。
+    """
+    from core import movies as M
+    from db.models import Movie
+    from services import enrich
+
+    async def resolve(*a, **kw):
+        return {"bangumi_id": 888, "display_name": "同一部剧场版"}
+    monkeypatch.setattr(enrich, "resolve", resolve)
+
+    with clean_tables.get_session() as s:
+        old = Movie(title="已经下好的", quarter="2024", bangumi_id=888)
+        new_m = Movie(title="刚扫到的", quarter="2026")
+        s.add(old); s.add(new_m); s.commit(); s.refresh(old); s.refresh(new_m)
+        old_id, new_id = old.id, new_m.id
+
+    await M.enrich_movie(new_id)
+    with clean_tables.get_session() as s:
+        assert s.get(Movie, old_id) is not None, "剧场版识别路径把另一部片删掉了"
+        assert s.get(Movie, new_id) is not None
+
+
+async def test_movie_explicit_bind_still_merges(clean_tables, monkeypatch, cfg):
+    """反向：剧场版『绑定 bgm』照常合并（它经 bind_preview + require_bind_confirm，有回显）。"""
+    from core import movies as M
+    from db.models import Movie
+    from services import enrich
+
+    async def by_id(bid):
+        return {"bangumi_id": bid, "display_name": "同一部剧场版"}
+    monkeypatch.setattr(enrich, "fetch_by_id", by_id)
+
+    with clean_tables.get_session() as s:
+        old = Movie(title="已经下好的", quarter="2024", bangumi_id=889)
+        new_m = Movie(title="刚扫到的", quarter="2026")
+        s.add(old); s.add(new_m); s.commit(); s.refresh(old); s.refresh(new_m)
+        old_id, new_id = old.id, new_m.id
+
+    await M.bind_movie_bgm(new_id, 889)
+    with clean_tables.get_session() as s:
+        assert s.get(Movie, old_id) is None, "带回显的绑定路径的合并被一起关掉了"
+        assert s.get(Movie, new_id) is not None
+
+
+def test_no_identification_path_calls_a_merge():
+    """广度守卫：两条线的【识别】函数体里都不许出现 `_merge_*`。
+
+    行为用例各测各的一半，挡不住"以后有人往 enrich_* 里又加回一处合并"。
+    这里对两个函数的 AST 一起断言 —— 少写一个就等于那条线没守。
+    用 AST 的真实调用节点，不是字符串匹配（两个文件的注释里都写满了 `_merge_anime`
+    / `_merge_movie`，按字符串判会被自己的解释判红）。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for mod, fn_name in (("core/anime.py", "enrich_anime"), ("core/movies.py", "enrich_movie")):
+        tree = ast.parse((root / mod).read_text(encoding="utf-8"))
+        fns = [n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn_name]
+        assert fns, f"没找到 {mod}::{fn_name}，用例的前提坏了"
+        called = {n.func.id for n in ast.walk(fns[0])
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        bad = {c for c in called if c.startswith("_merge")}
+        assert not bad, f"{mod}::{fn_name} 又在识别路径上合并了：{sorted(bad)}"
+
+    # 反向：绑定路径必须【仍然】合并，别把两条一起关掉
+    for mod, fn_name in (("core/anime.py", "bind_anime_bgm"), ("core/movies.py", "bind_movie_bgm")):
+        tree = ast.parse((root / mod).read_text(encoding="utf-8"))
+        fns = [n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn_name]
+        assert fns, f"没找到 {mod}::{fn_name}"
+        called = {n.func.id for n in ast.walk(fns[0])
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert any(c.startswith("_merge") for c in called), \
+            f"{mod}::{fn_name} 的合并被一起关掉了 —— 那条路是有回显的，该保留"
+
+
+async def test_movie_enrich_does_not_even_write_a_clashing_binding(clean_tables, monkeypatch, cfg):
+    """(R22) 识别撞上别人已占的 bgm 时，**连绑定本身都不写**。
+
+    R21 只把这里的"合并删行"去掉了，可**删除动作在 `_upsert_movie` 里原样保留着** ——
+    而那一处的立论是 R20 写的「keeper 是按 bgm_id 查出来的、两行本来就声称同一个 subject」。
+    一旦识别路径把一个**未经证明**的 bgm_id 写进去，那个立论就变成循环论证：
+    下一轮剧场版扫描（自动到点，或用户点一次『扫描』）调 `_upsert_movie`，
+    它按这个 bgm_id 查出 keeper、`s.delete` 掉正确的那一行 ——
+    **删除只是被推迟了一轮，而且这一次是全自动发生的。**
+    """
+    from core import movies as M
+    from db.models import Movie
+    from services import enrich
+
+    async def resolve(*a, **kw):
+        return {"bangumi_id": 777001, "display_name": "认错成了这一部"}
+    monkeypatch.setattr(enrich, "resolve", resolve)
+
+    with clean_tables.get_session() as s:
+        owner = Movie(title="正主（已下好）", quarter="2024", bangumi_id=777001)
+        mine = Movie(title="刚扫到的", quarter="2026")
+        s.add(owner); s.add(mine); s.commit(); s.refresh(owner); s.refresh(mine)
+        owner_id, my_id = owner.id, mine.id
+
+    await M.enrich_movie(my_id)
+    with clean_tables.get_session() as s:
+        assert s.get(Movie, owner_id) is not None, "正主那一行被删了"
+        me = s.get(Movie, my_id)
+        assert me.bangumi_id != 777001, (
+            "撞车的绑定被写进去了 —— 下一轮扫描的 _upsert_movie 会照着它删掉正主")
+        assert me.display_name != "认错成了这一部", "元数据也不该按未经证明的绑定覆盖"
+
+
+async def test_movie_enrich_still_writes_a_clean_binding(clean_tables, monkeypatch, cfg):
+    """反向：没撞车时照常写 —— 别为了消掉那条路把识别整个关掉。"""
+    from core import movies as M
+    from db.models import Movie
+    from services import enrich
+
+    async def resolve(*a, **kw):
+        return {"bangumi_id": 777002, "display_name": "认对了"}
+    monkeypatch.setattr(enrich, "resolve", resolve)
+
+    with clean_tables.get_session() as s:
+        mine = Movie(title="刚扫到的", quarter="2026")
+        s.add(mine); s.commit(); s.refresh(mine); my_id = mine.id
+
+    await M.enrich_movie(my_id)
+    with clean_tables.get_session() as s:
+        me = s.get(Movie, my_id)
+        assert me.bangumi_id == 777002 and me.display_name == "认对了"

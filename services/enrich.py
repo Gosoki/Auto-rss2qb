@@ -10,6 +10,7 @@
 import asyncio
 import logging
 import re
+from contextvars import ContextVar
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -72,18 +73,31 @@ async def _retryable(make_request):
 # 早先这里把 Mikan 桥的失败也记进同一个数：于是"bgm 一切正常、只是 Mikan 打不开"会被
 # 判成"bgm 整体不可达"，退避阶梯被无限退款、每个节拍重打一遍 bgm（实测 bgm 恒 200 也照样如此）。
 # 同理，纯本地的解析异常（JSON 坏了、字段类型不对）也不算"没问成"——问是问到了。
-_bgm_fail = 0
+# 【按 asyncio 任务分账，不是进程全局】(R21) 唯一的消费者 retry_unmatched 是这么用的：
+#     before = net_failures(); await enrich_anime(aid); reached += (net_failures() == before)
+# 而 `_bgm_fail` 原来是**进程级模块变量**——采集轮那条线
+# （run_worker → poll_once → process_item → _resolve_anime → enrich.resolve → _search_one）
+# 撞上 429/5xx 时同样会记账，两条协程互不相干、没有任何锁，
+# 而 `before = ...` 与 `await enrich_anime(aid)` 之间**正是采集轮最容易插进来的窗口**。
+# 被污染的方向恰恰是最坏的那个：reached 被少算 → `reached == 0` 更容易成立 →
+# 整轮 enrich_tries 被退款 → 退避阶梯永不推进、每个检查节拍都重打一遍 bgm，
+# 正是那段注释拼命要防的事。
+# ContextVar 天然按任务隔离：Task 创建时复制上下文，任务内的 set 不外泄。
+_bgm_fail_ctx: ContextVar[int] = ContextVar("autorss_bgm_fail", default=0)
 
 
 def _note_bgm_fail() -> None:
     """记一次【bgm 没问成】。只在"请求没能拿到一个可信答复"时调：连接层失败、429、5xx。"""
-    global _bgm_fail
-    _bgm_fail += 1
+    _bgm_fail_ctx.set(_bgm_fail_ctx.get() + 1)
 
 
 def net_failures() -> int:
-    """本进程累计的【bgm 没问成】次数。上层取调用前后的差值，判断这一次到底问成没有。"""
-    return _bgm_fail
+    """**当前任务**累计的【bgm 没问成】次数。上层取调用前后的差值，判断这一次到底问成没有。
+
+    按任务而不是按进程记账的理由见上面那段注释——按进程记的话，另一条协程的失败
+    会被算到本次调用头上。
+    """
+    return _bgm_fail_ctx.get()
 
 
 _MIKAN_BANGUMI_RE = re.compile(r"/Home/Bangumi/(\d+)")
@@ -277,7 +291,10 @@ async def fetch_by_id(bgm_id: int) -> dict | None:
 
 async def _fetch_by_id_inner(bgm_id: int) -> dict | None:
     try:
-        async with httpx.AsyncClient(**config.http_client_kwargs(max(1, config.ENRICH_TIMEOUT))) as client:
+        # url= 不能省：它是"内网地址不走代理"唯一的输入（见 config._direct_mounts）。
+        # BGM_API 是设置页可改的地址，指向局域网自建镜像是正当用法。(R21 补，此前 7 处只传了 5 处)
+        async with httpx.AsyncClient(**config.http_client_kwargs(
+                max(1, config.ENRICH_TIMEOUT), url=config.BGM_API)) as client:
             r = await _retryable(lambda: client.get(f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
             if r.status_code != 200:
                 return None
@@ -379,7 +396,11 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
 async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
     """resolve 的主体。拆出来只为让上面那层 asyncio.timeout 包得干净。"""
     try:
-        async with httpx.AsyncClient(**config.http_client_kwargs(max(1, config.ENRICH_TIMEOUT))) as client:
+        # 【两个地址都要报】这一个客户端既打 BGM_API（搜索/详情）又打 MIKAN_BASE
+        # （_mikan_bridge 桥接）。mounts 按 host 挂，所以两个一起传即可。(R21)
+        async with httpx.AsyncClient(**config.http_client_kwargs(
+                max(1, config.ENRICH_TIMEOUT),
+                url=(config.BGM_API, config.MIKAN_BASE))) as client:
             # ① 多名搜 bgm，统计投票（被几个名字命中）+ 记录日期贴合度
             votes: Counter = Counter()
             gap: dict = {}

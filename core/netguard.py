@@ -61,6 +61,55 @@ def not_blocked_by(ip: str, raw_cidrs: str) -> bool:
     return _allowed(ip, _parse(raw))
 
 
+# ---------------- Host 头校验：挡 DNS 重绑定（R21）----------------
+#
+# 【为什么网段白名单挡不住】攻击者把 rebind.evil.tld 的 A 记录 TTL 设成 1 秒，先解析到自己的
+# 服务器，诱导受害者打开 http://rebind.evil.tld:2333/（端口是本项目公开的默认值）；
+# 页面 JS 轮询 fetch('/')，攻击者随后把 DNS 改答 127.0.0.1（或面板所在的局域网 IP）。
+# 重绑定完成后**浏览器认为该来源与面板同源**，JS 就能读页面 HTML、取 NiceGUI 的 client id、
+# 连 /_nicegui_ws/socket.io/，像用户本人一样驱动整个 UI——而这个面板是无鉴权的，
+# 设置页上渲染着 qB 的地址与账号密码，下载目录也能改。
+# 两道现有防线都不生效：SubnetGuard 看到的对端就是受害者本机（127.0.0.1 恒放行）或
+# 白名单网段内的 IP；WEB_HOST=127.0.0.1 也不设防（请求确实来自本机）。
+#
+# 【Host 头能根治它】浏览器不允许脚本伪造 Host —— 重绑定之后它发的仍是 `Host: rebind.evil.tld`。
+# 所以只放行"用户真的会用来访问本机的名字"：
+#   · 字面 IP（`http://192.168.1.5:2333` 这种最常见的写法）；
+#   · localhost / *.localhost；
+#   · 内网后缀 .local / .lan / .internal / .home.arpa（都不是可公开注册的名字）；
+#   · 用户在 WEB_ALLOW_HOSTS 里显式列出的域名（走反代/自有域名时填这里）。
+#
+# 【不会把人锁在外面】按 IP 访问永远放行 —— 域名被拒时用 http://<IP>:<端口> 就能进去改配置。
+# 403 的文案里直接写着这句。
+_HOST_SUFFIXES = (".local", ".lan", ".internal", ".home.arpa", ".localhost")
+
+
+def host_allowed(host_header: str, raw_hosts: str) -> bool:
+    """Host 头是否可信。空 Host（HTTP/1.0、部分探针）视作不可信。
+
+    只看主机名部分：端口不参与判定（换端口不改变"是谁在解析这个名字"）。
+    """
+    host = (host_header or "").strip()
+    if not host:
+        return False
+    if host.startswith("["):                       # IPv6 字面量 [::1]:2333
+        host = host[1:host.find("]")] if "]" in host else host[1:]
+    elif ":" in host:
+        host = host.rsplit(":", 1)[0]
+    host = host.strip(".").lower()
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)                 # 字面 IP：本项目最常见的访问方式
+        return True
+    except ValueError:
+        pass
+    if host == "localhost" or host.endswith(_HOST_SUFFIXES):
+        return True
+    return host in {h.strip().strip(".").lower()
+                    for h in (raw_hosts or "").split(",") if h.strip()}
+
+
 class SubnetGuard:
     """ASGI 中间件：WEB_ALLOW_CIDRS 非空时，非白名单网段的 HTTP/WS 一律拒；空=放行一切。
 
@@ -95,14 +144,36 @@ class SubnetGuard:
                     if not _allowed(client[0] if client else None, _parse(raw)):
                         await self._reject(scope, send)
                         return
+            # 【Host 头校验放在两支【之外】】(R22 修) 挡 DNS 重绑定，理由见上面 host_allowed 处。
+            # 第一版把它写进了 `else:`（配置读出来了那一支），于是
+            # **`loaded_from_db` 为假时这道防线整个不设防** —— 而那正是重绑定的目标场景：
+            # 重绑定之后浏览器发的请求，对端就是受害者本机 127.0.0.1，必然过得了上面那关。
+            # 也就是说建表/迁移失败期间（本项目专门为它写了 503 分支和"本机仍进得去改回来"的设计），
+            # 攻击页面照样能读页面 HTML、连 /_nicegui_ws/socket.io/。
+            # 配置读不出来时 `config.WEB_ALLOW_HOSTS` 取到的是默认空串，
+            # 于是只放行字面 IP / localhost / 内网后缀 —— 那正是 fail-closed 该有的样子。
+            # 放在网段之后：网段是用户显式配的、更强的意图，先让它给出自己的文案。
+            host = next((v.decode("latin-1") for k, v in scope.get("headers") or ()
+                         if k == b"host"), "")
+            if not host_allowed(host, config.WEB_ALLOW_HOSTS):
+                await self._reject(scope, send, bad_host=host)
+                return
         await self.app(scope, receive, send)
 
     @staticmethod
-    async def _reject(scope, send, not_ready: bool = False) -> None:
+    async def _reject(scope, send, not_ready: bool = False, bad_host: str = "") -> None:
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008})
             return
-        if not_ready:
+        if bad_host:
+            status, body = 403, (
+                f"403 Forbidden：不接受 Host 头 {bad_host!r}。\n"
+                "这道校验挡的是 DNS 重绑定——把一个域名先解析到攻击者的服务器、"
+                "再改答成本机地址，浏览器就会把那个网页当成与本面板同源，"
+                "从而在无鉴权的前提下完全接管它。网段白名单挡不住这种攻击（对端确实是你自己）。\n\n"
+                f"如果 {bad_host!r} 是你自己的域名：用 http://<本机IP>:<端口> 进面板"
+                "（按 IP 访问永远放行），到设置页把它填进『允许的访问域名』。")
+        elif not_ready:
             status, body = 503, (
                 "503 服务未就绪：数据库初始化失败，安全起见暂时只允许本机访问。\n"
                 "这【不是】网段白名单的问题——配置根本没能从数据库读出来，"

@@ -129,7 +129,10 @@ class AnimeTorrent(SQLModel, table=True):
     save_path: str = Field(default="")          # 交 qB 时的实际保存路径；改季度/重绑后据此移动或提醒旧位置
     release_time: datetime | None = Field(default=None)
     priority: int = Field(default=0)            # 来源组优先级（缓冲窗口到点时按此选下哪一份）
-    created_at: datetime = Field(default_factory=datetime.now)
+    # 【index=True 是给"最近入库"那几条排序查询用的】(R21) 仪表盘打开后每 30 秒刷一次
+    # `ORDER BY created_at DESC LIMIT 50`，无索引时是 SCAN + 临时 B 树排序，
+    # 而 sent 是只增不减的终态、行数随挂机线性增长。真库(1675 行)实测 5.50ms → 0.23ms。
+    created_at: datetime = Field(default_factory=datetime.now, index=True)
     # ---- qB 实时状态（后台每 QB_SYNC_INTERVAL 秒从 qBittorrent 同步；未接 qB 时留空/0）----
     qb_state: str = Field(default="")           # qB 原始态：downloading/stalledUP/pausedDL/error…（空=qB 未跟踪）
     qb_progress: float = Field(default=0.0)     # 完成度 0..1
@@ -200,7 +203,7 @@ class MovieTorrent(SQLModel, table=True):
     save_path: str = Field(default="")          # 交 qB 时的实际保存路径；改季度/重绑后据此移动或提醒旧位置
     release_time: datetime | None = Field(default=None)
     priority: int = Field(default=0)
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=datetime.now, index=True)   # 同 AnimeTorrent，理由见那里
     # ---- qB 实时状态（同 AnimeTorrent）----
     qb_state: str = Field(default="")
     qb_progress: float = Field(default=0.0)

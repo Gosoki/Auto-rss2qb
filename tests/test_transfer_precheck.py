@@ -15,7 +15,7 @@ def _fresh(tmp_path, name):
     import subprocess
     import sys
     p = tmp_path / name
-    subprocess.run([sys.executable, "-c", "import db; db.init_db()"],
+    subprocess.run([sys.executable, "-c", "import config, db; db.init_db(); config.load_from_db(); db.apply_configured_backend()"],
                    env={**__import__("os").environ, "DB_PATH": str(p)},
                    cwd=str(__import__("pathlib").Path(__file__).resolve().parent.parent),
                    check=True, capture_output=True)
@@ -208,3 +208,62 @@ def test_verify_flags_a_shrinking_target(tmp_path):
     assert bad and "回滚" in bad[-1], f"目标库被清空却没有任何提醒：{bad}"
     assert "99 → 0" in bad[-1]
     a.dispose(); b.dispose()
+
+
+def test_a_stale_local_source_is_upgraded_before_it_is_migrated(tmp_path):
+    """(R22) 『本地 SQLite → MySQL』要能在源库版本过旧时照样迁成。
+
+    R21 之后 `init_db()` 只升 meta，data 链交给 `apply_configured_backend()` ——
+    于是 `DB_BACKEND=mysql` 时**没有任何路径**再升本地那份 SQLite，
+    它冻结在用户最后一次以 SQLite 为业务库时的版本。
+    而『本地 → MySQL』恒取 `db.meta_engine` 当源，`migrate_data` 是按 head 的列去读它的：
+    实测报 `源库的表 anime 读不出来…no such column: anime.finished_at`
+    （目标库未被改动，失败是安全的），而那条提示说的"用本程序打开它跑一次升级后再迁"
+    对 MySQL 用户已经**无路可走**。
+
+    修法是在用户明确要读它的那一刻升一次。这条用例钉住的就是这件事。
+    """
+    import pytest
+    import sqlalchemy as sa
+
+    from db import schema, transfer
+
+    src = sa.create_engine(f"sqlite:///{tmp_path/'old.db'}")
+    dst = sa.create_engine(f"sqlite:///{tmp_path/'new.db'}")
+    schema.upgrade(src, "data", "b2c9e4f17a03")     # 停在老版本
+    schema.upgrade(dst, "data")                     # 目标是 head
+
+    with src.connect() as c:
+        info = c.exec_driver_sql("PRAGMA table_info(anime)").fetchall()
+    notnull = [r[1] for r in info if r[3] and r[5] == 0]
+    vals = {"id": 1, "title": "甲"}
+    for k in notnull:
+        # 日期列不能填空串：迁移读回来会 
+        vals.setdefault(k, 0 if k in ("season", "confirmed", "rejected", "enrich_tries")
+                        else ("2026-01-01 00:00:00" if k.endswith("_at") else ""))
+    with src.begin() as c:
+        c.execute(sa.text(f"INSERT INTO anime ({','.join(vals)}) "
+                          f"VALUES ({','.join(':' + k for k in vals)})"), vals)
+
+    # 不升级：按 head 的列去读旧库，必然读不出来（这正是被修掉的那个状态）
+    with pytest.raises(ValueError, match="源库的表"):
+        transfer.migrate_data(src, dst, overwrite=True)
+
+    # 升一次之后就能迁 —— 这就是设置页在迁移那一刻做的事
+    schema.upgrade(src, "data")
+    res = transfer.migrate_data(src, dst, overwrite=True)
+    assert res["moved"]["anime"] == 1
+
+
+def test_the_migrate_handler_upgrades_its_source():
+    """反向：上一条自己调了 `schema.upgrade`，测不出**设置页到底有没有调**（第③号形状）。"""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse((Path(__file__).resolve().parent.parent / "pages/settings.py")
+                     .read_text(encoding="utf8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "_migrate")
+    dumped = ast.dump(fn)
+    assert "db_schema" in dumped and "upgrade" in dumped, \
+        "_migrate 没在读源库之前把它升到 head —— 旧结构的本地库迁不动，而 MySQL 用户没有别的升级入口"

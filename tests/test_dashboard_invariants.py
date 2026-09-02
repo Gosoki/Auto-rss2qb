@@ -145,8 +145,26 @@ def test_internal_marker_names_actually_exist_in_production_code():
     root = pathlib.Path(__file__).resolve().parent.parent
     src = "\n".join((root / d).read_text(encoding="utf-8")
                     for d in ("core/anime.py", "core/engine.py", "config.py"))
-    missing = [k for k in _INTERNAL_MARKERS if f'"{k}"' not in src and f"'{k}'" not in src]
+    # 【按基名查】(R26) 这些键在生产代码里已经是拼出来的
+    # （`f"_QB_PROGRESS_BACKFILLED@{data_identity()}"` / `_scoped(_IDLE_BACKFILL_KEY)`），
+    # 所以查的是基名出现过没有，而不是完整字面量。
+    missing = [k for k in _INTERNAL_MARKERS if k not in src]
     assert not missing, f"conftest 里这些键在生产代码里不存在：{missing}"
+
+    # 反向：键必须**带上业务库身份**，否则切库后标记与库不匹配（见 db.data_identity 的说明）。
+    # 三处标记同一个决定 —— 这条钉住三处都带了。
+    import ast
+    scoped = 0
+    for d in ("core/anime.py", "core/engine.py"):
+        tree = ast.parse((root / d).read_text(encoding="utf-8"))
+        for n in ast.walk(tree):
+            if isinstance(n, ast.JoinedStr) and "data_identity" in ast.dump(n):
+                scoped += 1
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "_scoped"):
+                scoped += 1
+    assert scoped >= 2, (
+        f"只有 {scoped} 处标记带上了业务库身份 —— 没带的那些切库之后会读到别的库的结论")
 
 
 def test_no_undefined_names_anywhere():

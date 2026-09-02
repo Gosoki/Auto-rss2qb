@@ -55,14 +55,20 @@ async def safe_ip_for(host: str, allow_fake_ip: bool = False) -> str | None:
     里对 DNS 重绑定的说明。字面 IP 原样返回（校验通过的话），域名取第一个解析结果。
     解析失败/无结果保守视作内网（反正也连不上）。
     """
-    def _bad(ip) -> bool:
-        if allow_fake_ip and ip.version == 4 and ip in _FAKE_IP_V4:
+    def _bad(ip, resolved: bool) -> bool:
+        # 【豁免只对【解析出来的】地址成立】(R21 收紧) fake-ip 的立论是"只有当本机解析器
+        # 就是 fake-ip 代理时才会返回这一段"——那是关于 **DNS 解析结果** 的论断。
+        # URL 里【字面写着】198.18.x.x 完全不需要这个前提：被投毒的 feed 给出
+        # `http://198.18.0.1:8080/api/v2/torrents/delete?hashes=all` 时，
+        # 原来这里照样放行（而 config._internal_literal_host 还会顺手把它挂成直连、绕开代理），
+        # 于是守卫既没拦住、又替它避开了代理。字面 IP 一律按 ip_is_internal 判。
+        if resolved and allow_fake_ip and ip.version == 4 and ip in _FAKE_IP_V4:
             return False                       # 代理的 fake-ip 池，见 _FAKE_IP_V4 处的说明
         return ip_is_internal(ip)
 
     host = (host or "").strip("[]")            # 去 IPv6 字面量方括号
     try:
-        return None if _bad(ipaddress.ip_address(host)) else host
+        return None if _bad(ipaddress.ip_address(host), resolved=False) else host
     except ValueError:
         pass
     try:
@@ -78,7 +84,7 @@ async def safe_ip_for(host: str, allow_fake_ip: bool = False) -> str | None:
             addr = ipaddress.ip_address(info[4][0])
         except ValueError:
             return None                        # 解析出无法识别的地址形态 → 保守拒
-        if _bad(addr):
+        if _bad(addr, resolved=True):
             return None                        # 只要有一个内网地址就整体拒（别给轮询解析留缝）
         if first is None:
             first = info[4][0]

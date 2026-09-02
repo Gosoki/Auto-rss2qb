@@ -192,6 +192,20 @@ _STATE_CAP_PER_HOUR = 12          # 状态型自己的小桶：6 组"坏+好"，
 # qb_down 抖起来能把 db_down 与 backlog 的额度一起吃光，而后两者恰恰是最需要送达的。
 # 上界从 12/小时 变成 12×kind 数，仍然有界。
 _state_times: dict[str, list[float]] = {}
+# 【被小桶挡下时留一行痕迹，每场只留一次】(R21)
+# 三层抑制里，另外两层各自都会留下账：`_rate_ok` 挡下时 `_dropped += 1`（并把条数挂在下一条
+# 消息的尾巴上），熔断期挡下时 `_dropped += 1` + 一行 warning。**只有状态型小桶这一层
+# 什么都不留** —— 桶满之后一整场 qb_down/db_down 的翻转会颗粒无收，
+# 而这两个恰恰是全项目仅有的带外故障信号（用户唯一能在"没盯着页面"时知道出事的途径）。
+# 抑制本身是有上界的（滚动一小时，见 D-04「边沿下一轮自动补发」），所以不该按次记 _dropped：
+# 那会把**同一次故障**报成"另有 40 条没能送到"（每轮重判一次边沿）。
+# 正确的粒度是【每条被压住的边沿只记一次】—— 进入抑制时一行，恢复后下次再进入才再记一行。
+# 【名字刻意不叫 _state_muted】(R22) 本模块里 "mute" 已经被**熔断**占用了
+# （`_muted_until`：连续失败 N 次后整个通知模块静音 M 秒）。两个概念完全不同：
+#   · 熔断静音 = 地址是个黑洞，**所有** kind 都不发，按墙钟解除；
+#   · 这里 = 某一个 kind 的小桶满了，只有它被压住，按滚动一小时解除。
+# 共用一个词根会让人以为它们是同一套机制的两半。
+_state_suppressed: dict[str, bool] = {}
 
 
 def _state_rate_ok(kind: str) -> bool:
@@ -319,7 +333,16 @@ async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "") -> None:
     # qB 在掉线边缘反复抖动时，判据每轮翻转一次，两小时能打出几百条。
     # 独立小桶两头都占住：不被 delivered 挤掉，自己也失控不了。
     if not _state_rate_ok(kind):
-        return                          # 抖动风暴：本轮不记也不发，等它稳定下来
+        # 抖动风暴：本轮不记也不发，等它稳定下来。但要留一行痕迹（理由见 _state_suppressed）。
+        if not _state_suppressed.get(kind):
+            _state_suppressed[kind] = True
+            times = _state_times.get(kind) or []
+            wait_min = int(max(0, (times[0] + 3600 - time.monotonic())) // 60) if times else 60
+            log.warning("状态通知『%s』被抖动限流挡下：一小时内已送达 %d 条，"
+                        "这一场的翻转暂不推送，约 %d 分钟后自动恢复（页面与日志仍然照常）",
+                        kind, len(times), wait_min)
+        return
+    _state_suppressed.pop(kind, None)         # 桶松开了：下次再被挡住时重新记一行
     # （令牌在下面【送达之后】才扣，见 _state_rate_commit 调用点）
     # 【先占位再发】边沿判定（上面那个 prev）与写回之间隔着 await（最长 NOTIFY_TIMEOUT）。
     # qB 掉线时两条路径会同时进来（qB 同步轮 与 flush 的 qb_precheck，分属不同锁；

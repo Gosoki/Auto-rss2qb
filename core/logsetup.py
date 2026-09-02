@@ -34,6 +34,52 @@ class _SuppressDeletedSlot(logging.Filter):
         return not any(n in text for n in self._NEEDLES)
 
 
+class _RedactUrls(logging.Filter):
+    """把每条日志里的 URL 换成"只留 scheme+host"的形式。**装在这里而不是各调用点。**
+
+    【为什么必须是结构性的】(R21) 泄漏的形状是：`except Exception as e: log.warning("… %s", e)`
+    —— 而 httpx 的 `HTTPStatusError`/`ConnectError` 的 `str()` 原样带着完整 URL。
+    私有站的 .torrent 直链把 **passkey 放在 query 里**（手动下载那条路的输入就是它），
+    Mikan『我的番组』订阅地址把 token 放在 query 里。一次 403 就把密钥写进三个地方：
+    `data/autorss.log`（滚动 5 份，/logs 页有『下载完整日志』按钮）、
+    /logs 页的实时视图、以及页面上的红字提示。
+
+    仓库里早有解药（`services.fetch.redact`），可 R21 之前**生产代码只有 2 处在用**。
+    全仓扫下来有 **77 个** `except … as e` 把异常写进日志 —— 逐处加必然漏，
+    而"漏一处就等于没做"正是本项目反复栽的那种形状。装成过滤器之后，
+    调用点写什么都不会漏，将来新增的 except 也自动被盖住。
+
+    非日志的出口（返回给页面的 error、持久化进库的 fail_reason）过滤器盖不到，
+    那几处仍然显式调 `fetch.redact`，见 core/manual.py、core/anime.py、core/movies.py。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        from services.fetch import redact          # 延迟导入：logsetup 在很早的启动期就被导入
+        try:
+            text = record.getMessage()
+        except Exception:
+            return True                            # 格式化不了就别拦，交给 handler 自己报
+        safe = redact(text)
+        if safe != text:
+            # 【连 args 一起清掉】只改 msg 而留着 args，handler 会拿 msg % args 再格式化一次，
+            # 原文又回来了（第一版就是这么假绿的）。
+            record.msg, record.args = safe, ()
+        if record.exc_info and not record.exc_text:
+            # 异常栈里同样会出现 URL（httpx 的异常消息就在 traceback 末行）。
+            # 先渲染成字符串再脱敏；`Formatter.format` 见到 exc_text 非空就跳过 formatException，
+            # 所以栈照样是脱敏后的那一份。
+            #
+            # 【绝不能把 exc_info 清成 None】(R22) 本过滤器挂在三个 handler 上，其中 ring 挂在
+            # 'autorss' logger 上，而 `logging.callHandlers` 先走本 logger 的 handler 再往 root 传
+            # —— ring 上这一个**总是第一个**跑。清掉 exc_info 之后，root 那两个 handler 上的
+            # `_SuppressDeletedSlot.filter` 里 `record.exc_info[1] if record.exc_info else None`
+            # 恒为 None，它要滤的那一族 NiceGUI 断连噪声（消息体是通用的
+            # `按钮操作失败：%s`，特征全在异常里）**整个失效**，日志被刷屏并掩盖真错。
+            import logging as _l
+            record.exc_text = redact(_l.Formatter().formatException(record.exc_info))
+        return True
+
+
 class RingHandler(logging.Handler):
     """把最近 capacity 条日志留在内存里，供 /logs 页读取。每条存 {levelno, level, line}。"""
 
@@ -68,6 +114,7 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     filt = _SuppressDeletedSlot()
+    redact_filt = _RedactUrls()
 
     handlers = [logging.StreamHandler()]
     try:
@@ -78,6 +125,7 @@ def setup_logging() -> None:
     for h in handlers:
         h.setFormatter(_FMT)
         h.addFilter(filt)
+        h.addFilter(redact_filt)
         root.addHandler(h)
 
     # 【httpx 的 INFO 访问日志压到 WARNING】它对每个请求记一行完整 URL，而 qB 的
@@ -89,5 +137,8 @@ def setup_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     ring.setFormatter(_FMT)
+    # 【环形缓冲也要挂】(R21) 它挂在 'autorss' logger 上，不经过 root 的那几个 handler ——
+    # 只给 root 挂过滤器的话，/logs 页的实时视图仍然明文显示 passkey。
+    ring.addFilter(redact_filt)
     logging.getLogger("autorss").addHandler(ring)  # 只收本应用日志（各模块都用这个 logger 名）
     _configured = True

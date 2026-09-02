@@ -48,7 +48,7 @@ def upgrade() -> None:
         return
     keep: dict = {}                 # (截断后的 title, season) -> 保留的那一行 id
     doomed = []
-    for rid, title, season, anime_id in sorted(rows, key=lambda r: r[0]):
+    for rid, title, season, anime_id in sorted(rows, key=lambda r: (r[3], r[0])):
         key = (title[:_LIMIT], season)
         exist = bind.execute(sa.text(
             "SELECT id FROM anime_alias WHERE title = :t AND season = :s"), 

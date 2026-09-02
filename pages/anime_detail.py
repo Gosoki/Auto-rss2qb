@@ -109,12 +109,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 if cur.rejected:
                     ui.badge("超期忽略" if not cur.confirmed else "已忽略").props("color=grey")
                 else:
-                    ui.badge("✓ 已确认" if cur.confirmed else "⏳ 待确认").props(
+                    ui.badge("已确认" if cur.confirmed else "待确认").props(
                         f"color={'green' if cur.confirmed else 'orange'}")
                 if cur.finished_at:
                     # 停订与否由全局开关决定，所以徽标的 tooltip 必须说清【当前这台机器上】它意味着什么，
                     # 否则用户看到"已完结"无从判断后台还会不会继续下。
-                    ui.badge("🎊 已完结").props("color=teal").tooltip(
+                    ui.badge("已完结").props("color=teal").tooltip(
                         f"1~{cur.total_episodes} 集全部到手（判定于 "
                         f"{cur.finished_at.strftime('%Y-%m-%d %H:%M')}）。"
                         + ("已停止自动下新集——若这部番其实还没完（bgm 的总集数少记了），"
@@ -244,7 +244,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 "系统对这段【既不自动合并、也不跨源去重】：同一集最多每个源各下一份，宁可多下也不冒险把两集不同内容当成一集而漏下。"
                 "如确认某两条其实是同一集，点左边集号手动改成一致即可。")
         if not eps:
-            ui.label("（还没有种子）").classes("text-gray-400")
+            ui.label("（还没有种子）").classes("text-gray-500")
             return
         # 两个问题各查各的：pending 行问『后台自动会下吗』(只算 pending，与 flush 同口径)，
         # error 行问『点补下会挑中吗』(含 error)。混用一个集合会让高优先级的 error 顶掉
@@ -446,11 +446,15 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 期间页面没有任何反馈，用户会以为没点上而再点一次。走 busy_action 去重。
         async def _go():
             old_path = anime.anime_save_path(anime_id)   # 重绑前的归档路径（bind 可能改名/季度/季号）
-            ok = await anime.bind_anime_bgm(anime_id, bid)
+            _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
+            ok = await anime.bind_anime_bgm(anime_id, bid, report=_rep)
             _after()
-            ui.notify("已绑定并识别 ✓（回到待确认，去点确认下载）" if ok
-                      else "绑定失败：ID 不存在或取不到 bgm 数据",
-                      type="positive" if ok else "negative")
+            # 冻结了就别报绿，理由同 pages/anime.py 那一处
+            _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
+                    else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen")
+                          else "已绑定并识别 ✓（回到待确认，去点确认下载）"))
+            ui.notify(_msg, type=("negative" if not ok
+                                  else "warning" if _rep.get("frozen") else "positive"))
             if ok:
                 await maybe_relocate_anime(anime_id, old_path, _after)
         await busy_action(None, f"bind:{anime_id}", _go, fail="绑定失败")

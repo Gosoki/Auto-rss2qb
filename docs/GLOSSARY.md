@@ -101,3 +101,82 @@
 调用点不许写 `font-size`。
 
 与徽标那一节是**同一条原则**：尺度由全局定，调用点只选角色。
+
+---
+
+## 九、R21 新增的几个词与纪律
+
+### `db.maintenance(reason, blocked_by=...)` —— 整库维护闸
+
+"切库"与"整库迁移"这两件事会把整个业务库换掉/清空重写。期间 `db.get_session()`
+一律抛 `DatabaseBusy`，`is_data_down()` 为真（后台四条循环按停摆跳过本轮）。
+
+**闸为什么装在 `get_session()` 上**：全仓 316 处业务库访问全部走它，
+而 `db/transfer.py` / `db/schema.py` / `db/backup.py` 用的是显式引擎、一处都不走它 ——
+这一个点既拦得住全部业务读写，又拦不到维护自己。装在别处必然漏。
+
+**`blocked_by` 为什么收在 `maintenance()` 里面**：它挡的是"交付协程跨 await 持着旧库的
+整数主键、维护结束之后才回写"那一种（`transfer` 保留主键，两个库里 id=501 是两条毫不相干的
+种子）。闸只挡得住维护**期间**的读写。调用方"先查一遍再进维护"的写法中间隔着一个
+`await confirm(...)`，窗口大得能开进一整轮交付；放在里面，检查与置位之间没有 await。
+
+### `observation_gap_seconds()` —— 观测断档窗口
+
+"这段空白不能归因于种子"的判定阈值。**必须按 worker 最慢的那一档正常节拍算**
+（`QB_IDLE_RECHECK_MIN`），不是活跃节拍（`QB_SYNC_INTERVAL`）。
+按错了的后果不是"偶尔误判"，而是**停滞检测整个功能从未生效过**（R21 复现）。
+
+### `_recheck_where()` 与 `_inflight_where()` 必须互斥
+
+`recheck` 的语义就是"被 `_inflight_where` 排除掉、需要额外问一遍的行"。
+两条 WHERE 一旦重叠，同一行会在 `rows_all` 里出现两次，并被 `if tid in recheck_ids: continue`
+**整个跳过落定** —— 该行永远落不了定，而 `sent ∈ HAVE_STATUSES` 让集去重认定这一集已有一份、
+盘上却什么都没有。互斥由 `_recheck_where` 末尾那个 `or_`（= NOT in-flight）在 SQL 里保证。
+
+### `host_allowed()` —— Host 头白名单
+
+挡 DNS 重绑定。浏览器不允许脚本伪造 Host，所以这一条就能根治。
+放行：字面 IP / `localhost` / `.local`·`.lan`·`.internal`·`.home.arpa` / `WEB_ALLOW_HOSTS` 里的域名。
+**按 IP 访问永远放行** —— 这是域名填错时唯一的自救出路，改这条判据时不能把它堵死。
+
+### 三条一直在复发的形状，R21 又各中了一次
+
+① **广度**：同一个决定应该在 N 处生效，只落了 1 处
+（`_sqlite_engine` 的 PRAGMA、`enrich_movie` 的不合并、`_has_unmovable_files`、`http_client_kwargs(url=)`）。
+
+② **作用域**：约束的范围大于验证的范围
+（迁移只锁两把轮次锁、页面写入口不受约束；徽标符号守卫只扫字面量）。
+
+③ **假用例**：断言自己传进去的参数、用字符串匹配源码、拿同一条链的产物跟自己比。
+R21 里我自己写的守卫就中了两次（索引一致性、分页尺寸），都是靠**当场变异验证**才发现的。
+
+**纪律：新写的守卫必须当场做一次变异验证** —— 把它声称守住的东西破坏掉，确认它真的会红。
+没做过变异验证的守卫，有相当概率是假的。
+
+---
+
+## 十、R22 记的几处命名（含一处已改、若干条待你判断）
+
+### 已改：`_state_muted` → `_state_suppressed`（services/notify.py）
+
+本模块里 **mute 这个词根已经被熔断占用了**（`_muted_until`：连续失败 N 次后整个通知模块
+静音 M 秒）。两个概念完全不同：
+
+| | 熔断静音 `_muted_until` | 状态型小桶 `_state_suppressed` |
+|---|---|---|
+| 范围 | **所有** kind 一起不发 | 只压住某一个 kind |
+| 触发 | 推送地址是黑洞（连续失败） | 该 kind 一小时内已真送达 12 条 |
+| 解除 | 墙钟 300 秒 | 滚动一小时窗口自然过期 |
+
+共用一个词根会让人以为它们是同一套机制的两半 —— 而实际上一个是"地址坏了"，
+一个是"你已经被这件事通知够多次了"。
+
+### 待你判断的几个（我没动）
+
+| 名字 | 读起来像 | 实际是 | 我的看法 |
+|---|---|---|---|
+| `engine.maintenance_blockers()` | "维护会挡住哪些东西" | "**现在不能开始**维护的理由清单" | 建议改 `why_maintenance_cannot_start()` 或 `blocked_from_maintenance()`。语义反了一半，而它是安全闸，读反的代价不小 |
+| `worker.loop_error(what, e)` | "循环结构出错了" | "**后台循环**的异常记账出口" | 建议 `log_loop_exception`。现名两个词都可以当形容词读 |
+| `db.data_down_reason()` vs `db.maintenance_reason()` | 两个平级的"原因" | 前者**包含**后者（维护也算"此刻不能用"） | 不建议改名，但两处 docstring 要互相点名（已补）。改名会牵动 8 个调用点，收益不抵风险 |
+| `_QB_NEEDS_RECHECK` | "需要补查的态" | "需要补查的态，**但两个来源的搭车条件不同**"（missingFiles 搭车、过渡态无条件） | 拆成两个常量更准，但 R21 已经把差异写进 `_recheck_where` 的 docstring，先留着 |
+| `existing_hashes(model_cls, hashes)` | 可能被读成"取出全部已有 hash" | "这批里哪些**已经在库里**" | 名字够准，只是第一个参数是表、第二个才是待查集合，调用时容易写反 —— 已由类型天然挡住（传反会 AttributeError） |

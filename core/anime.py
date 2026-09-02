@@ -18,7 +18,7 @@ from core import engine
 from db import get_session
 from db.dialect import ALIAS_TITLE_LEN
 from db.models import Anime, AnimeTorrent, Movie, MovieTorrent, SourceGroup, AnimeAlias
-from services import enrich
+from services import enrich, fetch
 from services.notify import (cooldown_active as notify_cooldown_active,
                              enabled as notify_enabled, event as notify_event,
                              state as notify_state)
@@ -30,6 +30,15 @@ log = logging.getLogger("autorss")
 
 # 串行化『选集→占位下载』，防止 worker flush 与 UI 补下并发对同一集重复放行
 _download_lock = asyncio.Lock()
+# 【重识别的轮次锁】(R22) 它是第五条"跨 await 持业务库整数主键"的后台线，而 R21/R22 的
+# `engine.maintenance_blockers()` 只列了四条（downloading 行 / qB 同步 / 采集轮 / 剧场版扫描轮）——
+# `retry_unmatched` 一条都不占：单轮最多 50 部，每部 `await enrich.resolve()`（预算 120 秒，
+# 全项目最长的 await 之一），出 await 后 `enrich_anime` 用 `s.get(Anime, anime_id)` 在
+# **当前 engine** 上按同一个整数主键写回。用户此刻点『切回本地 SQLite』（设置页那一节明写
+# "切错了再切回来即可，数据不会丢"，正是两库主键各自独立的场景）→ 闸返回 [] → 放行 →
+# 协程回到**新库**按那个 id 写回，把另一部番的身份整个改写。
+# 页面上的批量『刷新资料』走 `reenrich_scope`，同一条路，所以锁加在这一层、两个入口共用。
+_enrich_lock = asyncio.Lock()
 
 # 状态词表统一在 engine（两条线共用，见那里的定义与口径说明）。此处把本模块用到的都转出：
 # 一是供 pages 沿用 anime.HAVE_STATUSES，二是让本文件内引用风格一致（全用不带前缀的名字）。
@@ -416,6 +425,41 @@ def canonical_alias(title: str) -> str:
     return (m.group(1) if m else t).strip()
 
 
+def suspect_wrong_binding() -> list[dict]:
+    """绑定看着不对、**却还在追番中**的番（只读，不改任何东西）。(R26)
+
+    【为什么现有的闸看不到它】`binding_looks_wrong` 全项目有 4 个调用点，
+    但它们**全是"不让番【进入】追番中"的闸**（建番、自动升确认、批量重算超期、合并前）——
+    没有任何一处对【已经 confirmed 的番】重算，三条巡检也都不看它，页面上一次都没引用过。
+    于是一部**先被确认、之后才收到矛盾种子**的番会永久停在错状态。
+
+    真库实证：anime#6『超超超超超喜欢你的100个女朋友 第三季』(bgm 598058, season=3,
+    total_episodes=12) 的 `binding_looks_wrong` 返回 True，`_episode_cannot_belong`
+    逐条命中它 **24 条**种子（发布时间比本季首播早 130 多周，是第一季的正片），
+    而它 `confirmed=True / rejected=False` —— 仍然挂在"追番中"。
+
+    **只报不改**：自动改状态的代价太大（confirmed=False 会让整部番掉出 subscribed_where、
+    停掉自动下载），而判据本身有 bgm 数据质量的残留风险。与 `suspect_duplicate_anime`
+    同一个位置、同一种处理方式：报到仪表盘，用户去详情页重绑或删掉那批种子。
+    """
+    out = []
+    with get_session() as s:
+        for a in s.exec(select(Anime).where(
+                Anime.confirmed == True, Anime.rejected.is_not(True),        # noqa: E712
+                Anime.bangumi_id.is_not(None))):
+            if not binding_looks_wrong(s, a):
+                continue
+            bad = [t for t in s.exec(select(AnimeTorrent).where(
+                AnimeTorrent.anime_id == a.id)) if _episode_cannot_belong(a, t)]
+            out.append({"id": a.id, "name": display_of(a), "bgm": a.bangumi_id,
+                        "season": a.season, "total": a.total_episodes,
+                        "bad": len(bad),
+                        "eps": sorted({int(t.episode) for t in bad
+                                       if isinstance(t.episode, (int, float))
+                                       and t.episode >= 1})[:8]})
+    return out
+
+
 def suspect_duplicate_anime() -> list[dict]:
     """疑似"同一部番被拆成了两条记录"的配对（只读，不改任何东西）。
 
@@ -644,25 +688,11 @@ def _learn_and_normalize_episode(s, a, item) -> float:
     return ep
 
 
-def existing_hashes(hashes) -> set[str]:
-    """这批 info_hash 里哪些库里已经有了。一次 IN 查询，供 poll_once 批量预取。
-
-    每条 RSS 条目各开一个 session 查一次的代价并不小：100 条实测 42~45ms（本地 SQLite），
-    切到远程 MySQL 时是每轮 0.4~2 秒的裸阻塞（建连接 + 往返 ×100）。而 RSS 一轮的条目
-    绝大多数是【上一轮就见过的】，批量预取等于把这 100 次往返压成 1 次。
-    """
-    hs = [h for h in hashes if h]
-    if not hs:
-        return set()
-    with get_session() as s:
-        return set(s.exec(select(AnimeTorrent.info_hash).where(AnimeTorrent.info_hash.in_(hs))))
-
-
 async def process_item(item, known_hashes: set | None = None,
                        qb_alive: bool | None = None) -> bool:
     """处理一条标准条目。返回 True 表示是新种子（之前没见过）。
 
-    known_hashes：调用方批量预取的"库里已有的 hash"集合（见 existing_hashes）。
+    known_hashes：调用方批量预取的"库里已有的 hash"集合（见 engine.existing_hashes）。
     传了就用它做去重、不再单独查库；不传则照旧自己查一次（手动补齐等零散入口走这条）。
 
     qb_alive：本轮开头【只探一次】的 qB 可达性（poll_once 传进来）。
@@ -774,6 +804,19 @@ async def process_item(item, known_hashes: set | None = None,
 
 
 async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool | None:
+    """交付一条种子。**整段包在 try/finally 里注销交付登记**（见 engine._delivering）。
+
+    包装放在这一层而不是函数体内部：函数体从进锁到最后一次回写有一百多行、
+    多条 return 与 raise，任何一条漏掉注销都会让那一行被永久当成"正在交付中" ——
+    而 R24 之前它压根没有注销这回事，一次库抖动就把切库/迁移永久拒死。
+    """
+    try:
+        return await _download_anime_torrent_inner(torrent_id, force)
+    finally:
+        engine._delivering.discard(("AnimeTorrent", int(torrent_id)))
+
+
+async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) -> bool | None:
     """取种子文件并加入 qBittorrent。
 
     【三态返回】True=已交付 / False=**这一条自己**的毛病（坏种子、源站给不出、被 qB 明确拒）
@@ -847,6 +890,11 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool |
                     log.info("跳过重复集 - %s 第%s季 第%s集（已有一份在下/已下）", title, season, episode)
                     return False
             t.status = "downloading"  # 原子占位：先落库再 await，后到的协程一进来就被短路挡掉
+            # 【登记"本协程真的在管这一行"】(R24) 落库的 downloading 只说明"某进程某一刻开始交付"，
+            # 不说明"此刻真的有协程在管"。回写撞上库抖动时异常直接冒出去、行永久停在 downloading，
+            # 而它既不被 sync 复查、又占着 HAVE_STATUSES、还把切库/迁移永久拒死。
+            # 注销在本函数的外层包装的 finally 里（见 download_anime_torrent 那一层）。
+            engine._delivering.add(("AnimeTorrent", int(torrent_id)))
             # 重新下：清归档标记 + 重置 qB 实时态，让它作为『全新在下』被重新跟踪、从新完成点重算归档倒计时——
             # 否则重下已归档的种子会带着旧 qb_progress=1/旧完成时间，被下一轮完成归档立刻再归档掉。
             t.archived_at = None
@@ -959,10 +1007,13 @@ async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool |
         raise
     except Exception as e:
         if stage == "取种":     # 源站超时/502/DNS…——与种子本身无关，排进重试队列
-            _retry(f"取种失败：{e}")
+            _retry(f"取种失败：{fetch.redact(e)}")
         else:                   # 交付阶段的意外异常：不在约定的重试范围内，落失败留人工看
-            log.error("下载失败 - %s - %s", title, e)
-            _fail(reason=f"交付异常：{e}")
+            # 【脱敏】(R21) fail_reason 会**持久化进库**并在详情页展示，异常的 str() 带完整 URL。
+            # 番剧侧的 download_url 来自公开 RSS、通常没有凭据，但同一段代码也服务于人工补下，
+            # 而 redact 的代价是零 —— 四处一起套，别再留一处例外（那正是这类缺陷复发的方式）。
+            log.error("下载失败 - %s - %s", title, fetch.redact(e))
+            _fail(reason=f"交付异常：{fetch.redact(e)}")
         return False
 
     if ok is None:             # qB 连不上：留在待下，下轮 flush 自动重发（别记 error 要人工）
@@ -1504,9 +1555,16 @@ _FINISH_BACKFILL_KEY = "_FINISH_BACKFILL_DONE"
 _IDLE_BACKFILL_KEY = "_idle_backfilled"
 
 
+def _scoped(key: str) -> str:
+    """把"哪个业务库"拼进标记名。(R26) 理由见 `db.data_identity`。"""
+    import db as _db
+    return f"{key}@{_db.data_identity()}"
+
+
 def _backfilled(key: str) -> bool:
     from db import get_meta_session
     from db.models import Setting
+    key = _scoped(key)
     try:
         with get_meta_session() as s:
             return s.get(Setting, key) is not None
@@ -1517,6 +1575,7 @@ def _backfilled(key: str) -> bool:
 def _mark_backfilled(key: str) -> None:
     from db import get_meta_session
     from db.models import Setting
+    key = _scoped(key)
     try:
         with get_meta_session() as s:
             if s.get(Setting, key) is None:
@@ -1784,7 +1843,9 @@ async def sweep_alerts() -> dict:
     ② 批量补下可能一次落好几条 error，逐条推送本身就是噪声；③ 这三件事的价值都在"积压到一定
     程度该去处理了"，而不在"某一条具体失败了"——详情页本来就能看到每一条的 fail_reason。
 
-    去重用 (事件, 当前条数) 做 key + 6 小时冷却：条数没变就不重复打扰，变了立刻再说一次。
+    去重用 (事件, 当前这批的【id 指纹】) 做 key + 6 小时冷却：这一批没换人就不重复打扰，
+    换了立刻再说一次。**不能用条数**：3 → 2 → 3（处理掉一条、又新卡死一条）会撞回同一个 key，
+    第三次静默 —— 而那正是最需要说的一次。理由写在 _fingerprint 里。
 
     【番剧与剧场版两边都要数】早先三条统计全部只 select_from(AnimeTorrent)/Anime，
     而剧场版侧有一模一样的三种积压（MovieTorrent 的 error/stalled 走的是同一套
@@ -1806,6 +1867,29 @@ async def sweep_alerts() -> dict:
         m_stalls = _n(MovieTorrent, MovieTorrent.status == "stalled")
         m_backlog = _n(Movie, Movie.bangumi_id.is_(None), Movie.rejected.is_not(True))
 
+        def _ids(model, status: str) -> list[int]:
+            return sorted(s.exec(select(model.id).where(model.status == status)))
+        err_ids = (_ids(AnimeTorrent, "error"), _ids(MovieTorrent, "error"))
+        stall_ids = (_ids(AnimeTorrent, "stalled"), _ids(MovieTorrent, "stalled"))
+    suspects = suspect_wrong_binding()      # 只读，自己开会话（与仪表盘用的是同一个函数）
+
+    def _fingerprint(pair) -> str:
+        """去重键：这一批到底是【哪几条】，而不是【有几条】。(R21)
+
+        原来 key 是 f"{n}+{m}"（条数），配 6 小时冷却。而 `notify.cooldown_active` 按
+        (kind, key) 记账 —— 于是 3 → 2 → 3 这个序列（用户手工处理掉一条停滞种子，
+        随后又新卡死一条）在 6 小时内会撞上同一个 key『3+0』的冷却，**第三次一条都不发**。
+        而本函数的 docstring 明写"条数没变就不重复打扰，**变了立刻再说一次**"——
+        后半句在这个形状下是假的。这条巡检又是全项目唯一会主动说"有事要你处理"的地方，
+        用户此刻看到的仪表盘数字恰好还是他已经被通知过的那个 3，没有任何迹象说明里面换了人。
+
+        用 id 集合的哈希：集合真的变了就一定换 key，条数原地兜圈子也不会撞上旧键。
+        取前 12 位十六进制够用（这是个去重键，不是安全摘要）。
+        """
+        import hashlib
+        raw = ";".join(",".join(map(str, side)) for side in pair)
+        return hashlib.blake2b(raw.encode(), digest_size=6).hexdigest()
+
     def _two_sides(n_anime: int, n_movie: int, unit: str) -> str:
         """两边都有就写清各自多少，只有一边就别啰嗦。"""
         if n_anime and n_movie:
@@ -1817,11 +1901,23 @@ async def sweep_alerts() -> dict:
         # 6 小时内这次变化就静默了。
         await notify_event("failed",
                            f"{_two_sides(errs, m_errs, '条种子交付失败')}，去『失败/异常』页看看",
-                           key=f"{errs}+{m_errs}", cooldown=six_h)
+                           key=_fingerprint(err_ids), cooldown=six_h)
+    # 【绑定可疑：只报不改】(R26) 判据 `binding_looks_wrong` 全项目 4 个调用点全是
+    # "不让番【进入】追番中"的闸，没有一处对已确认的番重算 —— 于是先确认、后收到矛盾种子的
+    # 那些番永久停在错状态（真库上 anime#6 挂着 24 条别季正片仍在追番中）。
+    # 与失败/停滞同一套指纹去重：这一批没换人就不重复打扰。
+    if suspects:
+        await notify_event(
+            "backlog",
+            "有 %d 部番的 bgm 绑定看着不对（集号不可能属于所绑的那一季）：%s。"
+            "去详情页核对绑定，或删掉那批不属于本季的种子" % (
+                len(suspects), "、".join(f"#{x['id']}「{x['name']}」({x['bad']} 条)"
+                                        for x in suspects[:4])),
+            key=_fingerprint(([x["id"] for x in suspects], [])), cooldown=six_h)
     if stalls or m_stalls:
         await notify_event("stalled",
                            f"{_two_sides(stalls, m_stalls, '条种子长期无进度')}（qB 里可能没源了）",
-                           key=f"{stalls}+{m_stalls}", cooldown=six_h)
+                           key=_fingerprint(stall_ids), cooldown=six_h)
     # 待识别是状态型：积压【上穿】阈值时说一次，清空时再说一次。
     # ok 文案随实际条数生成：阈值下穿≠清零，6 部降到 4 部时说"已清空"是假话。
     total_backlog = backlog + m_backlog
@@ -1829,7 +1925,8 @@ async def sweep_alerts() -> dict:
                        f"待识别已积压 {_two_sides(backlog, m_backlog, '部')}，去『待识别』页处理",
                        "待识别已清空" if total_backlog == 0 else f"待识别降到 {total_backlog} 部")
     return {"error": errs, "stalled": stalls, "backlog": backlog,
-            "movie_error": m_errs, "movie_stalled": m_stalls, "movie_backlog": m_backlog}
+            "movie_error": m_errs, "movie_stalled": m_stalls, "movie_backlog": m_backlog,
+            "wrong_binding": len(suspects)}
 
 
 def resubscribe(anime_id: int) -> bool:
@@ -2216,21 +2313,6 @@ def _has_handled_torrents(s, anime_id: int) -> bool:
     )).first() is not None
 
 
-def _has_unmovable_files(s, anime_id: int) -> bool:
-    """该番是否有【搬不动】的已下文件：盘上有文件(HAVE)但已归档(archived_at 非空)。
-
-    归档=从 qB 移除只留文件，relocate 明确把这类行排除在外（engine.relocate 的选行带
-    archived_at.is_(None)，注释写明"已归档的不在 qB，setLocation 移不动"）。
-    所以只要存在这种行，改名/改季度就会造成【程序侧再也补救不了】的散目录：新集落新目录、
-    这批文件永久留在旧目录，UI 上没有任何按钮能把它们搬过去。此时宁可不改名。
-    """
-    return s.exec(select(AnimeTorrent).where(
-        AnimeTorrent.anime_id == anime_id,
-        AnimeTorrent.status.in_(HAVE_STATUSES),
-        AnimeTorrent.archived_at.is_not(None),
-    )).first() is not None
-
-
 async def enrich_anime(anime_id: int, freeze_empty_path: bool = False,
                        keep_binding: bool = False) -> bool:
     """富集某番剧：用它已有的名字 + 最近一条种子回退，重取 bgm 元数据并覆盖。
@@ -2415,7 +2497,7 @@ def _ep_span(eps: list) -> str:
     return f"{fmt(eps[0])}–{fmt(eps[-1])}（{len(eps)} 集）"
 
 
-async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
+async def bind_anime_bgm(anime_id: int, bgm_id: int, report: dict | None = None) -> bool:
     """把某番手动绑定到指定 bgm subject id：取元数据覆盖 + 身份合并。返回是否成功。
 
     自动匹配失败（罗马音/冷门名搜不到）时的人工兜底：用户给准确的 bgm id，直接取权威元数据。
@@ -2436,7 +2518,16 @@ async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
         # 『绑定』）成功后都会调 maybe_relocate_anime 把已下的集搬到新目录，散目录本该由它兜住——
         # 唯独【已归档】的行搬不了（不在 qB，relocate 显式排除），那种情况改名就是制造无法补救的散目录。
         # 自动路径 enrich_anime 的冻结保持原样（那是后台自作主张，更不该动目录）。
-        _apply_bgm(a, info, keep_path=_has_unmovable_files(s, anime_id))
+        # 【冻结这件事要能传出去】(R22) 有"盘上有文件但已归档"的版本时，keep_path 会把
+        # display_name / jp_name / quarter 全冻住 —— 冻结本身是对的（已归档的行不在 qB，
+        # relocate 移不动它们，改名就是制造程序侧补救不了的散目录），
+        # 但整条链没有任何一处把这件事告诉用户：页面无条件弹绿色的『已绑定并识别 ✓』，
+        # 而紧接着的 relocate 因为路径压根没变直接 return，连"有 N 个版本已归档"那句都到不了。
+        # 用户明明是来纠正认错的片名的，绑定报成功，片名却还是错的。
+        _frozen = engine.has_unmovable_files(s, AnimeTorrent, AnimeTorrent.anime_id, anime_id)
+        if report is not None:
+            report["frozen"] = _frozen
+        _apply_bgm(a, info, keep_path=_frozen)
         s.add(a)
         s.commit()
         # 身份守卫：该 bgm_id 已被别的番占用 → 合并过来，杜绝一部番裂成两条
@@ -2454,6 +2545,17 @@ async def bind_anime_bgm(anime_id: int, bgm_id: int) -> bool:
 
 
 async def reenrich_scope(seasons: int | None = None) -> int:
+    """按季度范围重新识别。**整轮持 `_enrich_lock`** —— 它是第五条跨 await 持业务库主键的线，
+    `engine.maintenance_blockers()` 靠这把锁看见它（理由写在 `_enrich_lock` 处）。
+
+    锁加在这一层而不是两个调用方（后台协程 + 页面按钮）：调用方漏拿一个，
+    闸就有一个盲区，而那正是本项目第①号形状。
+    """
+    async with _enrich_lock:
+        return await _reenrich_scope_inner(seasons)
+
+
+async def _reenrich_scope_inner(seasons: int | None = None) -> int:
     """按季度范围重新识别（bgm）：seasons=1 当季 / 2 近半年 / 4 近1年 / None 全部。返回命中数。
 
     【它做两件事，但都不改已有的绑定】
@@ -2520,6 +2622,17 @@ def reset_enrich_tries(anime_id: int) -> None:
 
 
 async def retry_unmatched() -> int:
+    """延迟重识别。**整轮持 `_enrich_lock`** —— 它是第五条跨 await 持业务库主键的线，
+    `engine.maintenance_blockers()` 靠这把锁看见它（理由写在 `_enrich_lock` 处）。
+
+    锁加在这一层而不是两个调用方（后台协程 + 页面按钮）：调用方漏拿一个，
+    闸就有一个盲区，而那正是本项目第①号形状。
+    """
+    async with _enrich_lock:
+        return await _retry_unmatched_inner()
+
+
+async def _retry_unmatched_inner() -> int:
     """后台延迟重试(指数退避)：对『待识别』(bangumi_id 空、未拒) 且未满次数上限的番，按『失败等待翻倍』重跑 bgm。
 
     每番下次到点 = max(上次尝试, 建番时) + min(BASE * 2^已试次数, MAX)；到点才试。每试记 enrich_tries += 1、
@@ -3093,7 +3206,7 @@ async def backfill_source(anime_id: int, name_filter: bool = False) -> dict:
             "sites": list(site_groups), "to_confirm": to_confirm}
 
 
-async def sync_qb_status(manual: bool = False) -> int:
+async def sync_qb_status(manual: bool = False) -> int | None:
     """从 qB 同步 TV 种子实时态（剧场版走 movies.sync_qb_status）。"""
     return await engine.sync_qb_status(AnimeTorrent, manual=manual)
 

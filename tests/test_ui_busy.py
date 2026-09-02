@@ -179,3 +179,47 @@ def test_quarter_fmt_ui_box_renders_the_raw_value():
     code = "\n".join(l.split("#", 1)[0] for l in seg.splitlines() if not l.strip().startswith("#"))
     assert re.search(r'config\.raw\(\s*"QUARTER_FMT_UI"\s*\)', code), \
         "『季度显示』框又渲染派生值了 —— 留空状态会被下一次保存钉死"
+
+
+# ---------------- (R22) 页面上的周期性定时器都要有停摆闸 ----------------
+
+def test_every_periodic_timer_skips_while_the_db_is_down():
+    """`ui.timer(≥10s, cb)` 的回调都必须先判 `db.is_data_down()`。
+
+    剧场版页的 `_refresh_live` 早有这道闸，注释还写着"番剧页的同名函数也是这个口径
+    （见 pages/anime.py 的 refresh_timer）"—— **而番剧页根本没有**。
+    同一句话只在一处兑现，第①号形状；而番剧页是默认首页。
+
+    两个后果：① MySQL 掉线/被 DROP 时首页每 30 秒撞一次库，而建连接是同步调用、
+    上界 `MYSQL_CONNECT_TIMEOUT=5` 秒 —— 事件循环每 30 秒被冻 5 秒，每开一个标签页翻一倍；
+    ② R21 之后维护期 `is_data_down()` 也为真，这些刷新会在 refresh 里抛 `DatabaseBusy`。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    offenders = []
+    for path in sorted((root / "pages").glob("*.py")):
+        src = path.read_text(encoding="utf8")
+        tree = ast.parse(src)
+        funcs = {n.name: n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "timer" and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "ui"):
+                continue
+            iv = n.args[0] if n.args else None
+            if not (isinstance(iv, ast.Constant) and isinstance(iv.value, (int, float))
+                    and iv.value >= 10):
+                continue        # 只管周期性的长间隔定时器；一次性/短间隔的另有用途
+            cb = n.args[1] if len(n.args) > 1 else None
+            name = cb.id if isinstance(cb, ast.Name) else None
+            fn = funcs.get(name)
+            if fn is None:
+                offenders.append(f"{path.name}:{n.lineno} 回调不是本模块里的具名函数，看不了")
+                continue
+            if "is_data_down" not in ast.dump(fn):
+                offenders.append(f"{path.name}:{n.lineno} {name}() 没有停摆闸")
+    assert not offenders, ("这些周期性定时器会在库停摆/维护时照撞不误：\n  "
+                           + "\n  ".join(offenders))

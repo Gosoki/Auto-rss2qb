@@ -157,8 +157,23 @@ def test_movie_rss_path_shares_the_hardened_bits():
     import inspect
 
     from sources import mikan
-    src = inspect.getsource(mikan.fetch_bangumi_torrents)
-    assert "bozo" in src, "缺 feed.bozo 告警：feed 坏掉时表现同样是 0 条，但没人知道为什么"
+    # 【两段一起看】R21 把解析整段丢进了线程（`asyncio.to_thread(_parse_bangumi_feed, ...)`），
+    # 于是"取回"和"解析"分在两个函数里。守卫只盯其中一个就会随重构变空。
+    src = (inspect.getsource(mikan.fetch_bangumi_torrents)
+           + inspect.getsource(mikan._parse_bangumi_feed))
+    # 【查 AST 的真实调用，不查源码字符串】(R21) 原来这里是 `assert "bozo" in src`，
+    # 而 bozo 判据早就抽进了 base.warn_if_not_a_feed —— 函数体里唯一含 "bozo" 三个字的
+    # 是那句中文注释『故抽成 base.warn_if_not_a_feed（"bozo 不够、要连 version 一起看"…）』。
+    # 剥掉注释与 docstring 之后源码里根本没有 bozo（实测），也就是说这条断言**当下只被一行注释满足**：
+    # 把 `warn_if_not_a_feed(feed, ...)` 整行删掉，900 条照样全绿 —— 而那正是它声称要挡的事。
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(mikan._parse_bangumi_feed)))
+    called = {n.func.id for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "warn_if_not_a_feed" in called, \
+        "缺 feed 校验：feed 坏掉时表现同样是 0 条，但没人知道为什么"
+    assert "clip_title" in called, "第三方标题没截长（理由见 parse.clip_title）"
     assert "repr(entry)" in src, "兜底里直接 entry.get(...) 的话，处理器自己会抛"
     assert mikan._HEX40_RE is __import__("sources.base", fromlist=["x"])._HEX40_RE, \
         "hash 校验正则应复用基类那一份，别各留一个拷贝"
@@ -232,3 +247,56 @@ def test_search_names_carry_the_real_title_not_just_the_season(cls, xml, raw, wa
     assert want_in_names in joined, f"搜索词里没有番名：{item.search_names}"
     assert item.search_names and all(len(n.strip()) > 2 for n in item.search_names), \
         f"搜索词退化成了季号：{item.search_names}"
+
+
+# ---------------- (R21) feed 解析不许在事件循环上跑 ----------------
+
+def test_no_feed_is_parsed_on_the_event_loop():
+    """三条 RSS 解析路径的 `feedparser.parse` 都必须在线程里跑。
+
+    feedparser 与随后的逐条 `parse_title` / `candidate_names` 全是**纯 CPU 的同步代码**。
+    实测 980KB / 4000 条的 feed：feedparser 971ms + 逐条解析 481ms = **连续阻塞 1.45 秒**；
+    Mikan 的 `/RSS/Bangumi` 返回番组的【全部历史种子】，长寿番组是 3.2MB / 4193 条，
+    而剧场版整年扫描会对桶里每一部都调它。这段时间里页面 ui.timer 不刷、
+    qB 状态同步不动、交付协程不动、`run_db_watch` 探不了库。
+
+    判据：任何**协程**函数体里都不许直接出现 `feedparser.parse(...)` ——
+    它只能出现在被 `asyncio.to_thread` 调起的同步函数里。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    offenders = []
+    for py in sorted((root / "sources").glob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.AsyncFunctionDef):
+                continue
+            for n in ast.walk(fn):
+                if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == "parse"
+                        and isinstance(n.func.value, ast.Name)
+                        and n.func.value.id == "feedparser"):
+                    offenders.append(f"{py.name}:{n.lineno} 在 async {fn.name}() 里")
+    assert not offenders, ("这些 feed 解析跑在事件循环上：\n  " + "\n  ".join(offenders))
+
+
+def test_the_feed_parsing_is_actually_dispatched_to_a_thread():
+    """反向：上一条只要求"协程里没有它"，把整段删掉也能过。
+
+    这里钉住两条路径确实把解析【交给了线程】：`asyncio.to_thread(<解析函数>, ...)`。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from sources import base, mikan
+
+    for fn, want in ((base.RssSource.fetch, "_parse_feed"),
+                     (mikan.fetch_bangumi_torrents, "_parse_bangumi_feed")):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        ok = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "to_thread" and want in ast.dump(n)
+                 for n in ast.walk(tree))
+        assert ok, f"{fn.__qualname__} 没把 {want} 丢进线程"

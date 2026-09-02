@@ -69,6 +69,15 @@ ui.input.default_props("dense outlined")
 ui.number.default_props("dense outlined")
 ui.textarea.default_props("dense outlined")
 ui.switch.default_props("dense")
+# 【折叠面板：两档，默认是紧凑那一档】(R22)
+# 全站 13 处 ui.expansion 原本 9 处写 dense、4 处不写，而两组之间没有任何成文的规则 ——
+# 那 4 处恰好是【番剧/剧场版列表的季度·年份分组头】，它们没有外框卡片，
+# 折叠头本身就是分组之间唯一的视觉分隔，需要更大的行高；
+# 其余 9 处要么在 ui.card() 里（设置页的分区），要么是页脚的次级折叠（已删除/已排除），
+# 外框已经提供了分隔。两档各有其用，但**必须是成文的两档，不能是漂移**。
+# 默认取多数那一档（dense）；主结构分组用 `.props(remove="dense")` 显式退出，
+# 调用点因此永远只做一个选择：我是不是主结构分组。
+ui.expansion.default_props("dense")
 # 按钮：no-caps 让拉丁文标签不被 Quasar 强制大写（中文看不出差别，混排时才显形）。
 # 【它是全局默认，调用点不要再写】写了也不会错，但会让角色词表里同一个角色出现两个名字
 #（"unelevated color=primary" 与 "…no-caps" 曾经各占 13 / 5 处，渲染出来一模一样）。
@@ -100,9 +109,13 @@ def _jump_targets() -> list:
     ]
 
 # 应用侧种子状态 → 中文（番剧表/剧场版/详情/新入库共用）
+# 【文案里不带装饰符号】(R21) `stalled` 原来带着一个警告 emoji —— 而这些值最终全部渲染进
+# ui.badge，全站 19 种徽标文案里只有它和另外两处带符号。严重度由颜色承担
+# （stalled 有专属的 deep-orange，见 SEVERITY_COLOR 与 _HEAD_BADGE_CSS），
+# 再叠一套符号编码只会让用户去找一个并不存在的规律。守卫见 tests/test_ui_badge_style.py。
 STATUS_CN = {"sent": "已交付", "pending": "待下", "downloading": "下载中",
              "error": "失败", "skipped": "跳过", "deleted": "已删", "excluded": "已排除",
-             "stalled": "⚠️停滞"}
+             "stalled": "停滞"}
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
@@ -185,7 +198,17 @@ def kpi_cards(cards) -> None:
             c.style("flex:1 1 0")          # 组内各卡等宽铺满，左右平衡
         with c:
             shade = "500" if hi == "green" else "400"   # 绿跟徽标同档(-500)，红及其余 -400
-            cls = "text-2xl font-bold" + (f" text-{hi}-{shade}" if hi and val else "")
+            # 【没有高亮色 / 值为 0 的要显式落一档灰，不能继承纯白】(R24)
+            # 原来这两种情况不加任何颜色类，直接继承 Quasar 的 `body--dark{color:#fff}` ——
+            # 于是一排卡里『不用动手的数字』（订阅中/已忽略/种子数/版本，以及所有 0）是纯白，
+            # 而『需要动手的数字』落在 -400/-500 档（亮度约 70%）：**最该被看见的那个对比度最低**。
+            # 同一页『番剧表』tab 的季度小结卡做法正相反（零值降到 gray-500、非零才上色），
+            # 两处必须同一次改完，否则又是同一个决定只落一半。
+            # 只有两档灰可用（见本文件的灰阶纪律，守卫 test_only_two_greys_exist 钉着）：
+            # 中性非零用 gray-400（与标签同档，靠字号+字重拉开层级），零值降到 gray-500。
+            # 于是最亮的永远是需要动手的那些彩色数字。
+            cls = "text-2xl font-bold " + (f"text-{hi}-{shade}" if hi and val
+                                           else "text-gray-500" if not val else "text-gray-400")
             ui.label(str(val)).classes(cls).style(  # 预留 5 位数宽度：数字增减时卡不抖、各卡等宽
                 "min-width:5ch;text-align:center;font-variant-numeric:tabular-nums")
             ui.label(label).classes(
@@ -434,7 +457,7 @@ def qb_live_text(t) -> str:
     #   · deleted/excluded：删除/排除只改 status、不清实时态，不拦住会显示成『已归档』或『已完成 100%』；
     #   · stalled：判停滞时同样只改 status，qb_state 仍是判定前那一刻的值（downloading/stalledDL…），
     #     而 stalled 已脱离轮询、这个值永远不会再更新——不拦住就恒显示『下载中 12%』，
-    #     『⚠️停滞』这个标记在详情页/新入库根本到不了，而停滞集恰恰是设计上要人工处理的那些。
+    #     『停滞』这个标记在详情页/新入库根本到不了，而停滞集恰恰是设计上要人工处理的那些。
     if getattr(t, "status", "") in engine.MANUAL_TERMINAL_STATUSES or \
             getattr(t, "status", "") == "stalled":
         return ""
@@ -756,6 +779,13 @@ _HEAD_BADGE_CSS = (
     # ascent+descent 超过 1em，line-height 接近 1 时字会偏低、上下留白不等。
     ".q-badge{font-size:14px!important;line-height:1.45!important;"
     "display:inline-flex!important;align-items:center!important;justify-content:center!important}"
+    # 【分页的字号也在这里定】(R21) 三处 ui.pagination 此前两种写法：两处 `size=sm`（Quasar 的
+    # xs8/sm10/md14/lg20/xl24 档，渲染成**行内** font-size:10px），一处 `dense` ——
+    # 而 QPagination 的 props 表里**根本没有 dense**（Vue 把它当 fallthrough attr 扔到根 div 上，
+    # 零效果）。于是同一个控件在同一个页面上一个 10px、一个 14px，还有一个写了等于没写。
+    # 与徽标/按钮同一条纪律：尺寸由全局一处定，调用点只选角色。
+    # 用 !important 的理由同 .btn-sm —— Quasar 的 size= 渲染成行内样式，分层规则压不住。
+    ".q-pagination .q-btn{font-size:12px!important}"
     # ---- 按钮只有两档尺度，且【只在这里定】----
     # 默认 14px（Quasar 的 md）＝面板级与主要操作；.btn-sm 12px ＝行内、密集行、元操作行。
     #
@@ -778,6 +808,22 @@ def _db_down_notice(detail: str = "") -> None:
     刻意【不】自动回退到本地 SQLite：那样界面看着正常，实则在往另一份数据集里写，
     等 MySQL 回来这些改动凭空消失（详见 db 模块 _data_down 处的注释）。
     """
+    # 【维护中不是"连不上"】(R21) 切库/迁移期间 is_data_down() 也为真（那是有意的：
+    # 后台四条循环的把门判据只此一条），但文案必须分开——把一次几秒的、用户自己点出来的
+    # 维护说成"数据库连不上，系统已停摆…恢复后 30 秒内自动接上"，是纯粹的误导。
+    if (m := db.maintenance_reason()):
+        # 【颜色必须取自 token 表】(R22 修) 第一版写的是 tint("orange") —— 而 _TOKENS 里
+        # 只有 blue/green/red/amber/grey/ink-soft，**没有 orange**：`tint()` 直接 KeyError，
+        # 而这一句在 frame() 的 `try: yield` **之前**执行，兜底够不着 ——
+        # 于是维护窗口一开，七个页面【全部构建失败】，偏偏那正是用户盯着屏幕等结果的几十秒。
+        # 图标颜色同理，别再写死 oklch（R20 刚清理过一批绕开 token 表的硬编码色）。
+        with ui.column().classes("w-full gap-2 p-3 rounded").style(tint("amber")):
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.icon("build").classes("text-xl").style(f"color:{text_token('amber')}")
+                ui.label("数据库维护中").classes("text-base font-bold")
+            ui.label(f"{m}。这期间采集/下载/同步会跳过，页面数据也读不出来——"
+                     "通常只有几秒，完成后刷新即可。").classes("text-xs text-gray-400")
+        return
     why = detail or db.data_down_reason() or "未知原因"
     with ui.column().classes("w-full gap-2 p-3 rounded").style(
             tint("red")):
@@ -813,6 +859,10 @@ async def _db_reconnect() -> None:
         return
     # 同 run_db_watch：建连接是同步的，主机被 DROP 时要挂到 connect_timeout。
     # 在处理器里直接调会连页面一起冻住，用户只会觉得"点了没反应"。
+    if (m := db.maintenance_reason()):
+        # 维护中点『立即重连』：探测返回的就是维护理由，报成"还是连不上"是误导。
+        ui.notify(f"{m} —— 维护中，请等它结束（通常只有几秒）再刷新页面", type="info")
+        return
     err = await asyncio.to_thread(db.probe_data_engine)
     if err:
         ui.notify(f"还是连不上：{err}", type="negative")
@@ -960,10 +1010,23 @@ def frame(active: str = ""):
     with ui.column().classes("w-full max-w-5xl mx-auto p-2") as body:
         try:
             yield header_right
+        except db.DatabaseBusy as e:
+            # 整库维护（切库/迁移）期间任何 get_session() 都会抛这个。这不是故障，
+            # 也不该走 mark_data_down（维护自己会在结束时把状态清干净）。
+            body.clear()
+            with body:
+                _db_down_notice(str(e))
         except (OperationalError, InterfaceError) as e:
             # 页面主体在这个 with 里跑，异常会被抛回 yield 点——正是唯一的兜底位置。
-            # 只接【连接层】异常：ProgrammingError（表不存在之类）是 schema 出了事，
-            # 那种要原样 500 冒出来让人看见，套上"数据库连不上"反而误导。
+            # 只接【连接层】异常：schema 出了事（表/列不对）要原样 500 冒出来让人看见，
+            # 套上"数据库连不上"反而误导。
+            # 【异常类不足以区分】(R21) 原来这里只按类判，注释说"ProgrammingError 才是 schema
+            # 问题"——那只在 MySQL 上成立。SQLite（本项目**默认**后端）把 `no such table`
+            # 和 `database is locked` 一起抛成 OperationalError，于是缺一张表就会被判成停摆，
+            # 而看守协程的 SELECT 1 在同一个文件上必然成功、又把它解除，来回翻转。
+            # 判据收进 db.looks_like_connection_error（那里写着完整理由与实测）。
+            if not db.looks_like_connection_error(e):
+                raise
             first = str(e).splitlines()[0]
             db.mark_data_down(f"{type(e).__name__}: {first}")   # 让全站状态立刻一致，别等看守那 30s
             # 不依赖页面主体画到哪一步：先清空，免得半截残骸叠在提示上面。

@@ -114,6 +114,8 @@ _SPEC = {
     # 于是设置页开关关着时环境里那个代理照样接管，本项开着才挡得住。
     "PROXY_SKIP_INTERNAL": (bool, True),
     "WEB_ALLOW_CIDRS": (str, ""),   # Web 访问网段白名单(CIDR,逗号分隔;空=不限)——绑 0.0.0.0 时限定可信内网,本机恒放行,即时生效
+    # Host 头白名单(逗号分隔的域名;空=只认字面 IP/localhost/内网后缀)。挡 DNS 重绑定，见 core/netguard.py
+    "WEB_ALLOW_HOSTS": (str, ""),
     "NOTIFY_URL": (str, ""),
     # 想收哪些事件（键见 services/notify.EVENTS）。【留空 = 全关】，不是全开——
     # 这与本项目别处"留空=不限"（字幕组白名单、标题关键词）恰好相反，设置页上写明了。
@@ -222,7 +224,7 @@ _DIRECT_PATTERNS = ("all://localhost", "all://127.0.0.1", "all://[::1]",
                     "all://*.local", "all://*.lan", "all://*.internal", "all://*.home.arpa")
 
 
-def _direct_mounts(url: str | None) -> dict:
+def _direct_mounts(url, force_direct=None) -> dict:
     """要绕开代理直连的挂载表。空表＝没有需要绕的。
 
     【为什么用 mounts 而不是 NO_PROXY】实测 httpx 的 mounts **同时压过环境变量代理与显式 proxy**，
@@ -231,9 +233,27 @@ def _direct_mounts(url: str | None) -> dict:
     if not _v.get("PROXY_SKIP_INTERNAL", True):
         return {}
     mounts = {p: None for p in _DIRECT_PATTERNS}
-    host = _internal_literal_host(url)
-    if host:
-        mounts[f"all://{host}"] = None     # 目标就是个字面内网 IP（qB 常见写法）
+    # 【url 可以是一串】(R21) 有的客户端一个 AsyncClient 打两个可配置的地址
+    # （services/enrich.py 的 _resolve_inner 既打 BGM_API 又打 MIKAN_BASE 做桥接）。
+    # mounts 本来就是按 host 挂的，收成可迭代之后这类客户端不必再拆成两个。
+    urls = [url] if isinstance(url, str) or url is None else list(url)
+    for u in urls:
+        host = _internal_literal_host(u)
+        if host:
+            mounts[f"all://{host}"] = None     # 目标就是个字面内网 IP（qB 常见写法）
+    # 【force_direct：不管是不是字面 IP，这个主机一律直连】(R21)
+    # 给 qB 用。`_internal_literal_host` 只认【字面 IP】，而 `_DIRECT_PATTERNS` 只静态覆盖
+    # localhost / 127.0.0.1 / [::1] / *.local / *.lan / *.internal / *.home.arpa。
+    # 把 QB_URL 写成 `http://nas:8080`、`http://qb.mydomain.com:8080`、`http://qb.fritz.box:8080`
+    # （本地 DNS / AdGuard / 路由器默认域，都很常见）时一个都不命中 ——
+    # 于是 `/api/v2/auth/login` 连同**明文的 username/password** 一起 POST 给代理。
+    # qB 是用户自己的服务器，凭据任何情况下都不该交给代理。
+    # 仍受 PROXY_SKIP_INTERNAL 管（上面已早退）：真要让 qB 走代理的人把那个开关关掉即可。
+    from urllib.parse import urlsplit
+    for u in ([force_direct] if isinstance(force_direct, str) else (force_direct or [])):
+        h = urlsplit(u if "//" in u else f"//{u}").hostname
+        if h:
+            mounts[f"all://{h}"] = None
     return mounts
 
 
@@ -263,7 +283,7 @@ def _internal_literal_host(url: str | None) -> str:
 _MAX_REDIRECTS = 3          # 见 http_client_kwargs 里那段说明（E-41）
 
 
-def http_client_kwargs(timeout: int = 30, url: str | None = None) -> dict:
+def http_client_kwargs(timeout: int = 30, url=None, force_direct=None) -> dict:
     """httpx.AsyncClient 的公共 kwargs：超时 + 跟随重定向 +（启用时）代理。各处抓取统一走它。
     代理账号/密码任一非空时走带认证的 httpx.Proxy；socks5:// 需自行装 socksio——
     缺了它是在【建 AsyncClient 那一步】就抛 ImportError（不是发请求时），而且抛的不是 httpx.HTTPError，
@@ -287,7 +307,7 @@ def http_client_kwargs(timeout: int = 30, url: str | None = None) -> dict:
     # 3 跳够用：真实的 feed/取种最多是 "http→https" + "裸域→www" 这两跳。
     kwargs = {"timeout": timeout, "follow_redirects": True, "max_redirects": _MAX_REDIRECTS,
               "event_hooks": {"request": [ssrf.guard_redirect_request]}}
-    mounts = _direct_mounts(url)
+    mounts = _direct_mounts(url, force_direct)
     if mounts:
         # 【即使没配代理也挂上】它同时挡住环境变量里的 HTTP_PROXY——
         # 那条路径不经过我们的开关，只有挂载表压得住。

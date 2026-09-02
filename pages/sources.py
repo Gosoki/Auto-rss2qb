@@ -57,7 +57,7 @@ def render_sources() -> None:
     def group_list():
         groups = anime.list_source_groups()
         if not groups:
-            ui.label("（还没有源组，下面添加）").classes("text-gray-400")
+            ui.label("（还没有源组，下面添加）").classes("text-gray-500")
         for g in groups:
             with ui.card().classes("w-full"):
                 with ui.row().classes("items-center gap-2 w-full flex-wrap"):

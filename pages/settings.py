@@ -12,7 +12,7 @@ from core import anime, engine, netguard, worker
 from urllib.parse import quote
 
 import config
-from db import backup
+from db import backup, schema as db_schema
 from services import notify
 from db.dialect import BINARY_COLLATION
 from sources.parse import format_quarter
@@ -69,6 +69,37 @@ def _valid_host(v: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _bad_proxy(v: str) -> str:
+    """代理地址不合法时返回一句人话，合法（或留空）返回空串。(R22)
+
+    【为什么必须在保存前拦】httpx 是在**建 AsyncClient 那一步**校验 proxy URL 的：
+    `PROXY_URL=127.0.0.1:7890`（最常见的手填法 —— 占位符只写了 "http://… 或 https://…"）
+    会让 `config.http_client_kwargs` 的**每一个**消费者在建 client 时抛
+    `ValueError: Unknown scheme for proxy URL` —— 取源、bgm 识别、通知、qB 全线断，
+    而日志里那一行指向的是各自的 URL，方向全错。
+    本函数所在的 `_save` 对 WEB_PORT / WEB_HOST / WEB_ALLOW_CIDRS / 下载目录 /
+    ANIME_START_DATE 都有保存前校验，唯独 PROXY_URL 是裸的 —— 第①号形状。
+    """
+    v = (v or "").strip()
+    if not v:
+        return ""
+    from urllib.parse import urlsplit
+    u = urlsplit(v)
+    if u.scheme not in ("http", "https", "socks5", "socks5h"):
+        return (f"代理地址 {v!r} 缺少协议头。要写成 http://主机:端口 "
+                "（或 https:// / socks5:// / socks5h://）")
+    if not u.hostname:
+        return f"代理地址 {v!r} 解析不出主机名"
+    if u.scheme.startswith("socks5"):
+        try:
+            import socksio  # noqa: F401
+        except ImportError:
+            return ("socks5 代理需要额外装 socksio（pip install httpx[socks]）；"
+                    "没装的话每个出站客户端在**建连接那一步**就抛 ImportError，"
+                    "而各处只接 httpx.HTTPError 的 except 都拦不住它")
+    return ""
 
 
 def _bad_cidrs(v: str) -> list:
@@ -179,7 +210,7 @@ def _backup_panel(f: dict) -> None:
         items = backup.list_backups()
         if not items:
             ui.label("还没有备份。点右边『立刻备份』或等自动备份到点。").classes(
-                "text-xs text-gray-400")
+                "text-xs text-gray-500")
             return
         ui.label(f"共 {len(items)} 份 · 目录 {backup.BACKUP_DIR}").classes("text-xs text-gray-400")
         for d in items[:10]:
@@ -349,6 +380,14 @@ def _db_panel(f: dict) -> None:
             ui.notify("MySQL 地址与库名都要填，并先点页面底部的『保存』", type="warning")
             return
         target = "MySQL" if to_mysql else "本地 SQLite"
+        # 【切之前先确认没有协程跨 await 持着旧库的主键】理由见 core.engine.maintenance_blockers：
+        # 交付协程回来后按整数主键回写，而两个库里同一个 id 是两条毫不相干的种子。
+        # 【这一次只是提前告诉用户，别让他填完确认框才被拒】真正把关的是下面
+        # db.maintenance(blocked_by=...) 那一处——它与置位之间没有 await，才是原子的。
+        if (busy := await run.io_bound(engine.maintenance_blockers)):
+            ui.notify("现在不能切库：" + "；".join(busy) + "。等它跑完（最多几分钟）再来。",
+                      type="warning")
+            return
         if not await confirm(
                 f"把业务数据库切到 {target}？",
                 "【只改连接，不搬任何数据】。切过去之后你看到的就是那个库里已有的内容——\n"
@@ -361,7 +400,12 @@ def _db_panel(f: dict) -> None:
             # → engine.connect()，全是同步调用；对着一台关机的主机点这个按钮，
             # 整个事件循环会被冻住到 connect_timeout 到点为止。
             # 与 pages/layout.py 的『立即重连』同款写法。
-            await run.io_bound(db.switch_data_engine, url)
+            # 【维护窗口】期间 get_session() 一律拒绝：后台四条循环按停摆跳过本轮，
+            # 页面上那几个写入口（补齐/新增源组/绑定 bgm）也一并被挡住。
+            # 理由与"为什么闸装在 get_session 上"写在 db/__init__.py 的 maintenance() 处。
+            with db.maintenance(f"正在把业务数据库切到 {target}",
+                                blocked_by=engine.maintenance_blockers):
+                await run.io_bound(db.switch_data_engine, url)
         except Exception as e:
             if db.mysql_errno(e) == db.MYSQL_ERR_NO_DB:
                 ui.notify(f"库 `{config.DB_MYSQL_NAME}` 不存在，已留在原库 —— 先点『创建数据库』",
@@ -411,71 +455,101 @@ def _db_panel(f: dict) -> None:
         # 【迁移本体的引擎不带查询超时】query_timeout=False：整库复制的单条 chunk 可能远超 15 秒，
         # 而那是"已清空目标、写到一半"最不能被打断的地方。
         other = db.make_mysql_engine(url, query_timeout=False)
+        # 【一个 finally 罩住整段，别在每条出口各写一次 dispose】(R21)
+        # 原来四条退出路径里有三条写了 dispose，唯独"用户在确认框点【取消】"那条直接 return ——
+        # 而那正是最常见的操作（用户就是来看两端行数的）。`_ping()` 真建过连接、
+        # `count_rows` 又对每张业务表各发一条 COUNT(*)，连接归池但仍是活的：
+        # 每取消一次就在 MySQL 服务端留下一个不会被回收的会话（pool_size=5 + max_overflow）。
+        # 逐出口写 dispose 是典型的"约束的作用域大于验证的作用域"，将来再加分支还会漏。
+        # 【为什么不拆成 _migrate_body】拆出去之后 `_migrate` 里就只剩 make_mysql_engine
+        # 而没有 io_bound，`test_the_settings_page_never_touches_mysql_on_the_event_loop`
+        # 当场判红 —— 那条守卫是对的，别为了绕过它去改守卫。
         try:
-            # 连通性预检丢进线程：建连接是同步调用，对着一台关机的主机点这个按钮会冻住事件循环。
-            def _ping():
-                with other.connect():
-                    pass
-            await run.io_bound(_ping)
-        except Exception as e:
-            other.dispose()
-            ui.notify(f"连不上 MySQL：{type(e).__name__}: {str(e)[:160]}", type="negative")
-            return
-        # 【本地那一端恒取 meta_engine，绝不能用 db.engine】。db.engine 是"当前在用的业务库"——
-        # 已经切到 MySQL 之后它就是那个 MySQL，拿它当"本地"会让源和目标指向同一个物理库：
-        # 两个不同的 Engine 对象、`is` 判等不出来，于是 overwrite 先把它清空、再从空库读出 0 行，
-        # 最后 verify 拿"删完之后"的两边行数比 0==0，弹一句绿色的『迁移完成并校验一致』——
-        # 用户的数据就这么没了。meta_engine 恒指向 DB_PATH 那个本地文件，两种后端下都对。
-        src, dst = (db.meta_engine, other) if to_mysql else (other, db.meta_engine)
-        # count_rows 也要丢线程：它对每张业务表各发一条 COUNT(*)，其中一端是 MySQL。
-        s_cnt, d_cnt = await run.io_bound(lambda: (transfer.count_rows(src), transfer.count_rows(dst)))
-        arrow = "本地 SQLite → MySQL" if to_mysql else "MySQL → 本地 SQLite"
-        # 把两端【具体是哪个库】写进确认框：只写"本地/MySQL"时，用户无从发现方向算错了
-        note = (f"{arrow}\n"
-                f"源：{db.engine_desc(src)}（{sum(s_cnt.values())} 行）\n"
-                f"目标：{db.engine_desc(dst)}（现有 {sum(d_cnt.values())} 行）\n"
-                "【只复制业务数据，配置不动】。主键(id)原样保留，跨表关联不会断。\n")
-        over = any(d_cnt.values())
-        if over:
-            note += "⚠️ 目标库【非空】，继续会先清空它的业务表再写入——那些数据将不可恢复。\n"
-        # 【目标正是当前在用的业务库】这是最危险的一种：清空+逐批写入是在【线程】里跑的，
-        # 而后台采集/同步/页面还在读同一个库，中间态（anime 全在、animetorrent 还空）是可见的，
-        # 集去重的 have_eps 会漏判，于是同一集被重下一份。下面用两把轮次锁把采集与扫描挡住，
-        # 但页面读取挡不住，所以这里必须把话说清楚。
-        live_target = transfer.same_database(dst, db.engine)
-        if live_target:
-            note += ("⚠️ 目标就是【当前正在使用】的业务库。迁移期间采集与剧场版扫描会被暂停，"
-                     "但页面上看到的数据会在清空→写入之间短暂不完整；请迁完再操作。\n")
-        note += "迁移完成后连接【仍在原库】，想改用新库请再点『切换』。"
-        if not await confirm("开始迁移数据？", note,
-                             ok_label="清空目标库并迁移" if over else "开始迁移",
-                             ok_icon="content_copy", ok_color="negative" if over else "primary"):
-            return
-        try:
-            # 【拿住两把轮次锁】迁移是"清空目标 → 逐批写入"，而后台采集正在往同一个库写：
-            # 复制出的会是撕裂快照（可产生 anime_id 指向不存在父行的孤儿种子，或静默丢行）。
-            # 两把锁正是 worker 用来串行化采集轮与剧场版扫描轮的那两把，这里借用它们把两条线挡在门外。
-            async with worker._poll_lock, worker._scan_lock:
-                res = await run.io_bound(transfer.migrate_data, src, dst, overwrite=over)
-            moved = res["moved"]
-            # 用【迁前】的源快照校验：现查源库有个自证陷阱——万一两端其实是同一个库，
-            # 清空之后现查两边都是 0，反而"校验通过"。
-            bad = await run.io_bound(
-                lambda: transfer.verify(src, dst, res["src_before"], res.get("dst_before")))
-        except Exception as e:
-            ui.notify(f"迁移失败：{type(e).__name__}: {str(e)[:200]}", type="negative")
-            return
+            try:
+                # 连通性预检丢进线程：建连接是同步调用，对着一台关机的主机点这个按钮会冻住事件循环。
+                def _ping():
+                    with other.connect():
+                        pass
+                await run.io_bound(_ping)
+            except Exception as e:
+                ui.notify(f"连不上 MySQL：{type(e).__name__}: {str(e)[:160]}", type="negative")
+                return
+            # 【本地那一端恒取 meta_engine，绝不能用 db.engine】。db.engine 是"当前在用的业务库"——
+            # 已经切到 MySQL 之后它就是那个 MySQL，拿它当"本地"会让源和目标指向同一个物理库：
+            # 两个不同的 Engine 对象、`is` 判等不出来，于是 overwrite 先把它清空、再从空库读出 0 行，
+            # 最后 verify 拿"删完之后"的两边行数比 0==0，弹一句绿色的『迁移完成并校验一致』——
+            # 用户的数据就这么没了。meta_engine 恒指向 DB_PATH 那个本地文件，两种后端下都对。
+            src, dst = (db.meta_engine, other) if to_mysql else (other, db.meta_engine)
+            # count_rows 也要丢线程：它对每张业务表各发一条 COUNT(*)，其中一端是 MySQL。
+            s_cnt, d_cnt = await run.io_bound(lambda: (transfer.count_rows(src), transfer.count_rows(dst)))
+            arrow = "本地 SQLite → MySQL" if to_mysql else "MySQL → 本地 SQLite"
+            # 把两端【具体是哪个库】写进确认框：只写"本地/MySQL"时，用户无从发现方向算错了
+            note = (f"{arrow}\n"
+                    f"源：{db.engine_desc(src)}（{sum(s_cnt.values())} 行）\n"
+                    f"目标：{db.engine_desc(dst)}（现有 {sum(d_cnt.values())} 行）\n"
+                    "【只复制业务数据，配置不动】。主键(id)原样保留，跨表关联不会断。\n")
+            over = any(d_cnt.values())
+            if over:
+                note += "⚠️ 目标库【非空】，继续会先清空它的业务表再写入——那些数据将不可恢复。\n"
+            # 【目标正是当前在用的业务库】这是最危险的一种：清空+逐批写入是在【线程】里跑的，
+            # 而后台采集/同步/页面还在读同一个库，中间态（anime 全在、animetorrent 还空）是可见的，
+            # 集去重的 have_eps 会漏判，于是同一集被重下一份。下面用两把轮次锁把采集与扫描挡住，
+            # 但页面读取挡不住，所以这里必须把话说清楚。
+            live_target = transfer.same_database(dst, db.engine)
+            if live_target:
+                note += ("⚠️ 目标就是【当前正在使用】的业务库。迁移期间采集与剧场版扫描会被暂停，"
+                         "但页面上看到的数据会在清空→写入之间短暂不完整；请迁完再操作。\n")
+            note += "迁移完成后连接【仍在原库】，想改用新库请再点『切换』。"
+            # 同上：提前提示而已，真正把关在 db.maintenance(blocked_by=...)。
+            if (busy := await run.io_bound(engine.maintenance_blockers)):
+                ui.notify("现在不能迁移：" + "；".join(busy) + "。等它跑完再来。", type="warning")
+                return
+            if not await confirm("开始迁移数据？", note,
+                                 ok_label="清空目标库并迁移" if over else "开始迁移",
+                                 ok_icon="content_copy", ok_color="negative" if over else "primary"):
+                return
+            try:
+                # 【拿住两把轮次锁】迁移是"清空目标 → 逐批写入"，而后台采集正在往同一个库写：
+                # 复制出的会是撕裂快照（可产生 anime_id 指向不存在父行的孤儿种子，或静默丢行）。
+                # 两把锁正是 worker 用来串行化采集轮与剧场版扫描轮的那两把，这里借用它们把两条线挡在门外。
+                # 【不再自己拿两把轮次锁】(R22) 它们现在是 `maintenance_blockers()` 的判据之一 ——
+                # 自己拿了反而会被自己判成"采集轮正在跑"，维护永远开不起来。
+                # 语义也从"等它跑完"变成"正忙就拒绝、让用户过一会儿再点"：一轮采集可能跑几分钟，
+                # 按钮转几分钟的圈比一句"现在不能迁移：采集轮正在跑"更糟。
+                # db.maintenance() 挡住其余全部业务读写（页面上的补齐/新增源组/绑定 bgm
+                # 以前完全不受约束，实测能撞出 `IntegrityError: UNIQUE constraint failed`，
+                # 而目标库停在"清空 + 写了一半"）。理由见 db/__init__.py 的 maintenance()。
+                with db.maintenance("正在迁移数据", blocked_by=engine.maintenance_blockers):
+                    # 【先把源库升到 head】(R22) R21 之后 `init_db()` 只升 meta，data 链交给
+                    # `apply_configured_backend()` —— 于是 `DB_BACKEND=mysql` 时**没有任何路径**
+                    # 再升本地那份 SQLite，它冻结在用户最后一次以 SQLite 为业务库时的版本。
+                    # 而『本地 → MySQL』恒取 `db.meta_engine` 当源，`migrate_data` 是按 head 的列去读它的：
+                    # 实测报 `源库的表 anime 读不出来…no such column: anime.finished_at`
+                    # （目标库未被改动，失败是安全的），提示说"用本程序打开它跑一次升级后再迁" ——
+                    # 可对 MySQL 用户来说那条路已经没有了。所以在这里、在用户明确要读它的这一刻升一次。
+                    # （不放回启动期：那正是 R21 摘掉它的理由 —— 链里两条【改数据】的 revision
+                    #   会在每次启动时动那份灾备副本。这里是用户显式要迁移它，动它是本意。）
+                    await run.io_bound(db_schema.upgrade, src, "data")
+                    res = await run.io_bound(transfer.migrate_data, src, dst, overwrite=over)
+                moved = res["moved"]
+                # 用【迁前】的源快照校验：现查源库有个自证陷阱——万一两端其实是同一个库，
+                # 清空之后现查两边都是 0，反而"校验通过"。
+                bad = await run.io_bound(
+                    lambda: transfer.verify(src, dst, res["src_before"], res.get("dst_before")))
+            except Exception as e:
+                ui.notify(f"迁移失败：{type(e).__name__}: {str(e)[:200]}", type="negative")
+                return
+            detail = "、".join(f"{k} {v}" for k, v in moved.items() if v)
+            if bad:
+                # 文案不能只说"行数对不上"：E-17 补的那一条报的是"目标库比迁移前少了行"，
+                # 那不是对不上，是【方向可能点反了】——用户要看的是这句，不是行数表。
+                ui.notify("迁移完成，但有要你看一眼的地方：\n" + "\n".join(bad), type="warning")
+            else:
+                ui.notify(f"迁移完成并校验一致：{detail or '（源库为空）'}。"
+                          "连接仍在原库，要用新库请点『切换』。", type="positive")
+            _status.refresh()
         finally:
             other.dispose()
-        detail = "、".join(f"{k} {v}" for k, v in moved.items() if v)
-        if bad:
-            # 文案不能只说"行数对不上"：E-17 补的那一条报的是"目标库比迁移前少了行"，
-            # 那不是对不上，是【方向可能点反了】——用户要看的是这句，不是行数表。
-            ui.notify("迁移完成，但有要你看一眼的地方：\n" + "\n".join(bad), type="warning")
-        else:
-            ui.notify(f"迁移完成并校验一致：{detail or '（源库为空）'}。"
-                      "连接仍在原库，要用新库请点『切换』。", type="positive")
-        _status.refresh()
 
     # 这两个按钮属于【上面那组连接参数】——它们只验证/准备连接，不改变当前用哪个库，
     # 所以放在字段正下方，别混进下面的『切换』分区惹人误会。
@@ -576,7 +650,7 @@ def settings():
         # ========== 折叠 ① 通用（默认展开）==========
         with ui.card().classes("w-full"), ui.expansion(
                 "通用（站点 / qB / 保存 / 网络 / Web / 高级）", icon="tune", value=True).classes(
-                "w-full").props("dense"):
+                "w-full"):
             _section("站点", "显示在顶栏左上角与浏览器标签页标题。保存后刷新页面即变。")
             with ui.element("div").classes("field-grid w-full"):
                 _text("SITE_NAME", "站点名", config.SITE_NAME, "空=autorss")
@@ -754,7 +828,11 @@ def settings():
             f["NOTIFY_EVENTS"] = ui.select(
                 {k: f"{icon} {cn}" for k, (cn, icon) in notify.EVENTS.items()},
                 value=list(config.NOTIFY_EVENTS or []), multiple=True,
-                label="推送这些事件").props("use-chips").classes("w-full")
+                # 【不用 use-chips】(R21) 它把选中项渲染成 `<q-chip>` —— 全站第二种标签控件，
+                # 而项目里没有任何 `.q-chip` 规则，它吃的是 Quasar 原样式（16px 圆角、14px、
+                # 深底白字），与徽标那套 4px 直角 + oklch 色底完全是两种东西。
+                # 多选默认的逗号串够用，也不会多出一种标签形状。
+                label="推送这些事件").classes("w-full")
             with ui.element("div").classes("field-grid w-full"):
                 _num("NOTIFY_MAX_PER_HOUR", "每小时最多几条（0=不限）", config.NOTIFY_MAX_PER_HOUR)
                 _num("NOTIFY_BACKLOG_MIN", "待识别积压到几部才提醒", config.NOTIFY_BACKLOG_MIN)
@@ -805,6 +883,13 @@ def settings():
                 _text("WEB_HOST", "绑定地址", _env_host)
                 _num("WEB_PORT", "Web 端口", _env_port)
                 _text("WEB_ALLOW_CIDRS", "允许网段(CIDR)", config.WEB_ALLOW_CIDRS)
+                _text("WEB_ALLOW_HOSTS", "允许的访问域名", config.WEB_ALLOW_HOSTS)
+            ui.label("『允许的访问域名』：按 IP / localhost / .local·.lan·.internal·.home.arpa "
+                     "访问永远放行，不必填。只有走自有域名或反向代理时才需要把那个域名填进来 —— "
+                     "这道校验挡的是 DNS 重绑定（把域名先解析到攻击者的服务器、再改答成本机地址，"
+                     "浏览器就把那个网页当成与本面板同源，从而在无鉴权的前提下完全接管它；"
+                     "网段白名单挡不住，因为对端确实是你自己）。填错了也锁不死：按 IP 进来改回即可。"
+                     ).classes("text-xs text-gray-400")
             if _bad_env_host:
                 warn_banner(f".env 里的 WEB_HOST 是 {_env_raw_host!r}，本页只接受 IP 或 localhost，"
                             f"已用当前实际绑定值 {config.WEB_HOST} 填入。"
@@ -827,7 +912,7 @@ def settings():
 
         # ========== 折叠 ② 番剧 ==========
         with ui.card().classes("w-full"), ui.expansion(
-                "番剧", icon="movie", value=True).classes("w-full").props("dense"):
+                "番剧", icon="movie", value=True).classes("w-full"):
             _section("采集",
                      "Bangumi 识别恒开：规范名/季度/日文名统一取自 bgm。源组（feed/策略/优先级/字幕组）在『订阅源』tab 配置。")
             _switch_field("ANIME_POLL_ENABLED", "启用后台采集（关=暂停抓取；首次配置好前可先关着）",
@@ -914,7 +999,7 @@ def settings():
 
         # ========== 折叠 ③ 剧场版 ==========
         with ui.card().classes("w-full"), ui.expansion(
-                "剧场版", icon="theaters", value=True).classes("w-full").props("dense"):
+                "剧场版", icon="theaters", value=True).classes("w-full"):
             _section("列表显示",
                      "默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
                      "自动扫描开关/间隔在『剧场版页 → 订阅源』里。")
@@ -927,12 +1012,12 @@ def settings():
 
         # ========== 折叠 ④ 数据库 ==========
         with ui.card().classes("w-full"), ui.expansion(
-                "数据库", icon="storage", value=False).classes("w-full").props("dense"):
+                "数据库", icon="storage", value=False).classes("w-full"):
             _db_panel(f)
 
         # ========== 折叠 ⑤ 备份 ==========
         with ui.card().classes("w-full"), ui.expansion(
-                "备份", icon="backup", value=False).classes("w-full").props("dense"):
+                "备份", icon="backup", value=False).classes("w-full"):
             _backup_panel(f)
 
         async def _save():
@@ -976,6 +1061,9 @@ def settings():
             if host and not _valid_host(host):
                 ui.notify(f"绑定地址 {host!r} 不是合法 IP（如 127.0.0.1 / 0.0.0.0），已取消保存",
                           type="negative")
+                return
+            if (why := _bad_proxy(updates.get("PROXY_URL", ""))):
+                ui.notify(why + "，已取消保存", type="negative")
                 return
             bad = _bad_cidrs(updates.get("WEB_ALLOW_CIDRS", ""))
             if bad:

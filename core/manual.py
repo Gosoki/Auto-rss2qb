@@ -10,7 +10,7 @@ import re
 
 import config
 from core import engine
-from services import enrich
+from services import enrich, fetch
 from sources.parse import season_from_name
 
 log = logging.getLogger("autorss")
@@ -125,8 +125,16 @@ async def add_manual(torrent_input: str, torrent_bytes, save_path: str) -> dict:
         else:
             return {"ok": False, "error": "请填 magnet: / http(s) .torrent 链接，或上传 .torrent 文件"}
     except Exception as e:
-        log.warning("手动下载失败: %s", e)
-        return {"ok": False, "error": str(e)}
+        # 【必须脱敏】(R21) 这一支的输入是【用户自己在输入框里打的 .torrent 直链】，
+        # 而私有站的直链恰恰把 passkey 放在 query 里。httpx 的 HTTPStatusError 的 str()
+        # 原样带着完整 URL，于是一次 403 就把 passkey 写进三个地方：
+        #   ① data/autorss.log（滚动 5 份，/logs 页有『下载完整日志』按钮）
+        #   ② logsetup 的 RingHandler（/logs 页的实时视图）
+        #   ③ 返回值 → pages/manual.py 的红字 toast
+        # 仓库里早有解药（services.fetch.redact），此前只用在 6 处里的 2 处。
+        msg = fetch.redact(e)[:300]
+        log.warning("手动下载失败: %s", msg)
+        return {"ok": False, "error": msg}
     if ok:
         log.info("手动下载已交 qB: %s → %s", (ih or inp or "上传文件")[:16], save_path)
     # add_torrent/add_url 是三态：None=连不上 qB（暂时性，重试就好），False=qB 明确拒了这一条

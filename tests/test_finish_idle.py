@@ -696,3 +696,67 @@ async def test_cooldown_does_not_block_the_mark_forever(clean_tables, make, cfg,
     assert await A.sweep_finished() == 1, "被冷却挡下之后完结标记再也落不下来了"
     assert _a(clean_tables, aid).finished_at is not None
     assert len(sent) == 1, f"冷却失效、重复推送了：{sent}"
+
+
+# ---------------- (R26) 一次性回填的标记必须按【业务库】分账 ----------------
+
+def test_the_backfill_latch_does_not_leak_across_databases(clean_tables, tmp_path):
+    """切库之后，"这件一次性的事做过没有"必须重新问一遍。
+
+    这类标记（`_FINISH_BACKFILL_DONE` / `_idle_backfilled` / `_QB_PROGRESS_BACKFILLED`）
+    判的对象是**业务库**（注释原文："本库【从来】没判过完结"），
+    可它们存在 **meta 库**里 —— 而按双引擎设计 meta 恒留本地、**不随业务库走**。
+    两个方向都错：
+
+      · 【标记跟过来了】业务库 A 跑过一轮 → 切到业务库 B（设置页明说"切过去就是那个库里
+        已有的内容"）→ B 从没回填过，标记却已是"做过了"，于是 B 里所有
+        "最后一条种子早于 ANIME_IDLE_DAYS×4"的番**首轮就发断更告警** ——
+        而那批静默是切库**之前**的历史，不是刚发生的，正是这个标记存在的唯一理由。
+      · 【标记没跟过来】业务库在 MySQL、本地 meta 被恢复成一份旧备份（backup 文档化的
+        恢复流程只换本地文件）→ 标记消失 → 对着一个跑了半年的库重新"首次回填"一遍。
+    """
+    import db as _db
+    from core import anime as A
+
+    assert not A._backfilled(A._IDLE_BACKFILL_KEY), "前提：这个库还没回填过"
+    A._mark_backfilled(A._IDLE_BACKFILL_KEY)
+    assert A._backfilled(A._IDLE_BACKFILL_KEY), "标记没落下"
+
+    before = _db.engine
+    try:
+        _db.switch_data_engine(f"sqlite:///{tmp_path/'other.db'}")
+        assert not A._backfilled(A._IDLE_BACKFILL_KEY), (
+            "切到另一个业务库之后标记还在 —— 那个库从没回填过，"
+            "首轮会把它全部历史静默当成『刚发生的断更』推给用户")
+        A._mark_backfilled(A._IDLE_BACKFILL_KEY)
+    finally:
+        _db.switch_data_engine(None if before is _db.meta_engine
+                               else str(before.url.render_as_string(hide_password=False)))
+    assert A._backfilled(A._IDLE_BACKFILL_KEY), "切回原来的库，之前的标记应该还在"
+
+
+def test_the_identity_matches_the_same_database_predicate(tmp_path):
+    """身份串的判据必须与 `transfer.same_database` 同口径 —— 否则两处会对"是不是同一个库"给出相反答案。
+
+    SQLite 比 realpath（相对路径、软链、`./` 前缀都指向同一个文件），
+    其余按 (方言, 主机, 端口, 库名) 比。
+    """
+    import os
+
+    import sqlalchemy as sa
+
+    import db as _db
+    from db import transfer
+
+    f = tmp_path / "x.db"
+    f.write_bytes(b"")
+    a = sa.create_engine(f"sqlite:///{f}")
+    b = sa.create_engine(f"sqlite:///{os.path.join(str(tmp_path), '.', 'x.db')}")
+    c = sa.create_engine(f"sqlite:///{tmp_path/'y.db'}")
+
+    assert transfer.same_database(a, b) is True, "前提：两条路径确实指向同一个文件"
+    assert _db.data_identity(a) == _db.data_identity(b), \
+        "same_database 说是同一个库，身份串却不同 —— 切库回来会白回填一次"
+    assert transfer.same_database(a, c) is False
+    assert _db.data_identity(a) != _db.data_identity(c), \
+        "两个不同的库拿到了同一个身份串 —— 标记会串库"

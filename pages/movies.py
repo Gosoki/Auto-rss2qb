@@ -56,13 +56,19 @@ def _group_by_year_quarter(items):
 
 def _season_toggle_btn(key: str, name: str, selected: set) -> None:
     """季度点选按钮：在 selected 集里=填充蓝，不在=描边灰；点击切换。比多选下拉直观，不用展开。"""
-    b = ui.button(name)
+    # 【尺寸档跟同行走】这一行里的其它控件都是 12px（btn-sm），这四个按钮此前是默认的 14px。
+    b = ui.button(name).classes("btn-sm")
 
     def _restyle():
         if key in selected:
             b.props(remove="outline").props("unelevated color=primary")
         else:
-            b.props(remove="unelevated").props("outline color=blue-grey")
+            # 【未选中用 grey 而不是 blue-grey】(R21) Quasar 把 color=blue-grey 渲染成
+            # `.text-blue-grey`，而 quasar.important.prod.css 里那条是 `color:#607d8b!important`
+            # —— 全站唯一一个**没被 layout 的 token 表接管**的按钮颜色：在卡片底 #1d1d1d 上
+            # 对比度只有 3.86:1（低于 4.5:1 的可读下限），而站里其余中性按钮走的
+            # `.q-btn.text-grey`（已重映射成 gray-400）是 6.48:1。
+            b.props(remove="unelevated").props("outline color=grey")
 
     def _toggle():
         selected.discard(key) if key in selected else selected.add(key)
@@ -195,7 +201,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     "flat dense color=grey").classes("btn-sm")
         ui.label(f"版本 / 种子（{len(ts)}）").classes("text-sm font-bold mt-2")
         if not ts:
-            ui.label("（还没有种子）").classes("text-gray-400")
+            ui.label("（还没有种子）").classes("text-gray-500")
             return
         for t in ts:
             with ui.column().classes("w-full gap-1 py-1").style(
@@ -405,10 +411,13 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         if not await require_bind_confirm(movie_id, bid, kind="movie"):
             return
         old_path = mov.movie_save_path(movie_id)
-        ok = await mov.bind_movie_bgm(movie_id, bid)
+        _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
+        ok = await mov.bind_movie_bgm(movie_id, bid, report=_rep)
         _after()
-        ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
-                  type="positive" if ok else "negative")
+        _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
+                else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen") else "已绑定并识别 ✓"))
+        ui.notify(_msg, type=("negative" if not ok
+                              else "warning" if _rep.get("frozen") else "positive"))
         if ok:
             await _maybe_relocate_movie(movie_id, old_path, _after)
 
@@ -516,10 +525,13 @@ def movies_page(t: str = ""):
                 if not await require_bind_confirm(movie_id, bid, kind="movie"):
                     return
                 old_path = mov.movie_save_path(movie_id)
-                ok = await mov.bind_movie_bgm(movie_id, bid)
+                _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
+                ok = await mov.bind_movie_bgm(movie_id, bid, report=_rep)
                 refresh_all()
-                ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
-                          type="positive" if ok else "negative")
+                _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
+                        else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen") else "已绑定并识别 ✓"))
+                ui.notify(_msg, type=("negative" if not ok
+                                      else "warning" if _rep.get("frozen") else "positive"))
                 if ok:
                     await _maybe_relocate_movie(movie_id, old_path, refresh_all)
             return h
@@ -744,14 +756,20 @@ def movies_page(t: str = ""):
                                     ui.label(lbl).classes("text-xs text-gray-400 mt-1")
                         ui.separator()
                         with ui.row().classes("gap-4 text-xs text-gray-400"):
-                            ui.label(f"已下 {b['done']}")
-                            ui.label(f"待下 {b['pending']}")
+                            # 【剧场版这一侧叫『可下载』，不叫『待下』】GLOSSARY 第一节把这两个词
+                            # 列为**有意区分**：番剧的 pending 是"后台到点会自动下、不用管"，
+                            # 剧场版的 pending 是"等着你去点"—— 同一个 status，对用户的含义相反。
+                            # 剧场版全线没有任何自动下载路径，写「待下」等于告诉用户这几百条不用管。
+                            # 同页另外 5 处同一状态全是「可下载」（KPI / 状态 chip / 详情页徽标），
+                            # `_mov_live_status` 还专门为此写了一个改写函数。这个词在这一页漂回来过一次了。
+                            ui.label(f"已交付 {b['done']}")
+                            ui.label(f"可下载 {b['pending']}")
                             ui.label(f"版本 {b['versions']}")
 
             items = mov.list_movies()
             if not items:
                 ui.label("还没有剧场版/OVA。去『订阅源』tab 点『立即扫描』从 Mikan 拉取。").classes(
-                    "text-gray-400 p-4")
+                    "text-gray-500 p-4")
                 return
             yrs = max(1, config.MOVIE_PAGE_YEARS)  # 防 0（每页 0 年会除零）
             shown, total_pages, page = paginate(_group_by_year_quarter(items), list_page["n"], yrs)
@@ -760,7 +778,7 @@ def movies_page(t: str = ""):
                 expand_collapse_bar(list_page, list_panel.refresh)
                 if total_pages > 1:
                     ui.pagination(1, total_pages, direction_links=True, value=page,
-                                  on_change=_list_goto).props("size=sm")
+                                  on_change=_list_goto)
                     ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
             exp = list_page["expand"]  # None=默认仅最新年展开(年内季度全铺开)；True/False=一键全展开/收起(跨页一致)
             tmap = mov.torrents_by_movie(
@@ -769,8 +787,9 @@ def movies_page(t: str = ""):
                 year_open = exp if exp is not None else i == 0   # 一级(年份)可折叠，默认仅最新年展开
                 year_total = sum(len(grp) for _, grp in quarters)
                 _yt = "未知年份" if year == "未知" else f"{year} 年"   # year 已是四位年（见 _group_by_year_quarter）
+                # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
                 year_exp = ui.expansion(f"{_yt}   ·   {year_total} 部",
-                                        value=year_open).classes("w-full")
+                                        value=year_open).classes("w-full").props(remove="dense")
                 # 懒加载在『年』这级：年展开才建内容。二级『季度』不折叠——小标题 + 卡直接全铺开。
                 _fl = {"built": False}
 
@@ -795,7 +814,7 @@ def movies_page(t: str = ""):
             items = mov.list_unmatched_movies()
             if not items:
                 ui.label("没有待识别的剧场版。（bgm 没自动匹配上的会出现在这里，可绑定或忽略）").classes(
-                    "text-gray-400 p-4")
+                    "text-gray-500 p-4")
                 return
             ui.label("这些剧场版没自动匹配到 bgm：缺规范名/日语文件夹名/季度。可『重试识别』或粘贴 bgm 链接『绑定』。").classes(
                 "text-xs text-gray-400 p-2")
@@ -825,7 +844,7 @@ def movies_page(t: str = ""):
             excls = mov.excluded_torrent_rows()    # 已排除种子（本页最底折叠②）
             if not rej and not dels and not excls:
                 ui.label("没有已忽略的剧场版。（列表里点『忽略』会进这里，可随时恢复）").classes(
-                    "text-gray-400 p-4")
+                    "text-gray-500 p-4")
                 return
             _smap = mov.source_map()   # 批量取来源，避免逐片查的 N+1
             for m in rej:
@@ -844,7 +863,7 @@ def movies_page(t: str = ""):
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（与番剧侧对称）
             if dels:
                 with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline").classes(
-                        "w-full mt-2").props("dense"):
+                        "w-full mt-2"):
                     ui.label("你手动删掉文件的剧场版版本（终态，不会自动重下）。需要就点『重新下载』找回。").classes(
                         "text-xs text-gray-500 p-1")
                     for d in dels:
@@ -864,7 +883,7 @@ def movies_page(t: str = ""):
             # 已排除的种子：独立折叠，可『恢复』放回可下（与番剧侧对称）
             if excls:
                 with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block").classes(
-                        "w-full mt-2").props("dense"):
+                        "w-full mt-2"):
                     ui.label("你从可下里主动排除的剧场版版本（不显示为可下、RSS 再遇到也不重收）。点『恢复』放回。").classes(
                         "text-xs text-gray-500 p-1")
                     for x in excls:
@@ -954,7 +973,12 @@ def movies_page(t: str = ""):
                 return
             overview_panel.refresh()
             inflight_panel.refresh()
-            ui.notify(f"已同步 {n} 个版本的进度" if n else "没有正在下载的版本", type="positive")
+            if n is None:
+                ui.notify("没能问到 qB（连不上或超时），本次一行都没改。"
+                          "检查设置页的 qB 地址与账号密码，或看日志页。", type="negative")
+            else:
+                ui.notify(f"已同步 {n} 个版本的进度" if n else "没有正在下载的版本",
+                          type="positive")
 
         # ---- 标签 ----
         with ui.tabs().classes("w-full") as tabs:

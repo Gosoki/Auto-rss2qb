@@ -74,15 +74,19 @@ def _importable_defs(node, out, rel, in_class=False):
         （它不是模块属性，但同样是一份"第二实现"，改判据时一样会被漏掉）
     所以这里递归进 If / Try / With 的各个分支体，并把类体单独标出来。
     """
+    # 【记到行号，不只记文件名】(R21) 原来 append 的是文件相对路径，于是
+    # **同一个文件里的两份同名定义会塌成同一个字符串** —— `len(set(...)) == 1` 恒成立。
+    # 而 core/anime.py 有 3000+ 行，在文件底部追加一份新版 dedup_key 恰恰是
+    # "改判据只改了一处"最现实的藏法，偏偏是这条守卫唯一没挡住的一种。
     for n in getattr(node, "body", []):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            out[n.name].append(f"{rel}::类内" if in_class else rel)
+            out[n.name].append(f"{rel}:{n.lineno}::类内" if in_class else f"{rel}:{n.lineno}")
         elif isinstance(n, ast.ClassDef):
             _importable_defs(n, out, rel, in_class=True)
         elif isinstance(n, ast.Assign) and isinstance(n.value, ast.Lambda):
             for t in n.targets:
                 if isinstance(t, ast.Name):
-                    out[t.id].append(f"{rel}::lambda")
+                    out[t.id].append(f"{rel}:{n.lineno}::lambda")
         elif isinstance(n, (ast.If, ast.Try, ast.With, ast.AsyncWith)):
             # 【按分支的语句列表递归，不要按单条语句】第一版对每个 sub 调 _importable_defs(sub)，
             # 而 FunctionDef 自身也有 .body —— 于是它被当成容器往下钻进函数体，
@@ -108,9 +112,12 @@ def test_every_cross_file_duplicate_is_registered():
     # 那是文档化的多态设计（base 里 raise NotImplementedError，两个源各给一份），不是重复实现。
     # 但它们仍会被下面 test_key_helpers_have_exactly_one_definition 看见 ——
     # "藏在类里"恰恰是给公共判据偷加第二份实现的方式。
+    # plain：去掉类内定义；files：按【文件】归并（行号只服务于"同文件两份"那条判据）
     plain = lambda v: {x for x in v if "::类内" not in x}      # noqa: E731
+    files = lambda v: {x.rsplit(":", 1)[0] if "::" not in x else x.split("::")[0].rsplit(":", 1)[0]
+                       for x in plain(v)}                      # noqa: E731
     defs = _module_level_defs()
-    dupes = {k: sorted(plain(v)) for k, v in defs.items() if len(plain(v)) > 1}
+    dupes = {k: sorted(files(v)) for k, v in defs.items() if len(files(v)) > 1}
     unregistered = {k: v for k, v in dupes.items() if k not in _INTENTIONAL}
     assert not unregistered, (
         "这些函数在多个文件里各有一份模块级定义，却没登记为『有意重名』。\n"
@@ -121,7 +128,8 @@ def test_every_cross_file_duplicate_is_registered():
 def test_registry_has_no_stale_entries():
     """反向：白名单里不该留着已经合并掉的条目，否则它会悄悄放行一次真正的重复。"""
     plain = lambda v: {x for x in v if "::类内" not in x}      # noqa: E731
-    dupes = {k for k, v in _module_level_defs().items() if len(plain(v)) > 1}
+    files = lambda v: {x.rsplit(":", 1)[0] for x in plain(v)}  # noqa: E731
+    dupes = {k for k, v in _module_level_defs().items() if len(files(v)) > 1}
     stale = sorted(set(_INTENTIONAL) - dupes)
     assert not stale, f"这些已经不再重名了，请从 _INTENTIONAL 里删掉：{stale}"
 
@@ -135,5 +143,6 @@ def test_key_helpers_have_exactly_one_definition(name):
     与上面两条的分工：那两条管的是『重名要登记』，这条管的是『这几个名字连登记都不许』。
     """
     where = _module_level_defs().get(name, [])
-    # 这里连"藏在类里/写成 lambda/藏在条件分支里"的第二份也算 —— 它们同样是改判据时会被漏掉的拷贝
+    # 这里连"藏在类里/写成 lambda/藏在条件分支里/**同一个文件里的第二份**"也算 ——
+    # 它们同样是改判据时会被漏掉的拷贝。收集侧带上了行号，所以同文件两份不会再塌成一条。
     assert len(set(where)) == 1, f"{name} 有 {len(set(where))} 份定义：{sorted(set(where))}"

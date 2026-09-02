@@ -27,6 +27,7 @@ def alerts(clean_tables, monkeypatch, cfg):
     N._state_now.clear()
     N._sent_times.clear()
     N._state_times.clear()
+    N._state_suppressed.clear()
     N._fail_streak, N._muted_until = 0, 0.0
     cfg(NOTIFY_URL="http://push.example/key", NOTIFY_MAX_PER_HOUR=0,
         NOTIFY_EVENTS=list(N.EVENTS), NOTIFY_BACKLOG_MIN=1)
@@ -120,3 +121,50 @@ async def test_quiet_when_nothing_is_wrong(alerts, clean_tables):
     """一切正常时一条都不该发（首次观测到"好"的状态型只记不发）。"""
     await A.sweep_alerts()
     assert alerts == [], alerts
+
+
+# ---------------- (R21) 去重键要认【是哪几条】，不是【有几条】 ----------------
+
+async def test_a_new_stall_is_reported_even_when_the_count_bounces_back(alerts, clean_tables):
+    """3 → 2 → 3：用户处理掉一条停滞、随后又新卡死一条 —— 第三次必须照样报。
+
+    去重键原来是 `f"{stalls}+{m_stalls}"`（条数）+ 6 小时冷却，而 `notify.cooldown_active`
+    按 (kind, key) 记账：条数兜回 6 小时内出现过的旧值时，新告警被静默吞掉。
+    而这条巡检是全项目唯一会主动说"有事要你处理"的地方，
+    用户此刻看到的仪表盘数字恰好还是他已经被通知过的那个 3 ——
+    没有任何迹象说明里面换了一条新的。函数 docstring 明写"变了立刻再说一次"，
+    在这个形状下是假话。
+    """
+    from sqlmodel import select
+
+    with clean_tables.get_session() as s:
+        for _ in range(3):
+            _anime_torrent(s, "stalled")
+    await A.sweep_alerts()
+    assert len(alerts) == 1, "第一次没报"
+
+    # 用户处理掉一条（改成人工终态）
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent).where(AnimeTorrent.status == "stalled")).first()
+        row.status = "deleted"
+        s.add(row)
+        s.commit()
+    await A.sweep_alerts()
+    assert len(alerts) == 2, "降到 2 条时没报"
+
+    # 又新卡死一条 → 条数回到 3，但【是另一条】
+    with clean_tables.get_session() as s:
+        _anime_torrent(s, "stalled")
+    await A.sweep_alerts()
+    assert len(alerts) == 3, "条数兜回 3 时新告警被旧 key 的冷却吞掉了"
+
+
+async def test_an_unchanged_batch_still_does_not_repeat(alerts, clean_tables):
+    """反向：同一批一条没变时仍然不许重复打扰 —— 冷却本身不能因为换了键就失效。"""
+    with clean_tables.get_session() as s:
+        for _ in range(3):
+            _anime_torrent(s, "stalled")
+    await A.sweep_alerts()
+    await A.sweep_alerts()
+    await A.sweep_alerts()
+    assert len(alerts) == 1, f"同一批被重复推送了 {len(alerts)} 次"

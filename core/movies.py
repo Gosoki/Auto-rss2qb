@@ -22,7 +22,7 @@ import config
 from core import engine
 from db import get_session
 from db.models import AnimeTorrent, Movie, MovieTorrent
-from services import enrich
+from services import enrich, fetch
 from services.notify import event as notify_event
 from sources import mikan
 from sources.parse import format_quarter, quarter_sort_key
@@ -196,9 +196,16 @@ def _store_movie_torrents(movie_id: int, items: list) -> int:
             log.info("剧场版 %s 在抓种期间已被合并/删除，本轮的 %d 个版本不入库（下轮扫描会重新归位）",
                      movie_id, len(items))
             return 0
+        # 【一次 IN 预取，不要逐条查】(R21) 原来这里对每个版本各发一条
+        # `SELECT <整行> WHERE info_hash = ?`。站上的版本绝大多数上轮已入库，于是每次重扫
+        # 都要把已知的 hash 各查一遍：真库 70 部 / 569 个版本 = 639 条 SQL、657ms 的同步阻塞，
+        # 而这跑在事件循环上（页面、下载放行、qB 同步一起卡）。番剧侧的 poll_once 早就是
+        # 批量预取了，这一半漏了 —— 第①号形状。
+        known = engine.existing_hashes(MovieTorrent, [i.info_hash for i in items])
         for item in items:
-            if s.exec(select(MovieTorrent).where(MovieTorrent.info_hash == item.info_hash)).first():
+            if item.info_hash in known:
                 continue
+            known.add(item.info_hash)   # 同一批里出现两次同 hash 时也只入一条
             s.add(MovieTorrent(
                 info_hash=item.info_hash, movie_id=movie_id, source=item.source,
                 site=item.site, raw_title=item.raw_title, download_url=item.download_url,
@@ -290,8 +297,13 @@ async def refresh_movie_torrents(movie_id: int) -> dict:
         # （没有 mikan_id）是老老实实按契约返回的，这条却直接抛——而 NiceGUI 的
         # on_click 里逃出去的异常只进服务端日志，用户看到的是"按钮点了没反应"。
         # 代理配错时抛的是 ImportError / ValueError，都不属 httpx 异常族。
-        log.warning("刷新剧场版版本失败 movie=%s mikan=%s: %s", movie_id, mid, e)
-        return {"ok": False, "msg": f"Mikan 取不到：{type(e).__name__}: {e}", "added": 0, "seen": 0}
+        # 脱敏：这个 msg 会被页面原样弹成红字，而 MIKAN_BASE 是设置页可改的地址
+        # （自建镜像可能带凭据），httpx 异常的 str() 带完整 URL。日志那半有过滤器兜着，
+        # 返回值这半没有 —— 这一处是 R22 的按出口守卫替我找出来的第 5 个出口。
+        emsg = fetch.redact(e)
+        log.warning("刷新剧场版版本失败 movie=%s mikan=%s: %s", movie_id, mid, emsg)
+        return {"ok": False, "msg": f"Mikan 取不到：{type(e).__name__}: {emsg}",
+                "added": 0, "seen": 0}
     # _store_movie_torrents 自带"入库前重取、悬空就放弃"的守卫（我们刚 await 过网络）
     added = _store_movie_torrents(movie_id, items)
     log.info("刷新剧场版版本 movie=%s mikan=%s：站上 %d 个，新增 %d", movie_id, mid, len(items), added)
@@ -617,18 +629,68 @@ async def enrich_movie(movie_id: int) -> bool:
         # UI 上弹的却是绿色的『识别成功 ✓』。
         # 判据用 compare-and-set 而不是"有值就不覆盖"：『重新识别』本来就是"我要你重算"，
         # 它读到的 bgm_before 与回来时相同、照常覆写；只有【第三方在这段窗口里改过】才让路。
+        dup_names = ""
         if m.bangumi_id != bgm_before:
             log.info("重新识别期间该片的 bgm 绑定已被改动（%s → %s），本次结果作废、以后者为准：%s",
                      bgm_before, m.bangumi_id, m.display_name or m.title)
             return m.bangumi_id is not None
-        # 手动重识别：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
-        engine.apply_bgm_meta(m, info, keep_path=False)
-        s.add(m)
-        s.commit()
-        if m.bangumi_id is not None:
-            for other in list(s.exec(select(Movie).where(
-                    Movie.bangumi_id == m.bangumi_id, Movie.id != m.id))):
-                _merge_movie(s, other.id, m.id)
+        # 【撞车时干脆不写 bangumi_id】(R22)
+        # R21 只是把这里的"合并删行"去掉了，可**删除动作在 `_upsert_movie` 里原样保留着**，
+        # 而那一处的立论是 R20 写的「keeper 是按 bgm_id 查出来的、两行本来就声称同一个 subject」——
+        # 一旦这里把一个**未经证明**的 bgm_id 写进去，那个立论就变成循环论证：
+        # 下一轮剧场版扫描（自动到点，或用户点一次『扫描』）处理另一部片时调 `_upsert_movie`，
+        # 它按这个 bgm_id 查出 keeper、`s.delete` 掉正确的那一行 —— 删除只是被**推迟**了一轮，
+        # 而且这一次是全自动发生的，连日志都归在扫描那一侧。
+        # 所以撞车时连绑定本身都不写：只记日志 + 推 backlog，等用户走带回显的『绑定 bgm』落定。
+        # 那条路有 `bind_preview` + `require_bind_confirm`，"这两行是同一部"由用户明确说出来。
+        new_bgm = (info or {}).get("bangumi_id")
+        clash = list(s.exec(select(Movie).where(
+            Movie.bangumi_id == new_bgm, Movie.id != m.id))) if new_bgm else []
+        if clash:
+            names = "、".join(f"#{o.id}「{o.display_name or o.title}」" for o in clash)
+            log.warning("识别把 #%s「%s」认成了 bgm %s，而 %s 已经占着它 —— "
+                        "**本次不写绑定**（写进去会让下一轮扫描的 _upsert_movie 按它删掉正主那一行）。"
+                        "要合并请到 /movies 走带回显的『绑定 bgm』",
+                        m.id, m.display_name or m.title, new_bgm, names)
+            dup_bgm, dup_me, dup_names = new_bgm, (m.display_name or m.title), names
+        else:
+            # 手动重识别：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
+            engine.apply_bgm_meta(m, info, keep_path=False)
+            s.add(m)
+            s.commit()
+        # 【识别路径一律不合并、不删行】(R21，与 core.anime.enrich_anime 同一条规矩)
+        # 原来这里是 `Movie.bangumi_id 相同 → _merge_movie`，而 _merge_movie 的最后一步是
+        # `s.delete(loser)`，没有撤销入口。合并的前提是"用户明确说这两条是同一部"——
+        # 而本函数的入口（详情页/『待识别』的『重新识别』、后台重识别）没有一个满足它：
+        # 人点下去之前【根本不知道会绑到哪个 subject】，没法预先回显。
+        # 上面那段注释自己就写着这条路的风险：剧场版的续作/重制/总集编彼此极像，
+        # 而"上架日当首映日"的日期校验对它们系统性地判错。
+        #
+        # 【番剧侧 R20 就收口了，这一半漏到 R21 才补】——同一件事有两处、只改了一处，
+        # 本项目第①号形状。R20 当时还特意回退过 `_upsert_movie` 那一处的同款改动，
+        # 理由是"那里的 keeper 是按 bgm_id 查出来的、合并是构造上正确的"——
+        # 那个判断对 `_upsert_movie` 成立，但**这里不是那条路**：这里的 bgm_id 来自一次
+        # 全新的 `enrich.resolve`，两行"是同一部"从没被证明过。
+        #
+        # 留下的两条同 bgm_id 记录靠日志 + backlog 通知报出来，
+        # 用户到 /movies 走『绑定 bgm』那条带回显（bind_preview + require_bind_confirm）的路合并。
+        if not clash and m.bangumi_id is not None:
+            # 兜底：撞车判定与写入之间没有 await，正常到不了这里；
+            # 留着是因为"两条同 bgm_id"还可能由别的路径造出来（历史数据、并发的绑定）。
+            dup = list(s.exec(select(Movie).where(
+                Movie.bangumi_id == m.bangumi_id, Movie.id != m.id)))
+            if dup:
+                dup_names = "、".join(f"#{o.id}「{o.display_name or o.title}」" for o in dup)
+                log.warning("识别把 %s 绑到了 bgm %s，而 %s 已经占着这个 bgm —— "
+                            "本路径不合并、不删行（合并只在『绑定 bgm』那条带回显的路上做），"
+                            "请人工核对",
+                            f"#{m.id}「{m.display_name or m.title}」", m.bangumi_id, dup_names)
+                dup_bgm, dup_me = m.bangumi_id, (m.display_name or m.title)
+    if dup_names:
+        await notify_event(
+            "backlog", f"{dup_me} 与 {dup_names} 绑到了同一个 bgm，"
+                       "识别没有合并（合并会删记录）。到剧场版页核对一下",
+            key=f"dupmovie:{dup_bgm}", cooldown=24 * 3600)
     return bool(info)
 
 
@@ -662,7 +724,7 @@ def bind_preview(movie_id: int, bgm_id: int) -> dict:
     return out
 
 
-async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
+async def bind_movie_bgm(movie_id: int, bgm_id: int, report: dict | None = None) -> bool:
     """手动把剧场版绑定到指定 bgm subject id：取元数据覆盖 + 身份合并。"""
     info = await enrich.fetch_by_id(bgm_id)
     if not info:
@@ -671,8 +733,19 @@ async def bind_movie_bgm(movie_id: int, bgm_id: int) -> bool:
         m = s.get(Movie, movie_id)
         if m is None:
             return False
-        # 手动纠正绑定：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
-        engine.apply_bgm_meta(m, info, keep_path=False)
+        # 手动纠正绑定：允许更新年份/片名（哪怕已下过）——变了由 UI 层确认后 relocate_movie 搬已下文件。
+        # 【唯独"搬不动"的要冻结】已归档的行不在 qB、relocate 移不动它们（R21 补，
+        # 番剧侧 bind_anime_bgm 早就是这个写法，剧场版这一半一直是漏的）。
+        # 【冻结这件事要能传出去】(R22) 有"盘上有文件但已归档"的版本时，keep_path 会把
+        # display_name / jp_name / quarter 全冻住 —— 冻结本身是对的（已归档的行不在 qB，
+        # relocate 移不动它们，改名就是制造程序侧补救不了的散目录），
+        # 但整条链没有任何一处把这件事告诉用户：页面无条件弹绿色的『已绑定并识别 ✓』，
+        # 而紧接着的 relocate 因为路径压根没变直接 return，连"有 N 个版本已归档"那句都到不了。
+        # 用户明明是来纠正认错的片名的，绑定报成功，片名却还是错的。
+        _frozen = engine.has_unmovable_files(s, MovieTorrent, MovieTorrent.movie_id, movie_id)
+        if report is not None:
+            report["frozen"] = _frozen
+        engine.apply_bgm_meta(m, info, keep_path=_frozen)
         s.add(m)
         s.commit()
         for other in list(s.exec(select(Movie).where(
@@ -765,6 +838,19 @@ def reset_downloading() -> None:
 
 
 async def download_movie_torrent(mt_id: int) -> bool:
+    """交付一条种子。**整段包在 try/finally 里注销交付登记**（见 engine._delivering）。
+
+    包装放在这一层而不是函数体内部：函数体从进锁到最后一次回写有一百多行、
+    多条 return 与 raise，任何一条漏掉注销都会让那一行被永久当成"正在交付中" ——
+    而 R24 之前它压根没有注销这回事，一次库抖动就把切库/迁移永久拒死。
+    """
+    try:
+        return await _download_movie_torrent_inner(mt_id)
+    finally:
+        engine._delivering.discard(("MovieTorrent", int(mt_id)))
+
+
+async def _download_movie_torrent_inner(mt_id: int) -> bool:
     """强制下某一版本到 qB（详情页逐条下用）。剧场版不建 Season 子目录。成功返回 True。"""
     if not config.QB_ENABLED:
         return False
@@ -781,6 +867,11 @@ async def download_movie_torrent(mt_id: int) -> bool:
             # 进锁时下面会清零这四个 qB 实时态；恢复原状态时要连它们一起放回（同番剧侧）
             orig_qb = (t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at)
             t.status = "downloading"
+            # 【登记"本协程真的在管这一行"】(R24) 落库的 downloading 只说明"某进程某一刻开始交付"，
+            # 不说明"此刻真的有协程在管"。回写撞上库抖动时异常直接冒出去、行永久停在 downloading，
+            # 而它既不被 sync 复查、又占着 HAVE_STATUSES、还把切库/迁移永久拒死。
+            # 注销在本函数的外层包装的 finally 里（见 download_movie_torrent 那一层）。
+            engine._delivering.add(("MovieTorrent", int(mt_id)))
             # 重新下：清归档标记 + 重置 qB 实时态，作『全新在下』重新跟踪、从新完成点重算归档倒计时（否则会被立刻再归档）
             t.archived_at = None
             t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 0.0, "", None, None
@@ -833,8 +924,9 @@ async def download_movie_torrent(mt_id: int) -> bool:
         _fail(reason="关停中断")
         raise
     except Exception as e:
-        log.error("剧场版下载失败 - %s", e)
-        _fail(reason=f"下载失败：{e}")
+        # 脱敏，理由同 core/anime.py 的交付异常那一处（fail_reason 会持久化并在详情页展示）
+        log.error("剧场版下载失败 - %s", fetch.redact(e))
+        _fail(reason=f"下载失败：{fetch.redact(e)}")
         return False
     if ok is None:             # qB 连不上：留在待下，别记 error
         log.warning("qB 连不上，本条留待重发 - movie torrent %s", mt_id)
@@ -894,7 +986,7 @@ async def delete_movie_torrent(mt_id: int) -> bool:
     return True
 
 
-async def sync_qb_status(manual: bool = False) -> int:
+async def sync_qb_status(manual: bool = False) -> int | None:
     """从 qB 同步剧场版种子实时态。"""
     return await engine.sync_qb_status(MovieTorrent, manual=manual)
 

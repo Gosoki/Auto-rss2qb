@@ -22,6 +22,7 @@ def _fresh():
     N._state_now.clear()
     N._sent_times.clear()
     N._state_times.clear()
+    N._state_suppressed.clear()
     N._dropped = 0
     N._fail_streak, N._muted_until = 0, 0.0
 
@@ -620,3 +621,119 @@ def test_the_test_button_uses_the_narrow_reset():
     assert "reset_state" not in code, "测试按钮又清掉了冷却窗口"
     assert "url_override=" in code, "测试按钮又去改全局 NOTIFY_URL 了"
     assert '_v["NOTIFY_URL"]' not in code
+
+
+# ---------------- (R21) 三层抑制里，每一层被挡下都要留痕迹 ----------------
+
+async def test_the_state_bucket_leaves_a_trace_when_it_suppresses(cfg, monkeypatch, caplog):
+    """状态型小桶挡下一场翻转时必须留一行日志 —— 而且【每场只留一行】。
+
+    三层抑制里另外两层各自都留账：`_rate_ok` 挡下时 `_dropped += 1`（条数会挂在下一条消息
+    尾巴上），熔断期挡下时 `_dropped += 1` + 一行 warning。**只有这一层什么都不留**，
+    于是桶满之后一整场 qb_down/db_down 的翻转颗粒无收 ——
+    而这两个恰恰是全项目仅有的带外故障信号。
+
+    【为什么不按次记 `_dropped`】抑制是按边沿【每轮重判】的，按次记会把同一次故障报成
+    "另有 40 条没能送到"。所以粒度是"每条被压住的边沿只记一次"。
+    """
+    # 【必须自己清一次】本文件的模块级状态由 `sent` 夹具里的 _fresh() 负责，
+    # 而这两条用例没用那个夹具 —— 不清的话上一条留下的 _state_times / _state_suppressed
+    # 会渗进来（实测：单跑绿、整文件跑红，最难查的那种）。
+    _fresh()
+    import logging
+
+    sent = []
+
+    async def ok(msg, base):
+        sent.append(msg)
+        return True
+    monkeypatch.setattr(N, "_send_once", ok)
+    cfg(NOTIFY_URL="http://push.example/k", NOTIFY_EVENTS=["qb_down"], NOTIFY_MAX_PER_HOUR=0)
+
+    with caplog.at_level(logging.WARNING, logger="autorss"):
+        for _ in range(6):                       # 6 组 down/up 把 12 枚令牌打满（都是真送达）
+            await N.state("qb_down", True, "坏", "好")
+            await N.state("qb_down", False, "坏", "好")
+        assert len(N._state_times["qb_down"]) == N._STATE_CAP_PER_HOUR, "前提：桶已经满了"
+        before = len(sent)
+        for _ in range(20):                      # 之后这一整场都被挡下
+            await N.state("qb_down", True, "坏", "好")
+            await N.state("qb_down", False, "坏", "好")
+
+    assert len(sent) == before, "桶满之后不该再送出去"
+    muted_logs = [r for r in caplog.records if "抖动限流" in r.getMessage()]
+    assert len(muted_logs) == 1, (
+        f"被挡下的这一场留了 {len(muted_logs)} 行日志 —— 应该恰好 1 行"
+        "（0 行=无声无息，多行=同一次故障刷屏）")
+    assert "qb_down" in muted_logs[0].getMessage()
+
+
+async def test_the_trace_comes_back_after_the_bucket_frees_up(cfg, monkeypatch, caplog):
+    """反向：桶松开、下一场再被挡住时，要重新记一行 —— 不能只记这辈子第一次。"""
+    # 【必须自己清一次】本文件的模块级状态由 `sent` 夹具里的 _fresh() 负责，
+    # 而这两条用例没用那个夹具 —— 不清的话上一条留下的 _state_times / _state_suppressed
+    # 会渗进来（实测：单跑绿、整文件跑红，最难查的那种）。
+    _fresh()
+    import logging
+    import time as _t
+
+    async def ok(msg, base):
+        return True
+    monkeypatch.setattr(N, "_send_once", ok)
+    cfg(NOTIFY_URL="http://push.example/k", NOTIFY_EVENTS=["qb_down"], NOTIFY_MAX_PER_HOUR=0)
+
+    with caplog.at_level(logging.WARNING, logger="autorss"):
+        for _ in range(6):
+            await N.state("qb_down", True, "坏", "好")
+            await N.state("qb_down", False, "坏", "好")
+        await N.state("qb_down", True, "坏", "好")            # 第一场：记一行
+        # 桶按滚动一小时过期 —— 把时间戳整体前移，模拟一小时后
+        N._state_times["qb_down"] = [t - 3601 for t in N._state_times["qb_down"]]
+        await N.state("qb_down", False, "坏", "好")            # 松开了，这条发得出去
+        for _ in range(6):                                     # 再打满一次
+            await N.state("qb_down", True, "坏", "好")
+            await N.state("qb_down", False, "坏", "好")
+        await N.state("qb_down", True, "坏", "好")            # 第二场：要再记一行
+
+    muted = [r for r in caplog.records if "抖动限流" in r.getMessage()]
+    assert len(muted) == 2, f"第二场没再记（拿到 {len(muted)} 行）—— 说明标记没被松开时清掉"
+
+
+# ---------------- (R24) 配置污染不能跨用例传播 ----------------
+
+def test_writing_config_does_not_leak_into_the_next_test(testdb):
+    """`config.set_many` 写完之后，收尾夹具必须把内存与 meta 库都还原。
+
+    ⚠️ 这条挡的不是"配置不对"，是它让**一整类用例变成空的**：
+    `set_many` 先写 meta 库的 setting 行、再 `_v.update(...)`，而 `_v` 是模块级、
+    整个 pytest session 只有一份。本文件上面两条用例（它们确实需要真写库 ——
+    测的就是"存进去再读回来"这条路）曾把 `NOTIFY_EVENTS` 从 9 个事件改成 `['delivered']`
+    并**保持到 session 结束**：此后任何不带 `cfg` 夹具的用例里
+    `notify_enabled('finished'/'idle'/'stalled'/…)` 恒为 False，
+    于是"断言没发通知"恒成立、`sweep_finished` 里
+    `may_mark = ok or not notify_enabled(...)` 也恒走那一支 ——
+    而那正是 R20 修过的 E-32 冷却回归的判据。
+
+    还原由 `tests/conftest.py::_restore_config_after_each_test`（autouse）负责，
+    这条用例只是把"它确实在工作"钉住。
+    """
+    import config as _C
+
+    before = list(_C.NOTIFY_EVENTS)
+    assert len(before) >= 5, f"前提坏了：进这条用例时 NOTIFY_EVENTS 已经被污染成 {before}"
+    _C.set_many({"NOTIFY_EVENTS": "delivered"})
+    assert _C.NOTIFY_EVENTS == ["delivered"], "写进去都没生效，用例的前提坏了"
+    # 收尾夹具会还原 —— 下一条用例看到的应当仍是 before。
+    # 这里不能自己还原，否则测的就是自己的 finally 而不是夹具（第③号形状）。
+
+
+def test_the_previous_test_did_not_leave_anything_behind():
+    """紧跟在上一条后面：看它写下的东西有没有被夹具收干净。
+
+    两条必须相邻且按顺序跑 —— 这正是"用例间污染"唯一能被观测到的方式。
+    """
+    import config as _C
+
+    assert _C.NOTIFY_EVENTS != ["delivered"], \
+        "上一条用例写的 NOTIFY_EVENTS 漏到了这一条 —— 收尾夹具没生效"
+    assert len(_C.NOTIFY_EVENTS) >= 5, f"NOTIFY_EVENTS 被污染成 {_C.NOTIFY_EVENTS}"

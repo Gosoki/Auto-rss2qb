@@ -39,8 +39,11 @@ def testdb():
     只给"必须有库才能测"的用例用（如 sync 状态机）；纯函数用例不要依赖它。
     """
     import db
+    # 【与生产同一条启动序列】main.py 是 init_db() → load_from_db() → apply_configured_backend()，
+    # 而业务表的迁移由最后那一步负责（R21 起）。少调一步，用例跑的就是另一套建库路径。
     db.init_db()
     config.load_from_db()
+    db.apply_configured_backend()
     return db
 
 
@@ -87,6 +90,67 @@ def _assert_throwaway(engine, what: str) -> None:
             f"测试夹具只允许操作系统临时目录下的一次性库（本次会话是 {_TMP_DB}）。\n"
             f"如果你是在写探针脚本：不要把 db.engine 指向开发库再用 clean_tables —— "
             f"它会 DELETE 掉全部六张业务表。")
+
+
+@pytest.fixture(autouse=True)
+def _restore_config_after_each_test():
+    """每条用例跑完把 `config._v` 与 meta 库的 `setting` 表还原。(R24)
+
+    【为什么必须是 autouse 的通用夹具，不是逐条用例自己 finally】
+    `config.set_many()` 会**先写 meta 库的 setting 行、再 `_v.update(...)`**，
+    而 `_v` 是模块级、整个 pytest session 只有一份，`clean_tables` 只清 4 个内部标记键。
+    实测：`tests/test_notify_events.py` 有两条用例直接调它且没有还原，
+    于是 `config.NOTIFY_EVENTS` 从默认的 9 个事件变成 `['delivered']` 并**保持到 session 结束** ——
+    此后任何不带 `cfg` 夹具的用例里 `notify_enabled('finished'/'idle'/'stalled'/…)` 恒为 False。
+
+    危险的不是"配置不对"，是它让一整类用例**变成空的**：
+    "断言没发通知"恒成立、`sweep_finished` 里 `may_mark = ok or not notify_enabled(...)`
+    也恒走那一支 —— 而那正是 R20 修过的那条 E-32 冷却回归的判据。
+    这两条用例又确实需要真写库（它们测的就是"存进去再读回来"这条路），所以不能改成 monkeypatch。
+
+    还原顺序要紧：先还内存再还库。反过来的话，中间那一刻 `_v` 还是脏的，
+    而 `load_from_db` 之类的收尾逻辑会把脏值再写回去。
+    """
+    import config as _C
+
+    snap_v = dict(_C._v)
+    snap_rows = None
+    try:
+        import db as _db
+        from db.models import Setting
+        with _db.get_meta_session() as s:
+            snap_rows = {r.key: r.value for r in s.exec(__import__("sqlmodel").select(Setting))}
+    except Exception:
+        pass                        # 还没建库的纯函数用例：没什么可还原的
+    yield
+    _C._v.clear()
+    _C._v.update(snap_v)
+    if snap_rows is None:
+        return
+    try:
+        import db as _db
+        from sqlmodel import select as _sel
+        from db.models import Setting
+        with _db.get_meta_session() as s:
+            now = {r.key: r for r in s.exec(_sel(Setting))}
+            changed = False
+            for k, v in snap_rows.items():
+                row = now.get(k)
+                if row is None:
+                    s.add(Setting(key=k, value=v))
+                    changed = True
+                elif row.value != v:
+                    row.value = v
+                    s.add(row)
+                    changed = True
+            for k, row in now.items():           # 用例新加的键：删掉
+                if k not in snap_rows:
+                    s.delete(row)
+                    changed = True
+            if changed:
+                s.commit()
+    except Exception:
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -141,9 +205,13 @@ def clean_tables(testdb):
             s.exec(delete(m))
         s.commit()
     with testdb.get_meta_session() as s:
-        for k in _INTERNAL_MARKERS:
-            row = s.get(Setting, k)
-            if row is not None:
+        # 【按前缀删，不能按精确键名】(R26) 这些标记的键现在带业务库身份后缀
+        # （`_idle_backfilled@sqlite:/path/to.db`，理由见 db.data_identity）——
+        # 按精确名删等于一个都删不掉，而删不掉的后果是隐蔽的：
+        # 前一个用例做过的回填会让后一个用例走上另一条分支。
+        from sqlmodel import select as _sel
+        for row in s.exec(_sel(Setting)):
+            if any(row.key == k or row.key.startswith(k + "@") for k in _INTERNAL_MARKERS):
                 s.delete(row)
         s.commit()
     return testdb

@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+import asyncio
+
 import feedparser
 import httpx
 
@@ -142,6 +144,16 @@ class RssSource(Source):
             # 走带上限+总超时的取回：feed 地址是用户填的、内容来自第三方，
             # 裸 client.get + resp.content 既能被涓流响应永久挂住，也能被超大 body 撑爆内存
             content = await _fetch.get_bytes(client, self.rss_url)
+        # 【解析整段丢线程】(R21) feedparser.parse 与随后的逐条 parse_title/candidate_names
+        # 全是**纯 CPU 的同步代码**，跑在事件循环上。实测 980KB / 4000 条的 feed：
+        # feedparser 971ms + 逐条解析 481ms = **连续阻塞 1.45 秒**（真实的 Mikan 长寿番组
+        # feed 有 3.2MB / 4193 条，量级还要大一截）。这段时间里页面的 ui.timer 不刷、
+        # qB 状态同步不动、交付协程不动、run_db_watch 探不了库。
+        # 丢线程是安全的：这一段只调纯函数与 config 的模块级读，不碰 DB/session。
+        return await asyncio.to_thread(self._parse_feed, content)
+
+    def _parse_feed(self, content: bytes) -> list[ParsedItem]:
+        """把 feed 字节解析成 ParsedItem 列表。**纯 CPU、不碰 DB**，故可整段丢线程。"""
         feed = feedparser.parse(content)
         # 【两个源都要告警】以前只有 nyaa 这一半有，mikan 那半静悄悄——
         # feed 结构坏掉时（站点改版、返回错误页）表现同样是"0 条"，但没人知道为什么。

@@ -390,3 +390,41 @@ def test_no_function_references_an_undefined_global():
     assert not offenders, (
         "这些函数引用了模块级不存在的名字，调用时会 NameError：\n  " + "\n  ".join(offenders)
         + "\n多半是把某个赋值搬进了嵌套函数。")
+
+
+def test_the_migrate_handler_disposes_its_engine_on_every_exit():
+    """(R21) 『迁移数据』建的那条 MySQL 引擎，**每一条**退出路径都必须释放。
+
+    原来四条出口里三条各写了一次 `other.dispose()`，唯独"用户在确认框点【取消】"那条
+    直接 return —— 而那正是最常见的操作（用户就是来看两端行数的）。
+    `_ping()` 真建过连接、`count_rows` 又对每张业务表各发一条 COUNT(*)，
+    连接归池但仍是活的：每取消一次就在 MySQL 服务端留下一个不会被回收的会话。
+
+    逐出口写 dispose 是"约束的作用域大于验证的作用域"的教科书例子 ——
+    所以这里钉的不是"有几处 dispose"，而是【结构】：引擎建出来之后必须紧跟一个
+    try/finally，且 finally 里就是它的 dispose。这样再加多少条 return 分支都跑不掉。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath(
+        "pages/settings.py").read_text(encoding="utf8")
+    tree = ast.parse(src)
+    fns = [n for n in ast.walk(tree)
+           if isinstance(n, ast.AsyncFunctionDef) and n.name == "_migrate"]
+    assert fns, "没找到 _migrate，用例的前提坏了"
+    fn = fns[0]
+
+    # 找到 `other = db.make_mysql_engine(...)` 之后紧跟的那个 Try，检查它的 finalbody
+    stmts = fn.body
+    made_at = next((k for k, n in enumerate(stmts)
+                    if isinstance(n, ast.Assign) and "make_mysql_engine" in ast.dump(n)), None)
+    assert made_at is not None, "_migrate 里没有 make_mysql_engine —— 用例的前提坏了"
+    nxt = stmts[made_at + 1] if made_at + 1 < len(stmts) else None
+    assert isinstance(nxt, ast.Try) and nxt.finalbody, \
+        "建完引擎之后没有紧跟 try/finally —— 某条 return 分支会漏掉 dispose"
+    assert "dispose" in ast.dump(ast.Module(body=nxt.finalbody, type_ignores=[])), \
+        "finally 里没有释放引擎"
+    # 反向：主体里确实有多条 return（否则这条结构断言毫无意义）
+    returns = [n for n in ast.walk(nxt) if isinstance(n, ast.Return)]
+    assert len(returns) >= 3, f"主体里只有 {len(returns)} 条 return，用例的前提变了"

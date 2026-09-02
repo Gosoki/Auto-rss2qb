@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 from nicegui import ui
 
+import db
 from db.models import AnimeTorrent
 from core import anime, engine
 import config
@@ -98,6 +99,21 @@ def anime_page(t: str = ""):
                     f"『{_d['b_name']}』(#{_d['b']}，bgm {_d['b_bgm']}) 共用番名 "
                     f"「{'、'.join(_d['shared'])}」，多半是同一部番被拆成了两条{_tail}。"
                     "去详情页核对 bgm 绑定：把错的那条改绑成对的 bgm，身份守卫会自动把它们合并。")
+
+            # 【绑定可疑：与"番被拆成两条"同一个位置、同一种处理】(R26)
+            # `binding_looks_wrong` 全项目 4 个调用点全是"不让番【进入】追番中"的闸，
+            # 没有一处对已确认的番重算 —— 先确认、后收到矛盾种子的番会永久停在错状态，
+            # 而它仍显示"追番中"、集去重照常生效。只报不改（自动改会停掉整部番的自动下载）。
+            for _w in anime.suspect_wrong_binding():
+                _eps = "、".join(str(e) for e in _w["eps"])
+                _tot = f"共 {_w['total']} 集" if _w["total"] else "集数未知"
+                warn_banner(
+                    f"『{_w['name']}』(#{_w['id']}，bgm {_w['bgm']}，第 {_w['season']} 季·{_tot})"
+                    f" 下面有 {_w['bad']} 条种子的集号不可能属于所绑的这一季"
+                    + (f"（如第 {_eps} 集）" if _eps else "")
+                    + "——多半是 bgm 绑错了季。去详情页核对绑定；"
+                    "或者那批种子本就属于别的季，删掉它们即可。"
+                    "在这之前，它们会一直占着集去重、挡住真正的本季集。")
 
             # ── 订阅源组 ──
             ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
@@ -309,11 +325,12 @@ def anime_page(t: str = ""):
         def confirm_panel():
             pend = anime.pending_confirm()
             if not pend:
-                ui.label("没有待确认的番。（『待确认』策略的源组发现的番会出现在这里）").classes("text-gray-400 p-4")
+                ui.label("没有待确认的番。（『待确认』策略的源组发现的番会出现在这里）").classes("text-gray-500 p-4")
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番查的 N+1
             for i, (q, items) in enumerate(group_by_quarter(pend)):
-                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
+                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
+                                  value=(i == 0)).classes("w-full").props(remove="dense"):
                     for a in items:
                         srcs = smap.get(a.id, [])
                         with ui.card().classes("w-full"):
@@ -345,12 +362,13 @@ def anime_page(t: str = ""):
             dels = anime.deleted_torrent_rows()      # 已删除种子（本页最底折叠①）
             excls = anime.excluded_torrent_rows()    # 已排除种子（本页最底折叠②）
             if not rej and not dels and not excls:
-                ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-400 p-4")
+                ui.label("没有已忽略的番。（待确认/详情页点『忽略』会进这里，可随时恢复）").classes("text-gray-500 p-4")
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番 N+1
             dlmap = anime.downloaded_counts([a.id for a in rej])   # 同上：可删文件数也一次取齐
             for i, (q, items) in enumerate(group_by_quarter(rej)):
-                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部", value=(i == 0)).classes("w-full"):
+                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
+                                  value=(i == 0)).classes("w-full").props(remove="dense"):
                     for a in items:
                         with ui.card().classes("w-full"):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
@@ -376,7 +394,7 @@ def anime_page(t: str = ""):
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（deleted 是终态、不会自动重下）
             if dels:
                 with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline").classes(
-                        "w-full mt-2").props("dense"):
+                        "w-full mt-2"):
                     ui.label("你手动删掉文件的种子（终态，不会自动重下）。需要就点『重新下载』找回。").classes(
                         "text-xs text-gray-500 p-1")
                     for d in dels:
@@ -397,7 +415,7 @@ def anime_page(t: str = ""):
             # 已排除的种子：独立折叠，可『恢复』放回待下（excluded 是主动从待下排除的终态）
             if excls:
                 with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block").classes(
-                        "w-full mt-2").props("dense"):
+                        "w-full mt-2"):
                     ui.label("你从待下里主动排除的种子（不自动下、RSS 再遇到也不重收）。点『恢复』放回待下。").classes(
                         "text-xs text-gray-500 p-1")
                     for x in excls:
@@ -417,7 +435,7 @@ def anime_page(t: str = ""):
             items = anime.list_unmatched_anime()
             if not items:
                 ui.label("没有待识别的番。（bgm 没自动匹配上的番会出现在这里，可重试或手动绑定）").classes(
-                    "text-gray-400 p-4")
+                    "text-gray-500 p-4")
                 return
             ui.label("这些番没自动匹配到 bgm：缺规范名 / 日语文件夹名 / 季度。"
                      "可『重试识别』，或粘贴 bgm 链接/ID『绑定』，实在没有就『忽略』。").classes(
@@ -537,7 +555,14 @@ def anime_page(t: str = ""):
                                     ui.label(lbl).classes("text-xs text-gray-400 mt-1")
                         ui.separator()
                         with ui.row().classes("gap-4 text-xs text-gray-400"):
-                            ui.label(f"已下 {b['done']}")
+                            # 【这个数叫『已交付』不叫『已下』】(R24) 同一个词此前指三个不同的量：
+                            #   · 这里 = `quarter_brief()['done']` = **status=='sent' 的种子条数**；
+                            #   · 列表行的 tooltip「已下 N 集」= episode_progress 的分子
+                            #     （HAVE_STATUSES 的**不同正集号**个数，R20 你拍板的口径）；
+                            #   · 剧场版详情的「已下 N」= 该片 HAVE_STATUSES 的**版本条数**。
+                            # 而这里这个数在仪表盘 KPI 上就叫『已交付』—— 同一个数两个名字。
+                            # 「已下」留给"真到手"那两个口径。
+                            ui.label(f"已交付 {b['done']}")
                             ui.label(f"待下 {b['pending']}")
                             ui.label(f"种子 {b['torrents']}")
 
@@ -550,7 +575,7 @@ def anime_page(t: str = ""):
                 return True
             animes = [a for a in anime.list_all_anime() if _visible(a)]
             if not animes:
-                ui.label("（还没有番剧，等采集）").classes("text-gray-400 p-4")
+                ui.label("（还没有番剧，等采集）").classes("text-gray-500 p-4")
                 return
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.source_map()
@@ -562,13 +587,14 @@ def anime_page(t: str = ""):
                 expand_collapse_bar(manage_page, manage_panel.refresh)
                 if total_pages > 1:
                     ui.pagination(1, total_pages, direction_links=True, value=page,
-                                  on_change=_manage_goto).props("size=sm")
+                                  on_change=_manage_goto)
                     ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
             exp = manage_page["expand"]  # None=各季按默认(仅最新季开)；True/False=一键全展开/收起(跨页一致)
             for i, (q, items) in enumerate(groups):
                 _open = exp if exp is not None else i == 0
+                # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
                 _exp = ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                    value=_open).classes("w-full")
+                                    value=_open).classes("w-full").props(remove="dense")
                 # 懒加载：折叠的季度先不建行（省首建成本）；首次展开时才建，之后不再重建
                 _fl = {"built": False}
 
@@ -618,6 +644,13 @@ def anime_page(t: str = ""):
 
         def refresh_timer():
             # 30s 定时器：只刷『当前可见 tab』的实时区，隐藏 tab 不动（省 CPU、消除每 30s 的周期性卡顿）。
+            # 【停摆/维护时不撞库】(R22) 剧场版页的同名函数早有这道闸，注释还写着"番剧页的
+            # 同名函数也是这个口径"—— 而这一页根本没有：同一句话只在一处兑现，第①号形状。
+            # 两个后果：① MySQL 掉线时首页每 30 秒撞一次库，而建连接是同步调用、上界 5 秒，
+            #   事件循环每 30 秒被冻 5 秒，每开一个标签页翻一倍；
+            # ② R21 之后维护期 is_data_down() 也为真，这些刷新会在 refresh 里抛 DatabaseBusy。
+            if db.is_data_down():
+                return
             _refresh_live(tabs.value)
 
         def refresh_all():
@@ -662,7 +695,7 @@ def anime_page(t: str = ""):
                         # 翻页＝按新页码重建本弹窗（fetch 会重查，数据变了页码也会被 paginate 夹回合法范围）
                         ui.pagination(1, pages, value=page, direction_links=True,
                                       on_change=lambda e: _open_torrent_list(
-                                          title, desc, fetch, int(e.value))).props("dense")
+                                          title, desc, fetch, int(e.value)))
                         ui.label(f"第 {page}/{pages} 页").classes("text-xs text-gray-500")
                     ui.space()
                     ui.button("关闭", on_click=list_dlg.close).props("flat")
@@ -750,10 +783,15 @@ def anime_page(t: str = ""):
                     # → 归档目录当场就变了。不问搬迁的话，之前下好的集会被静默遗弃在旧目录，
                     # 同一部番裂成两个文件夹（详情页那条路径一直是问的，这里漏了）。
                     old_path = anime.anime_save_path(anime_id)
-                    ok = await anime.bind_anime_bgm(anime_id, bid)
+                    _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
+                    ok = await anime.bind_anime_bgm(anime_id, bid, report=_rep)
                     refresh_all()
-                    ui.notify("已绑定并识别 ✓" if ok else "绑定失败：ID 不存在或取不到 bgm 数据",
-                              type="positive" if ok else "negative")
+                    # 【冻结了就别报绿】(R22) 有已归档文件时 keep_path 会把番名/季度全冻住，
+                    # 而用户来点这个按钮多半正是为了纠正认错的名字 —— 报成功等于骗他。
+                    _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
+                            else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen") else "已绑定并识别 ✓"))
+                    ui.notify(_msg, type=("negative" if not ok
+                                          else "warning" if _rep.get("frozen") else "positive"))
                     if ok:
                         await maybe_relocate_anime(anime_id, old_path, refresh_all)
                 await busy_action(getattr(e, "sender", None), f"bind:{anime_id}", _go,
@@ -805,14 +843,21 @@ def anime_page(t: str = ""):
                 return
             _refresh_overview(charts=False)              # 刷计数区，不重建环图（保住图例排除态）
             inflight_panel.refresh()                     # 『正在下载』列表的进度条也跟着更新
-            ui.notify(f"已同步 {n} 条种子的进度" if n else "没有正在下载的种子", type="positive")
+            if n is None:
+                # 【None ≠ 0】没能问到 qB（连不上/超时）。上面那个 except 接不住它：
+                # 整条链从头到尾不抛异常（理由见 engine.sync_qb_status 的三态说明）。
+                ui.notify("没能问到 qB（连不上或超时），本次一行都没改。"
+                          "检查设置页的 qB 地址与账号密码，或看日志页。", type="negative")
+            else:
+                ui.notify(f"已同步 {n} 条种子的进度" if n else "没有正在下载的种子",
+                          type="positive")
 
         _reident_busy = {"v": False}   # 防抖：整轮 bgm 遍历可能跑几分钟，期间连点会叠出多轮并发请求
 
         def _reident(seasons):
             async def h():
                 if _reident_busy["v"]:
-                    ui.notify("正在重新识别中，请稍候…", type="info")
+                    ui.notify("正在刷新资料中，请稍候…", type="info")
                     return
                 scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
                 ui.notify(f"正在刷新元数据（{scope}）…走 bgm，可能要一会儿。"

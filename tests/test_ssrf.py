@@ -246,22 +246,45 @@ def test_the_manual_page_actually_uses_the_loose_mode(site, monkeypatch):
 
 
 @pytest.mark.parametrize("ip", ["198.18.0.1", "198.18.255.254", "198.19.0.1", "198.19.255.254"])
-def test_fake_ip_pool_is_exempt_in_proxy_mode(ip, monkeypatch):
-    """(R20 回归) 代理的 fake-ip 池不能被当成内网 —— 否则代理模式下【全部出站】都会被拒。
+def test_fake_ip_pool_is_exempt_only_when_it_came_from_dns(ip, monkeypatch):
+    """(R20 立的豁免 · R21 收紧) fake-ip 池的豁免只对【解析出来的】地址成立。
 
-    clash-meta 默认 `fake-ip-range: 198.18.0.1/16`、sing-box 默认 `198.18.0.0/15`，
-    而 ipaddress 把 198.18.0.0/15（RFC 2544 基准段）判为 is_private=True。
-    开着 fake-ip 时本机解析【每一个域名】都得到这一段里的地址 —— E-40 那条收紧
-    如果不豁免它，抓源/取种/bgm 会一律被拒，而 core/ssrf.py 自己的说明就写着
-    "开着本机 clash/v2ray 几乎是默认姿势"。
+    立豁免的理由：clash-meta 默认 `fake-ip-range: 198.18.0.1/16`、sing-box 默认
+    `198.18.0.0/15`，而 ipaddress 把 198.18.0.0/15（RFC 2544 基准段）判为 is_private=True。
+    开着 fake-ip 时本机解析【每一个域名】都得到这一段里的地址 —— 不豁免的话，
+    抓源/取种/bgm 会一律被拒，而 core/ssrf.py 自己写着"开着本机 clash/v2ray 几乎是默认姿势"。
 
-    豁免它是安全的：这一段在正常网络里不承载任何真实服务，只有本机解析器【就是】
-    fake-ip 代理时才会返回它，而那时真正的连接由代理去建。
+    **但那个理由是关于 DNS 解析结果的**：URL 里【字面写着】198.18.x.x 完全不需要
+    "本机解析器是 fake-ip 代理"这个前提。R20 的第一版把豁免放在 `_bad()` 里、
+    两条分支共用，于是被投毒的 feed 给出
+    `http://198.18.0.1:8080/api/v2/torrents/delete?hashes=all` 时守卫照样放行，
+    而 `config._internal_literal_host` 还会顺手把它挂成直连、绕开代理 ——
+    既没拦住、又替它避开了代理。
     """
     import ipaddress
+
     assert ipaddress.ip_address(ip).is_private, "前提变了：这一段不再被判为 private"
+    # ① 字面 IP：两种口径下都必须拒
     assert asyncio.run(ssrf.safe_ip_for(ip)) is None, "严格口径下仍应拒"
-    assert asyncio.run(ssrf.safe_ip_for(ip, allow_fake_ip=True)) == ip, "代理模式下被误拒了"
+    assert asyncio.run(ssrf.safe_ip_for(ip, allow_fake_ip=True)) is None, \
+        "URL 里字面写着 fake-ip 段的地址被放行了 —— 豁免的前提（来自 DNS）根本不成立"
+
+    # ② 域名解析到 fake-ip 段：代理模式下必须放行，否则开着 fake-ip 就全站出不去
+    import socket as _socket
+
+    async def fake_getaddrinfo(self, host, port, **kw):
+        return [(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+    loop = asyncio.new_event_loop()
+    try:
+        monkeypatch.setattr(type(loop), "getaddrinfo", fake_getaddrinfo, raising=False)
+        assert loop.run_until_complete(
+            ssrf.safe_ip_for("mikan.example.com", allow_fake_ip=True)) == ip, \
+            "开着 fake-ip 时域名解析结果被误拒了 —— 全部出站都会挂"
+        assert loop.run_until_complete(
+            ssrf.safe_ip_for("mikan.example.com")) is None, "无代理口径下不该豁免"
+    finally:
+        loop.close()
 
 
 @pytest.mark.parametrize("ip", ["127.0.0.1", "192.168.1.5", "10.0.0.1", "169.254.1.1", "0.0.0.0"])

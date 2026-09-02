@@ -5,12 +5,14 @@
 """
 import asyncio
 import logging
+import time
 
 from core import anime
 import config
 from core import engine, movies
 import db
-from core.anime import existing_hashes, flush_ready_downloads, list_source_groups, process_item
+from db.models import AnimeTorrent
+from core.anime import flush_ready_downloads, list_source_groups, process_item
 from services import fetch
 from services.notify import state as notify_state
 from sources import SOURCES
@@ -56,6 +58,21 @@ def build_sources() -> list:
     return srcs
 
 
+def loop_error(what: str, e: BaseException, **kw) -> None:
+    """后台循环的统一异常记账。(R21/R22)
+
+    【为什么要收成一处】维护期（切库 / 整库迁移）里 `db.get_session()` 会抛 `DatabaseBusy`，
+    而它可能落在任意一条后台循环的轮次中间 —— 那不是"异常"，是**计划内的**、
+    用户自己点出来的、秒级的暂停。逐条报成 `ERROR ...异常` 会在日志页顶出一片红，
+    掩盖同一时间段里真正的错误。
+    本项目有 13 处这样的记账点，逐处判必然漏一处（第①号形状），所以收成一个函数。
+    """
+    if isinstance(e, db.DatabaseBusy):
+        log.info("%s：%s —— 整库维护中，这一轮跳过，维护结束后自动继续", what, e)
+        return
+    log.error("%s异常: %s", what, e, **kw)
+
+
 async def poll_once() -> None:
     # 【每轮只探一次 qB】传给本轮所有 process_item，让"最高优先级即时下载"在 qB 不可达时
     # 别去白取种（详见 anime.process_item 的 qb_alive 说明）。探测本身就是 flush 前那一次，
@@ -80,14 +97,21 @@ async def poll_once() -> None:
         # 那条 hash 预取时不存在、第一次处理后才存在，不补进集合的话第二条会再走一遍
         # 识别与入库（唯一约束会挡下写入，但 bgm 请求已经白打出去了）。
         # 所以处理完就补进集合：无论它是被入库还是被过滤掉，同一轮里再见到都该是同样的结局。
-        known = existing_hashes([getattr(i, "info_hash", "") for i in items])
+        known = engine.existing_hashes(
+            AnimeTorrent, [getattr(i, "info_hash", "") for i in items])
         new = 0
         for item in items:
             try:
                 if await process_item(item, known_hashes=known, qb_alive=qb_alive):
                     new += 1
+            except db.DatabaseBusy:
+                # 【整轮早退，不要逐条记】(R22) 维护一开，后面每一条的 get_session() 都会一样失败。
+                # 逐条落成 ERROR 的量是致命的：一轮 feed 几十到几千条（真实 Mikan 番组 feed 4193 条），
+                # 而 /logs 的环形缓冲只有 200 条 —— 一次切库就把实时视图整块冲掉，
+                # 同一时间段里真正的错误全被挤出去。冒到 run_worker 的 loop_error，整轮只留一行 INFO。
+                raise
             except Exception as e:
-                log.error("处理失败 %s: %s", getattr(item, "anime_title", "?"), e)
+                loop_error(f"处理 {getattr(item, 'anime_title', '?')}", e)
             finally:
                 if getattr(item, "info_hash", ""):
                     known.add(item.info_hash)   # 同一 feed 内的重复条目不再重复识别（理由见上）
@@ -98,7 +122,7 @@ async def poll_once() -> None:
         if n:
             log.info("缓冲窗口放行下载 %d 集", n)
     except Exception as e:
-        log.error("放行下载异常: %s", e)
+        loop_error("放行下载", e)
 
 
 # 【本进程是否还欠一次"启动复位"】只有 main.py 在【启动时业务库就不可用】的那一支会置 True：
@@ -135,11 +159,31 @@ async def run_db_watch() -> None:
     """
     was_down = db.is_data_down()
     while True:
+        # 【整库维护期间整轮跳过，且【不动 was_down】】(R22)
+        # 维护（切库 / 整库迁移）会让 `is_data_down()` 为真 —— 那是有意的（后台循环的把门
+        # 判据只此一条）。但看守协程把"真/假"喂给了 `notify_state("db_down", …)`，
+        # 而那是**边沿触发**的：维护窗口只要撞上这条 30 秒节拍，用户就会收到一条
+        # 『数据库停摆，采集/下载/同步已暂停』的推送，维护结束再收一条『数据库恢复』——
+        # 为一次他自己刚点下去的、几秒钟的操作。
+        # 更糟的是随后 `was_down and not now_down` 这条恢复边沿会成立，
+        # 白跑一次 init_business_state。
+        # 跳过时【不能碰 was_down】：它记的是"维护之前库到底是好是坏"，维护结束后照那个判。
+        if db.maintenance_reason():
+            await asyncio.sleep(30)
+            continue
         try:
             # 【必须丢到线程里】建连接是同步调用：目标主机关机或被防火墙 DROP 时，
             # TCP 连接要挂到超时才返回（已用 db.MYSQL_CONNECT_TIMEOUT 压到 5 秒，但仍是 5 秒），
             # 直接 await 不了的同步调用会把整个事件循环卡死——页面、下载、qB 同步一起停。
             now_down = bool(await asyncio.to_thread(db.probe_data_engine))
+            # 【await 之后必须再查一次】(R22) 上面 while 顶端那一查在 `to_thread` **之前**，
+            # 而 `to_thread` 是真实的挂起点（MySQL 后端上还要走 SELECT 1，重连时最长 5 秒）。
+            # 用户点『切库/迁移』的处理器在事件循环里同步置 `_maintenance`，正好落进这个窗口时，
+            # 线程里的 `probe_data_engine` 命中它自己那句 `if _maintenance: return _maintenance`，
+            # now_down 变 True → 照样推一条假的『数据库停摆』。同样不动 was_down。
+            if db.maintenance_reason():
+                await asyncio.sleep(30)
+                continue
             # 【状态型通知挂在这里】看守协程是全项目唯一知道"停摆↔恢复"何时翻转的地方；
             # 挂进 db.mark_data_down 反而不对——那是同步函数，且页面撞上异常时也会调它。
             await notify_state("db_down", now_down,
@@ -163,7 +207,7 @@ async def run_db_watch() -> None:
                 init_business_state(reset_leftovers=_startup_reset_pending)
             was_down = now_down
         except Exception as e:          # 探测自己出岔子也别让看守协程死掉，否则永远发现不了恢复
-            log.error("数据库看守异常: %s", e)
+            loop_error("数据库看守", e)
         await asyncio.sleep(30)
 
 
@@ -178,7 +222,7 @@ async def run_worker() -> None:
             async with _poll_lock:       # 与手动『重新激活』互斥，别把同一批源抓两遍
                 await poll_once()
         except Exception as e:
-            log.error("本轮异常: %s", e)
+            loop_error("本轮", e)
         await asyncio.sleep(max(60, config.ANIME_POLL_INTERVAL))  # 每轮读当前值；下限 60s 兜底，防坏值(0/负)忙循环
 
 
@@ -197,7 +241,7 @@ async def run_reenrich_retry() -> None:
         try:
             await anime.retry_unmatched()
         except Exception as e:
-            log.error("延迟重识别异常: %s", e)
+            loop_error("延迟重识别", e)
 
 
 async def run_backup() -> None:
@@ -223,7 +267,7 @@ async def run_backup() -> None:
         try:
             await asyncio.to_thread(backup.auto_tick)   # VACUUM INTO 是同步 IO，别卡事件循环
         except Exception as e:
-            log.error("自动备份异常: %s", e)
+            loop_error("自动备份", e)
 
 
 async def run_sweep() -> None:
@@ -249,13 +293,20 @@ async def run_sweep() -> None:
             continue
         # 【三段各自 try】它们互不相干：sweep_finished 抛一次异常不该让断更提醒与
         # 失败/停滞/积压告警整轮不跑——而后两者恰恰是"出事了要有人知道"的那一类。
-        for name, fn in (("完结判定", anime.sweep_finished),
+        # 【交付残骸的清扫挂在这里】(R24) `status=downloading` 但本进程并没有协程在管的行
+        # 是交付途中库抖了一下留下的残骸：sync 显式跳过它、集去重认定该集已有一份、
+        # 看守协程的恢复边沿也不复位它 —— 以前只有重启进程才清得掉，
+        # 而它还会把设置页的切库/迁移永久拒死。放在巡检轮上：有界、周期性、不碰在途的那些。
+        for name, fn in (("交付残骸清扫", engine.sweep_stale_delivering),
+                         ("完结判定", anime.sweep_finished),
                          ("断更提醒", anime.sweep_idle),
                          ("积压告警", anime.sweep_alerts)):
             try:
-                await fn()
+                r = fn()
+                if asyncio.iscoroutine(r):    # 清扫是同步的（一条 SQL），其余三段是协程
+                    await r
             except Exception as e:
-                log.error("巡检·%s 异常: %s", name, e, exc_info=True)
+                loop_error(f"巡检·{name} ", e, exc_info=True)
         await asyncio.sleep(max(300, config.SWEEP_INTERVAL_MIN * 60))   # 做完再睡到下一轮
 
 
@@ -275,8 +326,12 @@ async def run_movie_scan() -> None:
                     if await movies.auto_scan_tick():
                         log.info("剧场版自动扫描完成")
         except Exception as e:
-            log.error("剧场版自动扫描异常: %s", e)
+            loop_error("剧场版自动扫描", e)
         await asyncio.sleep(300)  # 5 分钟心跳，到点才真扫
+
+
+# 完成归档的墙钟节流间隔（秒）。内层高频轮询期间也要能跑到它，见 run_qb_sync 里的说明。
+_ARCHIVE_EVERY = 600
 
 
 async def run_qb_sync() -> None:
@@ -289,16 +344,16 @@ async def run_qb_sync() -> None:
     log.info("qB 状态同步启动（事件驱动，活跃间隔 %ds，保底 %d 分钟）",
              config.QB_SYNC_INTERVAL, config.QB_SYNC_BACKSTOP_MIN)
     try:
-        if not db.is_data_down() and engine.has_inflight():
+        if not db.is_data_down() and engine.needs_qb_poll():
             engine.qb_kick.set()      # 启动即自查：接上重启前遗留的『在下的』种子
     except Exception as e:            # 停摆时直接跳过，别白查一次库再把异常记成噪声
-        log.error("qB 同步启动自查异常（忽略，靠保底兜住）: %s", e)
+        loop_error("qB 同步启动自查（忽略，靠保底兜住）", e)
     while True:
         # 三档节奏：① 高频轮询在下面内层 while（有活跃下载，每 QB_SYNC_INTERVAL 秒）；② 还有没下完的在下种子
         # 但都不活跃(慢/stalled/暂停) → 每 QB_IDLE_RECHECK_MIN 分钟自查一次，别等一个保底周期才发现完成；
         # ③ 全无在下 → 睡到保底 QB_SYNC_BACKSTOP_MIN。任一 kick 立即打断醒来。
         try:
-            has_unfinished = engine.has_inflight()
+            has_unfinished = engine.needs_qb_poll()
         except Exception:
             has_unfinished = True      # 拿不准(DB 锁等) → 用中档短超时，宁可多查一次
         wait_min = config.QB_IDLE_RECHECK_MIN if has_unfinished else config.QB_SYNC_BACKSTOP_MIN
@@ -322,20 +377,39 @@ async def run_qb_sync() -> None:
                 await notify_state("qb_down", not await engine.qb.reachable(),
                                    "qB 连不上，下载状态无法同步", "qB 恢复，继续同步")
             except Exception as e:
-                log.error("qB 可达性探测异常（忽略）: %s", e)
-        try:
-            await engine.archive_old_completed()   # 顺手做完成归档（完成超 N 天→从 qB 移除留文件、标已归档；关则空转）
-        except Exception as e:
-            log.error("完成归档异常（忽略，下轮再来）: %s", e)
+                loop_error("qB 可达性探测（忽略）", e)
+        # 【归档不能只挂在"内层循环退出"这个事件上】(R22)
+        # 它原来只在这里跑一次，而内层 while 的四个出口里有一个是 `has_active_downloading()` ——
+        # 只要每轮都有一条在真下，idle 恒被清零、内层永不退出，外层这一句一次都不做。
+        # 判据是 `qb_dlspeed >= max(1, QB_ACTIVE_FLOOR_KBPS*1024)`，而设置页写着"0=只要有速度就算"，
+        # 于是 `QB_ACTIVE_FLOOR_KBPS=0` + 一条涓流种子就能把循环永久钉住：
+        # **`QB_ARCHIVE_AFTER_DAYS` 对它的目标用户（长期挂着下载的人）恒不生效**
+        # （R22 实测：跑满 200 个内层同步轮，archive 调用 0 次）。
+        # 所以改成"墙钟节流的心跳"：外层醒来一次，内层每隔 _ARCHIVE_EVERY 秒也顺手做一次。
+        last_archive = 0.0
+
+        async def _maybe_archive(force: bool = False) -> None:
+            nonlocal last_archive
+            now = time.monotonic()
+            if not force and now - last_archive < _ARCHIVE_EVERY:
+                return
+            last_archive = now
+            try:
+                await engine.archive_old_completed()
+            except Exception as e:
+                loop_error("完成归档（忽略，下轮再来）", e)
+
+        await _maybe_archive(force=True)
         idle = 0                            # 连续几轮没在真下（局部计数，本次唤醒周期内累加、下次唤醒清零，无需入库）
         try:
             while (config.QB_ENABLED and config.QB_SYNC_STATUS
-                   and not db.is_data_down() and engine.has_inflight()):
+                   and not db.is_data_down() and engine.needs_qb_poll()):
                 try:
                     await anime.sync_qb_status()   # 每轮批量刷新所有在下的：有活种子时慢的/stalled 的也顺便一起更新
                     await movies.sync_qb_status()
                 except Exception as e:
-                    log.error("qB 状态同步异常: %s", e)
+                    loop_error("qB 状态同步", e)
+                await _maybe_archive()             # 墙钟节流，理由见上面 _maybe_archive
                 if engine.has_active_downloading():
                     idle = 0
                 else:
@@ -344,8 +418,8 @@ async def run_qb_sync() -> None:
                         break   # 连续 N 轮没一个在真下(全 stalled/排队/慢速爬行) → 退出高频轮询，回等 kick/保底、休眠
                 await asyncio.sleep(max(5, config.QB_SYNC_INTERVAL))
         except Exception as e:
-            # has_inflight()/has_active_downloading() 若因 DB 锁等抛错，别让它掀翻 while True（否则 qB 同步永久死掉）
-            log.error("qB 同步内层循环异常（回退休眠，等下次 kick/保底）: %s", e)
+            # needs_qb_poll()/has_active_downloading() 若因 DB 锁等抛错，别让它掀翻 while True（否则 qB 同步永久死掉）
+            loop_error("qB 同步内层循环（回退休眠，等下次 kick/保底）", e)
 
 
 async def scan_movies_now(year: int, letters: list) -> dict | None:
@@ -394,7 +468,7 @@ async def run_all_once() -> tuple[bool, str]:
                 if await movies.auto_scan_tick():
                     log.info("重新激活：剧场版自动扫描完成")
         except Exception as e:
-            log.error("重新激活：剧场版扫描异常: %s", e)
+            loop_error("重新激活：剧场版扫描", e)
             notes.append("剧场版扫描出错（详见日志）")
     log.info("重新激活全部任务：完成%s", ("（" + "；".join(notes) + "）") if notes else "")
     tail = ("（" + "；".join(notes) + "）") if notes else ""

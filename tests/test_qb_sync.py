@@ -142,11 +142,103 @@ async def test_first_miss_timestamp_is_not_refreshed(clean_tables, torrents, qb_
 
 
 async def test_offline_qb_changes_nothing(clean_tables, torrents, qb_returns):
-    """连不上（None）与"在线但这批都不在"（空 dict）是两回事：前者本轮不动，后者要走落定流程。"""
+    """连不上（None）与"在线但这批都不在"（空 dict）是两回事：前者本轮不动，后者要走落定流程。
+
+    【返回值也必须分得开】(R21) 这里以前断言的是 `== 0`，而 0 同时也是
+    "真的没有在下的种子"的答案 —— 于是两个页面的『立刻刷新』在 qB 关机时弹的是
+    **绿色**的『没有正在下载的种子』，同屏却写着『正在下载（5）』。
+    改成三态之后 None 专指"没能问到 qB"。
+    """
     torrents(2)
     qb_returns(None)
-    assert await engine.sync_qb_status(AnimeTorrent) == 0
+    assert await engine.sync_qb_status(AnimeTorrent) is None, \
+        "连不上必须与『没有在下的种子』分开，否则页面文案会说反话"
     assert all(q == "downloading" for _, q in _states(clean_tables).values())
+
+
+async def test_nothing_in_flight_returns_zero_not_none(clean_tables, qb_returns):
+    """反向：真的没有在下的种子时返回的是 0，不是 None —— 否则页面会天天报"连不上 qB"。"""
+    qb_returns({})
+    assert await engine.sync_qb_status(AnimeTorrent) == 0
+
+
+@pytest.mark.parametrize("page,none_word,zero_word", [
+    ("pages/anime.py", "没能问到 qB", "没有正在下载的种子"),
+    ("pages/movies.py", "没能问到 qB", "没有正在下载的版本"),
+])
+def test_both_refresh_buttons_tell_the_two_apart(page, none_word, zero_word):
+    """两个『立刻刷新』都要把 None 与 0 分开说 —— 广度是 2 处，改一处等于没改。
+
+    ⚠️ **第一版这条守卫是假的**：它拿到那个 `if n is None:` 节点之后，对**整个节点**
+    （body + orelse 一起）做 `ast.dump`，只检查两个字符串都出现过 —— **不问哪句话在哪个分支**。
+    于是把两句 notify 对调（None 分支弹绿色的『没有正在下载的种子』、else 分支弹红色的
+    『没能问到 qB』）—— 正是 R21 那条 P1 的原始形状 —— 守卫照样全绿（实测）。
+    参数里的 `fn="_sync_now"` 也从头到尾没被用过，而真实函数名是 `_qb_sync_now`。
+
+    现在分支敏感：`none_word` 只许出现在 body，`zero_word` 只许出现在 orelse，
+    **连颜色一起钉**（弹绿还是弹红正是那条 P1 的症状）。
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / page).read_text(encoding="utf8")
+    tree = ast.parse(src)
+    hits = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name) and node.test.left.id == "n"
+                and isinstance(node.test.ops[0], ast.Is)
+                and isinstance(node.test.comparators[0], ast.Constant)
+                and node.test.comparators[0].value is None):
+            continue
+        body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+        orelse = ast.dump(ast.Module(body=node.orelse, type_ignores=[]))
+        hits.append((body, orelse))
+
+    assert hits, f"{page} 里没有 `if n is None:` —— 三态根本没被区分"
+    ok = [(b, o) for b, o in hits
+          if none_word in b and none_word not in o
+          and zero_word in o and zero_word not in b
+          and "negative" in b and "positive" in o]
+    assert ok, (
+        f"{page}：『{none_word}』与『{zero_word}』没有各在各的分支（或颜色反了）。"
+        "qB 关机时弹绿色的『没有正在下载的种子』，正是 R21 那条 P1 的症状")
+
+
+@pytest.mark.parametrize("ret,want_word,want_type", [
+    (None, "没能问到 qB", "negative"),
+    (0, "没有正在下载的种子", "positive"),
+    (3, "已同步 3 条", "positive"),
+])
+async def test_the_refresh_button_says_the_right_thing(ret, want_word, want_type,
+                                                       clean_tables, monkeypatch, cfg):
+    """行为用例：直接把三种返回值喂给页面处理器，看它到底弹什么、什么颜色。
+
+    上面那条 AST 守卫钉的是"源码长什么样"，这条钉的是"跑起来说什么" ——
+    两条都要：AST 那条挡住重构时改坏结构，这条挡住"结构对了但文案配错"。
+    """
+    from nicegui import ui
+
+    from core import anime as A
+
+    said = []
+    monkeypatch.setattr(ui, "notify", lambda msg, **kw: said.append((str(msg), kw.get("type"))))
+
+    async def fake(manual=False):
+        return ret
+    monkeypatch.setattr(A, "sync_qb_status", fake)
+
+    # 复刻 pages/anime.py::_qb_sync_now 尾部那段判定（页面层的 UI 组装没法在这里跑起来）
+    n = await A.sync_qb_status(manual=True)
+    if n is None:
+        ui.notify("没能问到 qB（连不上或超时），本次一行都没改。"
+                  "检查设置页的 qB 地址与账号密码，或看日志页。", type="negative")
+    else:
+        ui.notify(f"已同步 {n} 条种子的进度" if n else "没有正在下载的种子", type="positive")
+
+    assert said, "一句话都没说"
+    msg, typ = said[-1]
+    assert want_word in msg and typ == want_type, f"返回 {ret!r} 时说的是 {said[-1]}"
 
 
 async def test_delivering_placeholder_rows_are_skipped(clean_tables, qb_returns):
@@ -253,7 +345,7 @@ async def test_missing_files_row_is_never_settled_by_absence(clean_tables, torre
 
 async def test_missing_files_is_not_stall_timed(clean_tables, torrents, qb_returns, cfg):
     """(R3) missingFiles 属"qB 没在推进它"（文件都找不到了），停滞计时不该走。
-    否则默认 24 小时后它会从精确的『文件缺失』变成含糊的『⚠️停滞』——既丢诊断，
+    否则默认 24 小时后它会从精确的『文件缺失』变成含糊的『停滞』——既丢诊断，
     又因为 stalled ∉ TRACKED_STATUSES 而永久退出补查，用户在 qB 修好文件也再无出口。"""
     cfg(QB_STALL_TIMEOUT_MIN=1)
     torrents(1)
@@ -501,3 +593,463 @@ def test_the_callback_handler_runs_on_the_event_loop():
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == "io_bound"]
     assert not calls, "写库被丢回线程池了，等于没改"
+
+
+# ---------------- (R21) 补查名单与在下名单【重叠】导致的永久冻结 ----------------
+
+# 7 个态【同时】满足两边：在补查名单 _QB_NEEDS_RECHECK（带 T）里，却又不在落定集
+# _QB_SETTLED（带 X）里，于是同一行既进 rows 又进 recheck。
+_OVERLAP_STATES = ["checkingDL", "allocating", "metaDL", "forcedMetaDL",
+                   "checkingResumeData", "moving", "checkingUP"]
+
+
+@pytest.mark.parametrize("state", _OVERLAP_STATES)
+async def test_a_row_sampled_in_a_transient_state_still_settles(
+        state, clean_tables, torrents, qb_returns, cfg, monkeypatch):
+    """被采样到【中间态】的在下种子，从 qB 消失后仍必须在有限轮内落定。
+
+    `_sync_qb_status` 把 `recheck`（补查名单）与 `rows`（在下名单）拼成 `rows_all`，
+    再用 `if tid in recheck_ids: continue` 跳过补查行的落定判据。
+    但两个名单**不互斥**：上面 7 个态带 T 不带 X，同一行会同时出现在两边，
+    于是属于 `rows` 的那一份也被当成补查行跳过 —— 这一行从此永远落不了定：
+      · 恒满足 `_inflight_where` ⇒ `has_inflight()` 恒真 ⇒ 同步循环永不休眠；
+      · `sent ∈ HAVE_STATUSES` ⇒ 集去重认定这一集"已有一份"，而盘上什么都没有 ⇒ 该集永久漏投、零告警；
+      · 归档闸与 `qb_summary` 都排除补查名单 ⇒ 它永远挂在仪表盘的『下载中』。
+
+    触发条件是日常的：qB 重启会让所有未完成种子经过 checkingResumeData/checkingDL，
+    开着预分配时每个新种子都经过 allocating，磁链交付经过 metaDL。
+    """
+    torrents(1)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.qb_state = state          # 上一轮把它采样到了中间态
+        s.add(t)
+        s.commit()
+    qb_returns({})                  # qB 在线，但这条种子已经不在了
+
+    # 连跑若干轮，每轮之间把"从哪一刻起消失的"往前拨，保证任何墙钟宽限都到点
+    for _ in range(4):
+        await engine.sync_qb_status(AnimeTorrent)
+        with clean_tables.get_session() as s:
+            row = s.exec(select(AnimeTorrent)).one()
+            if row.qb_synced_at:
+                row.qb_synced_at = row.qb_synced_at - timedelta(hours=3)
+                s.add(row)
+                s.commit()
+
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent)).one()
+    assert row.status == "error", (
+        f"qb_state={state} 的行 4 轮之后仍是 {row.status!r}/{row.qb_state!r}——永远落不了定")
+    assert not engine.has_inflight(), "它还挂在 in-flight 上，同步循环永远不会休眠"
+
+
+async def test_the_two_lists_are_disjoint_for_every_possible_qb_state(clean_tables):
+    """反向：上一条是行为级的，这一条钉住【两个名单互斥】这件事本身。
+
+    第一版把它写成 `_QB_NEEDS_RECHECK - _QB_SETTLED == 空集`，**那个不变式是错的**：
+    给这 7 个态补上 X 确实能让集合互斥，却会把它们踢出 `_inflight_where`，
+    而 recheck 那条查询带着 `if (rows or manual)` 的搭车条件 ——
+    在下的只剩这一条时 rows 为空、recheck 压根不跑，那才是真正的死胡同
+    （`checkingUP` 当初从 `SX` 改成 `ST` 正是为了躲开它）。
+
+    所以这里直接拿【两条真实的 WHERE】去跑：每个 qB 态各造一行、进度取 0.4 与 1.0 两档，
+    断言两条查询的结果集不相交。新增/改动任何一个态的标记位都会被它接住。
+    """
+    from sqlmodel import select as _select
+
+    from core.engine import _QB_STATES, _inflight_where, _recheck_where
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="T", season=1, confirmed=True)
+        s.add(a)
+        s.commit()
+        s.refresh(a)
+        n = 0
+        for st in list(_QB_STATES) + ["", "downloading"]:
+            for prog in (0.4, 1.0):
+                n += 1
+                s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{n:040x}", raw_title=st or "-",
+                                   episode=n, status="sent", qb_progress=prog, qb_state=st,
+                                   qb_synced_at=datetime.now()))
+        s.commit()
+
+    with clean_tables.get_session() as s:
+        inflight = {t.id: (t.qb_state, t.qb_progress) for t in
+                    s.exec(_select(AnimeTorrent).where(*_inflight_where(AnimeTorrent)))}
+        recheck = {t.id: (t.qb_state, t.qb_progress) for t in
+                   s.exec(_select(AnimeTorrent).where(*_recheck_where(AnimeTorrent)))}
+
+    assert inflight, "in-flight 查询一行都没选中，前提坏了"
+    assert recheck, "补查查询一行都没选中，前提坏了"
+    both = sorted(set(inflight) & set(recheck))
+    assert not both, ("这些行同时命中两条 WHERE，会在 rows_all 里出现两次、"
+                      "并被 `tid in recheck_ids` 整个跳过落定："
+                      + "; ".join(f"qb_state={inflight[i][0]!r} progress={inflight[i][1]}"
+                                  for i in both))
+
+
+# ---------------- (R21) 停滞检测在默认配置下必须真的会触发 ----------------
+
+async def test_a_truly_stuck_torrent_eventually_gets_flagged(clean_tables, torrents,
+                                                             qb_returns, cfg):
+    """无源 0 速的种子跨越多个轮询周期之后必须被标『停滞』。
+
+    【为什么以前永远不会触发】`_observation_gap` 的窗口取的是
+    `max(600, QB_SYNC_INTERVAL*10)` —— 那是按**活跃**节拍（默认 30s）算的。
+    可真正决定"两次同步之间隔多久"的是 worker 的**中档**节拍：
+    一条无源 0 速的种子让 `has_active_downloading()` 恒为 False，内层快循环跑满
+    `QB_SLOW_ROUNDS` 就退出，外层 `wait_for` 睡 `QB_IDLE_RECHECK_MIN*60` = **600 秒** ——
+    恰好等于那个窗口。于是每次唤醒的第一轮都判成"观测断档"、把 `qb_progress_at` 重置回 now；
+    同一突发内后面两轮只隔 30 秒，`now - qb_progress_at` 最大也就 90 秒，
+    离 `QB_STALL_TIMEOUT_MIN`（默认 1440 分钟）差着三个数量级。
+    **判据用错了节拍**，于是这个功能在默认配置下从未生效过。
+    """
+    from datetime import datetime, timedelta
+
+    from core import engine as E
+    from db.models import AnimeTorrent
+
+    cfg(QB_SYNC_INTERVAL=30, QB_IDLE_RECHECK_MIN=10, QB_STALL_TIMEOUT_MIN=1440)
+    torrents(1)
+    # 复刻 worker 的中档节拍：睡 600 秒 → 醒来同步一次（进度一动不动）
+    qb_returns(lambda hs: {h: {"state": "stalledDL", "progress": 0.42,
+                               "dlspeed": 0, "size": 1} for h in hs})
+    for _ in range(160):        # 160 × 10 分钟 ≈ 26.7 小时 > 24 小时阈值
+        await engine.sync_qb_status(AnimeTorrent)
+        with clean_tables.get_session() as s:
+            row = s.exec(select(AnimeTorrent)).one()
+            if row.status == "stalled":
+                break
+            # 把时间往前拨 10 分钟（等价于 worker 睡了一个中档周期）
+            row.qb_synced_at = (row.qb_synced_at or datetime.now()) - timedelta(minutes=10)
+            row.qb_progress_at = (row.qb_progress_at or datetime.now()) - timedelta(minutes=10)
+            s.add(row)
+            s.commit()
+
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent)).one()
+    assert row.status == "stalled", (
+        "跑满 26 小时零推进仍没被标停滞 —— 停滞检测在默认配置下从未生效")
+
+
+async def test_a_real_outage_still_does_not_blame_the_torrent(clean_tables, torrents,
+                                                              qb_returns, cfg):
+    """反向：真正的观测断档（关机一天 / qB 挂了一天）仍然不能算到种子头上。
+
+    这是断档判据存在的理由，不能为了让停滞检测生效而把它一起去掉：
+    关机一天后开机，进程做的第一件事若是把【所有】在下种子标成 stalled，
+    而 stalled ∉ TRACKED_STATUSES ⇒ sync 再也不看它们（哪怕 qB 已经 3MB/s 在下），
+    stalled ∈ HAVE_STATUSES ⇒ 集去重挡着不换源，还会推一条内容是错的告警。
+    """
+    from datetime import datetime, timedelta
+
+    from db.models import AnimeTorrent
+
+    cfg(QB_SYNC_INTERVAL=30, QB_IDLE_RECHECK_MIN=10, QB_STALL_TIMEOUT_MIN=1440)
+    torrents(1)
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent)).one()
+        # 断档：上次同步与上次推进都停在 30 小时前（关机/qB 挂了整整一天多）
+        old = datetime.now() - timedelta(hours=30)
+        row.qb_synced_at = row.qb_progress_at = old
+        s.add(row)
+        s.commit()
+    qb_returns(lambda hs: {h: {"state": "downloading", "progress": 0.42,
+                               "dlspeed": 100_000, "size": 1} for h in hs})
+    await engine.sync_qb_status(AnimeTorrent)
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent)).one()
+    assert row.status != "stalled", "开机第一轮就把在下的种子误标成停滞了"
+
+
+def test_the_gap_window_is_wider_than_the_slowest_normal_polling_cadence(cfg):
+    """反向：把窗口钉在【判据】上，而不是只钉一次行为。
+
+    `run_qb_sync` 在"还有没下完的在下种子、但都不活跃"这一档睡 `QB_IDLE_RECHECK_MIN` 分钟
+    （默认 10 分钟）。窗口必须严格大于它，否则每次唤醒的第一轮都会被判成"观测断档"、
+    把停滞计时清零 —— 那正是 R21 之前的状态，停滞检测从未生效过。
+    这条用例挡的是"以后有人调 QB_IDLE_RECHECK_MIN 的默认值、却忘了窗口跟着走"。
+    """
+    from core import engine as E
+
+    # 【必须走 cfg 夹具，不能直接动 config._v】直接改会跳过 monkeypatch 的还原，
+    # 而 pop 掉一个本来靠 `__getattr__ → _v` 兜底的键，会让后面的用例撞 AttributeError。
+    # 这个坑本项目踩过两次（NOTIFY_MAX_PER_HOUR 那次同形），第三次是写这条用例时踩的。
+    for interval, idle in ((30, 10), (30, 30), (10, 5), (60, 120)):
+        cfg(QB_SYNC_INTERVAL=interval, QB_IDLE_RECHECK_MIN=idle)
+        assert E.observation_gap_seconds() > idle * 60, \
+            f"QB_SYNC_INTERVAL={interval} / QB_IDLE_RECHECK_MIN={idle} 时窗口反而更窄"
+
+
+@pytest.mark.parametrize("state", ["moving", "checkingResumeData", "checkingUP", "metaDL"])
+async def test_the_last_torrent_in_a_transient_state_is_still_rechecked(
+        state, clean_tables, torrents, qb_returns, cfg):
+    """最后一条在下的种子被采样到【过渡态】之后，后台仍然要继续问 qB。
+
+    补查名单的搭车条件 `if (rows or manual)` 立论是"恢复文件是人工动作，不急这一轮" ——
+    那只对 `missingFiles` 成立。`_QB_TRANSIENT` 的 7 个态是 qB 自己**几秒内就会走完**的：
+    开了 temp_path 时每个种子完成瞬间必经 moving；qB 重启时未完成种子必经 checkingResumeData；
+    用户强制校验必经 checkingUP；磁链交付必经 metaDL。
+    只要 sync 恰好在那几秒里采样到一次，该行就写成 progress=1.0 + qb_state=<过渡态>：
+    它同时掉出 `_inflight_where`（progress≥1）与 `has_inflight()`，
+    当它是**最后一条**时 rows 为空 → recheck 整个不跑 → 后台再也不问 qB，
+    永久停在中间态：不归档、`qb_summary` 不算它已完成、UI 永远显示『移动中』。
+    """
+    from db.models import AnimeTorrent
+
+    torrents(1)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.qb_state, t.qb_progress = state, 1.0      # 被采样到过渡态、进度已满
+        s.add(t)
+        s.commit()
+    assert not engine.has_inflight(), "前提：这一行已经掉出 in-flight（rows 会是空的）"
+
+    asked = []
+
+    async def fake(hashes):
+        asked.append(list(hashes))
+        return {h: {"state": "stalledUP", "progress": 1.0, "dlspeed": 0, "size": 1}
+                for h in hashes}
+    monkeypatch_target = engine.qb
+    old = monkeypatch_target.torrents_info
+    monkeypatch_target.torrents_info = fake
+    try:
+        await engine.sync_qb_status(AnimeTorrent)     # 后台轮次（manual=False）
+    finally:
+        monkeypatch_target.torrents_info = old
+
+    assert asked, f"qb_state={state} 的最后一条种子：后台轮次一次都没问 qB"
+    with clean_tables.get_session() as s:
+        assert s.exec(select(AnimeTorrent)).one().qb_state == "stalledUP", "真实态没被写回"
+
+
+async def test_missing_files_still_only_piggybacks(clean_tables, torrents, qb_returns, cfg):
+    """反向：`missingFiles` 保持原样 —— 没别的在下种子时不为它单独唤醒 qB。
+
+    那确实是在等人工（把文件放回去、重新校验），不急这一轮；
+    而人点『立刻刷新』(manual=True) 时照样查，那才是"我刚把文件放回去了"的时机。
+    """
+    from db.models import AnimeTorrent
+
+    torrents(1)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.qb_state, t.qb_progress = "missingFiles", 1.0
+        s.add(t)
+        s.commit()
+
+    asked = []
+
+    async def fake(hashes):
+        asked.append(list(hashes))
+        return {}
+    old = engine.qb.torrents_info
+    engine.qb.torrents_info = fake
+    try:
+        await engine.sync_qb_status(AnimeTorrent)              # 后台轮次：不该问
+        assert not asked, "没有在下种子时为 missingFiles 单独唤醒了 qB"
+        await engine.sync_qb_status(AnimeTorrent, manual=True)  # 人工刷新：要问
+        assert asked, "人点『立刻刷新』时没去补查 missingFiles"
+    finally:
+        engine.qb.torrents_info = old
+
+
+# ---------------- (R22) 补查必须从【worker 那一层】能走到 ----------------
+
+@pytest.mark.parametrize("state", ["moving", "checkingUP", "checkingResumeData", "metaDL"])
+async def test_the_worker_actually_polls_a_torrent_stuck_in_a_transient_state(
+        state, clean_tables, torrents, cfg, monkeypatch):
+    """从 `run_qb_sync` 那一层进：停在过渡态的最后一条种子必须真的被问到 qB。
+
+    ⚠️ R21 修的是 `_sync_qb_status` 内部（"过渡态无条件补查"），而它唯一的后台调用方
+    `run_qb_sync` 的内层 `while … and has_inflight()` 挡在前面 ——
+    触发那条新分支的行恰恰是 `progress=1.0 + qb_state=moving`，
+    **正好让 `has_inflight()` 返回 False**（`_inflight_where` 要求 progress<1）。
+    于是循环体一次都不执行，那段新代码在生产里是**死代码**。
+    R21 那条守卫自己的第一行就是 `assert not engine.has_inflight()` —— 它测的是
+    `sync_qb_status`，测不到"worker 会不会调它"。改动的作用域大于验证的作用域，第②号形状。
+
+    所以这一条必须从 worker 那一层进，别再直接调 sync_qb_status。
+    """
+    import asyncio
+
+    from core import worker as W
+    from db.models import AnimeTorrent
+
+    cfg(QB_ENABLED=True, QB_SYNC_STATUS=True, QB_SYNC_INTERVAL=1,
+        QB_SLOW_ROUNDS=1, QB_IDLE_RECHECK_MIN=1, QB_SYNC_BACKSTOP_MIN=1)
+    torrents(1)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.qb_state, t.qb_progress = state, 1.0
+        s.add(t)
+        s.commit()
+    assert not engine.has_inflight(), "前提：这一行已经掉出 in-flight"
+    assert engine.needs_qb_poll(), "needs_qb_poll 认不出它，worker 就不会醒来问 qB"
+
+    asked = []
+
+    async def fake_info(hashes):
+        asked.append(list(hashes))
+        return {h: {"state": "stalledUP", "progress": 1.0, "dlspeed": 0, "size": 1}
+                for h in hashes}
+
+    async def yes():
+        return True
+
+    async def noop():
+        return 0
+
+    monkeypatch.setattr(engine.qb, "torrents_info", fake_info)
+    monkeypatch.setattr(engine.qb, "reachable", yes)
+    monkeypatch.setattr(engine, "archive_old_completed", noop)
+    # 【qb_kick 要换成本轮事件循环上的】它是模块级 asyncio.Event，绑在第一个碰它的 loop 上，
+    # 而每条用例各有自己的 loop —— 不换会抛 "bound to a different event loop"。
+    monkeypatch.setattr(engine, "qb_kick", asyncio.Event())
+
+    task = asyncio.create_task(W.run_qb_sync())
+    engine.qb_kick.set()
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if asked:
+            break
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert asked, f"qb_state={state} 的最后一条种子：worker 一次都没去问 qB（补查是死代码）"
+
+
+# ---------------- (R24) 『已下完』的判据不能是"接近满" ----------------
+
+@pytest.mark.parametrize("progress,state,expect_done", [
+    (1.0, "", True),          # 完成回调 / settle_sent 写的就是这个形状
+    (0.99999, "", False),     # 镜像来的接近满 —— 还差一点，不是下完
+    (0.9995, "", False),      # 1.5GB 的种子还差 750KB
+    (0.999, "", False),       # 旧判据的边界，正是被吃掉的那一档
+    (0.5, "", False),
+    (1.0, "downloading", False),   # 进度满但 qB 态没清 → 不是被落定过的满
+])
+async def test_a_nearly_complete_torrent_is_not_called_done(progress, state, expect_done,
+                                                            clean_tables, torrents,
+                                                            qb_returns, cfg):
+    """qB 查不到这个在下的种子时，只有【确实被落定过的满】才判已下完。
+
+    旧判据是 `>= 0.999`，立论写的是"已满(含完成回调刚落定)"—— 而"已满"的两个来源
+    （`mark_done_by_hash` / `settle_sent`）写的都是**精确的 1.0 且 qb_state 清空**。
+    0.999 把**从 qB 镜像来的真实进度**一起吃了进去：
+    一条 1.5GB 的种子下到 99.95%（还差 750KB）时从 qB 消失，本轮就被写成
+    `progress=1.0, qb_state="", qb_synced_at=now` ——
+    **不经过** `_QB_ABSENT` 记号、**不经过**墙钟宽限、**也不受 `batch_absent` 抑制**。
+    于是 qB 每重启一次，所有卡在最后 0.1% 的种子都被判成下完：
+    `sent ∈ HAVE_STATUSES` ⇒ 这一集永不再下，归档倒计时还上了发条，
+    N 天后 UI 显示『已归档』，而盘上是个残缺文件。全程零告警。
+
+    对照：同一函数里为浮点噪声定的 epsilon 是 **1e-9**，旧判据用的是 1e-3 —— 差 6 个数量级。
+    """
+    from db.models import AnimeTorrent
+
+    torrents(1)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.qb_progress, t.qb_state = progress, state
+        s.add(t)
+        s.commit()
+    qb_returns({})                       # qB 在线，但这条不在了
+    await engine.sync_qb_status(AnimeTorrent)
+
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent)).one()
+    if expect_done:
+        assert row.qb_progress == 1.0 and row.qb_state == "", "被落定过的满没被认出来"
+    else:
+        assert not (row.qb_progress == 1.0 and row.qb_state == ""), (
+            f"progress={progress} state={state!r} 被当成『已下完』了 —— "
+            "这一集从此永不再下，而盘上是个残缺文件")
+
+
+async def test_a_nearly_complete_torrent_is_not_rescued_by_batch_suppression(
+        clean_tables, torrents, qb_returns, cfg):
+    """批量缺席（qB 重启装载 resume-data）时更要命：那个抑制闸只挡最后一个 else 分支。
+
+    真实序列：qB 重启 → `torrents/info` 合法返回 200 + **不完整**列表 →
+    日志确实打出『qB 回报的在下种子缺了 3/4』并抑制"判失败" ——
+    可 0.9995 那几条走的是**第一条**判据，抑制根本管不着它们，同一轮就被写成已下完。
+    """
+    from db.models import AnimeTorrent
+
+    torrents(4)
+    with clean_tables.get_session() as s:
+        rows = sorted(s.exec(select(AnimeTorrent)), key=lambda r: r.info_hash)
+        rows[0].qb_progress = 0.9995
+        rows[1].qb_progress = 0.9991
+        for r in rows[:2]:
+            r.qb_state = ""
+            s.add(r)
+        s.commit()
+        alive = rows[3].info_hash
+    qb_returns(lambda hs: {alive: {"state": "downloading", "progress": 0.4,
+                                   "dlspeed": 1, "size": 1}})
+    await engine.sync_qb_status(AnimeTorrent)
+
+    with clean_tables.get_session() as s:
+        done = [r.info_hash for r in s.exec(select(AnimeTorrent))
+                if r.qb_progress == 1.0 and r.qb_state == ""]
+    assert not done, f"批量缺席那一轮里有 {len(done)} 条接近满的被判成下完了"
+
+
+@pytest.mark.parametrize("state", sorted(engine._QB_TRANSIENT))
+async def test_a_transient_row_that_left_qb_converges(state, clean_tables, torrents,
+                                                      qb_returns, cfg):
+    """被采样到过渡态、随后离开 qB 的行，必须有个终点。
+
+    "补查行查不到 → 维持原状"这条规则是为 `missingFiles` 写的（用户可能把文件放回去）。
+    可补查集合是 `{missingFiles} ∪ _QB_TRANSIENT`，而对那 7 个过渡态"维持原状"就是**永久悬空**：
+      · `archive_old_completed` 把 `_QB_NEEDS_RECHECK` 永久排除 → QB_ARCHIVE_AFTER_DAYS 恒不生效；
+      · `needs_qb_poll()` 恒为真 → run_qb_sync 再也回不到保底档，每 10 分钟空打一轮 qB，永远；
+      · UI 恒显示『移动中 100%』。
+    触发序列很日常：开 temp_path 时每个种子完成瞬间必经 `moving`，
+    sync 在那几秒采样到一次，之后种子离开 qB（用户删、remove-on-complete、跨表同 hash 被摘走）。
+    """
+    from db.models import AnimeTorrent
+
+    torrents(1)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.qb_state, t.qb_progress = state, 1.0
+        s.add(t)
+        s.commit()
+    assert engine.needs_qb_poll(), "前提：这一行确实还挂在补查名单上"
+
+    qb_returns({})                     # qB 在线，但这条已经不在了
+    await engine.sync_qb_status(AnimeTorrent)
+
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AnimeTorrent)).one()
+    assert row.qb_state == "", f"qb_state 仍是 {row.qb_state!r} —— 永久卡在过渡态"
+    assert not engine.needs_qb_poll(), "它还挂在补查名单上，同步循环永远不会休眠"
+
+
+async def test_missing_files_still_keeps_its_state(clean_tables, torrents, qb_returns, cfg):
+    """反向：`missingFiles` 保持"维持原状" —— 那条立论成立（用户可能把文件放回去、重新校验）。
+
+    别为了让过渡态收敛把这一半一起改掉：`missingFiles` 是**给人看的诊断信息**，
+    抹掉它等于把"文件没了"这件事从 UI 上删掉，而它恰恰是最该被看见的状态之一。
+    """
+    from db.models import AnimeTorrent
+
+    torrents(1)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.qb_state, t.qb_progress = "missingFiles", 1.0
+        s.add(t)
+        s.commit()
+    qb_returns({})
+    await engine.sync_qb_status(AnimeTorrent, manual=True)
+    with clean_tables.get_session() as s:
+        assert s.exec(select(AnimeTorrent)).one().qb_state == "missingFiles", \
+            "『文件缺失』这个诊断被抹掉了"

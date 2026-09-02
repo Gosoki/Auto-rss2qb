@@ -301,3 +301,57 @@ async def test_date_proximity_breaks_the_tie(monkeypatch):
         "Some Show": (311310, "2021-10-02"),
     }, ["某番", "Some Show"], episode=5, release_time=datetime(2021, 11, 1))
     assert got is not None, "有日期基准时不该判成平票"
+
+
+# ---------------- (R21) 失败计数按【任务】分账，别被另一条协程污染 ----------------
+
+async def test_another_coroutines_bgm_failures_do_not_count_as_mine():
+    """采集轮撞上 bgm 429/5xx，不该被算进『延迟重识别这一部问成没有』。
+
+    `retry_unmatched` 是这么用的：
+        before = net_failures(); await enrich_anime(aid); reached += (net_failures() == before)
+    而计数器原来是**进程级模块变量**：采集轮那条线
+    （run_worker → poll_once → process_item → _resolve_anime → enrich.resolve → _search_one）
+    同样会记账，两条协程互不相干、没有任何锁，`before = ...` 与那个 await 之间
+    正是采集轮最容易插进来的窗口。
+    污染的方向恰恰最坏：reached 被少算 → `reached == 0` 更容易成立 → 整轮 enrich_tries 被退款
+    → 退避阶梯永不推进、每个检查节拍都重打一遍 bgm ——正是那段退款注释拼命要防的事。
+    """
+    import asyncio
+
+    from services import enrich as E
+
+    done = asyncio.Event()
+
+    async def noisy_collector():
+        """扮演采集轮：另一条 Task，撞了 5 次 bgm 失败。"""
+        for _ in range(5):
+            E._note_bgm_fail()
+            await asyncio.sleep(0)
+        done.set()
+
+    async def quiet_retrier():
+        before = E.net_failures()
+        task = asyncio.create_task(noisy_collector())
+        await done.wait()
+        await task
+        return E.net_failures() - before
+
+    leaked = await asyncio.create_task(quiet_retrier())
+    assert leaked == 0, (
+        f"另一条协程的 {leaked} 次 bgm 失败被算到了本次调用头上 —— 退避阶梯会被错误退款")
+
+
+async def test_my_own_failures_still_count():
+    """反向：自己这条线上的失败必须照记，否则退款判据整个失效（bgm 真挂了也不退款）。"""
+    import asyncio
+
+    from services import enrich as E
+
+    async def one():
+        before = E.net_failures()
+        E._note_bgm_fail()
+        E._note_bgm_fail()
+        return E.net_failures() - before
+
+    assert await asyncio.create_task(one()) == 2

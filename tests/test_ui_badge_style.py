@@ -193,6 +193,11 @@ _WIDGET_DEFAULTS = {
     #（pages/layout.py 的 ui.button.default_props）。漏掉它的后果不是样式错，
     # 是角色词表里同一个角色出现"带 no-caps"和"不带"两个名字。
     "button": {"no-caps"},
+    # 【expansion 有两档，默认是紧凑那一档】(R22) 全站 13 处原本 9 处写 dense、4 处不写，
+    # 两组之间没有任何成文规则 —— 那 4 处恰好是列表的【季度·年份分组头】（没有外框卡片，
+    # 折叠头本身就是分组之间唯一的视觉分隔）。两档各有其用，但必须是成文的两档，不能是漂移。
+    # 默认取多数那一档；主结构分组用 `.props(remove="dense")` 显式退出。
+    "expansion": {"dense"},
 }
 
 
@@ -286,7 +291,8 @@ _BUTTON_ROLES: dict[str, str] = {
     "unelevated color=primary": "主操作（确认下载 / 保存 / 绑定 / 恢复订阅 / 立刻备份）",
     # 【这一档是有意的，不是漏改】它与一个输入框同行，14px 的行高会比输入框胖一圈；
     # 不写 dense 是因为 dense 收的是内边距，而这里要的是"跟着行走"。全站只有这一处。
-    "unelevated color=primary +btn-sm": "与输入框同行的主操作（设置页『应用开始使用日过滤』）",
+    "unelevated color=primary +btn-sm": ("与输入框同行的主操作（设置页『应用开始使用日过滤』）；"
+                                        "以及点选/切换按钮的【已选中】档（剧场版季度点选）"),
     "unelevated dense color=primary +btn-sm": "行内主操作（详情页元操作行的『恢复订阅』『继续订阅』）",
 
     # ── 描边：会展开下一层的触发器 ────────────────────────────────
@@ -309,6 +315,14 @@ _BUTTON_ROLES: dict[str, str] = {
     "flat round dense color=primary +btn-sm": "行内图标按钮，主色（就地编辑 / 复制命令）",
     "flat round dense color=grey +btn-sm": "行内图标按钮，灰（移除附件 / ? 提示）",
     "flat round dense color=white": "深色顶栏上的图标按钮",
+
+    # ── R21 补登记：以前【采集不到】所以从没被检查过的四种 ───────────
+    # （`_button_calls` 原来只走链式 + 只认 ast.Constant，于是 f-string props 与
+    #   "先赋值再 .props()" 两种写法整个不可见。补采之后这几个才浮出来。）
+    "color={} unelevated": "确认框的『确定』按钮 —— 颜色随危险度动态给（primary / negative）",
+    "icon={}": "给上面那个确定按钮补图标；附加 props，不单独构成一个角色",
+    "loading": "忙碌态；busy_action 期间挂上，附加 props，不单独构成一个角色",
+    "outline color=grey +btn-sm": "点选/切换按钮的【未选中】档（剧场版季度点选）",
 }
 
 
@@ -328,8 +342,37 @@ def _button_calls():
     """
     import ast
     by_root: dict = {}
+    extra: list = []          # 分语句写法（b = ui.button(...) 之后 b.props("…")）
+    assign_cls: dict = {}     # (文件, 变量) → 赋值那条链上写下的 classes
     for path in sorted((_ROOT / "pages").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf8"))
+        # 【分语句写法也要采】(R21) `_button_calls` 原本只走链式调用，于是两种写法整个消失：
+        #   ① `b = ui.button(name)` 之后在别处 `b.props("outline color=blue-grey")`
+        #      —— 链根上一个 props 都没有，函数连一行都不 append（pages/movies.py 的季度点选）；
+        #   ② f-string props：`.props(f"color={ok_color} unelevated")`
+        #      —— 实参不是 ast.Constant，被静默跳过（layout.py 里**全站所有确认框**的确定按钮）。
+        # 实测 pages/ 下 `ui.button(` 共 90 处，旧实现只采到 88 —— 而漏掉的两个恰好都是
+        # 词表里没登记的样式。一条自称"覆盖全站"的守卫，覆盖不到的正是最容易跑偏的写法。
+        btn_vars = _assigned_button_vars(tree)
+        for _v, _c in btn_vars.items():
+            assign_cls[(path.name, _v)] = _c
+        if btn_vars:
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("props", "classes")):
+                    continue
+                # 【顺着链走到根】`b.props(remove="outline").props("unelevated color=primary")`
+                # 里第二个 props 的 func.value 是一个 Call，不是 Name —— 只认 Name 会漏掉它，
+                # 而那正是 pages/movies.py 季度点选按钮的写法（两档样式一档都采不到）。
+                root = node.func.value
+                while isinstance(root, ast.Call) and isinstance(root.func, ast.Attribute):
+                    root = root.func.value
+                if not (isinstance(root, ast.Name) and root.id in btn_vars):
+                    continue
+                v = _const_or_template(node.args[0] if node.args else None)
+                if v is None:
+                    continue
+                extra.append((path.name, node.lineno, root.id, node.func.attr, v))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -340,7 +383,7 @@ def _button_calls():
                         and cur.func.value.id == "ui"):
                     break                                  # 到达链根 ui.button(
                 a = cur.args[0] if cur.args else None
-                v = a.value if isinstance(a, ast.Constant) and isinstance(a.value, str) else None
+                v = _const_or_template(a)
                 if v is not None and attr in ("props", "classes"):
                     (props if attr == "props" else classes).append((v, cur.func.value.end_lineno))
                 cur = cur.func.value
@@ -353,7 +396,74 @@ def _button_calls():
     for (fname, _), (props, classes) in by_root.items():
         for val, ln in props:
             out.append((fname, ln, val, [c for c, _ in classes]))
+    # 分语句写法：按 (文件, 变量名) 把散落各处的 props/classes 归到同一个按钮上
+    grouped: dict = {}
+    for fname, ln, var, attr, val in extra:
+        g = grouped.setdefault((fname, var), {"props": [], "classes": [],
+                                              "assign_classes": assign_cls.get((fname, var), [])})
+        g[attr].append((val, ln))
+    for (fname, _var), g in grouped.items():
+        cls = [c for c, _ in g["classes"]] + g["assign_classes"]
+        for val, ln in g["props"]:
+            out.append((fname, ln, val, cls))
     return out
+
+
+def _assigned_widget_vars(tree, widget: str) -> dict:
+    """`x = ui.<widget>(...)` → {变量名: 赋值链上的 classes 实参}。(R22)
+
+    【为什么要抽出来】R21 给按钮补了"先赋值、之后再 `x.props(...)`"这种写法的采集
+    （原来只走链式，90 个按钮只采到 88），但**同一个决定只落到了按钮那一半** ——
+    分页那条守卫仍然只认链式：把 `ui.pagination(...)` 改写成
+    `p = ui.pagination(...)` + `p.props("size=sm")`，守卫完全看不见（实测）。
+    正是本项目第①号形状。收成一份，两处共用。
+    """
+    import ast
+    out: dict = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        call, classes = node.value, []
+        while isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute):
+            if call.func.attr == "classes":
+                v = _const_or_template(call.args[0] if call.args else None)
+                if v is not None:
+                    classes.append(v)
+            if not isinstance(call.func.value, ast.Call):
+                break
+            call = call.func.value
+        f = call.func if isinstance(call, ast.Call) else None
+        if isinstance(f, ast.Attribute) and f.attr == widget:
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    out.setdefault(t.id, []).extend(classes)
+    return out
+
+
+def _const_or_template(node):
+    """字符串实参 → 字符串；f-string → 把每个插值位换成 `{}` 的骨架；其余 → None。
+
+    f-string 不能直接跳过：全站所有确认框的『确定』按钮都是 `.props(f"color={ok_color} unelevated")`，
+    跳过它等于那一整类按钮从来没被检查过。换成骨架之后它有一个稳定的键 `color={} unelevated`，
+    照样能登记成一个角色。
+    """
+    import ast
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for v in node.values:
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                parts.append(v.value)
+            else:
+                parts.append("{}")
+        return "".join(parts)
+    return None
+
+
+def _assigned_button_vars(tree) -> dict:
+    """`x = ui.button(...)` → {变量名: 赋值链上的 classes}。实现见 _assigned_widget_vars。"""
+    return _assigned_widget_vars(tree, "button")
 
 
 def _role_key(props: str, classes) -> str:
@@ -518,3 +628,317 @@ def test_only_two_greys_exist():
     assert not offenders, (
         "只允许 text-gray-400 / text-gray-500 两档灰，颜色一律走 token：\n  " + "\n  ".join(offenders)
         + "\n（要读的正文不着灰，用默认前景色）")
+
+
+# ---------------- (R21) 徽标【文案】的一致性 ----------------
+
+# 徽标是全站唯一的标签机制，19 种文案里历史上只有两种带装饰符号
+# （`✓ 已确认` / `🎊 已完结`），其余 17 种是纯文字。
+# 两种写法混在同一屏时，用户会去找"带勾的和不带勾的差在哪"——而答案是"没差，
+# 只是写的人不同"。颜色已经承担了区分语义的职责（green/orange/teal/grey…），
+# 装饰符号是第二套并行的编码，且只覆盖了 2/19。
+#
+# 【判据用 Unicode 类别 So，不是"首字符白名单"】第一版写成"首字符必须是中日文/字母/数字"，
+# 当场误伤四类正当写法：f-string 的 `{name} …`、下载速度的 `↓ 1.2MB/s`、
+# 空值占位的 `—`、以及文案内部的间隔号 `·`。
+# `So`（Symbol, other）把它们干净地分开了：✓(2713) ⏳(23F3) 🎊(1F38A) ✔ ★ 都是 So；
+# 箭头 ↓→ 是 `Sm`（有方向语义，不是装饰）、`—` 是 `Pd`、`·` 是 `Po`，全部放行。
+# 【扫整串而不只是首字符】emoji 放中间同样是第二套编码；而且原来那处是三元写法
+# （`"✓ 已确认" if … else "⏳ 待确认"`），只钉前半截的话把符号搬到 else 分支就绕过去了。
+_SO = "So"
+
+
+def _badge_literal_texts():
+    """(文件名, 徽标里的每一个字面字符串) —— 含三元的两个分支；变量/表达式跳过。"""
+    import unicodedata  # noqa: F401  (供下面的用例用同一个 import 语义)
+    for p in sorted((_ROOT / "pages").glob("*.py")):
+        src = p.read_text(encoding="utf-8")
+        for _, chain in _badge_chains(src):
+            # 只看 ui.badge(...) 的【第一个实参段】：.props()/.tooltip() 里的字符串是
+            # 说明文字，不是标签文案，不受这条纪律约束（tooltip 里有 emoji 无所谓）。
+            head = chain[: chain.find(").props(")] if ").props(" in chain else chain
+            head = head[: head.find(").tooltip(")] if ").tooltip(" in head else head
+            for lit in re.findall(r'"([^"]*)"', head) + re.findall(r"'([^']*)'", head):
+                yield p.name, lit
+
+
+def test_badge_texts_carry_no_decorative_symbol():
+    """徽标文案里不许出现 Unicode `So` 类字符（emoji / ✓ / ⏳ / ★ …）。
+
+    语义由【颜色 + 文字】承担；再叠一套符号编码，只会覆盖到一部分标签，
+    让用户去找一个并不存在的规律。
+    """
+    import unicodedata
+    texts = list(_badge_literal_texts())
+    assert len(texts) >= 15, f"只抓到 {len(texts)} 条字面徽标文案，抓取逻辑多半坏了"
+    bad = [(f, t, c) for f, t in texts for c in t if unicodedata.category(c) == _SO]
+    assert not bad, "徽标文案带了装饰符号：" + "; ".join(
+        f"{f}: {t!r} 含 {c!r}" for f, t, c in bad)
+
+
+def test_the_symbol_guard_would_actually_fire():
+    """反向：上一条依赖 `unicodedata.category(...) == "So"` 真能认出那几个符号。
+
+    判据本身写错（比如把 `So` 打成 `Sc`）时，上一条会永远绿——这正是本项目
+    反复踩过的"守卫看着在守、其实什么都没守"的形状。这里直接钉住判据。
+    """
+    import unicodedata
+    for ch in "✓⏳🎊✔★":
+        assert unicodedata.category(ch) == _SO, f"{ch!r} 没被判成装饰符号"
+    for ch in "↓→—·":   # 有方向/分隔语义的，必须放行
+        assert unicodedata.category(ch) != _SO, f"{ch!r} 被误判成装饰符号"
+
+
+def test_the_symbol_rule_also_covers_texts_computed_elsewhere():
+    """上面两条只看 `ui.badge(...)` 里的**字面量** —— 而 pages/ 下 72 处徽标里有 21 处
+    的文案是别处算好再传进来的（`ui.badge(text)` / `ui.badge(torrent_status_cn(...))`）。
+
+    R21 第一版守卫就栽在这个盲区上：`STATUS_CN["stalled"]` 当时带着一个 U+26A0 警告号，
+    正是要禁的 `So`，它经 `torrent_status_cn` / `live_status` 渲染到三个徽标上，
+    而那条守卫的说明还写着"19 种文案里只有两种带符号"——**规则的作用域大于验证的作用域**，
+    本项目第②号形状，这一次是我自己写的守卫踩进去的。
+
+    这里从【文案的来源】查：状态词表的全部取值 + 两个文案函数在状态 × qB 态全组合下的返回。
+    """
+    import unicodedata
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(_ROOT))
+    from core import engine as ce
+    from pages import layout as L
+
+    texts = []
+    texts += [(f"STATUS_CN[{k!r}]", v) for k, v in L.STATUS_CN.items()]
+    texts += [(f"SEVERITY_COLOR 覆盖的 {k}", k) for k in L.SEVERITY_COLOR]
+    for st in list(L.STATUS_CN):
+        for prog in (0.0, 0.5, 1.0):
+            texts.append((f"torrent_status_cn({st},{prog})", L.torrent_status_cn(st, prog, None)))
+            for qs in [""] + list(ce._QB_STATES):
+                for in_plan in (None, True, False):
+                    t, _c = L.live_status(st, qs, prog, None, 0, in_plan, True, 1, "")
+                    texts.append((f"live_status({st},{qs},in_plan={in_plan})", t))
+    assert len(texts) > 200, f"只枚举出 {len(texts)} 条，组合表坏了"
+    bad = [(src, t, c) for src, t in texts for c in str(t)
+           if unicodedata.category(c) == _SO]
+    assert not bad, "徽标文案（含算出来的）带了装饰符号：" + "; ".join(
+        f"{src} -> {t!r} 含 {c!r}" for src, t, c in bad[:8])
+
+
+# ---------------- (R21) 分页与"第二种标签控件" ----------------
+
+def test_pagination_never_sets_its_own_size():
+    """三处 `ui.pagination` 的尺寸由全局 CSS 一处定，调用点不许自己写。
+
+    R21 之前是两种写法：两处 `size=sm`（Quasar 的档位，渲染成**行内** font-size:10px），
+    一处 `dense` —— 而 QPagination 的 props 表里**根本没有 dense**，
+    Vue 把它当 fallthrough attr 扔到根 div 上，零效果。
+    于是同一个控件在同一页上一个 10px、一个 14px，还有一个写了等于没写：
+    与徽标当年"同一个『待确认』三种大小"完全同形。
+    """
+    import ast
+
+    bad = []
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf8"))
+        # 【分语句写法也要采】(R22) `p = ui.pagination(...)` 之后 `p.props("size=sm")` ——
+        # R21 给按钮补过这一段，却**只落到了按钮那一半**，分页这条守卫仍然只认链式：
+        # 改写成分语句，加回 `size=sm` 它照样全绿（实测）。第①号形状。
+        pg_vars = _assigned_widget_vars(tree, "pagination")
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "props"):
+                continue
+            var_root = node.func.value
+            while isinstance(var_root, ast.Call) and isinstance(var_root.func, ast.Attribute):
+                var_root = var_root.func.value
+            if isinstance(var_root, ast.Name) and var_root.id in pg_vars:
+                v = _const_or_template(node.args[0] if node.args else None)
+                if v is not None and ("size=" in v or "dense" in v):
+                    bad.append(f"{path.name}:{node.lineno} → {v!r}（分语句写法）")
+                continue
+            # 顺着 `ui.pagination(...).props("…")` 这条链找根，把链上所有 props 收下来
+            root, props = node.func.value, []
+            v = _const_or_template(node.args[0] if node.args else None)
+            if v is not None:
+                props.append(v)
+            # 【走到链根就停，别再多走一步】第一版一路走到了 `ui` 这个 Name，
+            # 于是"根是不是 pagination"永远判否 —— 守卫看着在跑，实际一条都没检查
+            # （实测：把 `.props("size=sm")` 加回去，它照样全绿）。
+            is_pagination = False
+            while isinstance(root, ast.Call) and isinstance(root.func, ast.Attribute):
+                if root.func.attr == "pagination":
+                    is_pagination = True
+                    break
+                if root.func.attr == "props":
+                    pv = _const_or_template(root.args[0] if root.args else None)
+                    if pv is not None:
+                        props.append(pv)
+                root = root.func.value
+            if not is_pagination:
+                continue
+            for pv in props:
+                if "size=" in pv or "dense" in pv:
+                    bad.append(f"{path.name}:{node.lineno} → {pv!r}")
+    assert not bad, "分页在调用点自己定了尺寸：" + "; ".join(bad)
+
+
+def test_the_global_css_sizes_the_pagination():
+    """反向：上一条只禁调用点写，禁完之后必须有【一处】全局规则接管，否则分页会变回 14px。"""
+    from pages import layout
+    css = layout._HEAD_BADGE_CSS
+    assert ".q-pagination .q-btn{font-size:" in css, "全局没给分页定字号"
+    assert "!important" in css.split(".q-pagination .q-btn{")[1][:60], \
+        "Quasar 的 size= 是行内样式，不带 !important 压不住"
+
+
+def test_no_second_tag_widget_sneaks_in_through_props():
+    """全站唯一的标签机制是 `ui.badge`。
+
+    已有的 `test_badges_exist_and_are_the_only_tag_widget` 查的是 `ui.chip(`，
+    挡不住从 props 里溜进来的那一种：`ui.select(..., multiple=True).props("use-chips")`
+    会把选中项渲染成 `<q-chip>` —— 而项目里没有任何 `.q-chip` 规则，
+    它吃 Quasar 原样式（16px 圆角、14px、深底白字），与徽标那套 4px 直角 + oklch 色底
+    是两种完全不同的东西，同一屏里就有了两种"标签"。
+    """
+    bad = []
+    for p in sorted((_ROOT / "pages").glob("*.py")):
+        src = p.read_text(encoding="utf-8")
+        for i, line in enumerate(src.splitlines(), 1):
+            if "use-chips" in line and not line.lstrip().startswith("#"):
+                bad.append(f"{p.name}:{i}")
+    assert not bad, "这些地方引入了第二种标签控件（q-chip）：" + "; ".join(bad)
+
+
+def test_expansion_has_exactly_two_documented_tiers():
+    """折叠面板只允许两档，而且【哪一处属于哪一档】必须是显式的。
+
+    R22 之前是漂移：13 处里 9 处写 `dense`、4 处不写，两组之间没有任何成文的规则。
+    现在紧凑档是全局默认（`ui.expansion.default_props("dense")`），
+    主结构分组（列表的季度·年份分组头，没有外框卡片、折叠头本身就是分隔）
+    用 `.props(remove="dense")` 显式退出 —— 调用点因此永远只做一个选择：
+    "我是不是主结构分组"。
+
+    判据：任何调用点都不许再写 `props("dense")`（那是默认值，写了就是冗余、
+    而冗余正是漂移的起点）；退出那一档必须用 `remove=`。
+    """
+    import ast
+
+    bad_dense, opted_out = [], []
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf8"))
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "props"):
+                continue
+            root, is_exp = n.func.value, False
+            while isinstance(root, ast.Call) and isinstance(root.func, ast.Attribute):
+                if root.func.attr == "expansion":
+                    is_exp = True
+                    break
+                root = root.func.value
+            if not is_exp:
+                continue
+            v = _const_or_template(n.args[0] if n.args else None)
+            if v is not None and "dense" in v:
+                bad_dense.append(f"{path.name}:{n.lineno}")
+            if any(k.arg == "remove" for k in n.keywords):
+                opted_out.append(f"{path.name}:{n.lineno}")
+
+    assert not bad_dense, ("这些折叠面板在调用点写了 dense —— 那已经是全局默认："
+                           + "; ".join(bad_dense))
+    assert len(opted_out) == 4, (
+        f"显式退出紧凑档的有 {len(opted_out)} 处（预期 4 处：番剧列表 3 + 剧场版 1）："
+        + "; ".join(opted_out) + "。多了说明第二档在扩散，少了说明分组头被压扁了")
+
+
+# ---------------- (R24) 文案与配色的两条纪律 ----------------
+
+def test_the_movie_side_never_says_pending_the_anime_way():
+    """剧场版页不许出现字面量「待下」。
+
+    GLOSSARY 第一节把「待下」/「可下载」列为**有意区分**：
+    番剧的 pending 是"后台到点会自动下、不用管"，剧场版的 pending 是"等着你去点" ——
+    同一个 status，对用户的含义**相反**。剧场版全线没有任何自动下载路径，
+    写「待下」等于告诉用户这几百条不用管。
+
+    这个词在这一页漂回来过一次了（`_mov_live_status` 就是当初为改写它写的），
+    所以钉成守卫。`== "待下"` 那种等值比较是**判据**不是文案，排除掉。
+    """
+    import ast
+
+    # 【只看渲染出去的文案实参，别扫源码文本】第一版按行 grep，当场被**本文件自己的
+    # docstring**（`_mov_live_status` 里那句解释"把『待下』改写成『可下载』"）判红 ——
+    # 同一个坑本项目踩过四次。这里只取 `ui.<widget>(...)` 的字符串实参。
+    tree = ast.parse((_ROOT / "pages" / "movies.py").read_text(encoding="utf-8"))
+    bad = []
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and isinstance(n.func.value, ast.Name) and n.func.value.id == "ui"):
+            continue
+        for a in n.args:
+            v = _const_or_template(a)
+            if v and "待下" in v:
+                bad.append(f"movies.py:{n.lineno}: ui.{n.func.attr}({v!r})")
+    assert not bad, "剧场版页用了番剧那条线的『待下』（两条线含义相反）：\n  " + "\n  ".join(bad)
+
+
+def test_the_kpi_number_never_inherits_pure_white():
+    """KPI 卡的大数字必须显式落色 —— 不能靠继承 `body--dark{color:#fff}`。
+
+    原来"没有高亮色"与"值为 0"两种情况不加任何颜色类，于是一排卡里
+    『不用动手的数字』（订阅中/已忽略/种子数/版本，以及所有 0）是**纯白**，
+    而『需要动手的数字』落在 -400/-500 档（亮度约 70%）——
+    **最该被看见的那个对比度最低**。
+    """
+    import ast
+    import inspect
+
+    from pages import layout as L
+
+    src = inspect.getsource(L.kpi_cards)
+    tree = ast.parse(__import__("textwrap").dedent(src))
+    # 找 `cls = "text-2xl font-bold" ...` 那个赋值，要求它的每条分支都给出一个颜色类
+    target = None
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "cls"
+                                              for t in n.targets)):
+            target = n
+    assert target is not None, "没找到 KPI 数字的样式赋值，用例的前提坏了"
+    dumped = ast.dump(target)
+    assert "IfExp" in dumped, "样式里没有分支 —— 说明高亮/中性/零值没有各自的落色"
+    assert "text-gray-500" in dumped and "text-gray-400" in dumped, \
+        "中性与零值没有显式落灰，会继承纯白"
+
+
+def test_every_empty_state_uses_the_weaker_grey():
+    """空状态占位一律用 `text-gray-500`（更弱的那一档）。
+
+    `pages/layout.py` 的灰阶纪律成文写着：
+    「gray-500 —— 更弱的附注：页码、原始种子标题、"没有内容"这类占位」。
+    实际 14 处空状态里只有 3 处照做，其余 11 处是 gray-400 —— 与正文同档。
+    最直接的一处：仪表盘上『暂无正在下载的种子』是 gray-500，而同一屏
+    『没有待确认的番』是 gray-400，两句都是"这里什么都没有"，深浅却不一样。
+
+    这不是洁癖：两档灰是这套界面里**唯一**用来区分"内容"与"附注"的手段
+    （见 `test_only_two_greys_exist`），占位跑到内容那一档，用户会以为那句话是内容。
+    """
+    import ast
+
+    _EMPTY_PREFIXES = ("没有待确认", "没有已忽略", "没有待识别", "还没有番剧", "还没有种子",
+                       "还没有剧场版", "还没有备份", "还没有源组", "暂无正在下载", "暂无日志")
+    bad = []
+    for path in sorted((_ROOT / "pages").glob("*.py")):
+        src = path.read_text(encoding="utf-8")
+        lines = src.splitlines()
+        for n in ast.walk(ast.parse(src)):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "label"):
+                continue
+            v = _const_or_template(n.args[0] if n.args else None)
+            if not v or not any(v.startswith(e) for e in _EMPTY_PREFIXES):
+                continue
+            seg = "\n".join(lines[n.lineno - 1:(n.end_lineno or n.lineno) + 2])
+            if "text-gray-500" not in seg:
+                bad.append(f"{path.name}:{n.lineno} {v[:24]}")
+    assert not bad, "这些空状态占位没用更弱的那一档灰：\n  " + "\n  ".join(bad)

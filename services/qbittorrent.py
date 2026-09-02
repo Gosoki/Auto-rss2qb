@@ -29,6 +29,14 @@ _SESSION_TTL = 1800   # 复用已登录 client 的秒数；取小于 qB 默认 c
 _LOGIN_COOLDOWN_AUTH = 300    # 200 'Fails.'（账号密码错）/ 403（已被封）
 _LOGIN_COOLDOWN_NET = 30      # 连不上/超时
 
+# 【一次 qB 调用的总墙钟上限】(R21) httpx 的 timeout 是**逐块**的：对端每 <30 秒吐一个字节，
+# read timeout 就一直被重置、永不触发。而 qB 客户端串在 `poll_once` 的第一个 await 上
+# （run_worker → `async with _poll_lock:` → qb_precheck → reachable → _request → _ensure → _login），
+# 那条路径挂住＝采集轮永久停在第一行、`_poll_lock` 永不释放，而设置页的『迁移数据』也要拿这把锁。
+# 涓流对端不需要是恶意的：同机反代、隧道、运营商门户都会这么表现。
+# 这是全项目最后一条没有总超时的出站路径（其余走 services/fetch，那边有 asyncio.timeout 兜底）。
+_QB_TOTAL_TIMEOUT = 45        # 秒，一次请求（含登录）的总上限；超时按现有契约归一成"连不上"
+
 
 def _add_accepted(resp: httpx.Response) -> bool:
     """/torrents/add 是否被受理。两代 qB 的回法完全不同，都要认。
@@ -73,18 +81,28 @@ class QBittorrent:
             # 会把下面那条 /auth/login 连同【明文的 username/password】一起 POST 给代理，
             # 而代理回的 502 还会落进"凭据错"分支、冷却 300 秒并在日志里让用户去改密码。
             # 把 QB_URL 传进去，PROXY_SKIP_INTERNAL（默认开）就能让本机/局域网的 qB 直连。
-            kw = config.http_client_kwargs(30, url=config.QB_URL)
+            # force_direct：qB 的主机一律直连（哪怕写成主机名/自定义域）。
+            # 登录 POST 带着明文账号密码，绝不能交给代理 —— 见 config._direct_mounts。
+            kw = config.http_client_kwargs(30, url=config.QB_URL,
+                                           force_direct=config.QB_URL)
+            # 【qB 客户端不跟随重定向】(R21) 登录 POST 的 body 是**明文** username/password，
+            # 而 httpx 对 307/308 会原样复用 request.stream 重发（只剥 Authorization 头），
+            # SSRF 守卫又只拦内网目标、公网目标一律放行。也就是说 QB_URL 那头随便什么东西
+            # 回一个 `307 + Location: https://collect.evil.tld/`，凭据就被完整 POST 到公网去了。
+            # qB 是本地 API 客户端，登录与各接口都不需要重定向 —— 直接关掉，风险归零。
+            kw["follow_redirects"] = False
             client = httpx.AsyncClient(base_url=config.QB_URL, **kw)
         except Exception as e:                 # QB_URL 非法等 → 建 client 就抛，别逃逸成未处理异常
             log.error("qBittorrent 客户端创建失败（QB_URL 非法？）: %s", e)
             return None
         ok = False
         try:
-            resp = await client.post(
-                "/api/v2/auth/login",
-                data={"username": config.QB_USERNAME, "password": config.QB_PASSWORD},
-                headers={"Referer": config.QB_URL},
-            )
+            async with asyncio.timeout(_QB_TOTAL_TIMEOUT):   # 总墙钟上限，见常量处的说明
+                resp = await client.post(
+                    "/api/v2/auth/login",
+                    data={"username": config.QB_USERNAME, "password": config.QB_PASSWORD},
+                    headers={"Referer": config.QB_URL},
+                )
             # qB 对 /auth/login 有三种回法：
             #   200 "Ok."    正常登录成功，Set-Cookie 下发 SID
             #   200 "Fails." 账号或密码错（403 则是失败次数过多被临时封 IP）
@@ -158,7 +176,14 @@ class QBittorrent:
             if client is None:
                 return None
             try:
-                resp = await client.request(method, path, **kw)
+                async with asyncio.timeout(_QB_TOTAL_TIMEOUT):   # 见常量处：httpx 的超时是逐块的
+                    resp = await client.request(method, path, **kw)
+            except TimeoutError as e:
+                # asyncio.timeout 到点抛的是 TimeoutError（3.11+），它**不**是 httpx.TransportError，
+                # 得单独接。按现有三态契约归一成"连不上"：调用方本就把 None 当"留待下轮"。
+                log.error("qB 请求超过 %d 秒总上限 %s %s：%s", _QB_TOTAL_TIMEOUT, method, path, e)
+                await self._invalidate()
+                return None
             except httpx.TransportError as e:
                 # 传输层错误再给一次机会：client 是【全进程共享】的，另一个协程走到会话轮换
                 # （TTL 到点 / 认证被改 / 403 重登）时会直接 aclose 掉它，把【本协程此刻在途的】

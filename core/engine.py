@@ -4,6 +4,7 @@ anime.py(TV) 与 movies.py(剧场版) 都依赖这里；本模块不含任何 TV
 两条线因此互不相干又不重复造轮子。
 """
 import asyncio
+from contextlib import contextmanager
 import ipaddress
 import logging
 import ntpath
@@ -43,6 +44,133 @@ def sync_busy(model_cls) -> bool:
     """该表的 qB 同步是否正有一轮在跑。页面『立刻刷新』据此早退，别把后台那轮的宽限窗口压掉。"""
     lk = _sync_locks.get(model_cls)
     return bool(lk and lk.locked())
+
+
+# 【本进程此刻真的在交付哪些行】(R24)
+# `status == "downloading"` 是**落库的**占位，它只说明"某个进程某一刻开始交付这一行"，
+# 不说明"此刻真的有协程在管它"。两者分家的后果实测过：
+# 交付成功后的那次回写撞上 OperationalError（MySQL 重启 / 连接被切 / MYSQL_READ_TIMEOUT
+# 切断慢查询 / 锁等待），异常直接冒出函数，行就**永久**停在 downloading ——
+#   · `_sync_qb_status` 显式跳过 downloading 行（"交付协程独占"）；
+#   · `downloading ∈ HAVE_STATUSES` ⇒ 集去重认定该集已有一份，flush/补下永不再挑；
+#   · `run_db_watch` 的恢复边沿调 `init_business_state(reset_leftovers=_startup_reset_pending)`，
+#     而运行中掉线那一支该标志恒为 False（有意为之，防止打断真在途的交付）⇒ 不复位。
+# 只有重启进程才清得掉。而 R22 把 downloading 收进 `maintenance_blockers()` 之后又多一条：
+# 设置页的『切库』『迁移』从此**永久**被拒，提示还写着"等它跑完（最多几分钟）再来" ——
+# 它永远不会跑完。
+#
+# 这个集合把两者分开：进锁时登记、`finally` 里注销。于是
+#   · 在途闸只数"真的有协程在管"的那些（残骸不再挡住维护）；
+#   · `sweep_stale_delivering()` 能安全地把残骸复位（不在集合里 ⇒ 没人会再写它）。
+# 键带表名：两张表的整数主键各自独立，只用 id 会串。
+_delivering: set = set()
+
+
+@contextmanager
+def delivering(model_cls, torrent_id: int):
+    """声明"本协程正在交付这一行"。见 `_delivering` 处的说明。"""
+    key = (model_cls.__name__, int(torrent_id))
+    _delivering.add(key)
+    try:
+        yield
+    finally:
+        _delivering.discard(key)
+
+
+def is_delivering(model_cls, torrent_id: int) -> bool:
+    return (model_cls.__name__, int(torrent_id)) in _delivering
+
+
+def sweep_stale_delivering() -> int:
+    """把"落库是 downloading、但本进程并没有协程在管"的残骸复位成 pending。返回复位数。
+
+    只有本进程知道自己在交付什么，所以这件事只能在本进程做，且必须靠 `_delivering` 判 ——
+    单看状态列是分不出"在途"与"残骸"的，那正是这些行以前永远清不掉的原因。
+    """
+    from db.models import AnimeTorrent, MovieTorrent
+
+    n = 0
+    with get_session() as s:
+        for model_cls in (AnimeTorrent, MovieTorrent):
+            for t in s.exec(select(model_cls).where(model_cls.status == "downloading")):
+                if is_delivering(model_cls, t.id):
+                    continue
+                t.status = "pending"
+                s.add(t)
+                n += 1
+        if n:
+            s.commit()
+    if n:
+        log.warning("复位 %d 条僵死的『交付中』占位（多半是交付途中库抖了一下，"
+                    "回写没成功）——它们回到待下，下一轮 flush 会重发", n)
+    return n
+
+
+def maintenance_blockers() -> list[str]:
+    """现在【不能】做整库维护（切库 / 迁移）的理由清单；空列表＝可以做。(R21)
+
+    维护会把整个业务库换掉或清空重写，而下面这几件事**跨 await 持着业务库的整数主键**：
+    交付协程在锁内先把状态置成 `downloading`、出锁后 `await` 取种(最长 180s)+加 qB，
+    回来再按 `torrent_id` 回写。而 `db/transfer.py` 明确保留主键 ——
+    两个库里 id=501 是**两条毫不相干的种子**。维护窗口横在这中间时，
+    回写就落进了另一个库的另一行：那一集被静默标成"已交付"（∈HAVE_STATUSES，
+    集去重从此永远挡着），而盘上什么都没有，全程零告警。
+
+    `db.maintenance()` 那把闸挡得住维护【期间】的读写，挡不住"await 跨过整个维护窗口、
+    维护结束之后才回写"这一种。所以维护开始【之前】必须先确认没有这类协程在半途 ——
+    这就是本函数。判据全部复用现成的、本来就在维护的信号，不新造状态：
+      · `status == "downloading"` 的行 ＝ 交付协程正在半途（进锁即置、成败都会自己写回）
+      · `sync_busy(...)`           ＝ qB 同步有一轮在 await 中
+      · 两把轮次锁被持有 ＝ 采集轮 / 剧场版扫描轮正在半途 —— **它们同样跨 await 持主键**：
+        `process_item` 里 `anime_id = await _resolve_anime(item)`（enrich 预算 120 秒）
+        出 await 之后新开会话按那个 id 写种子行。R21 把这条留给了调用方"记得拿锁"，
+        而 `_migrate` 拿了、`_switch_backend` 一把都没拿 —— 标准的第①号形状（R22 实测复现：
+        采集轮卡在 enrich 的 await 上时闸放行，切库之后种子带着旧库的主键写进了新库）。
+        收进判据之后，调用方不必再记得任何事。
+
+    【库连不上时返回空表，不抛】(R22) `switch_data_engine` 的 docstring 明写
+    "切回本地 SQLite"是 fatal/停摆时的**唯一自救出口**（"至少要让连接层回到本地，
+    好让用户看得到设置页"）。而本函数要对着 `db.engine` 发两条 COUNT ——
+    正是那台连不上的 MySQL。第一版没接异常：MySQL 一挂，这个新加的预检就把自救出口堵死了
+    （实测弹"切换失败"，engine 一步都没动）。
+    库都连不上，本来也不可能有在途交付；真正的把关在 `db.maintenance(blocked_by=...)` 那一层。
+    """
+    from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+
+    from db.models import AnimeTorrent, MovieTorrent
+
+    reasons = []
+    try:
+        with get_session() as s:
+            for model_cls, what in ((AnimeTorrent, "番剧"), (MovieTorrent, "剧场版")):
+                # 【只数"真的有协程在管"的】落库的 downloading 里可能混着残骸
+                # （交付途中库抖了一下、回写没成功），而残骸永远不会消失 ——
+                # 只按状态列数的话，一条残骸就把切库/迁移永久拒死。见 _delivering 处的说明。
+                n = sum(1 for t in s.exec(select(model_cls.id).where(
+                    model_cls.status == "downloading")) if is_delivering(model_cls, t))
+                if n:
+                    reasons.append(f"有 {n} 条{what}种子正在交付中（取种最长 180 秒）")
+    except (SQLAlchemyError, DBAPIError) as e:
+        log.info("在途预检读不了业务库（%s: %.80s）—— 视作没有在途交付，"
+                 "别把『切回本地 SQLite』这条自救出口堵死", type(e).__name__, e)
+        return []
+    for model_cls, what in ((AnimeTorrent, "番剧"), (MovieTorrent, "剧场版")):
+        if sync_busy(model_cls):
+            reasons.append(f"{what}的 qB 状态同步正在跑")
+    # 延迟导入：这两个模块都 import engine，模块级会成环
+    from core import anime as _a
+    from core import worker as _w
+    # 【五条后台线，一条都不能漏】(R22) R21 只列了前两条（downloading 行 / qB 同步），
+    # R22 补了采集轮与剧场版扫描轮，而**第五条（延迟重识别）又漏了** ——
+    # 它单轮最多 50 部、每部 `await enrich.resolve()`（预算 120 秒，全项目最长的 await 之一），
+    # 出 await 后按同一个整数主键写回。第①号形状在同一个函数上连中两次，
+    # 所以这里按"有几条跨 await 持主键的线"逐条列全，新增一条就往这儿加一行。
+    for lock, what in ((_w._poll_lock, "采集轮"),
+                       (_w._scan_lock, "剧场版扫描轮"),
+                       (_a._enrich_lock, "延迟重识别/批量刷新资料")):
+        if lock.locked():
+            reasons.append(f"{what}正在跑（它跨 await 持着业务库主键）")
+    return reasons
 
 _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _QUARTER_KEY_RE = re.compile(r"(\d{2})([A-D])")
@@ -540,6 +668,48 @@ def unexclude_torrent(model_cls, tid: int) -> bool:
     return True
 
 
+def existing_hashes(model_cls, hashes) -> set[str]:
+    """这批 info_hash 里哪些库里已经有了。**一次 IN 查询**，供入库前批量预取。
+
+    逐条查的代价并不小：真库上 569 个 hash 单会话逐条 252ms、一条 IN 只要 2.8ms（90×）。
+    而入库路径的条目绝大多数是【上一轮就见过的】，批量预取等于把 N 次往返压成 1 次；
+    切到远程 MySQL 时省的是每轮 0.4~2 秒的裸阻塞（建连接 + 往返 ×N）。
+
+    【两条线共用一份】(R21) 原本只有番剧侧有（`core.anime.existing_hashes`，只给 poll_once 用），
+    剧场版的 `_store_movie_torrents` 仍是逐条 `WHERE info_hash = ?`：
+    真库 70 部 / 569 个版本重扫一遍 = 639 条 SQL、657ms 的同步阻塞，而它跑在事件循环上
+    （页面、下载放行、qB 同步一起卡）。同一件事有两处、只做了一处 —— 第①号形状。
+    """
+    hs = [h for h in hashes if h]
+    if not hs:
+        return set()
+    with get_session() as s:
+        return set(s.exec(select(model_cls.info_hash).where(model_cls.info_hash.in_(hs))))
+
+
+def has_unmovable_files(s, model_cls, owner_col, owner_id: int) -> bool:
+    """该番/该片是否有【搬不动】的已下文件：盘上有文件(HAVE)但已归档(archived_at 非空)。
+
+    判据必须与下面 `relocate` 的选行条件**互为反面**：relocate 明确排除
+    `archived_at.is_not(None)`（已归档＝从 qB 移除只留文件，setLocation 移不动）。
+    所以只要存在这种行，改名/改季度就会造成【程序侧再也补救不了】的散目录：
+    新集落新目录、这批文件永久留在旧目录，UI 上没有任何按钮能把它们搬过去。此时宁可不改名。
+
+    【放在 engine 而不是两条线各写一份】(R21) R21 之前只有 `core/anime.py` 有它，
+    剧场版侧漏了 —— 而两条线走的是同一个 relocate、同一个 archive_old_completed，
+    约束在两边都成立。补的时候第一版是在 movies 里又抄了一份，
+    被 `tests/test_single_definition.py` 当场判红：抄出来的第二份，下次只会被改掉一半。
+    收成参数化的一份之后，`relocate` 与它天然对齐（同一个文件、相邻两个函数）。
+
+    s 收成参数：两个调用点都在自己的会话里做完读改写，不该为这一问再开一个会话。
+    """
+    return s.exec(select(model_cls).where(
+        owner_col == owner_id,
+        model_cls.status.in_(HAVE_STATUSES),
+        model_cls.archived_at.is_not(None),
+    )).first() is not None
+
+
 async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
                    old_path: str | None = None, noun: str = "集") -> dict:
     """把某番/某片『盘上有文件』的种子移到新的归档目录（改季度/重绑后调用，调用方须已落新季度/名）。
@@ -578,7 +748,7 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
 
         只降级仍被 qB 跟踪的行(TRACKED)。stalled 有意保持原样——它是『等人工处理』的标记，
         降成 pending 会：① 让停滞集重回自动队列，flush 还可能挑中同集别的源＝对停滞集自动换源
-        （状态词表明令禁止）；② 抹掉『⚠️停滞』提示；③ 详情页删除按钮门槛是 HAVE，
+        （状态词表明令禁止）；② 抹掉『停滞』提示；③ 详情页删除按钮门槛是 HAVE，
         变 pending 后按钮消失，旧目录的半成品成了 UI 删不掉的孤儿。
         返回真实改动数是为了让报告不说谎（说要重下 N 条，就得真有 N 条被清）。
         """
@@ -824,7 +994,7 @@ _QB_STATES: dict[str, tuple[str, str]] = {
     "stoppedUP":          ("SX", "已完成"),
     # ---- 落定但不是完成 ----
     # 带 W：qB 确实没在推进它（文件都找不到了），所以【停滞计时也不该走】——
-    # 否则默认 24 小时后这一行会从精确的『文件缺失』变成含糊的『⚠️停滞』，既丢诊断信息，
+    # 否则默认 24 小时后这一行会从精确的『文件缺失』变成含糊的『停滞』，既丢诊断信息，
     # 又因为 stalled ∉ TRACKED_STATUSES 而永久退出上面那条补查（用户在 qB 修好文件也再无出口）。
     "missingFiles":       ("XW", "文件缺失"),      # 文件没了：终态，不再轮询，也不算已完成
     # ---- 既非在下也非已完成 ----
@@ -889,6 +1059,34 @@ def _inflight_where(model_cls):
     )
 
 
+def _recheck_where(model_cls, states=None):
+    """『被 _inflight_where 排除掉、但仍要额外问一遍 qB』的行 —— 与 _inflight_where **严格互斥**。
+
+    最后那个 or_ 就是 `NOT _inflight_where`（在 status 已经是 TRACKED 的前提下）：
+    进度满了、或者 qB 态已落定。少了它，两条 WHERE 会重叠 ——
+    `_QB_NEEDS_RECHECK = {missingFiles} | _QB_TRANSIENT`，而 _QB_TRANSIENT 的 7 个态
+    （checkingDL / allocating / metaDL / forcedMetaDL / checkingResumeData / moving / checkingUP）
+    【带 T 不带 X】，progress<1 时两边同时命中，同一行既进 rows 又进 recheck。
+    `_sync_qb_status` 里那句 `if tid in recheck_ids: continue` 是按 tid 判的、
+    认不出手上这一份来自哪一半，于是属于 rows 的那一份也被当成补查行跳过 ——
+    这一行从此【永远落不了定】：恒满足 in-flight（同步循环永不休眠）、
+    又恒在 HAVE_STATUSES 里（集去重认定这一集已有一份，而盘上什么都没有 → 该集永久漏投且零告警）。
+    触发条件很日常：qB 重启让所有未完成种子经过 checkingResumeData/checkingDL，
+    开着预分配时每个新种子经过 allocating，磁链交付经过 metaDL。（R21 修，用例钉在 test_qb_sync.py）
+
+    【为什么不改成"给这 7 个态补上 X"】那能让集合互斥，却会把它们踢出 _inflight_where；
+    而下面那条 recheck 查询带着 `if (rows or manual)` 的搭车条件 ——
+    在下的只剩这一条时 rows 为空、recheck 压根不跑，那才是真正的死胡同
+    （checkingUP 当初从 SX 改成 ST 正是为了躲开它）。
+    """
+    return (
+        model_cls.status.in_(TRACKED_STATUSES),
+        model_cls.qb_state.in_(list(states if states is not None else _QB_NEEDS_RECHECK)),
+        or_(model_cls.qb_progress >= 1.0,
+            func.coalesce(model_cls.qb_state, "").in_(_QB_SETTLED_LIST)),
+    )
+
+
 def inflight_count(model_cls) -> int:
     """『在下的』种子总数（口径同 _inflight_where）。列表页只取前 N 条展示，
     标题要显示真实总数——否则被 limit 截断时标题少报，还会和上方按 qb_summary 算的
@@ -903,6 +1101,30 @@ def has_inflight() -> bool:
     with get_session() as s:
         for model_cls in (AnimeTorrent, MovieTorrent):
             if s.exec(select(model_cls.id).where(*_inflight_where(model_cls)).limit(1)).first():
+                return True
+    return False
+
+
+def needs_qb_poll() -> bool:
+    """还该不该问 qB —— 供 worker 决定继续轮询还是休眠。(R22)
+
+    = 有在下的种子（`has_inflight()`）**或** 有停在过渡态、等着被补查的种子。
+
+    【为什么不能只用 has_inflight()】R21 给 `_sync_qb_status` 加了"过渡态无条件补查"
+    （`_QB_TRANSIENT` 的 7 个态是 qB 自己几秒内就走完的，不该等"有别的在下种子"才搭车）。
+    可它唯一的后台调用方是 `run_qb_sync` 的内层 `while … and has_inflight()` ——
+    而触发那条新分支的行恰恰是 `progress=1.0 + qb_state=moving/checkingUP` 这种，
+    **正好让 `has_inflight()` 返回 False**（`_inflight_where` 要求 progress<1）。
+    于是当它是最后一条时循环体一次都不执行，那段新代码是**死代码**
+    （R22 两个视角各自跑真实的 `run_qb_sync` 复现：torrents_info 被调 0 次）。
+    改动的作用域是"补查这件事"，验证却停在 `sync_qb_status` 那一层 —— 第②号形状。
+    """
+    if has_inflight():
+        return True
+    with get_session() as s:
+        for model_cls in (AnimeTorrent, MovieTorrent):
+            if s.exec(select(model_cls.id).where(
+                    *_recheck_where(model_cls, _QB_TRANSIENT)).limit(1)).first():
                 return True
     return False
 
@@ -979,7 +1201,11 @@ def backfill_legacy_progress_once() -> None:
     异常一抛，采集/qB同步/剧场版扫描/待识别重试【一个都起不来】，页面却照常 200，
     用户只会觉得"好几天没更新了"。标记位读写走 meta，业务行更新走 data，两段分开。
     """
-    flag = "_QB_PROGRESS_BACKFILLED"
+    # 【标记要带业务库身份】(R26) 它判的是"**这个业务库**回填过没有"，而标记存在 meta 库、
+    # 不随业务库走。第三处同款标记，理由与 core/anime.py 的 `_scoped` 逐字相同 ——
+    # 三处标记同一个决定，之前只有零处落到（第①号形状）。
+    from db import data_identity
+    flag = f"_QB_PROGRESS_BACKFILLED@{data_identity()}"
     n = 0
     with get_meta_session() as ms:            # 标记位：本地 SQLite
         if ms.get(Setting, flag) is not None:
@@ -999,20 +1225,43 @@ def backfill_legacy_progress_once() -> None:
         log.info("一次性迁移：%d 条历史 sent 种子标记为已完成（qb_progress=1，脱离 in-flight）", n)
 
 
+def observation_gap_seconds() -> int:
+    """"这段空白不能归因于种子"的判定窗口（秒）。
+
+    【必须按 worker 的【最慢】那一档正常节拍来算，不是活跃节拍】(R21 修)
+    原来窗口是 `max(600, QB_SYNC_INTERVAL*10)` —— 那是按**活跃**间隔（默认 30 秒）算的，
+    可真正决定"两次同步之间隔多久"的是 `run_qb_sync` 的**中档**节拍：
+    一条无源 0 速的种子让 `has_active_downloading()` 恒为 False，内层快循环跑满
+    `QB_SLOW_ROUNDS` 就退出，外层 `wait_for` 睡 `QB_IDLE_RECHECK_MIN*60` = 默认 **600 秒**
+    —— 恰好等于旧窗口。于是每次唤醒的第一轮都被判成"观测断档"、把 `qb_progress_at` 重置回 now，
+    而同一突发内后面两轮只隔 30 秒：`now - qb_progress_at` 最大 90 秒，
+    离 `QB_STALL_TIMEOUT_MIN`（默认 1440 分钟）差三个数量级。
+    **判据用错了节拍，于是停滞检测在默认配置下从未生效过**（R21 的用例复现了 26.7 小时零推进仍不触发）。
+
+    加 300 秒余量：那一觉醒来之后还要跑 `qb.reachable()` + `archive_old_completed()` + 本轮同步，
+    真实的 `now - prev_synced` 会比 `QB_IDLE_RECHECK_MIN*60` 略大一点。
+    """
+    return max(600, config.QB_SYNC_INTERVAL * 10, config.QB_IDLE_RECHECK_MIN * 60 + 300)
+
+
 def _observation_gap(prev_synced, now) -> bool:
     """距上一次成功同步是不是隔了太久——久到这段空白【不能归因于种子】。
 
-    窗口取 max(600 秒, QB_SYNC_INTERVAL*10)：正常在线时 sync 每 QB_SYNC_INTERVAL 秒刷新一次
-    qb_synced_at，远在窗口内，此闸永不误伤（与 has_active_downloads 的新鲜度闸同一套推理）。
+    窗口见 observation_gap_seconds()：正常在线时（含中档自查那一档）sync 都在窗口内刷新
+    qb_synced_at，此闸不误伤；真正的断档（关机、qB 挂掉）才会命中。
     prev_synced 为空＝这一行还没被同步过，同样不该拿它去判停滞。
     """
     if prev_synced is None:
         return True
-    return (now - prev_synced) > timedelta(seconds=max(600, config.QB_SYNC_INTERVAL * 10))
+    return (now - prev_synced) > timedelta(seconds=observation_gap_seconds())
 
 
-async def sync_qb_status(model_cls, manual: bool = False) -> int:
-    """从 qB 拉某表『在下的』种子实时态并写回。返回更新数。整轮串行化，实现见 _sync_qb_status。
+async def sync_qb_status(model_cls, manual: bool = False) -> int | None:
+    """从 qB 拉某表『在下的』种子实时态并写回。整轮串行化，实现见 _sync_qb_status。
+
+    【三态返回】int=实际更新了几行（0 也是有效答案：没有在下的种子）/ **None=没能问到 qB**
+    （连不上、超时、被总超时切断）。调用方必须把 None 与 0 分开 ——
+    否则 qB 关机时页面会弹一句绿色的『没有正在下载的种子』，而同屏正写着『正在下载（5）』。
 
     manual=True 是【页面上人点了『立刻刷新』】。差别只有一处：没有在下种子时，
     后台轮次直接收工，而人工这一次仍会去补查『文件缺失』的行——理由见 _sync_qb_status 里
@@ -1026,7 +1275,7 @@ async def sync_qb_status(model_cls, manual: bool = False) -> int:
         return await _sync_qb_status(model_cls, manual)
 
 
-async def _sync_qb_status(model_cls, manual: bool = False) -> int:
+async def _sync_qb_status(model_cls, manual: bool = False) -> int | None:
     """从 qB 拉『在下的』种子实时态写回某表（AnimeTorrent/MovieTorrent，qb_* 字段同名）。返回更新数。
 
     一次 hashes= 拿全状态，客户端按 qB 态分桶：
@@ -1059,11 +1308,21 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int:
         # 不急这一轮。但【人工点『立刻刷新』时不搭车、单独查】：那一下正是"我刚把文件放回去了"
         # 的时机，而搭车口径下它恰好不成立（都下完了才会去修文件，此时没有在下种子），
         # 于是那条『文件缺失』告警要挂到下一次有新种子在下时才会消失——休播期可能是几周。
+        # 【搭车条件只对 missingFiles 成立，对过渡态不成立】(R21)
+        # 上面那段"没别的事时不为它单独唤醒 qB"的立论是"恢复文件是人工动作，不急这一轮" ——
+        # 那只说得通于 missingFiles。`_QB_TRANSIENT` 的 7 个态是 qB 自己**几秒内就会走完**的
+        # 过渡态：开了 temp_path 时每个种子完成瞬间必经 moving；qB 重启时未完成种子必经
+        # checkingResumeData；用户强制校验必经 checkingUP；磁链交付必经 metaDL。
+        # 只要 sync 恰好在那几秒里采样到一次，该行就写成 progress=1.0 + qb_state=moving ——
+        # 它同时掉出 `_inflight_where`（progress≥1）与 `has_inflight()`，
+        # 于是当它是**最后一条**在下的种子时 rows 为空、recheck 整个不跑，后台再也不问 qB：
+        # 永久停在中间态（不归档、qb_summary 不算它已完成、UI 永远显示『移动中』）。
+        # 所以拆成两段：过渡态无条件补查，missingFiles 保持搭车。
+        _states = set(_QB_TRANSIENT) if not (rows or manual) else set(_QB_NEEDS_RECHECK)
         recheck = [(t.id, t.info_hash, True)
                    for t in s.exec(select(model_cls).where(
-                       model_cls.status.in_(TRACKED_STATUSES),
-                       model_cls.qb_state.in_(_QB_NEEDS_RECHECK_LIST)))
-                   if t.info_hash] if (rows or manual) else []
+                       *_recheck_where(model_cls, _states)))
+                   if t.info_hash]
     if not rows and not recheck:
         return 0
     # 【补查行必须与在下行分开】它们【不参与】下面那套"qB 查不到就在有限轮内落定"的判据：
@@ -1073,11 +1332,22 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int:
     #  · qB 查不到一条【本就报文件缺失】的种子，唯一正确的结论是"维持原状"：它可能已被用户
     #    从 qB 删掉，也可能 qB 还没扫到——两种都不该由我们改写状态。
     # 它们也不进 absent 的分母：那个比例判据算的是"在下的种子里有多少不见了"。
+    # 【两个名单严格互斥】由 _recheck_where 的最后一个 or_ 保证（那里写着为什么必须如此）。
+    # 下面 `if tid in recheck_ids: continue` 依赖的正是这个互斥：它按 tid 判、认不出来源，
+    # 一旦两边重叠，属于 rows 的那一份也会被跳过、这一行永远落不了定。
     recheck_ids = {tid for tid, _, _ in recheck}
     rows_all = rows + recheck
     info = await qb.torrents_info([h for _, h, _ in rows_all])
     if info is None:
-        return 0   # 只在『连不上/出错』(None) 本轮不动。空 dict {} 是『qB 在线但这批一个都不在』——
+        # 【返回 None 而不是 0】(R21) 三种完全不同的情形本来都塌成 `0`：
+        #   ① 真的没有在下的种子；② qB 连不上；③ await 期间用户关了跟踪。
+        # 而页面上的『立刻刷新』按 `n` 是不是 0 出文案，于是 qB 关机时弹的是
+        # **绿色**的『没有正在下载的种子』—— 页面同屏还写着『正在下载（5）』，自相矛盾。
+        # 上面那个 `except Exception → 同步失败` 接不住它：整条链
+        # （_login 的 `except httpx.HTTPError → None` → torrents_info 的 `if resp is None: return None`
+        # → 这里）从头到尾不抛异常，注释里点名要接的那一种恰恰是唯一接不到的。
+        # 与本项目已有的三态约定同形（add_to_qb / download_*_torrent 的 True/False/None）。
+        return None   # 只在『连不上/出错』(None) 本轮不动。空 dict {} 是『qB 在线但这批一个都不在』——
                    # 须落到下面逐行走 d is None 落定(全被删/移除时)，否则它们永久 in-flight、循环永不休眠。
     if not config.QB_SYNC_STATUS or not config.QB_ENABLED:
         return 0   # await 期间用户关了跟踪/关了 qB（这批已由 settle_inflight_off 落定）——
@@ -1117,11 +1387,50 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int:
             d = info.get(h)
             if d is None:
                 if tid in recheck_ids:
-                    continue        # 补查行查不到 → 维持原状（理由见上面 recheck 的注释）
+                    # 【补查行也要有个终点，不能一律"维持原状"】(R24)
+                    # "维持原状"这条规则是为 `missingFiles` 写的（用户可能把文件放回去、重新校验，
+                    # 那时 qB 会重新认得它）。可 R21/R23 把补查集合扩成了
+                    # `{missingFiles} ∪ _QB_TRANSIENT` —— 而对那 7 个**过渡态**，
+                    # "维持原状"就是**永久悬空**：再没有任何路径能改写它。
+                    # 触发序列很日常：① 开 temp_path 时每个种子完成瞬间必经 `moving`、
+                    # qB 重启时必经 `checkingResumeData`、强制校验必经 `checkingUP`、
+                    # 磁链交付必经 `metaDL`，sync 在那几秒采样到一次就写成
+                    # `sent / progress=1.0 / qb_state=moving`；② 此后该种子离开 qB
+                    # （用户删掉、remove-on-complete、跨表同 hash 被另一侧归档时 qb.delete 摘走）。
+                    # 后果三条：`archive_old_completed` 把 `_QB_NEEDS_RECHECK` 永久排除
+                    # （用户配的 QB_ARCHIVE_AFTER_DAYS 对它恒不生效）；`needs_qb_poll()` 恒为真，
+                    # run_qb_sync 再也回不到保底那一档、每 10 分钟醒来空打一轮 qB，永远；
+                    # UI 恒显示『移动中 100%』。
+                    # 这正是本函数上面那句不变式（"必须在有限轮内落定，否则循环永不休眠"）
+                    # 被补查这一半绕开了。
+                    #
+                    # 分两类收敛：missingFiles 维持原状（那条立论成立）；
+                    # 过渡态 —— qB 都查不到了，说明那几秒早就走完，把记号清掉即可
+                    # （progress 已是 1.0，等价于"下完后被 qB 移除"，与上面 in-flight 分支第一条同款）。
+                    if t.qb_state in _QB_TRANSIENT:
+                        t.qb_state, t.qb_synced_at = "", now
+                        s.add(t)
+                        updated += 1
+                    continue
                 # qB 查不到这个在下的种子——必须在有限轮内落定，否则它恒满足 in-flight、循环永不休眠。
                 # 用【重读后】的实时进度判定（await 期间该行可能被完成回调 mark_done_by_hash/新交付推进到满）：
                 # 若仍用 await 前的陈旧快照，会把刚被 /api/qb/done 回调标『已下完』的行覆写回 error、使回调形同虚设。
-                if (t.qb_progress or 0.0) >= 0.999:  # 已满(含完成回调刚落定) → 下完被 qB 移除，落定已下
+                # 【判据必须是"确实被落定过的满"，不是"接近满"】(R24 收紧)
+                # 这一条的立论是"已满(含完成回调刚落定)"，而"已满"的两个来源
+                # （`mark_done_by_hash` / `settle_sent`）写的都是**精确的 1.0 且 qb_state 清空**。
+                # 旧判据 `>= 0.999` 会把**从 qB 镜像来的真实进度**一起吃进去：
+                # 一条 1.5GB 的种子下到 99.95%（还差 750KB）时从 qB 消失，本轮就被写成
+                # `progress=1.0, qb_state="", qb_synced_at=now` —— 它**不经过** `_QB_ABSENT` 记号、
+                # **不经过** `max(600, QB_SYNC_INTERVAL*10)` 的墙钟宽限，
+                # **也不受 `batch_absent` 抑制**（那个闸只挡最下面的 else 分支）。
+                # 于是 qB 每重启一次，所有卡在最后 0.1% 的种子都被判成下完：
+                # `sent ∈ HAVE_STATUSES` ⇒ flush/补下/换源永不再碰这一集，
+                # `qb_synced_at=now` 还给归档倒计时上了发条，N 天后 UI 显示『已归档』——
+                # 而盘上是个残缺文件（开 temp_path 时最终目录里干脆什么都没有），全程零告警。
+                # 对照：同一函数下面为浮点噪声定的 epsilon 是 **1e-9**，这里却用了 1e-3，差 6 个数量级。
+                # 镜像来的 0.999x 应当落到下面的 _QB_ABSENT + 墙钟宽限路径，最终判 error ——
+                # 那才是可换源、可补下、可见的结局。
+                if (t.qb_progress or 0.0) >= 1.0 - 1e-9 and not t.qb_state:
                     t.qb_progress, t.qb_state, t.qb_synced_at = 1.0, "", now
                 elif not was_synced:        # 从未被 qB 确认(刚交付未登记?) → 给一轮宽限，下轮仍无则→error
                     t.qb_synced_at = now

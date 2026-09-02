@@ -157,6 +157,7 @@ def test_every_revision_gates_on_role():
     豁免：确实与 role 无关的 revision（两边都要跑同样的事）在下面登记并写清理由。
     """
     import pathlib
+    import ast
     import re
 
     # revision id → 为什么这条不需要 role 闸
@@ -169,11 +170,29 @@ def test_every_revision_gates_on_role():
         rev = rev.group(1) if rev else f.name
         if rev in _ROLE_AGNOSTIC:
             continue
-        body = src[src.index("def upgrade("):] if "def upgrade(" in src else ""
-        # 闸的形态：脚本里定义 _role() 并在 upgrade 开头比较，或直接读 x_argument
-        gated = ("_role()" in body or "get_x_argument" in body)
+        # 【必须用 AST 只看 upgrade()，不能切源码字符串】(R22 修)
+        # 第一版是 `src[src.index("def upgrade("):]` —— 这一刀切到**文件末尾**，
+        # 把 `def downgrade()` 一起装了进去；判据又只是子串匹配（注释里的同名词同样满足）。
+        # 而 `b2c9e4f17a03_retry.py` 与 `c7e1a93b4d02_finish_idle.py` 的 downgrade() 里
+        # 各有一句 `if _role() != "data": return` —— 这两条恰恰是最危险的加列 revision。
+        # 实测：把 upgrade() 里那句闸删掉，守卫仍判绿；
+        # 照着抄一条新 revision、只在 downgrade 写闸，同样判绿 ——
+        # 而它会在 role=meta 那一遍把业务表建进【配置库】，正是本守卫 docstring 自己写的那句话。
+        tree = ast.parse(src)
+        up = next((n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and n.name == "upgrade"), None)
+        if up is None:
+            offenders.append(f"{f.name}（revision {rev}）没有 upgrade()")
+            continue
+        # 闸的形态：调用本脚本的 _role()，或直接读 x_argument。查【真实调用节点】，
+        # 注释与字符串都不再算数。
+        gated = any(
+            (isinstance(n.func, ast.Name) and n.func.id == "_role")
+            or (isinstance(n.func, ast.Attribute) and n.func.attr == "get_x_argument")
+            for n in ast.walk(up) if isinstance(n, ast.Call))
         if not gated:
-            offenders.append(f"{f.name}（revision {rev}）的 upgrade() 里没有出现 role 判定")
+            offenders.append(f"{f.name}（revision {rev}）的 upgrade() 里没有 role 判定")
     assert not offenders, (
         "这些迁移没有 role 闸，会在【两个引擎上各跑一次】而没人拦得住：\n  "
         + "\n  ".join(offenders)
@@ -187,3 +206,101 @@ def test_the_role_gate_guard_is_not_vacuous():
     assert len(files) >= 5, f"只找到 {len(files)} 个 revision 脚本，上面那条守卫可能在空扫"
     assert any("_role()" in f.read_text(encoding="utf8") for f in files), \
         "一个脚本都没有 _role()，说明闸的形态变了，守卫的判据要跟着改"
+
+
+# ---------------- (R21) alembic 产出的库要与【模型声明的索引】一致 ----------------
+
+def test_the_migrated_database_has_every_index_the_models_declare(upgrade_from):
+    """模型上每一个 `index=True` / `Index(...)`，升级完的库里都得真有一个同名索引。
+
+    【第一版这条用例是假的，留着当反面教材】原本写成"全新库 vs 升级上来的库，索引集合相同"——
+    而本项目**只有一条建库路径**：全新库同样是一路 alembic 建过去的（见 db/schema.upgrade
+    的 docstring："全新库会一路建过去"），没有 `create_all` 那一支。
+    于是那条断言是拿同一条链的产物跟自己比，**永远成立**：
+    把 revision 里的索引名改错、甚至整段删掉剧场版那一半，它照样全绿（实测两次变异都没红）。
+
+    真正的不变式是"库要长成模型说的样子"，所以这里拿 `SQLModel.metadata` 当基准。
+    它同时挡住两种错法：
+      · revision 手写的索引名与 SQLModel 自动生成的 `ix_<表>_<列>` 不一致
+        —— 此后任何按名字判断"有没有这个索引"的代码（包括 revision 自己的幂等闸）都会错；
+      · 两张表只加了一张（第①号形状）。
+    """
+    import sqlite3
+
+    from sqlmodel import SQLModel
+
+    import db.models  # noqa: F401  只为注册表结构
+
+    eng = upgrade_from("41170d6a7ad4")      # 从 baseline 起
+    upgrade_from.to_head(eng)
+
+    con = sqlite3.connect(eng.url.database)
+    try:
+        got = {t: {r[1] for r in con.execute(f"PRAGMA index_list({t})")}
+               for t in (r[0] for r in con.execute(
+                   "SELECT name FROM sqlite_master WHERE type='table' "
+                   "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'alembic_%'"))}
+    finally:
+        con.close()
+
+    missing = []
+    checked = 0
+    for name, table in SQLModel.metadata.tables.items():
+        if name not in got:
+            continue        # meta 侧的表（setting）不在业务库里
+        for ix in table.indexes:
+            checked += 1
+            if ix.name not in got[name]:
+                missing.append(f"{name}.{ix.name}")
+    assert checked >= 8, f"只比对了 {checked} 个索引，模型注册多半没生效"
+    assert not missing, ("升级完的库里缺这些模型声明过的索引（多半是 revision 写错了名字、"
+                         "或者只加了两张表中的一张）：" + "、".join(missing))
+
+
+
+def test_trim_alias_keeps_the_row_its_docstring_promises(upgrade_from):
+    """(R22) `trim_alias` 保留的必须是 **anime_id 较小**的那条 —— 与它的 docstring 一致。
+
+    docstring 写的是「保留 anime_id 较小的那条（更早建的、种子多半挂在它下面）」，
+    而实现是 `sorted(rows, key=lambda r: r[0])`（r[0] 是 anime_alias.id），
+    循环里解包出来的 `anime_id` 一次都没用到。
+
+    两条超长别名截断后撞同一个 (title, season)、而它们各自指向的番在 anime 表里的先后顺序
+    与别名行的先后顺序相反时，活下来的映射指向的是【后建的那部番】——
+    而按 docstring 的立论，种子挂在先建的那部下面：**该番名的新种子全部落到另一部番上，
+    老集数留在原来那部，番静默裂成两半**，日志里只有一行「截断 N 条…删除 M 条」。
+    触发面窄，但这是一条【改数据且不可回退】的 revision，判据与文档必须说同一件事。
+    """
+    import sqlalchemy as sa
+
+    eng = upgrade_from("c7e1a93b4d02")          # 停在加约束之前
+    with eng.begin() as c:
+        # 直接照表的实际非空列插，别一个个试出来
+        cols = [r[1] for r in c.exec_driver_sql("PRAGMA table_info(anime)").fetchall()]
+        notnull = {r[1]: r[4] for r in c.exec_driver_sql("PRAGMA table_info(anime)").fetchall()
+                   if r[3] and r[5] == 0}     # NOT NULL 且非主键
+        for aid, name in ((7, "老番"), (3, "新番")):
+            vals = {"id": aid, "title": name}
+            for col in notnull:
+                if col in vals:
+                    continue
+                vals[col] = 0 if col in ("season", "confirmed", "rejected",
+                                         "enrich_tries", "finish_optout") else ""
+            keys = ", ".join(vals)
+            ph = ", ".join(f":{k}" for k in vals)
+            c.execute(sa.text(f"INSERT INTO anime ({keys}) VALUES ({ph})"), vals)
+        long1, long2 = "甲" * 250, "甲" * 251     # 截断到 191 之后是同一个 title
+        c.execute(sa.text(
+            "INSERT INTO anime_alias (id, title, season, anime_id, created_at) "
+            "VALUES (1, :t, 1, 7, '2026-01-01 00:00:00')"), {"t": long1})
+        c.execute(sa.text(
+            "INSERT INTO anime_alias (id, title, season, anime_id, created_at) "
+            "VALUES (2, :t, 1, 3, '2026-01-01 00:00:00')"), {"t": long2})
+    upgrade_from.to_head(eng)
+
+    with eng.connect() as c:
+        rows = c.exec_driver_sql(
+            "SELECT id, anime_id FROM anime_alias ORDER BY id").fetchall()
+    assert len(rows) == 1, f"截断后应只剩一条，实际 {rows}"
+    assert rows[0][1] == 3, (
+        f"活下来的别名指向 anime_id={rows[0][1]}，而 docstring 承诺的是 anime_id 较小的那条(3)")

@@ -15,6 +15,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
+import asyncio
+
 import feedparser
 import httpx
 
@@ -150,7 +152,17 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
     剧场版/OVA 常无规范集号，episode 允许 -1/-2；不做批量/字幕组过滤（剧场版逐版本人工挑着下）。
     """
     url = f"{config.MIKAN_BASE}/RSS/Bangumi?bangumiId={mikan_id}"
-    feed = feedparser.parse(await fetch.get_bytes(client, url))   # 带上限+总超时，理由同 RssSource.fetch
+    content = await fetch.get_bytes(client, url)   # 带上限+总超时，理由同 RssSource.fetch
+    # 【解析丢线程，同 RssSource.fetch】Mikan 的 /RSS/Bangumi 返回该番组【全部历史种子】，
+    # 长寿番组实测 3.2MB / 4193 条：feedparser + 逐条 parse_title 是纯 CPU 的同步代码，
+    # 连续占住事件循环好几秒（980KB/4000 条这个量级实测就已经 1.45 秒）。
+    # 剧场版整年扫描会对桶里每一部都调它，累计起来页面整段没反应。
+    return await asyncio.to_thread(_parse_bangumi_feed, content, mikan_id)
+
+
+def _parse_bangumi_feed(content: bytes, mikan_id: str) -> list[ParsedItem]:
+    """把番组 feed 解析成 ParsedItem 列表。**纯 CPU、不碰 DB**，故可整段丢线程。"""
+    feed = feedparser.parse(content)
     # 【与 RssSource.fetch 同口径，判据只此一份】这是本文件的【第三条】RSS 解析路径——
     # 番剧那两条已经合并进 RssSource，它因为语义不同（剧场版不过滤、允许 -1/-2 集号）留在这里，
     # 所以那次合并修好的几件事要手动同步过来。判据一旦各写各的就一定会再漂一次，
