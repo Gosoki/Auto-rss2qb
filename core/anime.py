@@ -25,7 +25,7 @@ from services.notify import (cooldown_active as notify_cooldown_active,
                              state as notify_state)
 from sources.parse import (extract_episode_abs, kw_match, parse_title, quarter_of,
                            quarter_sort_key,
-                           search_query_names, season_from_name)
+                           search_query_names, season_from_name, strip_season)
 
 log = logging.getLogger("autorss")
 
@@ -413,6 +413,35 @@ async def _resolve_anime(item) -> int:
         return anime.id
 
 
+def rekey_aliases() -> int:
+    """给存量别名补上按【当前】strip_season 算出来的新键，返回新增行数。启动时跑，幂等。(E-39)
+
+    别名表存的是"某组解析出的 (标题, 季) → 番"。解析规则变了（E-39 开始剥英文/裸 S 季标记），
+    新来的种子算出的键与库里存量键对不上 → alias miss → 走一次 bgm；**万一那一刻 bgm 不通，
+    `_resolve_anime` 会新建一条 Anime，番就临时裂成两条**（E-35 那个形状）。所以规则一变，
+    就把存量键按新规则再算一遍、缺的补上 —— 旧键留着不删（老标题形态的种子还会来）。
+
+    【不用标记位、每次启动都跑】它按数据本身判（"新键在不在"），跑几遍结果一样；
+    168 行的表扫一遍不到一毫秒。R26/R27 那三个带作用域的标记位踩的坑，这里一个都碰不到。
+    """
+    n = 0
+    with get_session() as s:
+        rows = list(s.exec(select(AnimeAlias)))
+        have = {(r.title, r.season) for r in rows}
+        for r in rows:
+            new = alias_key(strip_season(r.title))
+            if not new or new == r.title or (new, r.season) in have:
+                continue
+            s.add(AnimeAlias(title=new, season=r.season, anime_id=r.anime_id))
+            have.add((new, r.season))
+            n += 1
+        if n:
+            s.commit()
+    if n:
+        log.info("别名表按新的季标记规则补了 %d 个键（旧键保留）", n)
+    return n
+
+
 def alias_key(title: str) -> str:
     """番名对照的键：按 anime_alias.title 的列长截断。**查询侧与插入侧必须都用它。**
 
@@ -500,6 +529,34 @@ def suspect_wrong_binding() -> list[dict]:
                                        if isinstance(t.episode, (int, float))
                                        and t.episode >= 1})[:8]})
     return out
+
+
+def movie_twin(anime_id: int) -> dict | None:
+    """这部番在剧场版表里的"同体"：共用种子（info_hash 跨表相交）或同一个 bgm subject 的 Movie，以及共用的种子数。(E-52 的闸用)
+
+    `suspect_movie_as_anime` 是仪表盘的全表巡检（只报不改）；这里是**按钮级**的一问：
+    『恢复订阅』落下去之前先看这一部。返回 {"m", "m_name", "shared"} 或 None（没有同体）。
+    shared 按 info_hash 跨表相交数（两张种子表各自唯一、跨表没有约束，见 E-52）。
+    """
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is None:
+            return None
+        mine = {h for h in s.exec(select(AnimeTorrent.info_hash).where(AnimeTorrent.anime_id == anime_id))}
+        # 【先按种子相交找，再按 bgm 找】(R34 对抗审计) E-52 自己写的病因是"番剧侧对剧场版标题更宽松"——
+        # 那正是番剧侧绑错到 TV 条目、两边 bgm **不同**的形状；只看 bgm 的话同 hash 照样静默交付第二份。
+        # 同一个 hash 落在两张表里，本身就是最硬的"同体"证据。
+        m = None
+        if mine:
+            mt = s.exec(select(MovieTorrent).where(MovieTorrent.info_hash.in_(mine))).first()
+            if mt is not None:
+                m = s.get(Movie, mt.movie_id)
+        if m is None and a.bangumi_id is not None:
+            m = s.exec(select(Movie).where(Movie.bangumi_id == a.bangumi_id)).first()
+        if m is None:
+            return None
+        theirs = {h for h in s.exec(select(MovieTorrent.info_hash).where(MovieTorrent.movie_id == m.id))}
+        return {"m": m.id, "m_name": m.display_name or m.title, "shared": len(mine & theirs)}
 
 
 def suspect_movie_as_anime() -> list[dict]:
@@ -604,19 +661,9 @@ def suspect_duplicate_anime() -> list[dict]:
     return out
 
 
-def auto_downloadable_ep(ep) -> bool:
-    """这个集号能不能被【自动/批量】下载。用户拍板：特别篇(-1) 与 未知集/疑似批量(-2) 一律不自动下。
-
-    理由是这两类都不是"周更正片序列"上的一集：-1 常有多个字幕组的多个版本（剧场版/OVA/总集编都可能
-    落这里）、-2 更是一堆解析失败或整季合集包，自动挑一份下往往下错东西。要它们就到详情页对准那一条
-    点『下载』（force 路径不受本判据约束）。
-
-    【四条路径必须共用这一个判据】flush 放行 / instant 即时下 / 『下载该源』『补下全部』的挑选
-    / download_plan 的『将下载』标记。历史上 -2 就是在 instant 与 flush 之间漂移过——同一条种子
-    因为走哪条路而命运不同，而页面标注取自第三条，于是标着『将下载』的东西永远下不来。
-    小数集（11.5 这类插入话）仍算正集：它在周更序列上，>=0 天然覆盖。
-    """
-    return isinstance(ep, (int, float)) and ep >= 0
+# 【定义在 engine 里】(E-4) engine.relocate 的 _clear 也要用它（"搬不动就清成 pending"对 -1/-2 是错的：
+# 清了没有任何路径会再下它），而 engine 不能 import anime。这里保留同名，调用点一个都不用改。
+auto_downloadable_ep = engine.auto_downloadable_ep
 
 
 def _warn_unknown_episode(it) -> None:
@@ -938,6 +985,13 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
             t = s.get(AnimeTorrent, torrent_id)
             if t is None:
                 return False
+            # 【占位行永远不许第二条协程进来】(R34 对抗审计 P1) E-49 之后占位段不再清 archived_at，
+            # 于是"已归档的可 force 重下"这条例外会把**正在交付中**的已归档行也放进来（downloading +
+            # archived_at≠None）—— 双击『下载』= 两条协程交付同一行，两次取种都失败时第二条按
+            # orig_status='downloading' 恢复、还把 prev_status 清掉，清扫只能落 pending：已归档行掉出 HAVE，
+            # flush 当场为同一集换源下第二份到归档文件所在目录。HEAD 之前靠"锁内清 archived_at"侥幸挡住。
+            if t.status == "downloading":
+                return False
             if t.status in engine.TRACKED_STATUSES and not (force and t.archived_at is not None):
                 return False  # 已在下/已下：幂等短路（force 也不例外）。例外：已归档的可 force 重新下（重新交回 qB）
             if not force and t.status not in DOWNLOADABLE_STATUSES:
@@ -981,15 +1035,16 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
                     log.info("跳过重复集 - %s 第%s季 第%s集（已有一份在下/已下）", title, season, episode)
                     return False
             t.status = "downloading"  # 原子占位：先落库再 await，后到的协程一进来就被短路挡掉
+            # 【记下占位前的状态】(E-49) 协程活不到回写那一步（进程被杀 / 库抖）时行停在 downloading，
+            # sweep_stale_delivering / 启动时的 reset_downloading 按它还原，而不是一律写成 pending。
+            # 归档标记与 qB 实时态【不在这里清】：清了就得靠回写放回去，崩溃时放不回。
+            # 交付成功那一刻再清（见下面 save_path 那段），失败路径的 _keep_orig 照旧原样放回。
+            t.prev_status = orig_status
             # 【登记"本协程真的在管这一行"】(R24) 落库的 downloading 只说明"某进程某一刻开始交付"，
             # 不说明"此刻真的有协程在管"。回写撞上库抖动时异常直接冒出去、行永久停在 downloading，
             # 而它既不被 sync 复查、又占着 HAVE_STATUSES、还把切库/迁移永久拒死。
             # 注销在本函数的外层包装的 finally 里（见 download_anime_torrent 那一层）。
             engine._delivering.add(("AnimeTorrent", int(torrent_id)))
-            # 重新下：清归档标记 + 重置 qB 实时态，让它作为『全新在下』被重新跟踪、从新完成点重算归档倒计时——
-            # 否则重下已归档的种子会带着旧 qb_progress=1/旧完成时间，被下一轮完成归档立刻再归档掉。
-            t.archived_at = None
-            t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 0.0, "", None, None
             s.add(t)
             s.commit()
             url = t.download_url
@@ -1034,7 +1089,8 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
             t2 = s2.get(AnimeTorrent, torrent_id)
             if t2 is not None and t2.status == st:
                 t2.fail_reason = reason[:300]
-                if _keep_orig:      # 恢复原状态的同时，把进锁时清掉的 qB 实时态整组放回
+                t2.prev_status = None       # 占位已回写，记号用完即清（E-49）
+                if _keep_orig:      # 恢复原状态的同时，把 await 期间 sync 可能碰过的 qB 实时态整组放回
                     t2.archived_at = orig_archived
                     (t2.qb_progress, t2.qb_state,
                      t2.qb_synced_at, t2.qb_progress_at) = orig_qb
@@ -1057,6 +1113,7 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
             if t2 is None:
                 return
             nxt = engine.next_retry_at(t2.retry_count)
+            t2.prev_status = None           # 占位已回写（E-49）
             if nxt is None:
                 t2.status, t2.retry_at = "error", None
                 log.error("重试 %d 次仍失败，落失败等人工 - %s：%s", t2.retry_count, title, reason)
@@ -1124,6 +1181,12 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
             t.save_path = save_path
             # 交付成功 → 清空重试痕迹，下次再失败从头退避
             t.retry_count, t.retry_at, t.fail_reason = 0, None, ""
+            # 重新下（从已归档/停滞/终态出发）：到这一刻才清归档标记 + 重置 qB 实时态，让它作为
+            # 『全新在下』被重新跟踪、从新完成点重算归档倒计时 —— 否则会带着旧 qb_progress=1/旧完成时间，
+            # 被下一轮完成归档立刻再归档掉。(E-49) 以前在进锁占位时就清，崩溃后放不回来。
+            t.archived_at = None
+            t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 0.0, "", None, None
+            t.prev_status = None
             s.add(t)
             s.commit()
     if config.QB_SYNC_STATUS:
@@ -2599,6 +2662,12 @@ def _ep_span(eps: list) -> str:
 
 
 async def bind_anime_bgm(anime_id: int, bgm_id: int, report: dict | None = None) -> bool:
+    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
+    with engine.in_flight("绑定 bgm"):
+        return await _bind_anime_bgm_inner(anime_id, bgm_id, report=report)
+
+
+async def _bind_anime_bgm_inner(anime_id: int, bgm_id: int, report: dict | None = None) -> bool:
     """把某番手动绑定到指定 bgm subject id：取元数据覆盖 + 身份合并。返回是否成功。
 
     自动匹配失败（罗马音/冷门名搜不到）时的人工兜底：用户给准确的 bgm id，直接取权威元数据。
@@ -2696,6 +2765,13 @@ async def _reenrich_scope_inner(seasons: int | None = None) -> int:
 
 
 async def manual_enrich(anime_id: int, freeze_empty_path: bool = False,
+                        keep_binding: bool = False) -> bool:
+    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
+    with engine.in_flight("重新识别"):
+        return await _manual_enrich_inner(anime_id, freeze_empty_path=freeze_empty_path, keep_binding=keep_binding)
+
+
+async def _manual_enrich_inner(anime_id: int, freeze_empty_path: bool = False,
                         keep_binding: bool = False) -> bool:
     """**人工触发的一次重新识别**——所有『重试识别 / 重新识别』按钮都该走这里。
 
@@ -2830,6 +2906,12 @@ def _download_candidates(rows: list, pref: str | None = None, have_eps: set | No
 
 
 async def download_pending_for_anime(anime_id: int) -> int:
+    """页面入口：整段登记在途，理由见 `engine.in_flight`。(R33 对抗审计补：出 await 前读的种子 id，出 await 后逐个交给交付)"""
+    with engine.in_flight("补下该番"):
+        return await _download_pending_for_anime_inner(anime_id)
+
+
+async def _download_pending_for_anime_inner(anime_id: int) -> int:
     """把某番剧下 status=pending/error 的种子补下（人工确认后放行）。返回触发的下载数。
 
     加番剧级授权闸门：只对『已确认且未拒绝』的番补下。
@@ -3120,6 +3202,12 @@ def unexclude_torrent(torrent_id: int) -> bool:
 
 
 async def download_all_pending() -> int:
+    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
+    with engine.in_flight("补下全部待下"):
+        return await _download_all_pending_inner()
+
+
+async def _download_all_pending_inner() -> int:
     """补下所有『已订阅且已确认』番剧的待下/失败种子。返回触发数。
 
     只补【正集】、每集一份（特别篇/未知集不在其列，见 auto_downloadable_ep）。
@@ -3167,6 +3255,12 @@ def _norm_name(s: str) -> str:
 
 
 async def backfill_source(anime_id: int, name_filter: bool = False) -> dict:
+    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
+    with engine.in_flight("补齐该源"):
+        return await _backfill_source_inner(anime_id, name_filter=name_filter)
+
+
+async def _backfill_source_inner(anime_id: int, name_filter: bool = False) -> dict:
     """『补齐该源』/『自动补齐』：去 nyaa/Mikan 按名搜『该源』的种子，把漏收的补进这部番。
 
     该源 = 锁定源(pref_source)；没锁则取该番最高优先级的源。搜到的按 hash 去重、【季号过滤】（挡 S1/S2 混淆），
@@ -3332,12 +3426,21 @@ def anime_save_path(anime_id: int) -> str | None:
 async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
     """把该番已下/在下/停滞的种子移到当前归档目录（改季度/重绑后调用；调用方应已落新 a.quarter/名/季号）。
     实现见 engine.relocate（两条线共用）。返回 {new_path, old_path, moved, redownload, untracked,
-    failed, stalled_kept, fail_code?, error?}。"""
-    return await engine.relocate(AnimeTorrent, AnimeTorrent.anime_id, anime_id,
-                                 anime_save_path(anime_id), old_path, noun="集")
+    failed, stalled_kept, fail_code?, error?}。
+    页面入口：整段登记在途，理由见 `engine.in_flight`（跨 await 的那段在 engine.relocate 里：
+    读 (id, hash) → await setLocation → 按 id 写 save_path）。(R33 对抗审计补)"""
+    with engine.in_flight("移动归档目录"):
+        return await engine.relocate(AnimeTorrent, AnimeTorrent.anime_id, anime_id,
+                                     anime_save_path(anime_id), old_path, noun="集")
 
 
 async def delete_anime_torrent(torrent_id: int) -> bool:
+    """页面入口：整段登记在途，理由见 `engine.in_flight`。(R33 对抗审计补：读主键 → await qb.delete → 按主键写 deleted)"""
+    with engine.in_flight("删除单集文件"):
+        return await _delete_anime_torrent_inner(torrent_id)
+
+
+async def _delete_anime_torrent_inner(torrent_id: int) -> bool:
     """删除单条种子在 qB 里的文件（走 qB 接口），标记为 deleted。详情页按集删用。
 
     deleted 是用户主动删除的终态：恢复订阅时不会被重新下（区别于集去重落选、可复活的 skipped）。
@@ -3374,6 +3477,12 @@ async def delete_anime_torrent(torrent_id: int) -> bool:
 
 
 async def delete_anime_files(anime_id: int) -> int:
+    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
+    with engine.in_flight("删除整部番的文件"):
+        return await _delete_anime_files_inner(anime_id)
+
+
+async def _delete_anime_files_inner(anime_id: int) -> int:
     """删除该番在 qB 里的已下/在下种子及其硬盘文件（走 qB 正规接口，非裸删文件系统）。
 
     显式、独立于『拒绝』的动作，需 UI 二次确认。成功后把这些种子标记为 deleted（终态，恢复订阅不重下）。

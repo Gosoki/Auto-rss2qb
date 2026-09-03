@@ -843,3 +843,91 @@ def test_a_range_with_an_unpadded_side_is_still_a_batch(title):
 
     assert is_batch(title) is True, "未补零的区间没被判成合集"
     assert extract_episode(title) < 0, "它还被抽出了集号 —— 会以单集入库并被自动下载"
+
+
+# ---------------- E-39：番名里的季标记一并剥掉（2026-09-02 拍板 A + 存量别名补新键） ----------------
+
+@pytest.mark.parametrize("raw,want", [
+    ("[ANi]  地獄模式 ～喜歡挑戰特殊成就的玩家在廢設定的異世界成為無雙～ 2nd Season - 16 [1080P][Baha][WEB-DL][AAC AVC][CHT][MP4]",
+     "地狱模式～喜欢挑战特殊成就的玩家在废设定的异世界成为无双～"),
+    ("[LoliHouse] 地狱模式～喜欢速通游戏的玩家在废设定异世界无双～ S2 / Hell Mode S2 - 04 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+     "地狱模式～喜欢速通游戏的玩家在废设定异世界无双～"),
+    ("[LoliHouse] 入间同学入魔了！S4 / Mairimashita! Iruma-kun S4 - 17 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+     "入间同学入魔了！"),
+    ("[桜都字幕组] 某番 第三季 / Bou Ban Season 3 [05][1080p][简体内嵌]", "某番"),
+])
+def test_strip_season_removes_english_and_bare_markers_from_the_name(raw, want):
+    """真库里正是这 3 部番各带着季标记成了别名键（12 条种子）。季号在键的另一半，名字里不该再带一份。"""
+    group, name, season, ep = parse_title(raw)
+    assert name == want, (name, want)
+
+
+@pytest.mark.parametrize("raw,keep", [
+    ("[组] PS4 之王 - 03 [1080p]", "PS4"),                      # 裸 S 规则前后不许挨字母数字：PS4 不是季标记
+    ("[LoliHouse] Clevatess II-魔兽之王与虚假的勇者传承- / Clevatess S2 - 03 [WebRip 1080p]",
+     "ClevatessII-魔兽之王与虚假的勇者传承-"),                  # 罗马数字不在 strip_season 的范围内（见 season_from_name）
+])
+def test_strip_season_does_not_eat_lookalikes(raw, keep):
+    _, name, _, _ = parse_title(raw)
+    assert keep in name, name
+
+
+def test_rekey_aliases_adds_the_new_key_and_keeps_the_old_one(clean_tables):
+    """存量别名按新规则补键：旧键留着（老形态的种子还会来）、新键指向同一部番；再跑一次 0 新增。"""
+    from sqlmodel import select
+
+    from core import anime as A
+    from db.models import Anime, AnimeAlias
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="入间同学入魔了！", season=4, quarter="25D", confirmed=True)
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeAlias(title="入间同学入魔了！S4", season=4, anime_id=a.id))
+        s.add(AnimeAlias(title="没有季标记的", season=1, anime_id=a.id))
+        s.commit()
+        aid = a.id
+    assert A.rekey_aliases() == 1
+    assert A.rekey_aliases() == 0, "第二次必须是空操作"
+    with clean_tables.get_session() as s:
+        keys = {(r.title, r.season, r.anime_id) for r in s.exec(select(AnimeAlias))}
+    assert keys == {("入间同学入魔了！S4", 4, aid), ("入间同学入魔了！", 4, aid), ("没有季标记的", 1, aid)}, keys
+    # 新键真的能命中：按新规则解析出来的名字查得到这部番
+    with clean_tables.get_session() as s:
+        hit = s.exec(select(AnimeAlias).where(AnimeAlias.title == "入间同学入魔了！",
+                                              AnimeAlias.season == 4)).first()
+    assert hit is not None and hit.anime_id == aid
+
+
+def test_startup_runs_the_alias_rekey():
+    """(AST) init_business_state 里必须调 rekey_aliases —— 规则变了而存量键不补，就是 E-35 那个分裂形状。"""
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "core/worker.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "init_business_state")
+    # (R34 对抗审计) 只查"有没有调"不够：挪进 `if reset_leftovers:` 之后，运行中掉线恢复 / 运行中切库
+    # 这两条路（都传 False）就不再补键。要求那条调用语句直接挂在函数体顶层。
+    top = [st for st in fn.body if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
+           and getattr(st.value.func, "attr", "") == "rekey_aliases"]
+    assert top, "init_business_state 里 rekey_aliases 不在函数体顶层（被条件包住了？）"
+
+
+def test_init_business_state_rekeys_even_without_leftover_reset(clean_tables, monkeypatch):
+    """行为面：reset_leftovers=False（运行中切库 / 掉线恢复那两条路）也要补键。"""
+    from sqlmodel import select
+
+    from core import anime as A
+    from core import worker as W
+    from db.models import Anime, AnimeAlias
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="入间同学入魔了！", season=4, quarter="25D", confirmed=True)
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeAlias(title="入间同学入魔了！S4", season=4, anime_id=a.id))
+        s.commit()
+    monkeypatch.setattr(A, "seed_source_groups", lambda: None)
+    monkeypatch.setattr(W.engine, "backfill_legacy_progress_once", lambda: None)
+    W.init_business_state(reset_leftovers=False)
+    with clean_tables.get_session() as s:
+        assert s.exec(select(AnimeAlias).where(AnimeAlias.title == "入间同学入魔了！")).first() is not None

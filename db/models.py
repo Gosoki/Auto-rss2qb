@@ -27,7 +27,7 @@ class SourceGroup(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("name", name="uq_sourcegroup_name"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    name: str = Field(index=True)              # 展示名，唯一
+    name: str = Field()                        # 展示名，唯一；等值查找走 uq_sourcegroup_name，不再另建索引（E-48）
     site: str = Field(default="nyaa")          # 'nyaa' | 'mikan'
     feed: str = Field(default="")              # nyaa: 用户名或完整RSS URL；mikan: RSS URL
     policy: str = Field(default="auto")        # 'auto' 全下 | 'review' 进待确认队列
@@ -100,7 +100,7 @@ class AnimeAlias(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("title", "season", name="uq_alias_title_season"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    title: str = Field(index=True)
+    title: str = Field()        # 等值查找走 uq_alias_title_season 的最左前缀，不再另建索引（E-48）
     season: int = Field(default=1)
     anime_id: int = Field(index=True)                 # → Anime.id
     created_at: datetime = Field(default_factory=datetime.now)
@@ -156,6 +156,9 @@ class AnimeTorrent(SQLModel, table=True):
     retry_count: int = Field(default=0)     # 已重试次数；成功即清零，用满退避表就落 error 等人工
     retry_at: datetime | None = Field(default=None)   # 早于此刻不重发（None=不在重试队列里）
     fail_reason: str = Field(default="")    # 最近一次失败原因，详情页展示（成功即清空）
+    # 【占位前的状态】(E-49) force 重下进锁时记下 status，交付成功/失败回写时清空。
+    # 崩溃后行停在 downloading，sweep_stale_delivering 按它还原（None = 按老规矩落 pending）。
+    prev_status: str | None = Field(default=None)
 
 
 class Movie(SQLModel, table=True):
@@ -227,3 +230,6 @@ class MovieTorrent(SQLModel, table=True):
     retry_count: int = Field(default=0)     # 已重试次数；成功即清零，用满退避表就落 error 等人工
     retry_at: datetime | None = Field(default=None)   # 早于此刻不重发（None=不在重试队列里）
     fail_reason: str = Field(default="")    # 最近一次失败原因，详情页展示（成功即清空）
+    # 【占位前的状态】(E-49) force 重下进锁时记下 status，交付成功/失败回写时清空。
+    # 崩溃后行停在 downloading，sweep_stale_delivering 按它还原（None = 按老规矩落 pending）。
+    prev_status: str | None = Field(default=None)

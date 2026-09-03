@@ -11,7 +11,7 @@ import db
 from db.models import AnimeTorrent
 from core import anime, engine
 import config
-from .anime_detail import maybe_relocate_anime, render_anime_detail
+from .anime_detail import maybe_relocate_anime, render_anime_detail, restore_anime_gated, subscribe_gated
 from .layout import (busy_action, confirm, require_bind_confirm, ep_str, expand_collapse_bar,
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
@@ -803,8 +803,9 @@ def anime_page(t: str = ""):
         def _approve(anime_id, sel=None):
             async def h():
                 pref = (sel.value if sel is not None else "") or ""
-                anime.confirm_anime(anime_id, pref)
-                n = await anime.download_pending_for_anime(anime_id)
+                n = await subscribe_gated(anime_id, "confirm", pref)   # E-52 的闸，四个入口共用
+                if n is None:
+                    return
                 refresh_all()
                 ui.notify(f"已确认，补下 {n} 集" + (f"（源：{pref}）" if pref else ""), type="positive")
             return h
@@ -818,8 +819,9 @@ def anime_page(t: str = ""):
 
         def _restore(anime_id):
             async def h():
-                anime.restore_anime(anime_id)
-                n = await anime.download_pending_for_anime(anime_id)
+                n = await restore_anime_gated(anime_id)     # E-52 的闸在里面，两个入口共用
+                if n is None:
+                    return
                 refresh_all()
                 ui.notify(f"已恢复到『订阅中』，补下 {n} 集", type="positive")
             return h

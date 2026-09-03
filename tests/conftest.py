@@ -58,6 +58,22 @@ _INTERNAL_MARKERS = ("_FINISH_BACKFILL_DONE", "_KNOWN_NOTIFY_EVENTS",
                      "_QB_PROGRESS_BACKFILLED", "_idle_backfilled")
 
 
+def impl_of(tree, fn_name: str):
+    """按公开名找到【真正的函数体】——有 `_<name>_inner` 就返回它，没有才返回同名函数。
+
+    (R33) 八个页面入口改成了 `wrapper → _<name>_inner` 两层（外层只做 `engine.in_flight`
+    登记）。所有按函数名取 AST 断言"函数体里必须有 / 不许有 X"的守卫都要经这里：
+    直接按公开名找到的是空壳 ——【正向】守卫（不许有 X）会**静默变成真空**，
+    【反向】守卫（必须有 X）会红在"找不到"而不是红在缺陷上。
+    第一次就撞上了两条（test_bind_preview / test_wrong_season_match），所以收成一个口。
+    找不到返回 None，让调用方自己 assert 出带路径的提示。
+    """
+    import ast
+    fns = {n.name: n for n in ast.walk(tree)
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return fns.get(f"_{fn_name}_inner") or fns.get(fn_name)
+
+
 def _assert_throwaway(engine, what: str) -> None:
     """删数据之前，先确认删的是【一次性的库】。不是就当场炸掉。
 

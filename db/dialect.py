@@ -16,7 +16,8 @@
      由调用方按方言跳过（见 db.__init__._migrate_inflight_indexes）。
 
 改模型时要注意的唯一一条：新加的 str 列如果要建索引/唯一约束，长度会自动按 _KEYED_LEN 给；
-需要更长就往 _COL_LEN 里加一条，别在 MySQL 上撞 767/3072 字节的索引键上限。
+需要更长就往 _COL_LEN 里加一条，别在 MySQL 上撞 3072 字节的索引键上限
+（按索引**全部列**的字节之和算；tests/test_mysql_compat.py 对 alembic 的产物逐个索引核）。
 """
 import logging
 import re
@@ -42,8 +43,10 @@ log = logging.getLogger("autorss")
 BINARY_COLLATION = "utf8mb4_bin"
 
 # 参与索引/唯一约束/主键的 str 列的默认 VARCHAR 长度。
-# 255×4 字节 = 1020，稳在现代 InnoDB(DYNAMIC 行格式) 3072 字节的索引键上限内；
-# 老 InnoDB(COMPACT) 上限 767 字节则需要 191——真撞上了就往 _COL_LEN 里单独调小。
+# 255×4 字节 = 1020，稳在 InnoDB DYNAMIC 行格式（MySQL 5.7.7+ 默认）3072 字节的索引键上限内。
+# 【本项目不支持老的 COMPACT/REDUNDANT 行格式】(E-6，2026-09-02 拍板) 那个上限是 767 字节，
+# 而 uq_alias_title_season = 191×4 + BIGINT 8 = 772，本来就放不下；以前的注释按 767 算"留余量"，
+# 余量其实是负的 —— 那句话把"不支持"写成了"支持"。
 _KEYED_LEN = 255
 
 # 个别列的显式长度（覆盖 _KEYED_LEN）。实测生产数据：info_hash 恒 40，源组名 ≤9。
@@ -51,11 +54,10 @@ _COL_LEN = {
     "animetorrent.info_hash": 64,
     "movietorrent.info_hash": 64,
     "movie.mikan_id": 64,
-    "sourcegroup.name": 191,     # 唯一约束 + 索引，取保守值，老 InnoDB 也进得去
-    # 191 字符 × 4 字节 = 764 B。复合唯一约束 (title, season) 在 MySQL 8/9 的默认 DYNAMIC 行格式下
-    # 上限是 3072 B，绰绰有余。【注意 764 + season(4B) = 768 > 767】——所以本项目
-    # 【不支持】老的 COMPACT/REDUNDANT 行格式（那个上限才是 767）。以前这里写的是"留余量"，
-    # 但按 767 算余量是负的，那句话把不支持写成了支持。
+    "sourcegroup.name": 191,     # 唯一约束（uq_sourcegroup_name）；实测源组名 ≤9，191 已极宽松
+    # 191 字符 × 4 字节 = 764 B；复合唯一约束 (title, season) 整条键 = 764 + season(BIGINT 8B) = 772 B，
+    # 在 DYNAMIC 行格式的 3072 B 上限内绰绰有余（老行格式的 767 放不下 —— 见 _KEYED_LEN 处）。
+    # 以前这里把 season 按 4 字节算成 768：模型里整数一律 BIGINT，是 8。
     "anime_alias.title": 191,
     "setting.key": 191,          # 主键；虽然 setting 永远留在本地 SQLite，仍一并定型免得将来踩坑
     # 下面两条不是索引列，是为了【躲开 MySQL 的 TEXT 不能有 DEFAULT】（错误 1101）：

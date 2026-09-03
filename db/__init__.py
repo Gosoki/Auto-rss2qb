@@ -73,6 +73,12 @@ MYSQL_CONNECT_TIMEOUT = 5   # 秒。只管【建连接】，不限制查询本�
 # 【迁移那条路径要不带它】整库复制的单条 chunk 写入可能远超 15 秒，
 # 而那恰恰是"已清空目标、写到一半"最不能被打断的地方 —— 见 make_mysql_engine 的 query_timeout 形参。
 MYSQL_READ_TIMEOUT = 15
+# 秒。只给【跑 DDL 的那条连接】用（db/schema._ddl_engine）：MySQL 的 lock_wait_timeout 默认是
+# 31536000 秒（一年）—— 一条被元数据锁挡住的 ALTER 会挂一年，而它跑在 db.maintenance() 里，
+# 期间全站 DatabaseBusy、『切回本地 SQLite』这条自救出口也拿不到 schema._LOCK，只能重启进程。
+# 60 秒够本项目（单实例、自己的库）的任何合法等待；被挡住就失败报错，用户看清楚了再重试。
+# 【做成模块常量而不是设置页的键】设置页正是卡死时一起卡死的那一页。(E-50，2026-09-02 拍板)
+MYSQL_DDL_LOCK_WAIT_TIMEOUT = 60
 
 
 def make_mysql_engine(url: str, query_timeout: bool = True):

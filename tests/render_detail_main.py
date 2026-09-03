@@ -18,12 +18,20 @@ for _name in [n for n in list(sys.modules) if n == "pages" or n.startswith("page
 import pages  # noqa: E402,F401  导入即注册全部页面
 from pages.anime_detail import render_anime_detail  # noqa: E402
 from pages.layout import frame  # noqa: E402
+from pages.movies import render_movie_detail  # noqa: E402
 
 
 @ui.page("/detail/{anime_id}")
 def _detail(anime_id: int):
     with frame("番剧"):
         render_anime_detail(anime_id)
+
+
+@ui.page("/mdetail/{movie_id}")
+def _mdetail(movie_id: int):
+    """剧场版详情同样是渲染进悬浮框的组件，同样没有独立路由 —— 同一个理由、同一副垫片。(R34)"""
+    with frame("剧场版"):
+        render_movie_detail(movie_id)
 
 
 ui.run(show=False, reload=False)   # testing 模式下会被拦截，不会真的起服务

@@ -162,6 +162,7 @@ def init_business_state(reset_leftovers: bool = True) -> None:
         movies.reset_downloading()      # 复位上次遗留的 downloading（剧场版）
         _startup_reset_pending = False  # 复位成功才清；失败则下一次探测继续尝试
     engine.backfill_legacy_progress_once()   # 一次性：历史 sent 标记为已完成
+    anime.rekey_aliases()                    # 幂等：解析规则变了就给存量别名补新键（E-39）
 
 
 async def run_db_watch() -> None:

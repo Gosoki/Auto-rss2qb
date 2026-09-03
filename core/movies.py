@@ -25,7 +25,7 @@ from db.models import AnimeTorrent, Movie, MovieTorrent
 from services import enrich, fetch
 from services.notify import event as notify_event
 from sources import mikan
-from sources.parse import format_quarter, quarter_sort_key
+from sources.parse import format_quarter
 
 log = logging.getLogger("autorss")
 
@@ -271,6 +271,12 @@ async def _discover_loop(client, year: int, seasons: list) -> dict:
 
 
 async def refresh_movie_torrents(movie_id: int) -> dict:
+    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
+    with engine.in_flight("刷新版本"):
+        return await _refresh_movie_torrents_inner(movie_id)
+
+
+async def _refresh_movie_torrents_inner(movie_id: int) -> dict:
     """按需重拉这一部剧场版的全部版本（Mikan `/RSS/Bangumi?bangumiId=<mikan_id>`）。
 
     【为什么需要它】剧场版的 BD 普遍在首映后 6~18 个月才出。发现是按季度整年扫的，
@@ -433,10 +439,18 @@ def list_unmatched_movies() -> list[Movie]:
 
 
 def list_movies() -> list[Movie]:
-    """未忽略的剧场版/OVA（/movies 页展示）。"""
+    """未忽略的剧场版/OVA（/movies 页展示）。
+
+    【按上映日排，不按季度键】(R33, E-47) 剧场版按年归档（E-30）之后，新识别出来的片
+    一律落 `<yy>A`，而存量 53 行还带着旧规则算出的 B/C/D。按 `quarter DESC` 排的后果是
+    **凡是重新识别过的片，永远沉到本年最底下** —— 真库 2025 年那组，12-31 上映的片排在 03-07、04-18 的下面。
+    E-47 原来推荐的"回填季母"也修不好它：全成 `25A` 之后 quarter 全相等，退化成按 id（入库顺序）排，
+    照样不是按上映日。所以排序键直接用上映日，季度键只留给"未知年份垫底"。
+    `air_date` 是 'YYYY-MM-DD' 文本，字典序即时间序；为空的（还没识别）垫到最后。
+    """
     with get_session() as s:
         return list(s.exec(select(Movie).where(Movie.rejected.is_not(True))
-                           .order_by(Movie.quarter.desc(), Movie.id)))
+                           .order_by(Movie.air_date.is_(None), Movie.air_date.desc(), Movie.id.desc())))
 
 
 def list_rejected_movies() -> list[Movie]:
@@ -444,10 +458,13 @@ def list_rejected_movies() -> list[Movie]:
     with get_session() as s:
         rows = list(s.exec(select(Movie).where(Movie.rejected == True)))  # noqa: E712
     # 【不能用 SQL 的 ORDER BY quarter DESC】季度键的年份只有两位，字符串比较下 '99D' > '26C'，
-    # 1999 年的片会排到最前。别处的季度排序都过 quarter_sort_key，唯独这条是【平铺渲染】——
-    # pages/movies.py 的『已忽略』页直接按本函数的返回序渲染，没有上层分组重排来兜底，
-    # 所以这里排错就是用户直接看到的错。
-    return sorted(rows, key=lambda m: (quarter_sort_key(m.quarter), -(m.id or 0)), reverse=True)
+    # 1999 年的片会排到最前。这条是【平铺渲染】—— pages/movies.py 的『已忽略』页直接按本函数的
+    # 返回序渲染，没有上层分组重排来兜底，所以这里排错就是用户直接看到的错。
+    # 【年内按上映日，不按季母】(E-47 / R33 回归审计) 季母已经不是可信数据：新识别一律 <yy>A、
+    # 存量带 B/C/D，被忽略的片下一轮扫描照样被改写 —— 按季母排就是主列表修掉的那个形状
+    # （12-31 上映的沉到 03-01 之下）。与 list_movies 同口径：年 → 上映日 → id，空上映日垫底。
+    return sorted(rows, key=lambda m: (engine.quarter_year(m.quarter) or -1, m.air_date or "", m.id or 0),
+                  reverse=True)
 
 
 def get_movie(movie_id: int) -> Movie | None:
@@ -608,6 +625,12 @@ def unexclude_torrent(mt_id: int) -> bool:
 
 
 async def enrich_movie(movie_id: int) -> bool:
+    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
+    with engine.in_flight("识别剧场版"):
+        return await _enrich_movie_inner(movie_id)
+
+
+async def _enrich_movie_inner(movie_id: int) -> bool:
     """手动重识别某剧场版：用已有名字 + 最近一条种子回退，重取 bgm 元数据覆盖。"""
     with get_session() as s:
         m = s.get(Movie, movie_id)
@@ -735,6 +758,12 @@ def bind_preview(movie_id: int, bgm_id: int) -> dict:
 
 
 async def bind_movie_bgm(movie_id: int, bgm_id: int, report: dict | None = None) -> bool:
+    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
+    with engine.in_flight("绑定 bgm（剧场版）"):
+        return await _bind_movie_bgm_inner(movie_id, bgm_id, report=report)
+
+
+async def _bind_movie_bgm_inner(movie_id: int, bgm_id: int, report: dict | None = None) -> bool:
     """手动把剧场版绑定到指定 bgm subject id：取元数据覆盖 + 身份合并。"""
     info = await enrich.fetch_by_id(bgm_id)
     if not info:
@@ -831,9 +860,10 @@ def movie_save_path(movie_id: int) -> str | None:
 
 async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:
     """把该剧场版已下/在下/停滞的版本移到当前归档目录（改季度/重绑后调用；调用方应已落新 m.quarter/名）。
-    实现见 engine.relocate（与番剧共用同一份）。"""
-    return await engine.relocate(MovieTorrent, MovieTorrent.movie_id, movie_id,
-                                 movie_save_path(movie_id), old_path, noun="个版本")
+    实现见 engine.relocate（与番剧共用同一份）。页面入口：整段登记在途，理由同 relocate_anime。(R33)"""
+    with engine.in_flight("移动归档目录（剧场版）"):
+        return await engine.relocate(MovieTorrent, MovieTorrent.movie_id, movie_id,
+                                     movie_save_path(movie_id), old_path, noun="个版本")
 
 
 # ---------------- 下载 ----------------
@@ -867,24 +897,27 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
     async with _dl_lock:
         with get_session() as s:
             t = s.get(MovieTorrent, mt_id)
-            if t is None or (t.status in engine.TRACKED_STATUSES and t.archived_at is None):
+            # downloading 单独钉死：占位行的 archived_at 不再在锁内清（E-49），"已归档可重下"的例外
+            # 不能把交付中的已归档行放进来 —— 理由见番剧侧同一处（R34 对抗审计 P1）。
+            if t is None or t.status == "downloading" or (
+                    t.status in engine.TRACKED_STATUSES and t.archived_at is None):
                 return False  # 已在下/已下 → 幂等短路，防并发重复交 qB；例外：已归档的可重新下（重新交回 qB）
             # 跨表【不】去重：剧场版/番剧各下到各自目录（用户要各归各、重复提交也接受）。qB 按 hash 物理去重、
             # 不会真下两遍；某侧删文件后另一侧由 sync 落 error——不再造 progress=1 的幽灵 pointer。
             m = s.get(Movie, t.movie_id)
             orig_status = t.status        # 供失败恢复：从终态(deleted/excluded)重下失败别降级成 error
             orig_archived = t.archived_at  # 同上：重下【已归档】的版本失败要把归档标记原样放回
-            # 进锁时下面会清零这四个 qB 实时态；恢复原状态时要连它们一起放回（同番剧侧）
+            # await 期间 sync 可能碰这四个 qB 实时态（查不到 hash 就写记号）；恢复原状态时整组放回（同番剧侧）
             orig_qb = (t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at)
             t.status = "downloading"
+            # 【记下占位前的状态；归档标记与 qB 实时态留在行上不动】(E-49) 理由同番剧侧：崩溃后
+            # sweep_stale_delivering 按 prev_status 还原，而清掉的东西放不回来。清理挪到交付成功那一刻。
+            t.prev_status = orig_status
             # 【登记"本协程真的在管这一行"】(R24) 落库的 downloading 只说明"某进程某一刻开始交付"，
             # 不说明"此刻真的有协程在管"。回写撞上库抖动时异常直接冒出去、行永久停在 downloading，
             # 而它既不被 sync 复查、又占着 HAVE_STATUSES、还把切库/迁移永久拒死。
             # 注销在本函数的外层包装的 finally 里（见 download_movie_torrent 那一层）。
             engine._delivering.add(("MovieTorrent", int(mt_id)))
-            # 重新下：清归档标记 + 重置 qB 实时态，作『全新在下』重新跟踪、从新完成点重算归档倒计时（否则会被立刻再归档）
-            t.archived_at = None
-            t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 0.0, "", None, None
             s.add(t)
             s.commit()
             url = t.download_url
@@ -910,7 +943,8 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
             t2 = s2.get(MovieTorrent, mt_id)
             if t2 is not None and t2.status == st:
                 t2.fail_reason = reason[:300]
-                if _keep_orig:      # 恢复原状态时把进锁清掉的 qB 实时态整组放回
+                t2.prev_status = None       # 占位已回写，记号用完即清（E-49）
+                if _keep_orig:      # 恢复原状态时把 await 期间 sync 可能碰过的 qB 实时态整组放回
                     t2.archived_at = orig_archived
                     (t2.qb_progress, t2.qb_state,
                      t2.qb_synced_at, t2.qb_progress_at) = orig_qb
@@ -951,6 +985,11 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
         if t is not None:
             t.save_path = save_path
             t.fail_reason = ""      # 下成功了就把上次的失败原因抹掉
+            # 重新下：到这一刻才清归档标记 + 重置 qB 实时态，作『全新在下』重新跟踪、从新完成点重算
+            # 归档倒计时（否则会被立刻再归档）。(E-49) 以前在进锁占位时就清，崩溃后放不回来。
+            t.archived_at = None
+            t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 0.0, "", None, None
+            t.prev_status = None
             s.add(t)
             s.commit()
     if config.QB_SYNC_STATUS:
@@ -968,6 +1007,12 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
 
 
 async def delete_movie_torrent(mt_id: int) -> bool:
+    """页面入口：整段登记在途，理由见 `engine.in_flight`。(R33 对抗审计补：审计探针在这一条上真把 deleted 写进了另一个库)"""
+    with engine.in_flight("删除版本文件"):
+        return await _delete_movie_torrent_inner(mt_id)
+
+
+async def _delete_movie_torrent_inner(mt_id: int) -> bool:
     """删除单条剧场版种子在 qB 里的文件（走 qB 接口），标记为 deleted（终态，恢复时不重下）。
 
     若同一 hash TV 管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。

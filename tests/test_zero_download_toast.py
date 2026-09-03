@@ -109,3 +109,140 @@ async def test_zero_because_qb_is_down_is_not_reported_as_nothing_to_do(
     user.find("下载该源").click()
     await user.should_see("多半是 qB 此刻连不上")
     await user.should_not_see("该下的都下过了")
+
+
+@pytest.mark.parametrize("confirmed,rejected,gate", [
+    (False, False, "还没确认"),
+    (True, True, "『已忽略』"),
+])
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_an_unsubscribed_animes_error_row_is_not_advertised_as_backfillable(
+        user, clean_tables, cfg, confirmed, rejected, gate):
+    """(E-54，2026-09-02 拍板选 C：契约不动、改显示)
+
+    `download_plan` 按契约只排除 rejected + 停订，`confirmed` 由调用方过滤 —— 待确认番的 error 行
+    也在 backfill_plan 里，详情页把它标成橙色『失败·可补下』、tooltip 让人去点『下载该源』，
+    而那条路第一行就是 `return 0`。同一行在仪表盘『新入库』里是红色『失败』——两个界面结论相反。
+    现在：不在订阅里的番，error 行一律红色『失败』，tooltip 说清是哪道闸、出路是右边的『下载』。
+    """
+    from db.models import Anime, AnimeTorrent
+
+    cfg(QB_ENABLED=True)
+    with clean_tables.get_session() as s:
+        a = Anime(title="某番", display_name="某番", season=1, quarter="26C",
+                  confirmed=confirmed, rejected=rejected, bangumi_id=4242, total_episodes=12)
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="1" * 40, source="ANi",
+                           raw_title="[ANi] 某番 - 01", season=1, episode=1.0, status="error"))
+        s.commit()
+        aid = a.id
+
+    await user.open(f"/detail/{aid}")
+    await user.should_not_see("失败·可补下")
+    # 徽标本身在页面上；tooltip 的文案要从元素的 props 里取（testing.User 的 should_see 看不到 tooltip）
+    from nicegui import ui
+    badges = [b for b in user.find(ui.badge).elements if getattr(b, "text", "") == "失败"]
+    assert badges, "没有红色『失败』徽标"
+    assert badges[0].props.get("color") == "red", badges[0].props
+    # NiceGUI 的 tooltip 是一个**兄弟**元素，靠 props['target'] = '#<html_id>' 指回去
+    from nicegui.elements.tooltip import Tooltip
+    targets = {f"#{b.html_id}" for b in badges}
+    tips = [t for t in user.find(Tooltip).elements if t.props.get("target") in targets]
+    assert tips and gate in tips[0].text and "『补下』不会挑它" in tips[0].text, \
+        [t.text for t in tips]
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_a_subscribed_animes_error_row_is_still_advertised_as_backfillable(
+        user, clean_tables, cfg):
+    """反向：已确认、未忽略的番，error 行照旧是橙色『失败·可补下』——别把两种一起改没了。"""
+    from db.models import Anime, AnimeTorrent
+
+    cfg(QB_ENABLED=True)
+    with clean_tables.get_session() as s:
+        a = Anime(title="某番", display_name="某番", season=1, quarter="26C",
+                  confirmed=True, rejected=False, bangumi_id=4242, total_episodes=12)
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="1" * 40, source="ANi",
+                           raw_title="[ANi] 某番 - 01", season=1, episode=1.0, status="error"))
+        s.commit()
+        aid = a.id
+
+    await user.open(f"/detail/{aid}")
+    await user.should_see("失败·可补下")
+
+
+# ---------------- E-3：两条线详情页的『停滞』徽标都要说清为什么（R34 对抗审计：此前零守卫） ----------------
+
+def _tooltip_of(user, badge_text: str):
+    from nicegui import ui
+    from nicegui.elements.tooltip import Tooltip
+
+    badges = [b for b in user.find(ui.badge).elements if getattr(b, "text", "") == badge_text]
+    assert badges, f"没有『{badge_text}』徽标"
+    targets = {f"#{b.html_id}" for b in badges}
+    tips = [t for t in user.find(Tooltip).elements if t.props.get("target") in targets]
+    return badges[0], (tips[0].text if tips else "")
+
+
+@pytest.mark.parametrize("reason", ["从 qB 消失（已下 40%，半成品文件应仍在目录里）", "qB 报错（已下 50%）",
+                                    "60 分钟进度无推进（40%）"])
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_anime_detail_explains_a_stalled_row(user, clean_tables, cfg, reason):
+    from db.models import Anime, AnimeTorrent
+
+    cfg(QB_ENABLED=True)
+    with clean_tables.get_session() as s:
+        a = Anime(title="某番", display_name="某番", season=1, quarter="26C", confirmed=True, bangumi_id=1)
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="2" * 40, source="ANi", raw_title="[ANi] 某番 - 01",
+                           season=1, episode=1.0, status="stalled", qb_progress=0.4, qb_state="stalledDL",
+                           fail_reason=reason))
+        s.commit()
+        aid = a.id
+    await user.open(f"/detail/{aid}")
+    badge, tip = _tooltip_of(user, "停滞")
+    assert badge.props.get("color") == "deep-orange", badge.props
+    assert reason in tip and "『删除』" in tip, tip
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_movie_detail_explains_a_stalled_row_and_does_not_call_it_a_failure(user, clean_tables, cfg):
+    """剧场版那页原来对任何 fail_reason 都改成橙色『上次失败』—— stalled 要分叉、颜色留 deep-orange。"""
+    from db.models import Movie, MovieTorrent
+
+    cfg(QB_ENABLED=True)
+    with clean_tables.get_session() as s:
+        m = Movie(title="某片", display_name="某片", quarter="2026", bangumi_id=2)
+        s.add(m); s.commit(); s.refresh(m)
+        s.add(MovieTorrent(movie_id=m.id, info_hash="3" * 40, raw_title="[组] 某片", status="stalled",
+                           qb_progress=0.4, qb_state="stalledDL",
+                           fail_reason="从 qB 消失（已下 40%，半成品文件应仍在目录里）"))
+        s.commit()
+        mid = m.id
+    await user.open(f"/mdetail/{mid}")
+    badge, tip = _tooltip_of(user, "停滞")
+    assert badge.props.get("color") == "deep-orange", badge.props
+    assert "从 qB 消失" in tip and "『删除』" in tip, tip
+    assert "上次失败" not in tip, tip
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_an_unsubscribed_because_finished_animes_error_row_names_that_gate(user, clean_tables, cfg):
+    """(R34 对抗审计) is_subscribed 的第三种情形：已判完结 + 开了停订。文案要说"已判完结并停订"。"""
+    from datetime import datetime
+
+    from db.models import Anime, AnimeTorrent
+
+    cfg(QB_ENABLED=True, ANIME_FINISH_UNSUB=True)
+    with clean_tables.get_session() as s:
+        a = Anime(title="某番", display_name="某番", season=1, quarter="26C", confirmed=True,
+                  rejected=False, bangumi_id=4242, total_episodes=12, finished_at=datetime(2026, 1, 1))
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="1" * 40, source="ANi",
+                           raw_title="[ANi] 某番 - 01", season=1, episode=1.0, status="error"))
+        s.commit()
+        aid = a.id
+    await user.open(f"/detail/{aid}")
+    badge, tip = _tooltip_of(user, "失败")
+    assert badge.props.get("color") == "red" and "已判完结并停订" in tip, (badge.props, tip)

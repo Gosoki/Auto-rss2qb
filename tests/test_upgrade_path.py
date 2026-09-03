@@ -208,6 +208,48 @@ def test_the_role_gate_guard_is_not_vacuous():
         "一个脚本都没有 _role()，说明闸的形态变了，守卫的判据要跟着改"
 
 
+def test_each_role_upgrades_its_own_database_to_head_and_touches_nothing_else(tmp_path):
+    """(E-1，2026-09-02 拍板选 B) 两条 role 链各自在【分开的】空库上真跑到 head，核终态。
+
+    上面那条 AST 守卫挡得住"忘了写闸"，挡不住"闸写反了"：把某条 data revision 的
+    `if _role() != "data": return` 抄成 `!= "meta"`，AST 上照样"有 role 判定"（变异实测绿）。
+    只有真跑才分得出：闸写反的那条会在 meta 库上对着不存在的业务表 ALTER（炸）、
+    或把业务列建进配置库、而 data 库缺一段。默认布局两个引擎共用一个 SQLite 文件，
+    所以这里必须用两个文件 —— 那正是切了 MySQL 之后的形状。
+    【边界】(R34 对抗审计) 闸**整段删掉**时这条单独看仍绿：逐步幂等的 revision（`if table in have`）在
+    meta 库上是 no-op。那种漏法由上面的 AST 守卫接住；两条互补，别删任何一条。
+    """
+    import sqlite3
+
+    from db import META_TABLES, schema
+    from db.models import SQLModel  # noqa: F401  注册表结构
+
+    meta_eng = sa.create_engine(f"sqlite:///{tmp_path / 'meta.db'}")
+    data_eng = sa.create_engine(f"sqlite:///{tmp_path / 'data.db'}")
+    schema.upgrade(meta_eng, "meta")
+    schema.upgrade(data_eng, "data")
+    assert schema.current_revision(meta_eng, "meta") == schema.head_revision()
+    assert schema.current_revision(data_eng, "data") == schema.head_revision()
+
+    def tables(eng):
+        con = sqlite3.connect(eng.url.database)
+        try:
+            return {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+        finally:
+            con.close()
+
+    business = {t for t in SQLModel.metadata.tables if t not in META_TABLES}
+    assert tables(meta_eng) == set(META_TABLES) | {"alembic_version_meta"}, tables(meta_eng)
+    assert tables(data_eng) == business | {"alembic_version_data"}, tables(data_eng)
+    # data 库要长成模型说的样子：每张业务表的列集合与模型一致（加列 revision 漏跑一条这里就红）
+    insp = sa.inspect(data_eng)
+    for t in business:
+        want = {c.name for c in SQLModel.metadata.tables[t].columns}
+        have = {c["name"] for c in insp.get_columns(t)}
+        assert want == have, f"{t}：模型 {sorted(want - have)} 缺 / 多出 {sorted(have - want)}"
+
+
 # ---------------- (R21) alembic 产出的库要与【模型声明的索引】一致 ----------------
 
 def test_the_migrated_database_has_every_index_the_models_declare(upgrade_from):
@@ -243,18 +285,28 @@ def test_the_migrated_database_has_every_index_the_models_declare(upgrade_from):
     finally:
         con.close()
 
-    missing = []
+    missing, extra = [], []
     checked = 0
     for name, table in SQLModel.metadata.tables.items():
         if name not in got:
             continue        # meta 侧的表（setting）不在业务库里
+        declared = {ix.name for ix in table.indexes}
         for ix in table.indexes:
             checked += 1
             if ix.name not in got[name]:
                 missing.append(f"{name}.{ix.name}")
+        # 【反向：不许多出模型没声明的】(R34 对抗审计) E-48 那条 revision 的 drop 只有离线分支被
+        # 回放器看着；线上分支把 `if name in …` 写反成 `not in`，SQLite 真升上来两个索引一个没掉、
+        # 版本号照写，全套仍绿。sqlite_autoindex_* 是唯一约束自带的，ix_*_inflight 是方言手建的 partial index。
+        for ix_name in got[name]:
+            if ix_name.startswith("sqlite_autoindex_") or ix_name.endswith("_inflight"):
+                continue
+            if ix_name not in declared:
+                extra.append(f"{name}.{ix_name}")
     assert checked >= 8, f"只比对了 {checked} 个索引，模型注册多半没生效"
     assert not missing, ("升级完的库里缺这些模型声明过的索引（多半是 revision 写错了名字、"
                          "或者只加了两张表中的一张）：" + "、".join(missing))
+    assert not extra, "升级完的库里多出模型没声明的索引（drop 的 revision 没真的 drop？）：" + "、".join(extra)
 
 
 
@@ -348,22 +400,57 @@ def test_the_ddl_engine_for_mysql_has_a_connect_timeout_but_no_query_timeout(mon
     from db import schema as S
 
     calls = []
-
-    class _FakeEng:
-        def dispose(self):
-            pass
+    made = sa.create_engine("sqlite://")     # 真引擎（E-50 要往上挂 connect 事件），不连 MySQL
 
     def fake_make(url, query_timeout=True):
         calls.append(query_timeout)
-        return _FakeEng()
+        return made
 
     monkeypatch.setattr("db.make_mysql_engine", fake_make)
     fake_url = sa.engine.url.make_url(
         "mysql+pymysql://u:p@127.0.0.1:3306/x")
     holder = type("E", (), {"url": fake_url})()
     with S._ddl_engine(holder) as e:
-        assert isinstance(e, _FakeEng), "MySQL 分支没有另建 DDL 引擎"
+        assert e is made, "MySQL 分支没有另建 DDL 引擎"
     assert calls == [False], f"DDL 引擎的 query_timeout 参数不对：{calls}"
+
+
+def test_the_ddl_engine_bounds_metadata_lock_waits(monkeypatch):
+    """(E-50，2026-09-02 拍板) DDL 连接一建立就 `SET SESSION lock_wait_timeout = 60`。
+
+    MySQL 默认是一年。被元数据锁挡住的 ALTER 跑在 db.maintenance() 里，期间全站 DatabaseBusy、
+    『切回本地』也拿不到 schema._LOCK —— 两个出口同时死。这里不连库：把 connect 事件对着一个
+    假的 DBAPI 连接触发一次，核它发了什么。
+    """
+    import db as D
+    from db import schema as S
+
+    made = sa.create_engine("sqlite://")
+    monkeypatch.setattr("db.make_mysql_engine", lambda url, query_timeout=True: made)
+    holder = type("E", (), {"url": sa.engine.url.make_url("mysql+pymysql://u:p@127.0.0.1:3306/x")})()
+
+    sent = []
+
+    class _Cur:
+        def execute(self, sql, *a):
+            sent.append(sql)
+
+        def __getattr__(self, name):        # fetchone/close 之类：方言自己的探测语句
+            return lambda *a, **k: None
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def __getattr__(self, name):        # 方言自己的 on_connect（create_function 之类）一律吞掉
+            return lambda *a, **k: None
+
+    with S._ddl_engine(holder) as e:
+        # 触发的是 SQLAlchemy 的 connect 事件（pool 拿到新 DBAPI 连接时那一次）
+        e.pool.dispatch.connect(_Conn(), None)
+    assert D.MYSQL_DDL_LOCK_WAIT_TIMEOUT == 60, "拍板的值是 60 秒"
+    ours = [q for q in sent if "lock_wait_timeout" in str(q)]
+    assert ours == [f"SET SESSION lock_wait_timeout = {D.MYSQL_DDL_LOCK_WAIT_TIMEOUT}"], sent
 
 
 def test_sqlite_reuses_the_callers_engine(tmp_path):

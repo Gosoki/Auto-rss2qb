@@ -721,24 +721,27 @@ def test_no_identification_path_calls_a_merge():
     import ast
     from pathlib import Path
 
+    from conftest import impl_of
+
     root = Path(__file__).resolve().parent.parent
+    # (R33) 四个函数里三个已是 `wrapper → _inner` 两层，判据要落在 _inner 上：
+    # 正向那条按公开名找到空壳会**静默通过**（enrich_movie 实测如此），反向那条会红在"找不到"。
     for mod, fn_name in (("core/anime.py", "enrich_anime"), ("core/movies.py", "enrich_movie")):
         tree = ast.parse((root / mod).read_text(encoding="utf-8"))
-        fns = [n for n in ast.walk(tree)
-               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn_name]
-        assert fns, f"没找到 {mod}::{fn_name}，用例的前提坏了"
-        called = {n.func.id for n in ast.walk(fns[0])
+        fn = impl_of(tree, fn_name)
+        assert fn is not None, f"没找到 {mod}::{fn_name}，用例的前提坏了"
+        called = {n.func.id for n in ast.walk(fn)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert called, f"{mod}::{fn_name} 的函数体里一个调用都没有 —— 找到的是空壳，守卫真空了"
         bad = {c for c in called if c.startswith("_merge")}
         assert not bad, f"{mod}::{fn_name} 又在识别路径上合并了：{sorted(bad)}"
 
     # 反向：绑定路径必须【仍然】合并，别把两条一起关掉
     for mod, fn_name in (("core/anime.py", "bind_anime_bgm"), ("core/movies.py", "bind_movie_bgm")):
         tree = ast.parse((root / mod).read_text(encoding="utf-8"))
-        fns = [n for n in ast.walk(tree)
-               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn_name]
-        assert fns, f"没找到 {mod}::{fn_name}"
-        called = {n.func.id for n in ast.walk(fns[0])
+        fn = impl_of(tree, fn_name)
+        assert fn is not None, f"没找到 {mod}::{fn_name}"
+        called = {n.func.id for n in ast.walk(fn)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
         assert any(c.startswith("_merge") for c in called), \
             f"{mod}::{fn_name} 的合并被一起关掉了 —— 那条路是有回显的，该保留"

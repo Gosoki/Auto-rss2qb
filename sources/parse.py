@@ -21,8 +21,11 @@ _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
 # 对长数字串是 O(n²)：实测 8000 位数字要跑 1.37 秒，而标题来自第三方 feed，
 # 一条畸形标题就能把常驻采集协程卡住。加上界后是线性，且不损失任何真实标题的识别。
 _SEASON_CN_RE = re.compile(r"第\s*([一二三四五六七八九十]{1,4}|\d{1,3})\s*[季期]")  # 第三季/第3期
+# 【`\s*` 而不是 `\s+`】(E-39，2026-09-02 拍板) parse_title 是 strip_season(t2s(_clean_name(...)))，
+# _clean_name 先把空格洗掉，"2nd Season" 到这里已经是 "2ndSeason" —— 要求 `\s+` 的话在番名里永远剥不到。
+# 抽季号那一支吃的是洗之前的 body，两种写法都对；剥番名这一支只有 `\s*` 才生效。
 _SEASON_WORD_RE = re.compile(                            # 3rd Season / Season 3（ANi 罗马音常见）
-    r"(\d{1,3})(?:st|nd|rd|th)\s+season|season\s*(\d{1,3})", re.I)
+    r"(\d{1,3})(?:st|nd|rd|th)\s*season|season\s*(\d{1,3})", re.I)
 _SEASON_EN_RE = re.compile(r"[Ss](\d{1,2})[Ee]\d")       # S02E07 → 第2季
 # 裸季标记 S4 / S2（LoliHouse、喵萌等常写 『番名 S4 / Romaji S4 - 17』）——前后都不许挨字母数字，
 # 免得吃到 PS4 / DTS5 / S02E07(由上面那条管) 之类。仅作最后兜底，显式的『第X季/Season N』优先。
@@ -297,7 +300,22 @@ def season_from_name(name: str):
 
 
 def strip_season(title: str) -> str:
-    return _SEASON_CN_RE.sub("", title)
+    """把番名里的季标记剥掉：『第X季/期』、『Nth Season / Season N』、裸 `S4`。
+
+    (E-39，2026-09-02 拍板) 以前只剥中文，于是 ANi 的『…2ndSeason』与 LoliHouse 的『…S2』各自
+    带着季标记成为别名键（真库：anime#25 两个别名键、anime#20『入间同学入魔了！S4』）。
+    季号本来就在键的另一半（(title, season)），名字里再带一份只是让同一部番多出几个键。
+    真库 1683 条标题上量过：番名会变的 12 条、3 个不同的名字，没有误伤（裸 S 那条前后都不许挨
+    字母数字，PS4 / DTS5 / S02E07 都吃不到）。存量别名由 core.anime.rekey_aliases 补新键。
+    【已知边界】(R34 对抗审计) ① 纯罗马音标题的裸 S 剥不到：_clean_name 先删空格，"Hell Mode S2" 到这里是
+    "HellModeS2"，S 前面挨着字母；② 『season 后接数字』那条没有左边界，"Offseason 2" 会剥成 "Off"；③ 裸 S 前后只排
+    拉丁字母数字，"命运S2石之门" 会剥成 "命运石之门" —— 但加 CJK 边界会把真实的 "番名S4"（空格被洗掉后
+    CJK 直接挨着 S）一起挡掉。真库 1716 条标题上三类都是 0 命中，所以不动；改之前先在真库标题上量。
+    """
+    t = _SEASON_CN_RE.sub("", title)
+    t = _SEASON_WORD_RE.sub("", t)
+    t = _SEASON_BARE_RE.sub("", t)
+    return t.strip()
 
 
 # 双编号写法：'- 16(88)' —— 括号外是【季内】集号、括号内是【全系列绝对】集号（LoliHouse 系常用）。

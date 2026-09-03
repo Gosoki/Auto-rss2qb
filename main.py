@@ -34,6 +34,10 @@ install_netguard(app)   # 网段白名单中间件（WEB_ALLOW_CIDRS 为空则�
 log = logging.getLogger("autorss")
 
 
+# 七条后台协程的句柄。理由见 on_startup 里的说明。
+background_tasks: list = []
+
+
 @app.on_startup
 async def _startup():
     # 【这三步必须整体兜住】它们裸调时，任一抛异常都会让下面七个 create_task 一个都建不起来，
@@ -64,13 +68,21 @@ async def _startup():
         except Exception:           # 复位/种源组失败不该连累后台协程的建立
             log.exception("业务初始化失败（采集仍会启动，遗留的 downloading 可能未复位）")
     # 协程照常建：它们各自都按 db.is_data_down() 把门，停摆期间空转短睡，库一恢复就自动接上。
-    asyncio.create_task(run_db_watch())    # 业务库健康看守：连不上→停摆；恢复→自动接上
-    asyncio.create_task(run_worker())
-    asyncio.create_task(run_qb_sync())    # qB 种子实时态同步（独立频率）
-    asyncio.create_task(run_movie_scan())  # 剧场版/OVA 自动扫描（独立频率）
-    asyncio.create_task(run_reenrich_retry())  # 『待识别』番后台重试 bgm（独立频率，不阻塞采集）
-    asyncio.create_task(run_backup())      # 整库自动备份（独立频率；采集暂停/qB 掉线都不影响它）
-    asyncio.create_task(run_sweep())       # 完结判定 + 断更提醒（回答"有没有【没发生】的事"）
+    # 【句柄必须存住】(R33) 两个理由：① asyncio 只对 task 持弱引用，官方文档明写
+    #   "Save a reference to the result of this function, to avoid a task disappearing mid-execution"
+    #   —— 这七条是长驻循环、实际一直被调度着，大概率没事，但那是靠运气不是靠设计；
+    # ② E-46 讨论过"切库前先停掉全部后台线"这条路，它的前提就是有句柄可停。
+    #   这一轮没走"停"（所有跨 await 的线都已在闸里，"有界地等"就够，见 engine.wait_until_quiet），
+    #   但把抓手留下：将来要停，一行 `for t in background_tasks: t.cancel()`。
+    background_tasks.extend([
+        asyncio.create_task(run_db_watch(), name="db_watch"),    # 业务库健康看守：连不上→停摆；恢复→自动接上
+        asyncio.create_task(run_worker(), name="worker"),
+        asyncio.create_task(run_qb_sync(), name="qb_sync"),      # qB 种子实时态同步（独立频率）
+        asyncio.create_task(run_movie_scan(), name="movie_scan"),  # 剧场版/OVA 自动扫描（独立频率）
+        asyncio.create_task(run_reenrich_retry(), name="reenrich"),  # 『待识别』番后台重试 bgm（独立频率，不阻塞采集）
+        asyncio.create_task(run_backup(), name="backup"),        # 整库自动备份（独立频率；采集暂停/qB 掉线都不影响它）
+        asyncio.create_task(run_sweep(), name="sweep"),          # 完结判定 + 断更提醒（回答"有没有【没发生】的事"）
+    ])
 
 
 if __name__ in {"__main__", "__mp_main__"}:

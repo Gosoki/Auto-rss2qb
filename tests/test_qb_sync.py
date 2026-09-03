@@ -91,7 +91,8 @@ async def test_steady_mass_absence_still_settles_eventually(clean_tables, torren
             s.add(t)
         s.commit()
     await engine.sync_qb_status(AnimeTorrent)
-    assert all(s == "error" for s, _ in _states(clean_tables).values()), "有界宽限到点必须落定"
+    # (E-3) 夹具里的种子都有过进度（0.4），落定态是 stalled；这条用例守的是"到点必须落定、不再 in-flight"
+    assert all(s == "stalled" for s, _ in _states(clean_tables).values()), "有界宽限到点必须落定"
 
 
 async def test_single_absence_only_marks_first_round(clean_tables, torrents, qb_returns):
@@ -113,7 +114,12 @@ async def test_grace_is_wall_clock_not_just_round_count(clean_tables, torrents, 
 
 
 async def test_absent_does_settle_after_the_wall_clock(clean_tables, torrents, qb_returns):
-    """但它【必须】在有限时间内落定：否则该行恒满足 in-flight，同步循环永不休眠。"""
+    """但它【必须】在有限时间内落定：否则该行恒满足 in-flight，同步循环永不休眠。
+
+    (E-3，2026-09-02 拍板) 终局按"盘上有没有半成品"分：夹具里的种子 qb_progress=0.4，
+    有过进度 → 落 **stalled**（∈ HAVE：集去重挡着，不会为同一集换源下第二份到同一目录；
+    详情页能删、能人工重下）；原因写进 fail_reason 给徽标 tooltip 用。
+    """
     torrents(5)
     qb_returns(lambda hs: _alive(hs[1:]))
     await engine.sync_qb_status(AnimeTorrent)
@@ -123,7 +129,64 @@ async def test_absent_does_settle_after_the_wall_clock(clean_tables, torrents, q
         s.add(t)
         s.commit()
     await engine.sync_qb_status(AnimeTorrent)
+    assert _states(clean_tables)["00"][0] == "stalled"
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == f"{0:040x}")).one()
+        assert "从 qB 消失" in t.fail_reason and "40%" in t.fail_reason, t.fail_reason
+        assert t.qb_state == "", "落定后记号要清"
+
+
+async def test_absent_without_any_progress_still_lands_on_error(clean_tables, torrents, qb_returns):
+    """(E-3 的另一半) 一个字节都没下到就从 qB 消失 → 盘上没有半成品 → 照旧 **error**（可换源、可补下）。
+
+    这一半才是 error 的本义："从没交付出去"。两半合起来，error 与 stalled 各自只剩一种语义
+    （E-19 立的原则），failed_rows 的两栏各自名副其实。
+    """
+    torrents(5)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == f"{0:040x}")).one()
+        t.qb_progress = 0.0
+        s.add(t)
+        s.commit()
+    qb_returns(lambda hs: _alive(hs[1:]))
+    await engine.sync_qb_status(AnimeTorrent)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == f"{0:040x}")).one()
+        t.qb_synced_at = datetime.now() - timedelta(minutes=20)
+        s.add(t)
+        s.commit()
+    await engine.sync_qb_status(AnimeTorrent)
     assert _states(clean_tables)["00"][0] == "error"
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == f"{0:040x}")).one()
+        assert "没下到任何数据" in t.fail_reason, t.fail_reason
+
+
+async def test_every_stalled_verdict_writes_a_reason(clean_tables, torrents, qb_returns, cfg):
+    """(E-3 的配套) 三个产生 stalled 的地方都要写 fail_reason —— 详情页徽标靠它说"为什么停滞"。
+
+    只改 sync 里一处、另两处（qB 报错 / 长期无推进）不写，徽标就对同一个状态有时有话有时没话。
+    """
+    torrents(3, synced_ago_min=1)
+    # ① qB 侧 state=error
+    qb_returns(lambda hs: {h: {"progress": 0.5, "state": "error", "dlspeed": 0, "size": 1}
+                           for h in hs[:1]} | _alive(hs[1:]))
+    await engine.sync_qb_status(AnimeTorrent)
+    # ② 长期无推进：把 1 号的 qb_progress_at 推到两天前
+    cfg(QB_STALL_TIMEOUT_MIN=60)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == f"{1:040x}")).one()
+        t.qb_progress_at = datetime.now() - timedelta(days=2)
+        t.qb_synced_at = datetime.now() - timedelta(minutes=1)
+        s.add(t)
+        s.commit()
+    qb_returns(lambda hs: {h: {"progress": 0.4, "state": "downloading", "dlspeed": 0, "size": 1}
+                           for h in hs})
+    await engine.sync_qb_status(AnimeTorrent)
+    with clean_tables.get_session() as s:
+        rows = {t.info_hash[-1]: (t.status, t.fail_reason) for t in s.exec(select(AnimeTorrent))}
+    assert rows["0"][0] == "stalled" and "qB 报错" in rows["0"][1], rows["0"]
+    assert rows["1"][0] == "stalled" and "无推进" in rows["1"][1], rows["1"]
 
 
 async def test_first_miss_timestamp_is_not_refreshed(clean_tables, torrents, qb_returns):
@@ -639,7 +702,8 @@ async def test_a_row_sampled_in_a_transient_state_still_settles(
 
     with clean_tables.get_session() as s:
         row = s.exec(select(AnimeTorrent)).one()
-    assert row.status == "error", (
+    # (E-3) 这条种子有过进度（0.4）→ 落定态是 stalled；本用例守的是"必须落定、不再 in-flight"
+    assert row.status == "stalled", (
         f"qb_state={state} 的行 4 轮之后仍是 {row.status!r}/{row.qb_state!r}——永远落不了定")
     assert not engine.has_inflight(), "它还挂在 in-flight 上，同步循环永远不会休眠"
 

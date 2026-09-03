@@ -28,15 +28,66 @@ def notify_relocate_anime(rep):
         parts.append(f"{rep['failed']} 集移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
     if rep.get("stalled_kept"):   # 停滞集有意不动：不降级、不自动重下，但要告诉用户文件没跟着走
         parts.append(f"{rep['stalled_kept']} 集处于停滞、未移动（保留停滞标记，未自动重下）")
+    if rep.get("special_kept"):   # 特别篇/未知集：清成待下也没有路径会再下它（E-4），所以不动，要说清
+        # 【出路不能是"点『下载』"】(R34 对抗审计) 这些行仍是 sent，force 也被 TRACKED 短路，点了只会
+        # 弹"下载失败"。能走通的是：先『删除』（qB 不认识它 → 只标记、文件留在旧目录）再『下载』；
+        # 或者手动把文件搬到新目录、状态不动。它们**不进**下面那句"旧文件需你手动清理"——
+        # 那是唯一的一份，行还指着它。
+        parts.append(f"{rep['special_kept']} 条特别篇/未知集 qB 未跟踪、未移动（这类不会自动重下；"
+                     "要搬到新目录：先对准那条点『删除』（只标记，文件留在原处）再点『下载』，"
+                     "或手动把文件挪过去、状态不用改）")
     if rep.get("delivering"):     # 正在交付给 qB 的集：路径在交付前就定死了，搬不了也不能碰
         parts.append(f"{rep['delivering']} 集正在交付给 qB、未移动"
                      "（它会先落到旧目录，交付完成后再点一次『编辑季度』即可搬过来）")
     msg = "；".join(parts) or "无需移动"
     warn = bool(rep.get("redownload") or rep.get("failed")
-                or rep.get("stalled_kept") or rep.get("delivering"))
+                or rep.get("stalled_kept") or rep.get("special_kept") or rep.get("delivering"))
     if (rep.get("redownload") or rep.get("stalled_kept")) and rep.get("old_path"):
         msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
     ui.notify(msg, type="warning" if warn else "positive")
+
+
+async def subscribe_gated(anime_id: int, action: str, pref_source: str | None = None) -> int | None:
+    """让一部番【进入订阅并立刻补下】的唯一入口：先过 E-52 的闸，再做动作、再补下。
+
+    action ∈ {"confirm"（『确认下载』）, "restore"（『恢复订阅』）, "resubscribe"（『继续订阅』）}。
+    返回补下的集数；用户在闸上取消则返回 None（调用方据此不弹"已确认/已恢复"）。
+
+    【为什么要闸、为什么三个动作都要】(E-52，2026-09-02 拍板：只报不改 + 按钮上加闸；R34 对抗审计把
+    "只有『恢复订阅』一个入口"这句证伪了：改开始日会把同体番打回**待确认**，列表上就是『确认下载』；
+    『绑定 bgm』『补齐该源』也把番打回待确认。) 同一部作品可能在番剧表与剧场版表里各有一条记录
+    （真库里正好 2 部）。两张种子表各自唯一、**跨表没有**约束。任何一个动作都会立刻补下 —— 两边各自
+    交付同一个 info_hash：qB 对已存在的 hash 返回失败，add_to_qb 的幂等兜底查到"它确实在 qB 里"判成功，
+    于是**两条记录都显示『已交付』，文件只落在其中一个目录**。仪表盘横幅只是提醒；闸在按钮上。
+    程序判不出该留哪一条（剧场版那条通常才是对的，但番剧那条底下可能已经下过东西），所以是确认框
+    而不是拒绝：把后果说清楚，让用户自己拍。
+    """
+    verbs = {"confirm": "确认下载", "restore": "恢复订阅", "resubscribe": "继续订阅"}
+    assert action in verbs, action
+    twin = anime.movie_twin(anime_id)
+    if twin is not None:
+        ok = await confirm(
+            f"这部番在剧场版里也有一条记录：《{twin['m_name']}》(#{twin['m']})",
+            (f"两边有 {twin['shared']} 条种子是同一个文件。" if twin["shared"] else
+             "两边目前没有共用的种子，但它们是同一个 bgm 条目、以后会各收一份。")
+            + f"『{verbs[action]}』会立刻补下：qB 对同一个种子只收一次，两条记录都会显示『已交付』，"
+              "文件却只落在其中一个目录。\n通常剧场版那条才是对的 —— 建议改成删掉番剧这一条。"
+              f"仍要{verbs[action]}吗？",
+            ok_label=f"仍然{verbs[action]}", ok_icon="undo", ok_color="warning")
+        if not ok:
+            return None
+    if action == "confirm":
+        anime.confirm_anime(anime_id, pref_source)
+    elif action == "restore":
+        anime.restore_anime(anime_id)
+    else:
+        anime.resubscribe(anime_id)
+    return await anime.download_pending_for_anime(anime_id)
+
+
+async def restore_anime_gated(anime_id: int) -> int | None:
+    """『恢复订阅』= subscribe_gated(…, "restore")。留这个名字给两个现有调用点。"""
+    return await subscribe_gated(anime_id, "restore")
 
 
 async def maybe_relocate_anime(anime_id: int, old_path, after=None):
@@ -344,10 +395,32 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _bf = t.id in backfill_plan
                         _why = f"{t.fail_reason}；" if t.fail_reason else ""
                         _tried = f"（已自动重试 {t.retry_count} 次仍不行）" if t.retry_count else ""
-                        ui.badge("失败·可补下" if _bf else "失败").props(
-                            f"color={'orange' if _bf else 'red'}").tooltip(
-                            _why + (f"点右边『下载』或『下载该源』手动重试{_tried}"
-                                    if _bf else f"下载失败过{_tried}"))
+                        if not anime.is_subscribed(cur):
+                            # 【E-54，2026-09-02 拍板选 C：契约不动、改显示】download_plan 按契约只排除
+                            # rejected + 停订，`confirmed` 由调用方过滤 —— 于是待确认番的 error 行也在
+                            # backfill_plan 里，上面会把它标成『失败·可补下』、tooltip 让人去点『下载该源』，
+                            # 而 download_pending_for_anime 第一行就是 `if not is_subscribed(a): return 0`。
+                            # 同一行在仪表盘『新入库』里（先过 confirmed_anime_ids）显示的是红色『失败』。
+                            # 这里按 is_subscribed 分叉，判据与 pending 分支那三条（待确认/已忽略/已停订）同源；
+                            # 已忽略/已停订的番 _bf 本来就是 False，也走这里 —— 让 tooltip 说清是哪道闸，
+                            # 而不是一句"下载失败过"。
+                            _gate = ("这部番还没确认" if not cur.confirmed else
+                                     "这部番在『已忽略』里" if cur.rejected else "这部番已判完结并停订")
+                            ui.badge("失败").props("color=red").tooltip(
+                                _why + f"{_gate}，『补下』不会挑它；要这一集就点右边『下载』{_tried}")
+                        else:
+                            ui.badge("失败·可补下" if _bf else "失败").props(
+                                f"color={'orange' if _bf else 'red'}").tooltip(
+                                _why + (f"点右边『下载』或『下载该源』手动重试{_tried}"
+                                        if _bf else f"下载失败过{_tried}"))
+                    elif t.status == "stalled":
+                        # 【停滞要说清为什么、以及它不会自己动】(E-3) 三个来源（qB 报错 / 长期无推进 /
+                        # 从 qB 消失但盘上有半成品）都把原因写进 fail_reason；stalled 有意不进补下、
+                        # 不自动换源，所以要告诉用户出路在右边的按钮上。
+                        ui.badge("停滞").props(f"color={SEVERITY_COLOR['stalled']}").tooltip(
+                            (f"{t.fail_reason}；" if t.fail_reason else "")
+                            + "半成品文件在下载目录里。停滞集不会自动重下/换源："
+                              "要重试点右边『下载』，要放弃点『删除』")
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删/已排除)按状态
                         # 【严重度色取公共表】写死 blue-grey 会让同一条 stalled/error 在仪表盘是
                         # 橙红、在详情页是中性灰——而两边渲染的是同一列 status。
@@ -361,7 +434,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "flat dense color=grey").classes("btn-sm").tooltip(
                             "不想要这条：从待下直接排除（不删文件，只改状态；可撤销）")
-                    if t.status in engine.HAVE_STATUSES:  # 下过/在下/停滞(盘上有文件)都可删（delete 函数亦接受 stalled）
+                    # 下过/在下/停滞(盘上有文件)都可删（delete 函数亦接受 stalled）。交付中的占位行不给按钮：
+                    # delete_anime_torrent 对 downloading 直接返回 False，而它身上可能还挂着旧的 archived_at，
+                    # 会被渲染成"已归档：只能标记已删"这种错话（E-49 后占位段不清归档标记）。
+                    if t.status in engine.HAVE_STATUSES and t.status != "downloading":
                         ui.button(icon="delete_forever",
                                   on_click=_del_one(t.id, t.archived_at, t.save_path)).props(
                             "flat dense color=negative").classes("btn-sm").tooltip(
@@ -496,8 +572,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
 
 
     async def _approve():
-        anime.confirm_anime(anime_id)
-        n = await anime.download_pending_for_anime(anime_id)
+        n = await subscribe_gated(anime_id, "confirm")     # E-52 的闸：『确认下载』也是入口之一
+        if n is None:
+            return
         _after()
         ui.notify(f"已确认，补下 {n} 集", type="positive")
 
@@ -507,15 +584,17 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         ui.notify("已忽略，移到『已忽略』页", type="positive")
 
     async def _restore():
-        anime.restore_anime(anime_id)
-        n = await anime.download_pending_for_anime(anime_id)
+        n = await restore_anime_gated(anime_id)
+        if n is None:
+            return          # 用户在 E-52 的闸上取消了
         _after()
         ui.notify(f"已恢复到『订阅中』，补下 {n} 集", type="positive")
 
     async def _resubscribe():
         """继续订阅：清完结标记 + 记下别再自动判它完结，顺手把攒下的待下补一遍。"""
-        anime.resubscribe(anime_id)
-        n = await anime.download_pending_for_anime(anime_id)
+        n = await subscribe_gated(anime_id, "resubscribe")  # E-52 的闸
+        if n is None:
+            return
         _after()
         ui.notify(f"已继续订阅，补下 {n} 集（此后不再自动判它完结）" if n
                   else "已继续订阅（此后不再自动判它完结）", type="positive")

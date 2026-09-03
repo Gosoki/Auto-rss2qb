@@ -57,6 +57,31 @@ def _slot_safe_notify(message, **kwargs) -> None:
 
 ui.notify = _slot_safe_notify
 
+
+def reload_other_tabs() -> int:
+    """让【其他】已连接的标签页刷新一次，返回刷新了几个。当前标签页由调用方自己决定怎么处理。
+
+    (E-55，2026-09-02 拍板选 A) 页面渲染时把业务库的整数主键捕进了闭包（按钮的 torrent_id /
+    anime_id）；切库之后那些主键指向另一个库里毫不相干的行，而 `db/transfer.py` 明确保留主键。
+    在途闸（E-46）盖不住这一类：那里的 "await" 是用户的思考时间。所以切库成功后把其他标签页
+    整个刷掉 —— 它们重新渲染就拿到新库的主键。只漏"确认框已弹出、切库恰在此刻、然后点确认"
+    那一毫秒级的窗口（B 案要在 20 多个写回入口逐点比对库身份，为那一毫秒不值当）。
+    形状与上面 _slot_safe_notify 的多标签页分支相同：遍历 Client.instances、只碰有 socket 的。
+    """
+    me = None
+    try:
+        me = context.client
+    except RuntimeError:
+        pass
+    n = 0
+    for client in list(Client.instances.values()):
+        if client is me or not client.has_socket_connection:
+            continue
+        with client:
+            ui.navigate.reload()
+        n += 1
+    return n
+
 # 下拉恒为『锚在输入框下方的菜单』。Quasar 的 behavior 默认值是 default，判定是
 # `platform.is.mobile !== true && behavior !== "dialog" ? false : behavior !== "menu" && …`——
 # 即手机/平板上默认翻成顶部弹出的全宽 dialog（带一个没用的只读输入框），跟桌面端两副样子。
@@ -466,6 +491,11 @@ def qb_live_text(t) -> str:
     if getattr(t, "status", "") in engine.MANUAL_TERMINAL_STATUSES or \
             getattr(t, "status", "") == "stalled":
         return ""
+    #   · downloading：(E-49) 从已归档/停滞重下时占位段**不再清**归档标记与旧实时态（崩溃后要还原），
+    #     所以交付中的那 ≤180 秒行上还挂着旧 archived_at / 旧 progress —— 不拦住会显示成『已归档』
+    #     或『已完成 100%』，而它此刻正在被重新交付。回落到 torrent_status_cn 的『交付中』。
+    if getattr(t, "status", "") == "downloading":
+        return ""
     if getattr(t, "archived_at", None):
         return "已归档"          # 完成后已从 qB 移除(留文件)、不再跟踪
     if not getattr(t, "qb_state", ""):
@@ -497,6 +527,8 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
     if status in engine.MANUAL_TERMINAL_STATUSES or status == "stalled":
         return (torrent_status_cn(status, qb_progress, qb_synced_at),
                 SEVERITY_COLOR.get(status, "blue-grey"))
+    if status == "downloading":     # 交付中的占位：旧实时态是陈旧的（理由见 qb_live_text，E-49）
+        return torrent_status_cn(status, qb_progress, qb_synced_at), "blue"
     if qb_state:
         pr = qb_progress or 0
         parts = [qb_state_cn(qb_state), f"{pr * 100:.0f}%"]

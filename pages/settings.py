@@ -16,7 +16,7 @@ from db import backup, schema as db_schema
 from services import notify
 from db.dialect import BINARY_COLLATION
 from sources.parse import format_quarter
-from .layout import busy_action, confirm, frame, require_config_loaded, warn_banner
+from .layout import busy_action, confirm, frame, reload_other_tabs, require_config_loaded, warn_banner
 
 _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "NOTIFY_MAX_PER_HOUR", "NOTIFY_BACKLOG_MIN", "ANIME_IDLE_DAYS", "SWEEP_INTERVAL_MIN",
@@ -425,6 +425,16 @@ def _db_panel(f: dict) -> None:
             # 【维护窗口】期间 get_session() 一律拒绝：后台四条循环按停摆跳过本轮，
             # 页面上那几个写入口（补齐/新增源组/绑定 bgm）也一并被挡住。
             # 理由与"为什么闸装在 get_session 上"写在 db/__init__.py 的 maintenance() 处。
+            # 【先有界地等，等不到再拒】(R33, E-46) R22 把语义定成"正忙就拒绝"，理由是
+            # 一轮采集可能跑几分钟、按钮转几分钟的圈比一句清楚的拒绝更糟 —— 成立。
+            # 但最常见的"忙"是一个几秒钟的取种/识别正在半途，为它让用户手动重试很傻。
+            # 所以等 30 秒：盖住那类，盖不住的（整轮采集/延迟重识别）照旧拒绝并列出理由。
+            # 真正的把关仍在下面 db.maintenance(blocked_by=...) —— 它与切换之间没有 await，才是原子的。
+            _left = await engine.wait_until_quiet(30)
+            if _left:
+                ui.notify("等了 30 秒仍有工作在途，没有切库：" + "；".join(_left)
+                          + " —— 等它跑完再点一次", type="warning")
+                return
             with db.maintenance(f"正在把业务数据库切到 {target}",
                                 blocked_by=engine.maintenance_blockers):
                 await run.io_bound(db.switch_data_engine, url)
@@ -464,11 +474,15 @@ def _db_panel(f: dict) -> None:
         # **保留 fatal 并静默 return** 的（见 db/__init__.py 那段说明）——此时系统仍然停摆，
         # 而这里却弹一句绿色的"已切到 本地 SQLite（数据未改动）"，用户会以为救回来了。
         # 全站的口径是：提示只描述【已经发生的事实】。
+        # 【其他标签页整个刷掉】(E-55) 它们闭包里的主键是旧库的，见 layout.reload_other_tabs。
+        # 当前这个标签页不刷：用户正在看切换结果，下面那句提示要留得住。
+        _n = reload_other_tabs()
+        _tail = f"；已刷新另外 {_n} 个标签页" if _n else ""
         if db.is_data_down():
             ui.notify(f"连接已切到 {db.data_target_desc()}，但系统仍在停摆："
-                      f"{db.data_down_reason()}", type="warning")
+                      f"{db.data_down_reason()}{_tail}", type="warning")
         else:
-            ui.notify(f"已切到 {db.data_target_desc()}（数据未改动）。刷新页面看新库内容。",
+            ui.notify(f"已切到 {db.data_target_desc()}（数据未改动）。刷新页面看新库内容{_tail}。",
                       type="positive")
 
     async def _migrate(to_mysql: bool):
@@ -545,8 +559,14 @@ def _db_panel(f: dict) -> None:
                 # 两把锁正是 worker 用来串行化采集轮与剧场版扫描轮的那两把，这里借用它们把两条线挡在门外。
                 # 【不再自己拿两把轮次锁】(R22) 它们现在是 `maintenance_blockers()` 的判据之一 ——
                 # 自己拿了反而会被自己判成"采集轮正在跑"，维护永远开不起来。
-                # 语义也从"等它跑完"变成"正忙就拒绝、让用户过一会儿再点"：一轮采集可能跑几分钟，
-                # 按钮转几分钟的圈比一句"现在不能迁移：采集轮正在跑"更糟。
+                # 语义是"**有界地等**、等不到再拒"(R33 修订 R22 的"正忙就拒绝")：一轮采集可能跑几分钟，
+                # 按钮转几分钟的圈比一句"现在不能迁移：采集轮正在跑"更糟 —— 所以只等 30 秒，
+                # 够盖住"一个取种/识别正在半途"这种最常见的忙，盖不住的照旧拒绝并列出理由。
+                _left = await engine.wait_until_quiet(30)
+                if _left:
+                    ui.notify("等了 30 秒仍有工作在途，没有迁移：" + "；".join(_left)
+                              + " —— 等它跑完再点一次", type="warning")
+                    return
                 # db.maintenance() 挡住其余全部业务读写（页面上的补齐/新增源组/绑定 bgm
                 # 以前完全不受约束，实测能撞出 `IntegrityError: UNIQUE constraint failed`，
                 # 而目标库停在"清空 + 写了一半"）。理由见 db/__init__.py 的 maintenance()。
@@ -925,7 +945,7 @@ def settings():
                 _num("WEB_PORT", "Web 端口", _env_port)
                 _text("WEB_ALLOW_CIDRS", "允许网段(CIDR)", config.WEB_ALLOW_CIDRS)
                 _text("WEB_ALLOW_HOSTS", "允许的访问域名", config.WEB_ALLOW_HOSTS)
-            ui.label("『允许的访问域名』：按 IP / localhost / .local·.lan·.internal·.home.arpa "
+            ui.label("『允许的访问域名』：按 IP / localhost·*.localhost / .local·.lan·.internal·.home.arpa "
                      "访问永远放行，不必填。只有走自有域名或反向代理时才需要把那个域名填进来 —— "
                      "这道校验挡的是 DNS 重绑定（把域名先解析到攻击者的服务器、再改答成本机地址，"
                      "浏览器就把那个网页当成与本面板同源，从而在无鉴权的前提下完全接管它；"

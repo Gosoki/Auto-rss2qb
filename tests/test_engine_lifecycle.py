@@ -948,3 +948,983 @@ async def test_a_crashing_delivery_still_unregisters(monkeypatch, clean_tables):
     assert ce.sweep_stale_delivering() == 1, "残骸清扫救不回它"
     with clean_tables.get_session() as s:
         assert s.exec(select(AnimeTorrent)).one().status == "pending"
+
+
+# ---------------- (R33) E-46：枚举"工作单元"，并用形状守卫逼着登记 ----------------
+
+# 【这张表就是 E-46 的答案】core/ 里每一个"出 await 之后还开 get_session"的 async 函数，
+# 都必须能说出它被哪道闸看见。名单从 R21 到 R27 错过四次，因为它从来只存在于人的记忆里；
+# 现在它存在这里，而且下面那条用例会用 AST **扫形状**去核对它 —— 新写了一个同形函数
+# 却没登记，红的是用例，不是用户的数据。
+#   lock:<名>   ＝ 调用方整轮持着那把模块级锁（闸按 .locked() 看）
+#   delivering  ＝ 进锁即落 status='downloading' 并登记 _delivering（闸按行数看）
+#   sync_busy   ＝ qB 同步的轮次锁（闸按 sync_busy() 看）
+#   in_flight   ＝ 页面驱动的入口，本函数是 `engine.in_flight` 包住的 wrapper 的 _inner
+#   caller:<名> ＝ 只被某个已登记的函数调用（不是页面直接调的）
+_STRADDLERS = {
+    "core/anime.py": {
+        "_resolve_anime":                 "caller:process_item",
+        "process_item":                   "lock:_poll_lock",
+        "_download_anime_torrent_inner":  "delivering",
+        "flush_ready_downloads":          "lock:_poll_lock",
+        "sweep_finished":                 "lock:_sweep_lock",
+        "sweep_idle":                     "lock:_sweep_lock",
+        "enrich_anime":                   "caller:_manual_enrich_inner|_retry_unmatched_inner",  # _resolve_anime 调的是 enrich.resolve，不是它（R33 对抗审计纠）
+        "_bind_anime_bgm_inner":          "in_flight",
+        "_manual_enrich_inner":           "in_flight",
+        "_retry_unmatched_inner":         "lock:_enrich_lock",
+        "_download_all_pending_inner":    "in_flight",
+        "_backfill_source_inner":         "in_flight",
+        "_delete_anime_files_inner":      "in_flight",
+        # (R33 对抗审计补) 下面三条是扫描器认得"经辅助函数写回"之后才冒出来的
+        "_delete_anime_torrent_inner":    "in_flight",     # 读 → await qb.delete → _set_status(id)
+        "_download_pending_for_anime_inner": "in_flight",  # 读 id 列表 → await 预检 → 逐个交付
+        "relocate_anime":                 "in_flight",     # 真正跨 await 的在 engine.relocate
+    },
+    "core/engine.py": {
+        "archive_old_completed":          "lock:_archive_lock",
+        "_sync_qb_status":                "sync_busy",
+        "relocate":                       "caller:relocate_anime|relocate_movie",  # 读 (id,hash) → await setLocation → _mark_moved(ids)
+    },
+    "core/movies.py": {
+        "_enrich_movie_inner":            "in_flight",
+        "_bind_movie_bgm_inner":          "in_flight",
+        "_download_movie_torrent_inner":  "delivering",
+        "_refresh_movie_torrents_inner":  "in_flight",
+        "_delete_movie_torrent_inner":    "in_flight",     # 审计探针在这条上真把 deleted 写进了另一个库
+        "relocate_movie":                 "in_flight",
+        "_discover_loop":                 "lock:_scan_lock",  # 只经 discover_movies ← scan_now / worker 整年扫描，都在 _scan_lock 里
+    },
+}
+
+
+_CORE = ("core/engine.py", "core/anime.py", "core/movies.py")
+
+
+def _session_openers(root):
+    """三个 core 模块里【会打开业务库会话】的函数名集合：{模块相对路径: {函数名}}。
+
+    直接调 `get_session` 的算；调了本模块里已算上的算；anime/movies 里调 `engine.<已算上>` 的也算
+    （求不动点）。(R33 对抗审计) 第一版扫描只认函数体里**字面**的 `get_session(`，
+    于是 `delete_movie_torrent` 这种"读主键 → await qb.delete → `_set_status(id)`"的
+    经辅助函数写回的形状整个漏掉 —— 审计的探针在它身上真的把 deleted 写进了另一个库。
+    "已知盲区，手工列入"在这一条上失效了：手工列入的前提是知道它在，而它正是不知道的那个。
+    """
+    import ast
+
+    trees = {rel: ast.parse((root / rel).read_text(encoding="utf-8")) for rel in _CORE}
+
+    def callees(fn):
+        out = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Name):
+                    out.add(("", f.id))
+                elif isinstance(f, ast.Attribute):
+                    base = f.value.id if isinstance(f.value, ast.Name) else "?"
+                    out.add((base, f.attr))
+        return out
+
+    openers = {}
+    for rel in _CORE:                       # engine 先算，anime/movies 再引用它
+        fns = {n.name: n for n in trees[rel].body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        eng = openers.get("core/engine.py", set())
+        mine, changed = set(), True
+        while changed:
+            changed = False
+            for name, fn in fns.items():
+                if name in mine:
+                    continue
+                cs = callees(fn)
+                if (any(a == "get_session" for _, a in cs)
+                        or any(b == "" and a in mine for b, a in cs)
+                        or any(b == "engine" and a in eng for b, a in cs)):
+                    mine.add(name)
+                    changed = True
+        openers[rel] = mine
+    return openers
+
+
+def _straddlers_by_shape(root, rel, openers):
+    """AST 扫出"出 await 之后还开业务库会话"的 async 函数（含经辅助函数、经 `engine.*`、
+    经函数体内嵌套 def 打开的）。
+
+    只看本函数体自己的语句顺序（嵌套 def 的**体**不展开，但对嵌套 def 的**调用**按它是否
+    开会话计入 —— `engine.relocate` 里的 `_mark_moved` 就是这种：读 → await set_location → 写）。
+    行号顺序是启发式（按行比较，同一行的不算跨）。
+    """
+    import ast
+
+    out = []
+    tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+    mine = openers[rel]
+    eng = openers["core/engine.py"]
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        # 函数体内嵌套的 def，若自己开会话（直接或经本模块/engine 的 opener），对它的调用也算
+        nested = set()
+        for n in ast.walk(fn):
+            if n is not fn and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for c in ast.walk(n):
+                    if isinstance(c, ast.Call):
+                        f = c.func
+                        if ((isinstance(f, ast.Name) and (f.id == "get_session" or f.id in mine))
+                                or (isinstance(f, ast.Attribute) and (
+                                    f.attr == "get_session"
+                                    or (isinstance(f.value, ast.Name) and f.value.id == "engine"
+                                        and f.attr in eng)))):
+                            nested.add(n.name)
+                            break
+        body = []
+        stack = list(ast.iter_child_nodes(fn))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            body.append(n)
+            stack.extend(ast.iter_child_nodes(n))
+        awaits = [n.lineno for n in body if isinstance(n, ast.Await)]
+        # 被 await 的那个调用本身算（`await download_anime_torrent(t.id)` 拿着出 await 前读的主键
+        # 去写，是标准的跨），但它**实参里**的调用不算 —— 实参在 await 之前求值
+        # （`await engine.relocate(..., anime_save_path(anime_id), ...)` 换行写的实参会落在下一行）。
+        in_args = set()
+        for n in body:
+            if isinstance(n, ast.Await) and isinstance(n.value, ast.Call):
+                for a in ast.walk(n.value):
+                    if a is not n.value:
+                        in_args.add(id(a))
+        sess = []
+        for n in body:
+            if not isinstance(n, ast.Call) or id(n) in in_args:
+                continue
+            f = n.func
+            if isinstance(f, ast.Name) and (f.id == "get_session" or f.id in mine or f.id in nested):
+                sess.append(n.lineno)
+            elif isinstance(f, ast.Attribute) and (
+                    f.attr == "get_session"
+                    or (isinstance(f.value, ast.Name) and f.value.id == "engine" and f.attr in eng)):
+                sess.append(n.lineno)
+        if awaits and sess and max(sess) > min(awaits):
+            out.append(fn.name)
+    return sorted(out)
+
+
+def _enclosing_callers(root, names):
+    """{被调函数名: {调用它的外层函数名}}，扫 core/ pages/ services/ 与 main.py。
+
+    `foo(` 与 `x.foo(` 都算（页面经 `anime.foo(`、movies 经 `engine.foo(` 调）；**只提到名字**也算
+    （worker.sweep_round 把 `anime.sweep_finished` 放进元组再逐个 `fn()`）—— 宁可多报。
+    模块级的记作 "<module>"。只认名字不认模块：两条线各有一个 `_set_status`，
+    但登记表里没有这种重名，真撞上时守卫会多报不会漏报。
+    """
+    import ast
+
+    graph = _reference_graph(root)
+    return {n: set(graph.get(n, ())) for n in names}
+
+
+def _reference_graph(root):
+    """{被提到的名字: {提到它的外层函数名}}，整仓算一次（按 root 缓存 —— 调用链要反复查）。"""
+    import ast
+
+    cache = _reference_graph.__dict__.setdefault("cache", {})
+    if root in cache:
+        return cache[root]
+    out = {}
+    files = [*root.glob("core/*.py"), *root.glob("pages/*.py"), *root.glob("services/*.py"),
+             root / "main.py"]
+    for f in files:
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+
+        def visit(node, owner):      # 给每个节点标上最近的外层函数
+            for ch in ast.iter_child_nodes(node):
+                if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    visit(ch, ch.name)
+                    continue
+                nm = ch.id if isinstance(ch, ast.Name) else ch.attr if isinstance(ch, ast.Attribute) else ""
+                if nm and owner != nm:
+                    out.setdefault(nm, set()).add(owner)
+                visit(ch, owner)
+        visit(tree, "<module>")
+    cache[root] = out
+    return out
+
+
+def _lock_holders(root, lock_names):
+    """{锁名: {函数体里有 `async with <锁>` / `with <锁>` 的函数名}}，扫 core/ pages/ services/ main.py。"""
+    import ast
+
+    out = {n: set() for n in lock_names}
+    files = [*root.glob("core/*.py"), *root.glob("pages/*.py"), *root.glob("services/*.py"),
+             root / "main.py"]
+    for f in files:
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for w in ast.walk(fn):
+                if isinstance(w, (ast.With, ast.AsyncWith)):
+                    for item in w.items:
+                        ce = item.context_expr
+                        nm = ce.id if isinstance(ce, ast.Name) else ce.attr if isinstance(ce, ast.Attribute) else ""
+                        if nm in out:
+                            out[nm].add(fn.name)
+    return out
+
+
+def test_every_pk_straddler_is_registered():
+    """core/ 里每一个"出 await 之后还开 get_session"的函数，都必须在 _STRADDLERS 里有一行。
+
+    这是 E-46 的守卫：它扫的是**形状**（await 之后开 session），不是名单。
+    新写了一个同形函数而没登记 → 这里红。登记时必须写清楚它被哪道闸看见，
+    而"caller:"只允许指向**本表里已有**的名字（否则等于把责任推给一个不存在的人）。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    openers = _session_openers(root)
+    problems = []
+    for rel, table in _STRADDLERS.items():
+        found = _straddlers_by_shape(root, rel, openers)
+        missing = [f for f in found if f not in table]
+        if missing:
+            problems.append(f"{rel}: 这些函数出 await 后还开 session，却没登记怎么被闸看见 → {missing}")
+        # in_flight 的条目允许扫不到：wrapper 委托的 _inner 自己可能只是再委托一层（_manual_enrich_inner）
+        stale = [f for f in table if f not in found and table[f] != "in_flight"]
+        if stale:
+            problems.append(f"{rel}: 登记表里这些名字 AST 已经扫不到了（改名/删了？）→ {stale}")
+        for f, how in table.items():
+            if how.startswith("caller:"):
+                for c in how.split(":", 1)[1].split("|"):
+                    if not any(c in t for t in _STRADDLERS.values()):
+                        problems.append(f"{rel}::{f} 说自己被 {c} 盖住，但 {c} 不在本表里")
+    # 【caller: 必须与调用图一致】(R33 对抗审计) 上一版只查"名字在不在表里"：
+    # 表里 enrich_anime 写着被 _resolve_anime 盖住，而 _resolve_anime 从不调它（它调 enrich.resolve）；
+    # 给 _resolve_anime 在锁外加一个新调用方，全套照样绿。这里按 AST 收集 core/ pages/ services/ main.py
+    # 里每一处对该函数的调用（含 `模块.名字(` 形态）所在的外层函数，要求恰好 ⊆ 所列 caller。
+    everything = {f: how for t in _STRADDLERS.values() for f, how in t.items()}
+    real_callers = _enclosing_callers(root, [f for f, how in everything.items()
+                                            if how.startswith("caller:")])
+    for f, how in everything.items():
+        if not how.startswith("caller:"):
+            continue
+        listed = set(how.split(":", 1)[1].split("|"))
+        actual = real_callers.get(f, set())
+        if not actual:
+            problems.append(f"{f} 登记为 caller:，但整个仓库没人调它 —— 名单是假的或函数已死")
+        extra = sorted(actual - listed)
+        if extra:
+            problems.append(f"{f} 还被这些不在名单上的函数调：{extra}（它们在闸外就是漏洞）")
+        phantom = sorted(listed - actual)
+        if phantom:
+            problems.append(f"{f} 说自己被 {phantom} 盖住，但它们根本不调 {f}")
+    # 【lock:L 必须真的在 f 或它的调用链上被拿】(R33 对抗审计) 表里写一把**真锁、闸看得见、
+    # 但函数根本不在它里面跑**的锁（process_item → lock:_sweep_lock），上面全绿。
+    # 这里沿调用图往上找（core/pages/services/main + worker），要求某一层的函数体里有
+    # `async with <…>.L` / `with L`。
+    lock_names = sorted({how.split(":", 1)[1] for how in everything.values() if how.startswith("lock:")})
+    holders = _lock_holders(root, lock_names)
+    for f, how in everything.items():
+        if not how.startswith("lock:"):
+            continue
+        L = how.split(":", 1)[1]
+        graph = _reference_graph(root)
+        chain, frontier = {f}, {f}
+        while frontier:
+            nxt = set()
+            for g in frontier:
+                nxt |= graph.get(g, set())
+            nxt -= chain
+            chain |= nxt
+            frontier = nxt
+        if not (chain & holders.get(L, set())):
+            problems.append(f"{f} 登记为 lock:{L}，但它和它的所有调用方都没有 `async with {L}`：调用链 {sorted(chain)}")
+    # 【caller: 链必须走到一道真闸，且不许绕圈】"A 说被 B 盖住、B 说被 A 盖住"在上面那条里是合法的。
+    for f, how in everything.items():
+        seen, cur = set(), f
+        while everything[cur].startswith("caller:"):
+            if cur in seen:
+                problems.append(f"{f} 的 caller: 链绕圈了：{sorted(seen)}")
+                break
+            seen.add(cur)
+            # 多个 caller 各自都得到闸；这里沿第一个走，其余在各自的条目里被同样地追
+            cur = everything[cur].split(":", 1)[1].split("|")[0]
+    assert not problems, "\n  ".join(["E-46 的工作单元登记表与代码对不上："] + problems)
+
+
+async def test_every_registered_gate_is_one_the_maintenance_window_actually_sees(clean_tables):
+    """登记表里写的 `lock:<名字>` 一把把真的拿住，`maintenance_blockers()` 必须说话。
+
+    上一条只核"表与代码对得上"，核不了"表里写的那道闸是真的"——
+    `lock:_foo_lock` 随手写一个不存在的锁名，或者写一把闸看不见的真锁，上一条照样绿。
+    这里按表逐把拿住真锁问闸。`delivering` / `sync_busy` / `in_flight` 各有自己的行为用例。
+    """
+    from core import anime as A
+    from core import engine as ce
+    from core import worker as W
+
+    assert ce.maintenance_blockers() == [], "起点就不干净"
+    names = sorted({how.split(":", 1)[1] for t in _STRADDLERS.values()
+                    for how in t.values() if how.startswith("lock:")})
+    assert names, "表里一把锁都没有？前提坏了"
+    bad = []
+    for name in names:
+        lock = getattr(W, name, None) or getattr(A, name, None)
+        if lock is None:
+            bad.append(f"lock:{name} —— worker / anime 里都没有这把锁")
+            continue
+        async with lock:
+            if not ce.maintenance_blockers():
+                bad.append(f"lock:{name} 拿住了，maintenance_blockers() 却是空的 —— 这把锁闸看不见")
+        assert ce.maintenance_blockers() == [], f"放开 {name} 之后闸没归零"
+    assert not bad, "\n  ".join(["登记表里这些闸是假的："] + bad)
+
+
+def test_in_flight_entries_are_really_wrapped():
+    """登记表里标 in_flight 的，必须真的有一个同名 wrapper 用 `engine.in_flight(` 包住它。
+
+    光在表里写 in_flight 不算数 —— 那又回到"名单只存在于纸上"。这里按 AST 核：
+    存在 `async def <name去掉 _ 与 _inner>`，且它的函数体里有 `with engine.in_flight(...)`
+    并在里面 `await _<name>(...)`。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    bad = []
+    for rel, table in _STRADDLERS.items():
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)}
+        for inner, how in table.items():
+            if how != "in_flight":
+                continue
+            if not inner.endswith("_inner"):
+                # 没拆两层的（relocate_anime 这种一句委托）：函数体自己的每个 await 都得在 with 里
+                fn = fns.get(inner)
+                if fn is None:
+                    bad.append(f"{rel}: {inner} 标了 in_flight，但没这个函数")
+                    continue
+                withs = [n for n in ast.walk(fn) if isinstance(n, ast.With)
+                         and any(isinstance(i.context_expr, ast.Call)
+                                 and getattr(i.context_expr.func, "attr",
+                                             getattr(i.context_expr.func, "id", "")) == "in_flight"
+                                 for i in n.items)]
+                inside = {id(a) for w_ in withs for a in ast.walk(w_) if isinstance(a, ast.Await)}
+                all_awaits = [a for a in ast.walk(fn) if isinstance(a, ast.Await)]
+                if not all_awaits or any(id(a) not in inside for a in all_awaits):
+                    bad.append(f"{rel}: `{inner}` 有 await 落在 `with engine.in_flight(...)` 外面")
+                continue
+            pub = inner[1:-len("_inner")]
+            w = fns.get(pub)
+            if w is None:
+                bad.append(f"{rel}: {inner} 标了 in_flight，但没有公开的 wrapper `{pub}`")
+                continue
+            # 【看 With 节点，不看字符串】(R33 自查) 第一版用 `"in_flight" in ast.dump(w)`，
+            # 而 wrapper 的 docstring 里就写着 "见 engine.in_flight" —— 把登记整个拿掉它照样绿。
+            # 判据：存在一个 With，其上下文表达式是对 in_flight 的调用，且 _inner 的调用在它体内。
+            withs = [n for n in ast.walk(w) if isinstance(n, ast.With)
+                     and any(isinstance(i.context_expr, ast.Call)
+                             and getattr(i.context_expr.func, "attr",
+                                         getattr(i.context_expr.func, "id", "")) == "in_flight"
+                             for i in n.items)]
+            wrapped = any(
+                any(isinstance(c, ast.Call)
+                    and getattr(c.func, "id", getattr(c.func, "attr", "")) == inner
+                    for c in ast.walk(wn))
+                for wn in withs)
+            if not wrapped:
+                bad.append(f"{rel}: `{pub}` 没有在 `with engine.in_flight(...)` 体内调用 {inner}")
+                continue
+            # 【await 也得在 with 里】(R33 对抗审计) `with in_flight(): coro = _inner()` / `return await coro`
+            # —— Call 在 with 体内、await 在外面，登记在真正跑之前就注销了。上一版只看 Call，这个变异存活。
+            inside = {id(a) for wn in withs for a in ast.walk(wn) if isinstance(a, ast.Await)}
+            all_awaits = [a for a in ast.walk(w) if isinstance(a, ast.Await)]
+            if not all_awaits or any(id(a) not in inside for a in all_awaits):
+                bad.append(f"{rel}: `{pub}` 有 await 落在 `with engine.in_flight(...)` 外面")
+    assert not bad, "\n  ".join(["这些 in_flight 登记是空头的："] + bad)
+
+
+async def test_a_page_entry_blocks_maintenance_while_it_runs(clean_tables, monkeypatch):
+    """行为面：页面入口跑到一半时，在途闸必须说话；结束（含异常）后必须放开。
+
+    要 clean_tables：`maintenance_blockers()` 读不到业务库时**整个返回空表**（那是给『切回本地』
+    留的自救出口），in_flight 那一段根本走不到 —— 没有库的话这条用例单跑必红、跟在别的用例后面才绿。
+    """
+    from core import anime as A
+    from core import engine as ce
+
+    assert ce.maintenance_blockers() == [], "起点就不干净"
+
+    seen = {}
+
+    async def slow_inner(anime_id, bgm_id, report=None):
+        seen["during"] = ce.maintenance_blockers()
+        raise RuntimeError("模拟 bgm 中途炸了")
+
+    monkeypatch.setattr(A, "_bind_anime_bgm_inner", slow_inner)
+    try:
+        await A.bind_anime_bgm(1, 2)
+    except RuntimeError:
+        pass
+    assert any("绑定 bgm" in r for r in seen["during"]), \
+        f"绑定 bgm 跑到一半，闸却没看见它：{seen['during']}"
+    assert ce.maintenance_blockers() == [], "异常之后登记没注销 —— 切库会被永久拒死"
+
+
+async def test_wait_until_quiet_returns_when_the_gate_clears(clean_tables):
+    """`wait_until_quiet` 要真的等：闸忙时不立刻返回，放空后立刻返回。"""
+    import asyncio
+
+    from core import engine as ce
+
+    with ce.in_flight("测试用"):
+        async def release():
+            await asyncio.sleep(0.3)
+            ce._in_flight.clear()
+        asyncio.get_running_loop().create_task(release())
+        t0 = asyncio.get_running_loop().time()
+        left = await ce.wait_until_quiet(timeout=5, poll=0.05)
+        dt = asyncio.get_running_loop().time() - t0
+    assert left == [], f"闸放空了却还回了阻塞项：{left}"
+    assert 0.25 < dt < 2, f"等待时长不对（{dt:.2f}s）—— 要么没等、要么没及时返回"
+
+    with ce.in_flight("一直占着"):
+        # wait_for：把"忽略超时、永远等"这个变异变成失败而不是挂死（审计的 M4c 挂了 300 秒）
+        left = await asyncio.wait_for(ce.wait_until_quiet(timeout=0.3, poll=0.05), timeout=3)
+    assert left and "一直占着" in left[0], "超时后必须把还在阻塞的东西回出来，交给原来的拒绝路径"
+
+
+async def test_gate_still_lists_memory_signals_when_the_db_is_unreadable(clean_tables, monkeypatch):
+    """(R33 对抗审计) 业务库读不了时，锁 / in_flight / 交付登记这些**内存信号**照样要列出来。
+
+    R22 在 except 里整个 `return []`（"别把『切回本地』堵死"）。探针：MySQL 抖动 → 用户走自救出口
+    → 此刻『删除单集文件』正停在 qb.delete 的 await 上 → 三道预检全拿到 [] → 切库放行 →
+    await 回来后 `deleted` 按 MySQL 的主键写进了 SQLite 的另一行。
+    自救出口只需要跳过那两条 COUNT，不需要跳过内存信号。
+    """
+    from sqlalchemy.exc import OperationalError
+
+    from core import engine as ce
+    from core import worker as W
+
+    def boom():
+        raise OperationalError("SELECT 1", {}, Exception("库连不上"))
+
+    monkeypatch.setattr(ce, "get_session", boom)
+    assert ce.maintenance_blockers() == [], "库读不了、也没有在途工作 → 自救出口必须开着"
+    with ce.in_flight("删除单集文件"):
+        got = ce.maintenance_blockers()
+        assert any("删除单集文件" in r for r in got), f"库读不了时 in_flight 被吞了：{got}"
+    async with W._poll_lock:
+        got = ce.maintenance_blockers()
+        assert any("采集轮" in r for r in got), f"库读不了时轮次锁被吞了：{got}"
+    ce._delivering.add(("AnimeTorrent", 999))
+    try:
+        got = ce.maintenance_blockers()
+        assert any("交付中" in r for r in got), f"库读不了时交付登记被吞了：{got}"
+    finally:
+        ce._delivering.discard(("AnimeTorrent", 999))
+    assert ce.maintenance_blockers() == [], "全放开后必须归零"
+
+
+async def test_wait_until_quiet_polls_off_the_event_loop(clean_tables, monkeypatch):
+    """(R33 对抗审计) 轮询里的 `maintenance_blockers()` 必须在线程上跑，不能在事件循环上。
+
+    它对业务库发两条 SELECT，而那可能是台连不上的 MySQL —— E-36 定的纪律是碰 MySQL 的同步调用
+    一律上线程；设置页那一次预检就是 `run.io_bound` 的。这里一轮最多 60 次，更不能例外。
+    `tests/test_mysql_compat.py` 的 ON_THREAD_ONLY 只扫页面处理器，看不见 core 里的这一处，所以单独钉。
+    """
+    import threading
+
+    from core import engine as ce
+
+    threads = []
+    real = ce.maintenance_blockers
+
+    def spy():
+        threads.append(threading.get_ident())
+        return real()
+
+    monkeypatch.setattr(ce, "maintenance_blockers", spy)
+    await ce.wait_until_quiet(timeout=0.2, poll=0.05)
+    assert threads, "轮询一次都没调 maintenance_blockers —— 前提坏了"
+    assert threading.get_ident() not in threads, "maintenance_blockers 在事件循环线程上同步跑了"
+
+
+def test_every_maintenance_window_waits_before_refusing():
+    """(R33) 设置页每一处 `db.maintenance(...)` 之前都必须先 `await engine.wait_until_quiet(...)`。
+
+    "有界地等、等不到再拒"这个决定有**两个**入口（切库 / 迁移）。只落一处就是
+    本项目第①号缺陷形状。按 AST 逐个 async 处理器核：含 db.maintenance 的，
+    必须在它之前（同一函数体内）出现对 wait_until_quiet 的 await。
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent.joinpath("pages/settings.py").read_text(
+        encoding="utf-8")
+    tree = ast.parse(src)
+    seen, bad = 0, []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        maint = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and getattr(n.func, "attr", "") == "maintenance"]
+        if not maint:
+            continue
+        seen += 1
+        # 【判据落在语句序列上】(R33 对抗审计) 上一版按行号比：去掉 `await`（留一个没人等的协程）、
+        # 或把 wait 挪进 `if False:` 死分支，都在"更早的行上有个 wait_until_quiet 调用"，照样绿。
+        # 现在要求：在**包含 db.maintenance 那条语句的同一个语句列表**里，它前面有一条语句，
+        # 其值是 `await …wait_until_quiet(...)`。
+        def _is_await_wait(stmt):
+            v = getattr(stmt, "value", None)
+            return (isinstance(v, ast.Await) and isinstance(v.value, ast.Call)
+                    and getattr(v.value.func, "attr", "") == "wait_until_quiet")
+
+        def _stmt_lists(node):
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                seq = getattr(node, field, None)
+                if isinstance(seq, list) and seq and isinstance(seq[0], ast.stmt):
+                    yield seq
+            for ch in ast.iter_child_nodes(node):
+                yield from _stmt_lists(ch)
+
+        ok = False
+        for seq in _stmt_lists(fn):
+            for i, stmt in enumerate(seq):
+                if any(n is m for m in maint for n in ast.walk(stmt)):
+                    if any(_is_await_wait(prev) for prev in seq[:i]):
+                        ok = True
+                    break
+        if not ok:
+            bad.append(f"pages/settings.py:{fn.lineno} {fn.name}() 进维护窗口前没有先 await 等在途工作"
+                       "（要在同一个语句序列里、在 db.maintenance 之前）")
+    assert seen >= 2, f"只找到 {seen} 个进维护窗口的处理器，守卫的前提坏了"
+    assert not bad, "\n  ".join(["这些处理器直接拒绝、没先等："] + bad)
+
+
+def test_background_task_handles_are_kept():
+    """(R33) main.py 里每一个 create_task 的结果都必须被存住。
+
+    asyncio 只对 task 持弱引用（官方文档明写要存引用），而 E-46 讨论的"切库前停掉后台线"
+    也以"有句柄"为前提。按 AST 核：main.py 里不允许出现**表达式语句**形态的裸 create_task。
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent.joinpath("main.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    # 【判据落在"存进了哪里"】(R33 对抗审计) 上一版只拦裸表达式语句：`_ = create_task(...)`、
+    # 或存进 _startup 的局部列表（函数一返回就丢），都算"存住了"，而 asyncio 同样只剩弱引用。
+    # 现在要求每个 create_task 调用的祖先链里有 `background_tasks.extend/append(...)`
+    # 或对 `background_tasks` 的赋值 / 增量赋值。
+    parent = {}
+    for n in ast.walk(tree):
+        for ch in ast.iter_child_nodes(n):
+            parent[ch] = n
+
+    def _kept(call):
+        cur = call
+        while cur in parent:
+            cur = parent[cur]
+            if (isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute)
+                    and cur.func.attr in ("extend", "append")
+                    and isinstance(cur.func.value, ast.Name)
+                    and cur.func.value.id == "background_tasks"):
+                return True
+            if isinstance(cur, (ast.Assign, ast.AugAssign)):
+                targets = cur.targets if isinstance(cur, ast.Assign) else [cur.target]
+                if any(isinstance(t, ast.Name) and t.id == "background_tasks" for t in targets):
+                    return True
+        return False
+
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", "") == "create_task"]
+    lost = [c.lineno for c in calls if not _kept(c)]
+    assert not lost, f"main.py 这些行的 create_task 句柄没存进 background_tasks：{lost}"
+    assert len(calls) >= 7, f"只找到 {len(calls)} 个 create_task，后台线少了？"
+
+
+# ---------------- E-49：崩溃后的『交付中』残骸要还原到占位前的状态（2026-09-02 拍板） ----------------
+
+@pytest.mark.parametrize("line", ["anime", "movie"])
+@pytest.mark.parametrize("orig", ["deleted", "excluded", "stalled", "archived"])
+async def test_a_crashed_force_redownload_restores_the_original_state(clean_tables, cfg, monkeypatch,
+                                                                       line, orig):
+    """force 重下从终态出发 → 取种的 await 里"进程死了" → 下一轮清扫必须把它放回原状态，一样都不少。
+
+    以前进锁占位时就清掉 archived_at 与 qB 实时态、清扫又一律写 pending：
+    deleted 变回自动队列、excluded 的排除被撤销、**stalled 丢掉 HAVE 身份**（flush 当场为同一集换源
+    下第二份到同一目录）、已归档的 archived_at 再也回不来。四种原态 × 两条线逐个钉。
+    "崩溃"的模拟：让取种抛一个**不是 Exception 的**东西（BaseException），
+    交付协程的回写路径整个跳过，只剩外层 finally 的注销 —— 与进程被杀后重启的行是同一副样子。
+    """
+    from datetime import datetime
+
+    from core import anime as A
+    from core import engine as ce
+    from core import movies as M
+    from db.models import Anime, AnimeTorrent, Movie, MovieTorrent
+
+    class _Crash(BaseException):
+        pass
+
+    async def die(url):
+        raise _Crash()
+
+    monkeypatch.setattr(ce, "fetch_torrent_bytes", die)
+    cfg(QB_ENABLED=True, DOWN_PATH="/tmp/dl")
+
+    fields = dict(info_hash="9" * 40, raw_title="x", download_url="http://x/t",
+                  qb_progress=0.4, qb_state="stalledDL",
+                  qb_synced_at=datetime(2026, 1, 1), qb_progress_at=datetime(2026, 1, 1))
+    if orig == "archived":
+        fields.update(status="sent", qb_progress=1.0, qb_state="", archived_at=datetime(2026, 2, 2))
+    else:
+        fields["status"] = orig
+
+    with clean_tables.get_session() as s:
+        if line == "anime":
+            a = Anime(title="T", season=1, confirmed=True, quarter="26A")
+            s.add(a); s.commit(); s.refresh(a)
+            row = AnimeTorrent(anime_id=a.id, episode=3, **fields)
+        else:
+            m = Movie(title="M", quarter="2026")
+            s.add(m); s.commit(); s.refresh(m)
+            row = MovieTorrent(movie_id=m.id, **fields)
+        s.add(row); s.commit(); s.refresh(row)
+        tid = row.id
+        before = {k: getattr(row, k) for k in ("status", "archived_at", "qb_progress",
+                                                "qb_state", "qb_synced_at", "qb_progress_at")}
+
+    with pytest.raises(_Crash):
+        if line == "anime":
+            await A.download_anime_torrent(tid, force=True)
+        else:
+            await M.download_movie_torrent(tid)     # 剧场版一律是"点了就下"，没有 force 形参
+
+    model = AnimeTorrent if line == "anime" else MovieTorrent
+    with clean_tables.get_session() as s:
+        t = s.get(model, tid)
+        assert t.status == "downloading", "前提：崩溃后行停在占位上"
+        assert t.prev_status == before["status"], "占位时没记下原状态"
+    assert ce.sweep_stale_delivering() == 1
+    with clean_tables.get_session() as s:
+        t = s.get(model, tid)
+        after = {k: getattr(t, k) for k in before}
+        assert after == before, f"{line}/{orig}：还原后与占位前不一致：{after} != {before}"
+        assert t.prev_status is None, "记号用完要清"
+
+
+@pytest.mark.parametrize("reset", ["sweep", "startup"])
+def test_both_reset_points_restore_the_original_state(clean_tables, reset):
+    """两个复位点（运行中的 sweep_stale_delivering / 启动时的 reset_downloading）同一口径。
+
+    E-49 点名"两个复位点都要改"—— 只改一处就是本项目第①号缺陷形状。
+    """
+    from core import engine as ce
+    from db.models import Anime, AnimeTorrent, MovieTorrent
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="T", season=1, confirmed=True)
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="a" * 40, raw_title="x", episode=1,
+                           status="downloading", prev_status="excluded"))
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="b" * 40, raw_title="y", episode=2,
+                           status="downloading", prev_status=None))     # 老库残骸：没有记号
+        s.commit()
+
+    if reset == "sweep":
+        assert ce.sweep_stale_delivering() == 2
+    else:
+        ce.reset_downloading(AnimeTorrent)
+        ce.reset_downloading(MovieTorrent)
+    with clean_tables.get_session() as s:
+        got = {t.info_hash[0]: (t.status, t.prev_status) for t in s.exec(select(AnimeTorrent))}
+    assert got == {"a": ("excluded", None), "b": ("pending", None)}, got
+
+
+def test_the_placeholder_no_longer_wipes_archive_and_progress_in_the_lock():
+    """(AST) 两条交付线进锁占位那一段，不许再清 archived_at / qB 实时态 —— 清了崩溃后就放不回。
+
+    行为用例（崩溃还原 ×8、重下成功不再归档 ×2）才是主守卫；这条钉的是位置：清理只许出现在
+    `save_path = save_path` 之后（交付成功那一段），给以后改这段的人一句当场的提示。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for rel, fn_name in (("core/anime.py", "_download_anime_torrent_inner"),
+                         ("core/movies.py", "_download_movie_torrent_inner")):
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == fn_name)
+        # 找到"save_path 回写"那一行，作为成功段的起点
+        success_line = min(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                           and any(isinstance(t, ast.Attribute) and t.attr == "save_path" for t in n.targets))
+        # (R34 对抗审计) 上一版只认 `x.archived_at = None` 这一种写法；元组赋值、setattr、清 qb_* 都漏。
+        # 现在：任何对这五个属性的赋值（含 Tuple 目标）或 setattr 调用，都不许出现在成功段之前。
+        _fields = {"archived_at", "qb_progress", "qb_state", "qb_synced_at", "qb_progress_at"}
+
+        def _is_wipe(value):        # 清空：写常量（None / 0.0 / ""）或全是常量的元组；从变量放回原值的不算
+            if isinstance(value, ast.Constant):
+                return value.value in (None, 0, 0.0, "")
+            if isinstance(value, ast.Tuple):
+                return all(_is_wipe(e) for e in value.elts)
+            return False
+
+        def _targets(node):
+            out = set()
+            if isinstance(node, ast.Assign) and _is_wipe(node.value):
+                for t in node.targets:
+                    for leaf in ast.walk(t):
+                        if isinstance(leaf, ast.Attribute) and leaf.attr in _fields:
+                            out.add(leaf.attr)
+            if (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "setattr"
+                    and len(node.args) >= 3 and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value in _fields and _is_wipe(node.args[2])):
+                out.add(node.args[1].value)
+            return out
+
+        wipes = [(n.lineno, _targets(n)) for n in ast.walk(fn) if _targets(n)]
+        assert any("archived_at" in f for _, f in wipes), \
+            f"{rel}::{fn_name} 里找不到对 archived_at 的清理（成功段该清一次）"
+        early = [(ln, sorted(f)) for ln, f in wipes if ln < success_line]
+        assert not early, f"{rel}::{fn_name} 在交付成功之前就动了归档标记/qB 实时态（E-49）：{early}"
+
+
+# ---------------- E-4：relocate 搬不动时，特别篇/未知集不清成 pending（2026-09-02 拍板） ----------------
+
+async def test_relocate_keeps_special_and_unknown_episodes_instead_of_clearing_them(
+        clean_tables, cfg, monkeypatch):
+    """qB 不认识这个 hash（remove-on-complete）时，正集清成 pending 等重下；-1/-2 **不清**、报告单列。
+
+    四条自动/批量路径都被 auto_downloadable_ep 挡住 -1/-2：清成 pending 之后没有任何路径会再下它，
+    而报告还会提示"旧文件需你手动清理"—— 用户照做就删光了唯一一份。
+    剧场版那张表没有 episode 列：同一段代码要用 getattr 兜底，那边一律照旧清（本用例末尾顺带核）。
+    """
+    from datetime import datetime
+
+    from core import anime as A
+    from core import engine as ce
+    from core import movies as M
+    from db.models import Movie, MovieTorrent
+
+    cfg(QB_ENABLED=True, DOWN_PATH="/data")
+
+    async def nobody_home(hashes):      # qB 在线，但这些 hash 它一个都不认识
+        return {}
+    monkeypatch.setattr(ce.qb, "torrents_info", nobody_home)
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="番", display_name="番", quarter="26A", confirmed=True)
+        s.add(a); s.commit(); s.refresh(a)
+        for h, ep in (("a", 1), ("b", -1), ("c", -2), ("d", 2)):
+            s.add(AnimeTorrent(anime_id=a.id, info_hash=h * 40, raw_title=f"[组][{ep}]",
+                               episode=ep, status="sent", qb_progress=1.0,
+                               save_path="/data/26A/番", created_at=datetime.now()))
+        s.commit()
+        aid = a.id
+
+        # 停滞且 -1 的行：只算进 stalled_kept，不重复计入 special_kept（R34 对抗审计的变异 M9 要挡的）
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="e" * 40, raw_title="[组][SP]", episode=-1,
+                           status="stalled", qb_progress=0.3, save_path="/data/26A/番",
+                           created_at=datetime.now()))
+        s.commit()
+
+    rep = await A.relocate_anime(aid, old_path="/data/26A/番")
+    assert (rep["redownload"], rep["special_kept"], rep["stalled_kept"]) == (2, 2, 1), rep
+    with clean_tables.get_session() as s:
+        got = {t.info_hash[0]: t.status for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == aid))}
+    assert got == {"a": "pending", "b": "sent", "c": "sent", "d": "pending", "e": "stalled"}, got
+
+    # 剧场版：没有 episode 列，getattr 兜底 → 一律可重下（别让番剧的判据在这边变成 AttributeError）
+    with clean_tables.get_session() as s:
+        m = Movie(title="片", quarter="2026")
+        s.add(m); s.commit(); s.refresh(m)
+        s.add(MovieTorrent(movie_id=m.id, info_hash="e" * 40, raw_title="mv", status="sent",
+                           qb_progress=1.0, save_path="/data/2026/片"))
+        s.commit()
+        mid = m.id
+    rep = await M.relocate_movie(mid, old_path="/data/2026/片")
+    assert rep["redownload"] == 1 and rep["special_kept"] == 0, rep
+
+
+@pytest.mark.parametrize("mod, fn", [("pages.anime_detail", "notify_relocate_anime"),
+                                     ("pages.movies", "_notify_relocate_movie")])
+def test_both_relocate_notifiers_report_kept_specials_as_a_warning(monkeypatch, mod, fn):
+    """两个页面把 relocate 报告翻成人话的函数，对 special_kept 都得：算进文案、算进 warning、
+    **不**说"旧文件需你手动清理"（那是唯一的一份，行还指着它）、出路不是"点『下载』"（force 被 TRACKED 短路）。
+
+    (R34 对抗审计) 上一版是 AST 查字符串常量 —— 读了不用、从 warn/old_path 里剔掉都照样绿。改成行为用例。
+    """
+    import importlib
+
+    m = importlib.import_module(mod)
+    got = []
+    monkeypatch.setattr(m.ui, "notify", lambda msg, **kw: got.append((msg, kw)))
+    getattr(m, fn)({"new_path": "/n", "old_path": "/o", "moved": 0, "redownload": 0, "untracked": 0,
+                    "failed": 0, "stalled_kept": 0, "special_kept": 2, "delivering": 0})
+    assert got, "没有弹提示"
+    msg, kw = got[0]
+    assert "2" in msg and kw.get("type") == "warning", (msg, kw)
+    assert "需你手动清理" not in msg, msg
+    assert "『删除』" in msg, msg
+    assert "要搬就点『下载』" not in msg, msg
+
+
+def test_a_downloading_placeholder_never_renders_as_archived_or_complete():
+    """(E-49 的显示面) 占位段不再清旧的归档标记/实时态，交付中的那 ≤180 秒行上还挂着它们 ——
+    两个渲染入口都得让『交付中』盖过陈旧的『已归档』/『已完成 100%』。"""
+    from datetime import datetime
+
+    from pages.layout import live_status, qb_live_text
+
+    class _T:
+        status = "downloading"
+        archived_at = datetime(2026, 2, 2)
+        qb_state, qb_progress, qb_dlspeed = "", 1.0, 0
+    assert qb_live_text(_T()) == "", "qb_live_text 把交付中的行显示成了『已归档』"
+    text, color = live_status("downloading", qb_state="uploading", qb_progress=1.0)
+    assert "100%" not in text and "做种" not in text, text
+
+
+@pytest.mark.parametrize("line", ["anime", "movie"])
+async def test_a_second_force_click_during_delivery_of_an_archived_row_is_refused(clean_tables, cfg,
+                                                                                  monkeypatch, line):
+    """(R34 对抗审计 P1) 已归档行 force 重下、取种 await 中再点一次『下载』→ 第二条协程必须被挡在锁里。
+
+    E-49 之后占位段不再清 archived_at，于是"已归档的可 force 重下"这条例外会把**交付中**的行也放进来：
+    两条协程交付同一行，两次取种都失败时第二条按 orig_status='downloading' 恢复、还把 prev_status 清掉，
+    清扫只能落 pending —— 已归档行掉出 HAVE，flush 为同一集换源下第二份到归档文件所在目录。
+    HEAD 之前靠锁内清 archived_at 侥幸挡住；现在 downloading 单独钉死。
+    """
+    import asyncio
+    from datetime import datetime
+
+    from core import anime as A
+    from core import engine as ce
+    from core import movies as M
+    from db.models import Anime, AnimeTorrent, Movie, MovieTorrent
+
+    cfg(QB_ENABLED=True, DOWN_PATH="/tmp/dl")
+    gate = asyncio.Event()
+    fetches = []
+
+    async def slow_fetch(url):
+        fetches.append(url)
+        await gate.wait()
+        raise RuntimeError("502")      # 两次都失败的那条链
+
+    monkeypatch.setattr(ce, "fetch_torrent_bytes", slow_fetch)
+    with clean_tables.get_session() as s:
+        if line == "anime":
+            a = Anime(title="T", season=1, confirmed=True, quarter="26A")
+            s.add(a); s.commit(); s.refresh(a)
+            row = AnimeTorrent(anime_id=a.id, episode=3, info_hash="c" * 40, raw_title="x",
+                               download_url="http://x/t", status="sent", qb_progress=1.0,
+                               archived_at=datetime(2026, 2, 2))
+        else:
+            m = Movie(title="M", quarter="2026")
+            s.add(m); s.commit(); s.refresh(m)
+            row = MovieTorrent(movie_id=m.id, info_hash="c" * 40, raw_title="x",
+                               download_url="http://x/t", status="sent", qb_progress=1.0,
+                               archived_at=datetime(2026, 2, 2))
+        s.add(row); s.commit(); s.refresh(row)
+        tid = row.id
+
+    dl = (lambda: A.download_anime_torrent(tid, force=True)) if line == "anime" \
+        else (lambda: M.download_movie_torrent(tid))
+    first = asyncio.get_running_loop().create_task(dl())
+    await asyncio.sleep(0.05)               # 第一条已进 await
+    assert fetches == ["http://x/t"], "前提：第一条协程停在取种上"
+    # wait_for：闸没了的话第二条协程会跟第一条一样卡在 gate 上 —— 那要红，不要挂死
+    second = await asyncio.wait_for(dl(), timeout=2)     # 双击
+    assert second is False and fetches == ["http://x/t"], "第二条协程进了锁、又取了一次种"
+    gate.set()
+    await first
+    model = AnimeTorrent if line == "anime" else MovieTorrent
+    with clean_tables.get_session() as s:
+        t = s.get(model, tid)
+    assert (t.status, t.archived_at, t.prev_status) == ("sent", datetime(2026, 2, 2), None), \
+        "失败后已归档行没有原样放回"
+
+
+@pytest.mark.parametrize("line", ["anime", "movie"])
+async def test_a_successfully_redelivered_archived_row_is_not_rearchived_at_once(clean_tables, cfg,
+                                                                                 monkeypatch, line):
+    """(R34 对抗审计 P2) 成功段要把旧的 qb_progress/qb_synced_at 清掉 —— 否则刚交回 qB 的种子
+    带着旧完成时间，下一轮 archive_old_completed 立刻把它 qb.delete 掉（下载中断、UI 显示『已归档』）。
+    这一段以前只有 AST 守卫盯 `archived_at = None`，删掉 qB 重置那一行全量照样绿。
+    """
+    from datetime import datetime, timedelta
+
+    from core import anime as A
+    from core import engine as ce
+    from core import movies as M
+    from db.models import Anime, AnimeTorrent, Movie, MovieTorrent
+
+    cfg(QB_ENABLED=True, QB_SYNC_STATUS=True, DOWN_PATH="/tmp/dl", QB_ARCHIVE_AFTER_DAYS=7)
+
+    async def ok_fetch(url):
+        return b"torrent"
+
+    async def ok_add(*a, **k):
+        return True
+    deleted = []
+
+    async def fake_delete(hashes, delete_files=False):
+        deleted.extend(hashes)
+        return True
+
+    async def fake_info(hashes):
+        return {h: {"state": "uploading", "progress": 1.0, "dlspeed": 0, "size": 1} for h in hashes}
+    monkeypatch.setattr(ce, "fetch_torrent_bytes", ok_fetch)
+    monkeypatch.setattr(ce, "add_to_qb", ok_add)
+    monkeypatch.setattr(ce.qb, "delete", fake_delete)
+    monkeypatch.setattr(ce.qb, "torrents_info", fake_info)
+
+    old = datetime.now() - timedelta(days=30)
+    with clean_tables.get_session() as s:
+        if line == "anime":
+            a = Anime(title="T", season=1, confirmed=True, quarter="26A")
+            s.add(a); s.commit(); s.refresh(a)
+            row = AnimeTorrent(anime_id=a.id, episode=3, info_hash="d" * 40, raw_title="x",
+                               download_url="http://x/t", status="sent", qb_progress=1.0,
+                               qb_synced_at=old, archived_at=old)
+        else:
+            m = Movie(title="M", quarter="2026")
+            s.add(m); s.commit(); s.refresh(m)
+            row = MovieTorrent(movie_id=m.id, info_hash="d" * 40, raw_title="x",
+                               download_url="http://x/t", status="sent", qb_progress=1.0,
+                               qb_synced_at=old, archived_at=old)
+        s.add(row); s.commit(); s.refresh(row)
+        tid = row.id
+
+    ok = await (A.download_anime_torrent(tid, force=True) if line == "anime"
+                else M.download_movie_torrent(tid))
+    assert ok is True
+    model = AnimeTorrent if line == "anime" else MovieTorrent
+    with clean_tables.get_session() as s:
+        t = s.get(model, tid)
+        assert (t.status, t.archived_at, t.qb_progress, t.qb_synced_at, t.prev_status) == \
+            ("sent", None, 0.0, None, None), (t.status, t.archived_at, t.qb_progress, t.qb_synced_at)
+    assert await ce.archive_old_completed() == 0, "刚重下的种子被立刻再归档了"
+    assert deleted == [], deleted
+
+
+def test_callback_rescue_clears_the_stall_reason(clean_tables, two_tables):
+    """(R34 对抗审计) stalled → 回调救回 sent 时把 fail_reason 一并清掉，否则剧场版页把它显示成『上次失败』。"""
+    from core import engine as ce
+    from db.models import AnimeTorrent, MovieTorrent
+
+    reason = "从 qB 消失（已下 40%，半成品文件应仍在目录里）"
+    two_tables(dict(status="stalled", qb_progress=0.4, fail_reason=reason),
+               dict(status="stalled", qb_progress=0.4, fail_reason=reason))
+    assert ce.mark_done_by_hash(H)
+    tv, mv = _rows(clean_tables)
+    assert (tv.status, tv.fail_reason) == ("sent", ""), (tv.status, tv.fail_reason)
+    assert (mv.status, mv.fail_reason) == ("sent", ""), (mv.status, mv.fail_reason)

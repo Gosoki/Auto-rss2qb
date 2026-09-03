@@ -76,3 +76,48 @@ async def test_the_dashboard_bar_says_year(user, clean_tables):
     await user.open("/movies?t=overview")
     await user.should_see("各年份")
     await user.should_not_see("各季度")
+
+
+def test_movies_within_a_year_are_ordered_by_air_date_not_by_quarter_letter(clean_tables):
+    """(R33, E-47) 年内按上映日倒序，季母不参与排序。
+
+    剧场版按年归档之后，新识别的片一律落 `<yy>A`、存量还带 B/C/D。按季度键排的后果是
+    **凡是重新识别过的片，永远沉到本年最底下**（真库 2025 年：12-31 上映的排在 02-14 下面）。
+    而"回填季母"也修不好：全成 A 之后退化成按 id 排。所以排序键必须是上映日。
+    """
+    from core import movies as M
+    from db.models import Movie
+    import pages.movies as PM
+
+    with clean_tables.get_session() as s:
+        # 故意让季母与上映日反着来：新规则的 A 是最新的片，旧规则的 D 反而更早
+        s.add(Movie(title="最新·新规则A", quarter="25A", air_date="2025-12-31"))
+        s.add(Movie(title="旧规则D", quarter="25D", air_date="2025-10-01"))
+        s.add(Movie(title="旧规则C", quarter="25C", air_date="2025-06-01"))
+        s.add(Movie(title="无上映日", quarter="25B", air_date=None))
+        s.commit()
+
+    (year, groups), = PM._group_by_year_quarter(M.list_movies())
+    assert year == "2025"
+    titles = [m.title for _, grp in groups for m in grp]
+    assert titles == ["最新·新规则A", "旧规则D", "旧规则C", "无上映日"], (
+        f"年内没有按上映日倒序（或空上映日没垫底）：{titles}")
+
+
+def test_rejected_movies_within_a_year_are_ordered_by_air_date_too(clean_tables):
+    """(R33 回归审计) 『已忽略』页是平铺渲染，E-47 只改了主列表，它还按季母排 ——
+    12-31 上映的沉到 03-01 之下，正是主列表刚修掉的形状。与 list_movies 同口径：年 → 上映日 → id。
+    夹具刻意让季母与上映日反着走（新规则 A 配最晚的日期）。
+    """
+    from core import movies as M
+    from db.models import Movie
+
+    with clean_tables.get_session() as s:
+        s.add(Movie(title="新规则A·12-31", quarter="25A", air_date="2025-12-31", rejected=True, bangumi_id=1))
+        s.add(Movie(title="旧规则D·10-01", quarter="25D", air_date="2025-10-01", rejected=True, bangumi_id=2))
+        s.add(Movie(title="旧规则B·03-01", quarter="25B", air_date="2025-03-01", rejected=True, bangumi_id=3))
+        s.add(Movie(title="没有上映日", quarter="25C", air_date=None, rejected=True, bangumi_id=4))
+        s.add(Movie(title="去年的", quarter="24D", air_date="2024-12-31", rejected=True, bangumi_id=5))
+        s.commit()
+    got = [m.title for m in M.list_rejected_movies()]
+    assert got == ["新规则A·12-31", "旧规则D·10-01", "旧规则B·03-01", "没有上映日", "去年的"], got

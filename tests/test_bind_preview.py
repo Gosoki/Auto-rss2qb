@@ -259,13 +259,15 @@ def test_the_unmovable_gate_exists_on_both_lines():
     """
     import ast
     from pathlib import Path
+    from conftest import impl_of
 
     root = Path(__file__).resolve().parent.parent
     for mod, fn_name in (("core/anime.py", "bind_anime_bgm"), ("core/movies.py", "bind_movie_bgm")):
         tree = ast.parse((root / mod).read_text(encoding="utf-8"))
-        fns = [n for n in ast.walk(tree)
-               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn_name]
-        assert fns, f"没找到 {mod}::{fn_name}"
+        # 【判据要落在真正的函数体上】(R33) 页面入口是 `wrapper → _<name>_inner` 两层，
+        # 逻辑全在 _inner 里；统一经 conftest.impl_of 找，理由写在它的 docstring 里。
+        fns = [impl_of(tree, fn_name)]
+        assert fns[0] is not None, f"没找到 {mod}::{fn_name}"
         # 【判据必须落在同一个调用节点上】(R24 修)
         # 上一版是两个互不相干的条件的 and：① 文件里出现过 "has_unmovable_files"；
         # ② 函数体里【任意一个】 Call 带 keep_path=。把 `keep_path=_frozen` 改成

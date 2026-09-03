@@ -19,6 +19,8 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+import sqlalchemy as sa
+
 # 【必须在 import alembic 之前】alembic 那堆 "setup plugin …" / "Context impl …" 是 INFO 级，
 # 会顺着 logger 继承传播到本项目的 root handler、灌进 data/autorss.log（每次热重载好几行）。
 # 其中 "setup plugin" 是在【导入 alembic 时】就打的，等到模块体后面再压级别已经晚了。
@@ -73,7 +75,7 @@ def _ddl_engine(engine):
     而一条 DDL（大表加索引）合法地跑几分钟很正常，套上它会把正常的迁移拦腰切断
     —— 那正是"已经改了一半表结构"最不能被打断的地方，与 `_migrate` 那条整库复制同理。
     这里要的只是**握手有上界**：连不上就快点失败，别把整站拖进维护态。
-    （"DDL 被 MySQL 的元数据锁挡住"是另一件事，见 DECISIONS 的 E-50。）
+    （"DDL 被 MySQL 的元数据锁挡住"是另一件事：E-50 给它设了 lock_wait_timeout 上界，见下面的 connect 事件。）
 
     SQLite 直接用调用方的引擎：本地文件，没有握手这回事，而它的 busy_timeout
     已经在 `_sqlite_engine` 里设过了。
@@ -81,9 +83,21 @@ def _ddl_engine(engine):
     if engine.url.get_backend_name() != "mysql":
         yield engine
         return
-    from . import make_mysql_engine
+    from . import MYSQL_DDL_LOCK_WAIT_TIMEOUT, make_mysql_engine
     eng = make_mysql_engine(engine.url.render_as_string(hide_password=False),
                             query_timeout=False)
+
+    # 【DDL 被元数据锁挡住也要有上界】(E-50) 见 db.MYSQL_DDL_LOCK_WAIT_TIMEOUT 的说明。
+    # 挂在 connect 事件上而不是 connect_args 的 init_command：pymysql 的 init_command 只在
+    # 建连接时执行一次，语义相同，但事件写法能在用例里不连库地核到（见 tests/test_upgrade_path.py）。
+    @sa.event.listens_for(eng, "connect")
+    def _bound_lock_wait(dbapi_conn, _record):
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute(f"SET SESSION lock_wait_timeout = {int(MYSQL_DDL_LOCK_WAIT_TIMEOUT)}")
+        finally:
+            cur.close()
+
     try:
         yield eng
     finally:

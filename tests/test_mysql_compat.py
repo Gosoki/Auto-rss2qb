@@ -138,16 +138,16 @@ def test_migrations_add_columns_idempotently():
 def test_alias_key_fits_the_index_key_limit():
     """(MySQL) 截断按【字符】算，而 InnoDB 的索引键上限按【字节】算。
 
-    utf8mb4 下一个字符最多 4 字节：191 × 4 = **764 字节**，正好卡在老 InnoDB(COMPACT) 的
-    767 字节上限之内——这就是 `db/dialect._COL_LEN` 里那个 191 的由来（注释也是这么写的）。
-    真实 MySQL 9.7（Dynamic 行格式，上限 3072B）上实测 191 个 emoji 能插进去、且用同一个 key 查得到。
-
-    改大这个数之前先算一遍字节：192 × 4 = 768 > 767，老 InnoDB 上就会
-    "Specified key was too long"——而那是建表期才报的错，本地 SQLite 上永远测不出来。
+    utf8mb4 下一个字符最多 4 字节。别名键参与复合唯一约束 (title, season)，
+    整条键 = 191×4 + BIGINT 8 = **772 字节**。上限是 **3072**（MySQL 8/9 默认的 DYNAMIC 行格式；
+    E-6，2026-09-02 拍板：**明确不支持**老的 COMPACT/REDUNDANT 行格式，那个上限 767 连这条键都放不下——
+    以前的注释按 767 算"留余量"，余量其实是负的）。
+    真实 MySQL 9.7 上实测 191 个 emoji 能插进去、且用同一个 key 查得到。
+    整条索引键的字节数由 test_every_mysql_index_key_fits_the_dynamic_row_format 按 alembic 的产物核。
     """
     worst = alias_key("🎬" * 300)
     assert len(worst) == ALIAS_TITLE_LEN
-    assert len(worst.encode("utf-8")) <= 767, "超过老 InnoDB 的索引键上限"
+    assert len(worst.encode("utf-8")) == ALIAS_TITLE_LEN * 4, "最坏情形应正好是 4 字节/字符"
 
 
 def test_alias_key_never_splits_a_character():
@@ -158,16 +158,201 @@ def test_alias_key_never_splits_a_character():
         assert len(k) == ALIAS_TITLE_LEN
 
 
-def test_col_len_values_all_fit_the_legacy_index_limit():
-    """(防回归) `_COL_LEN` 里凡是【参与索引/唯一约束】的列，长度 × 4 都不能超 767。
-    这条用例挡住"顺手把某个长度调大一点"——那种改动在 SQLite 上毫无症状，
-    只有在老 InnoDB 的真实 MySQL 上建表时才炸。"""
-    from db.dialect import _COL_LEN
-    keyed = {"sourcegroup.name", "anime_alias.title", "setting.key",
-             "animetorrent.info_hash", "movietorrent.info_hash", "movie.mikan_id"}
-    for col in keyed:
-        n = _COL_LEN[col]
-        assert n * 4 <= 767, f"{col}={n} → {n*4} 字节，超过老 InnoDB 的 767 索引键上限"
+# ---------------- E-6 / E-7：对 alembic 的【产物】断言，不对 metadata（2026-09-02 拍板） ----------------
+#
+# 本项目日常只跑 SQLite，而"只在 MySQL 上错"的东西本地跑一辈子也碰不到。以前的 DDL 快照用例
+# 编译的是 `SQLModel.metadata` —— 那是 db/dialect.adapt_metadata 改过的对象，
+# 而**生产库的结构完全由 alembic 建**，两者之间没有任何联系（R11 那条 float 守卫就这么空跑过）。
+# 这里用 `alembic upgrade head --sql` 把整条 revision 链按 MySQL 方言离线渲染成脚本，
+# 再把脚本"执行"进一个内存里的表模型，得到**真正会落到 MySQL 上的**表 / 列 / 索引。
+
+_INNODB_KEY_LIMIT = 3072    # DYNAMIC / COMPRESSED 行格式（MySQL 5.7.7+ 默认）的索引键上限，字节
+_LEGACY_KEY_LIMIT = 767     # COMPACT / REDUNDANT：本项目【不支持】，见 E-6
+
+
+def _mysql_offline_ddl() -> str:
+    """把整条链按 MySQL 方言离线渲染。URL 只决定方言，不会真连。"""
+    import io
+    from contextlib import redirect_stdout
+
+    from alembic import command
+
+    from db import schema as S
+
+    holder = type("E", (), {"url": sa.engine.url.make_url("mysql+pymysql://u:p@127.0.0.1/x")})()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        command.upgrade(S._config(holder, "data"), "head", sql=True)
+    return buf.getvalue()
+
+
+def _replay_mysql_ddl(script: str):
+    """把离线脚本回放成 {表: {列: 类型串}} 与 {(表, 索引名): (列列表, 是否唯一)}。
+
+    只认本项目 revision 会渲染出来的几种语句形态（CREATE TABLE / CREATE [UNIQUE] INDEX /
+    DROP INDEX / ALTER TABLE … ADD COLUMN | MODIFY | DROP COLUMN）。认不出的语句直接报错，
+    别静默跳过 —— 那会让守卫在新形态的语句上悄悄失明。
+    """
+    import re
+
+    tables: dict = {}
+    indexes: dict = {}
+    for chunk in script.split(";"):
+        # 先剥掉注释行再判空："-- Running upgrade …" 与下一条 CREATE TABLE 在同一个分号块里
+        # 也剥掉 revision 自己 print 的进度行（trim_alias 在离线模式会打一句 "[trim_alias] …"）
+        st = "\n".join(l for l in chunk.splitlines()
+                       if not l.strip().startswith(("--", "["))).strip()
+        if not st:
+            continue
+        m = re.match(r"CREATE TABLE (\w+) \((.*)\)\s*$", st, re.S)
+        if m:
+            name, body = m.group(1), m.group(2)
+            cols = {}
+            parts = [p_.strip() for p_ in re.split(r",\s*\n", body)]
+            for part in parts:
+                if part.startswith("PRIMARY KEY"):
+                    pk = re.findall(r"\((.*?)\)", part)[0]
+                    indexes[(name, "PRIMARY")] = ([c.strip() for c in pk.split(",")], True)
+                elif part.startswith("CONSTRAINT"):
+                    mm = re.match(r"CONSTRAINT (\w+) (UNIQUE|PRIMARY KEY) \((.*?)\)", part)
+                    assert mm, f"认不出的约束：{part}"
+                    indexes[(name, mm.group(1))] = ([c.strip() for c in mm.group(3).split(",")], True)
+                else:
+                    cn, ctype = part.split(" ", 1)
+                    cols[cn] = ctype
+            tables[name] = cols
+            continue
+        m = re.match(r"CREATE (UNIQUE )?INDEX (\w+) ON (\w+) \((.*?)\)$", st)
+        if m:
+            indexes[(m.group(3), m.group(2))] = ([c.strip() for c in m.group(4).split(",")],
+                                                 bool(m.group(1)))
+            continue
+        m = re.match(r"DROP INDEX (\w+) ON (\w+)$", st)
+        if m:
+            assert (m.group(2), m.group(1)) in indexes, f"drop 一个不存在的索引：{st}"
+            del indexes[(m.group(2), m.group(1))]
+            continue
+        m = re.match(r"ALTER TABLE (\w+) ADD COLUMN (\w+) (.*)$", st, re.S)
+        if m:
+            tables[m.group(1)][m.group(2)] = m.group(3)
+            continue
+        m = re.match(r"ALTER TABLE (\w+) MODIFY (\w+) (.*)$", st, re.S)
+        if m:
+            assert m.group(2) in tables[m.group(1)], f"MODIFY 一个不存在的列：{st}"
+            tables[m.group(1)][m.group(2)] = m.group(3)
+            continue
+        m = re.match(r"ALTER TABLE (\w+) DROP COLUMN (\w+)$", st)
+        if m:
+            del tables[m.group(1)][m.group(2)]
+            continue
+        if st.startswith(("INSERT", "UPDATE", "DELETE", "CREATE TABLE alembic_version")):
+            continue
+        raise AssertionError(f"离线脚本里有守卫认不出的语句形态，先教会 _replay_mysql_ddl：{st[:120]}")
+    return tables, indexes
+
+
+def _key_bytes(ctype: str) -> int:
+    """一个列在 InnoDB 索引键里最多占多少字节（utf8mb4 按 4 字节/字符算）。"""
+    import re
+
+    t = ctype.upper()
+    m = re.match(r"VARCHAR\((\d+)\)", t)
+    if m:
+        return int(m.group(1)) * 4
+    if t.startswith("BIGINT"):
+        return 8
+    if t.startswith(("INTEGER", "INT ", "INT(")) or t == "INT":
+        return 4
+    if t.startswith("DATETIME"):
+        return 8
+    if t.startswith(("BOOL", "TINYINT")):
+        return 1
+    if t.startswith("DOUBLE"):
+        return 8
+    if t.startswith("FLOAT"):
+        return 4
+    if t.startswith(("TEXT", "BLOB")):
+        raise AssertionError(f"TEXT/BLOB 列进了索引（MySQL 要求前缀长度，本项目不用）：{ctype}")
+    raise AssertionError(f"不认识的列类型，先教会 _key_bytes：{ctype}")
+
+
+def test_every_mysql_index_key_fits_the_dynamic_row_format():
+    """(E-6) 按 alembic 的产物，每个索引 / 唯一约束 / 主键的**全部列**字节之和 ≤ 3072。
+
+    以前的守卫按【单列】×4 ≤ 767 算，而 uq_alias_title_season 是 (title, season) 两列：
+    191×4 + 8 = 772 —— 它自己就超过 767，那条守卫守的是一个早就没守住的承诺。
+    E-6 拍板：放弃老 InnoDB 行格式（COMPACT/REDUNDANT，上限 767），按 DYNAMIC 的 3072 算，
+    且**必须按索引的全部列求和**。这里顺带把"我们确实超过了 767"钉死，免得注释又漂回去。
+    """
+    tables, indexes = _replay_mysql_ddl(_mysql_offline_ddl())
+    assert len(indexes) >= 10, f"只回放出 {len(indexes)} 个索引，回放器多半没认全"
+    sizes = {}
+    for (table, name), (cols, _uniq) in indexes.items():
+        sizes[(table, name)] = sum(_key_bytes(tables[table][c]) for c in cols)
+    too_big = {k: v for k, v in sizes.items() if v > _INNODB_KEY_LIMIT}
+    assert not too_big, f"这些索引键超过 DYNAMIC 行格式的 {_INNODB_KEY_LIMIT} 字节上限：{too_big}"
+    widest = max(sizes.values())
+    assert widest > _LEGACY_KEY_LIMIT, (
+        f"最宽的索引键只有 {widest} 字节 —— 本项目声明不支持老行格式的依据（772 > 767）已经不成立，"
+        "去把 db/dialect.py 与本用例的说法一起改了")
+
+
+def test_the_dropped_duplicate_indexes_are_really_gone_on_mysql():
+    """(E-48) 两个与唯一约束重复的索引，在 alembic 产物的终态里不存在；唯一约束本身还在。"""
+    tables, indexes = _replay_mysql_ddl(_mysql_offline_ddl())
+    names = {n for _, n in indexes}
+    assert "ix_anime_alias_title" not in names and "ix_sourcegroup_name" not in names, sorted(names)
+    assert {"uq_alias_title_season", "uq_sourcegroup_name"} <= names, sorted(names)
+
+
+def _varlen(ctype: str):
+    import re
+    m = re.match(r"VARCHAR\((\d+)\)", ctype.upper())
+    return int(m.group(1)) if m else None
+
+
+def test_alembic_product_has_every_model_column_with_the_right_shape():
+    """(E-7) alembic 链在 MySQL 上的终态，列集合与类型族要与模型一致。
+
+    这是"库要长成模型说的样子"在 MySQL 方言上的版本：SQLite 侧由 tests/test_upgrade_path.py
+    真升一个库来核，MySQL 侧没有真库，就核离线产物。挡住的形状：改了模型没开 revision、
+    revision 写错了列名、或者只改了两张对称表里的一张。
+    """
+    from sqlalchemy.dialects import mysql
+    from sqlmodel import SQLModel
+
+    import db.models  # noqa: F401
+    from db import META_TABLES
+
+    tables, _ = _replay_mysql_ddl(_mysql_offline_ddl())
+    problems = []
+    for tname, table in SQLModel.metadata.tables.items():
+        if tname in META_TABLES:
+            continue
+        assert tname in tables, f"alembic 产物里没有表 {tname}"
+        got = tables[tname]
+        for col in table.columns:
+            if col.name not in got:
+                problems.append(f"{tname}.{col.name}：模型有、alembic 产物没有（没开 revision？）")
+                continue
+            want = col.type.compile(dialect=mysql.dialect()).upper()
+            have = got[col.name].upper()
+            # 比类型族（VARCHAR / BIGINT / DOUBLE / DATETIME / TEXT / BOOL）与 VARCHAR 的长度，不比 NULL
+            fam = lambda x: x.split(" ")[0].split("(")[0]     # noqa: E731
+            if fam(want) != fam(have):
+                problems.append(f"{tname}.{col.name}：模型是 {want}，alembic 产物是 {have}")
+            elif fam(want) == "VARCHAR" and _varlen(want) != _varlen(have):
+                # (R34 对抗审计) _COL_LEN 与 baseline 里硬编码的 191 漂开时，alias_key 按模型截、
+                # MySQL 列只收 191 —— db/dialect.py docstring 里的缺陷①。以前只靠 alias_key 用例里一个字面量 191 兜底。
+                problems.append(f"{tname}.{col.name}：VARCHAR 长度模型 {_varlen(want)} ≠ alembic 产物 {_varlen(have)}")
+            # (R34 对抗审计) TEXT/BLOB 列带字面量 DEFAULT 在 MySQL 8/9 一律报 1101（b2c9e4f17a03 因此把
+            # fail_reason 改成 VARCHAR(300)）。SQLite 不报、全套用例看不见，MySQL 用户升级时第一条 ADD COLUMN 就 fatal。
+            if fam(have) in ("TEXT", "BLOB", "JSON", "LONGTEXT", "MEDIUMTEXT") and " DEFAULT " in f" {have} ":
+                problems.append(f"{tname}.{col.name}：TEXT/BLOB 列带 DEFAULT，MySQL 建列必报 1101：{have}")
+        extra = set(got) - {c.name for c in table.columns}
+        if extra:
+            problems.append(f"{tname}：alembic 产物多出模型没有的列 {sorted(extra)}")
+    assert not problems, "\n  ".join(["alembic 的 MySQL 产物与模型对不上："] + problems)
 
 
 def test_float_columns_are_double_on_mysql():

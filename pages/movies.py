@@ -11,8 +11,8 @@ import config
 import db
 from db.models import MovieTorrent
 from core import engine, movies as mov, worker
-from sources.parse import SEASON_CN, quarter_sort_key
-from .layout import (WEEKDAY_CN, barline, busy_action, confirm, require_bind_confirm,
+from sources.parse import SEASON_CN
+from .layout import (SEVERITY_COLOR, WEEKDAY_CN, barline, busy_action, confirm, require_bind_confirm,
                      require_config_loaded,
                      expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
@@ -34,23 +34,25 @@ def _mov_live_status(*a):
 
 
 def _group_by_year_quarter(items):
-    """两级分组：先按年份、年内再按季度。季度 key 形如 '26C'（前两位=年）。
-    返回 [(年份2位, [(季度, [movie...]), ...]), ...]，年份倒序、季度倒序、未知垫底。"""
+    """按年份分组，年内**保持传入顺序**（list_movies 已按上映日倒序）。
+    返回 [(年份4位, [("", [movie...])]), ...]，年份倒序、未知垫底。
+
+    【年内不再按季度分段/排序】(R33, E-47) 剧场版按年归档（E-30），季母对它没有意义；
+    R31 已把二级小标题去掉，但这里仍按季度键给年内**排序** —— 于是新识别的片（一律 `<yy>A`）
+    永远沉到本年最底下。现在年内顺序交给 list_movies 的 `air_date DESC`，这层只负责按年切。
+    保留 [(季度, [...])] 的返回形状（单个空季度键），调用方不用改。
+    """
     from collections import defaultdict
-    by_year: dict = defaultdict(lambda: defaultdict(list))
+    by_year: dict = defaultdict(list)
     for it in items:
-        q = it.quarter or "未知"
         # 【用四位年做分组键】原来是 f"{_y - 2000:02d}"：1999 年的片会算出 '-1'，
         # 下面的 -int(y) 排序把它当成最大、显示又拼成『20-1 年』。四位年三处都正确。
-        _y = engine.quarter_year(q)
+        _y = engine.quarter_year(it.quarter or "")
         year = str(_y) if _y is not None else "未知"
-        by_year[year][q].append(it)
+        by_year[year].append(it)
     out = []
     for year in sorted(by_year, key=lambda y: (1, 0) if y == "未知" else (0, -int(y))):
-        qs = sorted(by_year[year], key=quarter_sort_key, reverse=True)
-        if "未知" in qs:                       # 未知季度垫到年内最后
-            qs.remove("未知"); qs.append("未知")
-        out.append((year, [(q, by_year[year][q]) for q in qs]))
+        out.append((year, [("", by_year[year])]))
     return out
 
 
@@ -92,14 +94,17 @@ def _notify_relocate_movie(rep):
         parts.append(f"{rep['failed']} 个版本移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
     if rep.get("stalled_kept"):   # 停滞版本有意不动：保留停滞标记与删除入口，但文件没跟着走，要说清楚
         parts.append(f"{rep['stalled_kept']} 个版本处于停滞、未移动（保留停滞标记）")
+    if rep.get("special_kept"):   # 剧场版没有集号，今天恒为 0；与番剧侧对齐着读，免得将来静默漏报（E-4）
+        parts.append(f"{rep['special_kept']} 个版本 qB 未跟踪、未移动（不会自动重下；"
+                     "要搬到新目录：先点『删除』（只标记，文件留在原处）再点『下载』）")
     if rep.get("delivering"):     # 正在交付给 qB 的版本：路径在交付前就定死了，搬不了也不能碰
         parts.append(f"{rep['delivering']} 个版本正在交付给 qB、未移动"
                      "（它会先落到旧目录，交付完成后再点一次即可搬过来）")
     msg = "；".join(parts) or "无需移动"
     warn = bool(rep.get("redownload") or rep.get("failed")
-                or rep.get("stalled_kept") or rep.get("delivering"))
+                or rep.get("stalled_kept") or rep.get("special_kept") or rep.get("delivering"))
     if (rep.get("redownload") or rep.get("stalled_kept")) and rep.get("old_path"):
-        msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
+        msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"   # special_kept 有意不进这句：那是唯一的一份
     ui.notify(msg, type="warning" if warn else "positive")
 
 
@@ -229,7 +234,13 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                         # 只有这里写死了 blue-grey —— 文案统一了颜色没统一，反而更像两个状态。
                         _b = ui.badge("可下载" if _st == "待下" else _st).props(
                             "color=blue" if _st == "待下" else "color=blue-grey")
-                        if t.fail_reason:
+                        if t.status == "stalled":
+                            # (E-3) 停滞的原因也在 fail_reason 里，但它不是"上次失败"：盘上有半成品，
+                            # 且有意不自动重发。颜色留 SEVERITY_COLOR 的 deep-orange，别改成失败的 orange。
+                            _b.props(f"color={SEVERITY_COLOR['stalled']}").tooltip(
+                                (f"{t.fail_reason}；" if t.fail_reason else "")
+                                + "半成品文件在下载目录里；要重试点右边『下载』，要放弃点『删除』")
+                        elif t.fail_reason:
                             _b.props("color=orange").tooltip(
                                 f"上次失败：{t.fail_reason}（剧场版不自动重发，要重试就点右边『下载』）")
                     _vdl = ui.button("下载", icon="download", on_click=_force(t.id)).props(
@@ -237,7 +248,8 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     _vdl.set_enabled(config.QB_ENABLED)
                     _vdl.tooltip("强制下这一版本到文件夹" if config.QB_ENABLED
                                  else "qB 未启用，去设置页开启后可下载")
-                    if t.status in engine.HAVE_STATUSES:  # 下过/在下/停滞(盘上有文件)都可删（delete 函数亦接受 stalled）
+                    # 交付中的占位行不给删除按钮，理由同番剧详情页（E-49 后占位段不清归档标记）
+                    if t.status in engine.HAVE_STATUSES and t.status != "downloading":
                         ui.button(icon="delete_forever",
                                   on_click=_del(t.id, t.archived_at, t.save_path)).props(
                             "flat dense color=negative").classes("btn-sm").tooltip(
