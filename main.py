@@ -58,15 +58,15 @@ async def _startup():
     # run_db_watch 探到库回来会补跑同一个函数，所以这里静静让过去，别把启动整个掀翻。
     if db.is_data_down():
         log.error("业务数据库停摆中，采集/下载/同步全部暂停；到设置页『数据库』改连接或切回本地 SQLite")
-        # 这一支跳过了 init_business_state，其中的"复位上个进程遗留的 downloading"就欠着了。
+        # 这一支跳过了 init_business_state，其中的"清扫上个进程遗留的 downloading"就欠着了。
         # 记个账，让 run_db_watch 在库首次可用时补做（那时库从启动起一直 down，
-        # 所有后台循环都空转过，绝不可能有交付协程在半途，复位是安全的）。
-        worker_mod._startup_reset_pending = True
+        # 所有后台循环都空转过，绝不可能有交付协程在半途，清扫是安全的）。
+        worker_mod._stale_sweep_pending = True
     else:
         try:
             init_business_state()
-        except Exception:           # 复位/种源组失败不该连累后台协程的建立
-            log.exception("业务初始化失败（采集仍会启动，遗留的 downloading 可能未复位）")
+        except Exception:           # 记账/种源组失败不该连累后台协程的建立
+            log.exception("业务初始化失败（采集仍会启动，遗留的 downloading 可能未清扫）")
     # 协程照常建：它们各自都按 db.is_data_down() 把门，停摆期间空转短睡，库一恢复就自动接上。
     # 【句柄必须存住】(R33) 两个理由：① asyncio 只对 task 持弱引用，官方文档明写
     #   "Save a reference to the result of this function, to avoid a task disappearing mid-execution"

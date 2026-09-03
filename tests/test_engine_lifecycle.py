@@ -237,12 +237,12 @@ def test_switching_to_another_engine_still_rolls_back_on_failure(monkeypatch, tm
     assert db.engine is before
 
 
-async def test_reconnect_button_consumes_the_pending_init_immediately(clean_tables, monkeypatch):
+async def test_reconnect_button_consumes_the_pending_init_immediately(clean_tables, cfg, monkeypatch):
     """「立即重连」探通之后要【当场】补跑业务初始化，不能等看守协程那一轮。
 
     probe_data_engine 一成功，is_data_down() 当场变 False，各后台循环下一次醒来就开始交付
     （写 downloading 行）。而 run_db_watch 的恢复边沿最多 30 秒后才轮到——那时它调的
-    reset_downloading 打的就是**正在交付**的行：打回 pending 会当场解除集去重，
+    残骸清扫打的就是**正在交付**的行：打回 pending 会当场解除集去重，
     同一集被两个源各下一份到同一目录。
     """
     from datetime import datetime
@@ -260,14 +260,15 @@ async def test_reconnect_button_consumes_the_pending_init_immediately(clean_tabl
                            episode=1, status="downloading", created_at=datetime.now()))
         s.commit()
 
-    monkeypatch.setattr(worker, "_startup_reset_pending", True)
+    cfg(QB_ENABLED=False)          # 这条测的是"欠账被当场消费"，别让它去连 qB
+    monkeypatch.setattr(worker, "_stale_sweep_pending", True)
     monkeypatch.setattr(L.ui, "notify", lambda *a, **k: None)
     monkeypatch.setattr(L.ui, "navigate", type("X", (), {"reload": staticmethod(lambda: None)})())
     _db.mark_data_down("模拟停摆")
 
     await L._db_reconnect()
 
-    assert worker._startup_reset_pending is False, "欠账没被消费，看守协程稍后会打到正在交付的行上"
+    assert worker._stale_sweep_pending is False, "欠账没被消费，看守协程稍后会打到正在交付的行上"
     with clean_tables.get_session() as s:
         assert s.exec(select(AnimeTorrent)).one().status == "pending"
 
@@ -759,7 +760,7 @@ async def test_a_db_blip_during_delivery_does_not_wedge_the_row_forever(clean_ta
     而这一状态**没有任何在线恢复路径**：
       · `_sync_qb_status` 显式跳过 downloading 行（"交付协程独占"）；
       · `downloading ∈ HAVE_STATUSES` ⇒ 集去重认定该集已有一份，flush/补下永不再挑；
-      · `run_db_watch` 的恢复边沿调 `init_business_state(reset_leftovers=False)`（运行中掉线那一支
+      · `run_db_watch` 的恢复边沿调 `init_business_state(sweep_leftovers=False)`（运行中掉线那一支
         该标志恒为 False，有意为之），**不复位**。
     只有重启进程才清得掉。而 R22 把 downloading 收进在途闸之后又多一条：
     设置页的『切库』『迁移』从此**永久**被拒，提示还写着"等它跑完（最多几分钟）再来"。
@@ -775,7 +776,7 @@ async def test_a_db_blip_during_delivery_does_not_wedge_the_row_forever(clean_ta
         s.add(row); s.commit()
 
     assert ce.maintenance_blockers() == [], "残骸不该挡住维护"
-    assert ce.sweep_stale_delivering() == 1, "残骸没被清扫掉"
+    assert await ce.sweep_stale_delivering() == 1, "残骸没被清扫掉"
     with clean_tables.get_session() as s:
         assert s.exec(select(AnimeTorrent)).one().status == "pending", \
             "残骸没回到待下 —— 这一集永远不会再被下"
@@ -785,7 +786,7 @@ async def test_the_sweep_never_touches_a_real_in_flight_delivery(clean_tables, c
     """反向：**真在途**的那一行绝不能被清扫碰到。
 
     打回 pending 会当场解除集去重 —— 同一集会被另一个源再下一份到**同一个目录**，
-    而交付协程回来还会把它写回 sent。这正是 `reset_downloading` 那段长注释警告的事。
+    而交付协程回来还会把它写回 sent。这正是 `_stale_sweep_pending` 那段长注释警告的事。
     """
     from core import engine as ce
     from db.models import Anime, AnimeTorrent
@@ -799,7 +800,7 @@ async def test_the_sweep_never_touches_a_real_in_flight_delivery(clean_tables, c
         tid = row.id
 
     with ce.delivering(AnimeTorrent, tid):
-        assert ce.sweep_stale_delivering() == 0, "把正在交付的那一行清掉了"
+        assert await ce.sweep_stale_delivering() == 0, "把正在交付的那一行清掉了"
         with clean_tables.get_session() as s:
             assert s.exec(select(AnimeTorrent)).one().status == "downloading"
 
@@ -945,7 +946,7 @@ async def test_a_crashing_delivery_still_unregisters(monkeypatch, clean_tables):
         pass
     assert ("AnimeTorrent", int(tid)) not in ce._delivering, \
         "协程抛异常之后交付登记还留着 —— 这一行会被永久当成『正在交付中』"
-    assert ce.sweep_stale_delivering() == 1, "残骸清扫救不回它"
+    assert await ce.sweep_stale_delivering() == 1, "残骸清扫救不回它"
     with clean_tables.get_session() as s:
         assert s.exec(select(AnimeTorrent)).one().status == "pending"
 
@@ -983,6 +984,9 @@ _STRADDLERS = {
     },
     "core/engine.py": {
         "archive_old_completed":          "lock:_archive_lock",
+        # (E-57) 清扫要先问 qB 才分得清"崩在交给 qB 之前/之后"，于是它自己也跨 await 持主键了。
+        # 两个调用方都在 _sweep_lock 里：周期巡检轮 sweep_round、启动补做 sweep_leftovers_if_pending。
+        "sweep_stale_delivering":         "lock:_sweep_lock",
         "_sync_qb_status":                "sync_busy",
         "relocate":                       "caller:relocate_anime|relocate_movie",  # 读 (id,hash) → await setLocation → _mark_moved(ids)
     },
@@ -1579,6 +1583,10 @@ async def test_a_crashed_force_redownload_restores_the_original_state(clean_tabl
     monkeypatch.setattr(ce, "fetch_torrent_bytes", die)
     cfg(QB_ENABLED=True, DOWN_PATH="/tmp/dl")
 
+    async def qb_has_nothing(hashes):     # (E-57) 崩在取种上 → qB 里当然没有它，清扫该按 prev 还原
+        return {}
+    monkeypatch.setattr(ce.qb, "torrents_info", qb_has_nothing)
+
     fields = dict(info_hash="9" * 40, raw_title="x", download_url="http://x/t",
                   qb_progress=0.4, qb_state="stalledDL",
                   qb_synced_at=datetime(2026, 1, 1), qb_progress_at=datetime(2026, 1, 1))
@@ -1612,7 +1620,7 @@ async def test_a_crashed_force_redownload_restores_the_original_state(clean_tabl
         t = s.get(model, tid)
         assert t.status == "downloading", "前提：崩溃后行停在占位上"
         assert t.prev_status == before["status"], "占位时没记下原状态"
-    assert ce.sweep_stale_delivering() == 1
+    assert await ce.sweep_stale_delivering() == 1
     with clean_tables.get_session() as s:
         t = s.get(model, tid)
         after = {k: getattr(t, k) for k in before}
@@ -1620,15 +1628,19 @@ async def test_a_crashed_force_redownload_restores_the_original_state(clean_tabl
         assert t.prev_status is None, "记号用完要清"
 
 
-@pytest.mark.parametrize("reset", ["sweep", "startup"])
-def test_both_reset_points_restore_the_original_state(clean_tables, reset):
-    """两个复位点（运行中的 sweep_stale_delivering / 启动时的 reset_downloading）同一口径。
+@pytest.mark.parametrize("entry", ["sweep", "startup"])
+async def test_both_entry_points_restore_the_original_state(clean_tables, cfg, entry):
+    """运行中的巡检轮与启动补做那次，走的是**同一个** `sweep_stale_delivering`。(E-49 + E-57)
 
-    E-49 点名"两个复位点都要改"—— 只改一处就是本项目第①号缺陷形状。
+    E-49 点名"两个复位点都要改"，而 E-57 干脆把它们合成了一个：启动那条以前是同步的
+    `reset_downloading`（问不了 qB），现在记账 + `worker.sweep_leftovers_if_pending()` 消费。
+    只剩一处实现，就再没有"只改一半"的余地。
     """
     from core import engine as ce
-    from db.models import Anime, AnimeTorrent, MovieTorrent
+    from core import worker as W
+    from db.models import Anime, AnimeTorrent
 
+    cfg(QB_ENABLED=False)          # qB 关着：种子不可能在里面，一律按 prev_status 还原
     with clean_tables.get_session() as s:
         a = Anime(title="T", season=1, confirmed=True)
         s.add(a); s.commit(); s.refresh(a)
@@ -1638,11 +1650,15 @@ def test_both_reset_points_restore_the_original_state(clean_tables, reset):
                            status="downloading", prev_status=None))     # 老库残骸：没有记号
         s.commit()
 
-    if reset == "sweep":
-        assert ce.sweep_stale_delivering() == 2
+    if entry == "sweep":
+        assert await ce.sweep_stale_delivering() == 2
     else:
-        ce.reset_downloading(AnimeTorrent)
-        ce.reset_downloading(MovieTorrent)
+        W._stale_sweep_pending = True
+        try:
+            await W.sweep_leftovers_if_pending()
+            assert W._stale_sweep_pending is False, "做成了要把账清掉"
+        finally:
+            W._stale_sweep_pending = False
     with clean_tables.get_session() as s:
         got = {t.info_hash[0]: (t.status, t.prev_status) for t in s.exec(select(AnimeTorrent))}
     assert got == {"a": ("excluded", None), "b": ("pending", None)}, got
@@ -1928,3 +1944,201 @@ def test_callback_rescue_clears_the_stall_reason(clean_tables, two_tables):
     tv, mv = _rows(clean_tables)
     assert (tv.status, tv.fail_reason) == ("sent", ""), (tv.status, tv.fail_reason)
     assert (mv.status, mv.fail_reason) == ("sent", ""), (mv.status, mv.fail_reason)
+
+
+# ---------------- E-57：崩在"交给 qB 之后"的残骸，要落已交付而不是还原（2026-09-03 拍板 A） ----------------
+
+@pytest.mark.parametrize("line", ["anime", "movie"])
+@pytest.mark.parametrize("orig", ["archived", "stalled", "deleted"])
+async def test_a_row_that_actually_reached_qb_is_settled_not_restored(clean_tables, cfg, monkeypatch,
+                                                                      line, orig):
+    """`add_to_qb` 成功了、回写 save_path 那次 commit 撞库抖 → 种子在 qB 里下着，行停在 downloading。
+
+    按 prev_status 还原会把它放回 已归档 / 停滞 / 已删 —— **从此没有任何路径再看它一眼**
+    （progress=1.0 掉出在途闸、archived_at 非空又进不了归档轮）。清扫先问 qB，问到了就按已交付落定。
+    """
+    from datetime import datetime
+
+    from core import anime as A
+    from core import engine as ce
+    from core import movies as M
+    from db.models import Anime, AnimeTorrent, Movie, MovieTorrent
+
+    cfg(QB_ENABLED=True, QB_SYNC_STATUS=True, DOWN_PATH="/tmp/dl")
+
+    async def ok_fetch(url):
+        return b"torrent"
+
+    async def ok_add(*a, **k):
+        return True
+    monkeypatch.setattr(ce, "fetch_torrent_bytes", ok_fetch)
+    monkeypatch.setattr(ce, "add_to_qb", ok_add)
+
+    fields = dict(info_hash="a" * 40, raw_title="x", download_url="http://x/t",
+                  save_path="/old/dir", qb_progress=0.4, qb_state="stalledDL",
+                  qb_synced_at=datetime(2026, 1, 1), qb_progress_at=datetime(2026, 1, 1))
+    if orig == "archived":
+        fields.update(status="sent", qb_progress=1.0, qb_state="", archived_at=datetime(2026, 2, 2))
+    else:
+        fields["status"] = orig
+
+    with clean_tables.get_session() as s:
+        if line == "anime":
+            a = Anime(title="T", season=1, confirmed=True, quarter="26A")
+            s.add(a); s.commit(); s.refresh(a)
+            row = AnimeTorrent(anime_id=a.id, episode=3, **fields)
+        else:
+            m = Movie(title="M", quarter="2026")
+            s.add(m); s.commit(); s.refresh(m)
+            row = MovieTorrent(movie_id=m.id, **fields)
+        s.add(row); s.commit(); s.refresh(row)
+        tid = row.id
+
+    # 【模拟"add 成功之后那次回写崩掉"】把成功段那个会话的 commit 换成抛库错
+    import db as _db
+    real_get_session = _db.get_session
+    blown = {"n": 0}
+
+    class _Blowing:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._s = self._inner.__enter__()
+            return self
+
+        def __exit__(self, *a):
+            return self._inner.__exit__(*a)
+
+        def __getattr__(self, name):
+            return getattr(self._s, name)
+
+        def commit(self):
+            from sqlalchemy.exc import OperationalError
+            blown["n"] += 1
+            raise OperationalError("commit", {}, Exception("库抖了一下"))
+
+    def flaky():
+        # 只炸交付成功之后的那一次（前面进锁占位那次要照常提交）
+        return _Blowing(real_get_session()) if blown["n"] == 0 and _armed["on"] else real_get_session()
+
+    _armed = {"on": False}
+    monkeypatch.setattr(ce, "get_session", lambda: real_get_session())   # engine 侧不动
+    mod = A if line == "anime" else M
+    monkeypatch.setattr(mod, "get_session", flaky)
+
+    async def arm_then_add(*a, **k):
+        _armed["on"] = True          # 进锁那次 commit 已经过去了，从现在起炸
+        return True
+    monkeypatch.setattr(ce, "add_to_qb", arm_then_add)
+
+    with pytest.raises(Exception):
+        if line == "anime":
+            await A.download_anime_torrent(tid, force=True)
+        else:
+            await M.download_movie_torrent(tid)
+
+    model = AnimeTorrent if line == "anime" else MovieTorrent
+    with clean_tables.get_session() as s:
+        t = s.get(model, tid)
+        assert t.status == "downloading", "前提：回写崩了，行停在占位上"
+
+    # qB 说"这个种子我这儿有"，且它自己知道保存在哪
+    async def qb_has_it(hashes):
+        return {"a" * 40: {"state": "downloading", "progress": 0.1, "dlspeed": 1, "size": 1,
+                           "save_path": "/new/dir"}}
+    monkeypatch.setattr(ce.qb, "torrents_info", qb_has_it)
+    monkeypatch.setattr(mod, "get_session", real_get_session)
+
+    assert await ce.sweep_stale_delivering() == 1
+    with clean_tables.get_session() as s:
+        t = s.get(model, tid)
+    assert t.status == "sent", f"{line}/{orig}：qB 里明明有它，却被还原成了 {t.status}"
+    assert t.archived_at is None and t.prev_status is None
+    assert t.save_path == "/new/dir", "save_path 该以 qB 说的为准（本地那次回写正是没成的那步）"
+    assert (t.qb_progress, t.qb_state, t.qb_synced_at) == (0.0, "", None), "该作为『全新在下』重新跟踪"
+
+
+async def test_the_sweep_touches_nothing_while_qb_is_unreachable(clean_tables, cfg, monkeypatch):
+    """qB 连不上 ≠ qB 里没有它：问不到就一行都不动，下一轮再来（与 relocate / sync 同一口径）。"""
+    from core import engine as ce
+    from db.models import Anime, AnimeTorrent
+
+    cfg(QB_ENABLED=True)
+
+    async def unreachable(hashes):
+        return None
+    monkeypatch.setattr(ce.qb, "torrents_info", unreachable)
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="T", season=1, confirmed=True)
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="c" * 40, raw_title="x", episode=1,
+                           status="downloading", prev_status="deleted"))
+        s.commit()
+
+    assert await ce.sweep_stale_delivering() == 0
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+    assert (t.status, t.prev_status) == ("downloading", "deleted"), "qB 问不到时不该动它"
+
+
+def test_every_async_caller_of_init_business_state_consumes_the_pending_sweep():
+    """(E-57 的广度守卫) `init_business_state` 只记账；欠着的清扫要在协程里消费掉。
+
+    它有四个调用点：main 的 `_startup`、看守协程的恢复边沿、顶栏『立即重连』、设置页『切库』。
+    少一处消费，那台机器上的残骸就要等到下一轮巡检（默认 3 小时）——而它们占着 HAVE_STATUSES，
+    这期间那一集不会被补下。第①号缺陷形状，所以按 AST 逐个调用点核。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    # 调用点 → 为什么这一处不必自己消费
+    _EXEMPT = {
+        "_startup": "main.py 的启动路径：run_sweep 协程一起来就 await sweep_leftovers_if_pending()，"
+                    "而在 _startup 里做会把七个 create_task 卡在 qB 的连接超时后面",
+    }
+    problems, seen = [], 0
+    for rel in ("main.py", "core/worker.py", "pages/layout.py", "pages/settings.py"):
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            names = {n.attr if isinstance(n, ast.Attribute) else n.id if isinstance(n, ast.Name) else ""
+                     for n in ast.walk(fn)}
+            if "init_business_state" not in names or fn.name == "init_business_state":
+                continue
+            seen += 1
+            if fn.name in _EXEMPT:
+                continue
+            if "sweep_leftovers_if_pending" not in names:
+                problems.append(f"{rel}::{fn.name}() 调了 init_business_state 却没消费欠着的清扫")
+    assert seen >= 4, f"只找到 {seen} 个调用点，守卫的前提坏了"
+    assert not problems, "\n  ".join(problems)
+
+
+def test_run_sweep_consumes_the_pending_sweep_before_its_first_long_nap():
+    """(E-57) `run_sweep` 一起来就要把欠着的残骸清扫做掉 —— 不能等那个 3 小时的长睡。
+
+    上个进程遗留的 downloading 占位既不被 sync 复查、又占着 HAVE_STATUSES（集去重认定该集已有一份），
+    等一轮巡检才清，那一集三个小时补不下来。以前这件事在 init_business_state 里（同步、立刻做），
+    E-57 把它挪到协程里之后，"立刻"这半个性质只剩这一行在守。按 AST 核语句顺序，别只查"有没有调"。
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "core/worker.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "run_sweep")
+    consume = sleep = None
+    for i, st in enumerate(fn.body):        # 只看函数体顶层的语句序列
+        dump = ast.dump(st)
+        if consume is None and "sweep_leftovers_if_pending" in dump:
+            consume = i
+        if sleep is None and "'sleep'" in dump and isinstance(st, ast.Expr) \
+                and isinstance(st.value, ast.Await):
+            sleep = i
+    assert consume is not None, "run_sweep 里没有 await sweep_leftovers_if_pending()"
+    assert sleep is not None, "找不到那个长睡，守卫的前提坏了"
+    assert consume < sleep, "欠着的残骸清扫排在长睡之后 —— 那一集要等一整轮巡检才补得下来"

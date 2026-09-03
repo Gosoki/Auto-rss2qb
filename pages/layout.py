@@ -906,13 +906,13 @@ async def _db_reconnect() -> None:
         return
     # 【探通了就【立刻】把欠下的初始化补上，不能等看守协程】probe_data_engine 一成功，
     # is_data_down() 当场变 False，各后台循环下一次醒来就开始交付（写 downloading 行）。
-    # 而 run_db_watch 的恢复边沿最多要 30 秒后才轮到——那时它调的 reset_downloading
-    # 打的就是【正在交付】的行：打回 pending 会当场解除集去重，同一集被两个源各下一份到
-    # 同一目录（这正是 _startup_reset_pending 那段注释警告的事）。
-    # 在这里补做，窗口从 30 秒缩到几毫秒；标记被消费掉之后，看守协程那次会以
-    # reset_leftovers=False 跑，只剩两个幂等操作，无害。
+    # 而 run_db_watch 的恢复边沿最多要 30 秒后才轮到——那时它清的就是【正在交付】的行：
+    # 动它的占位会当场解除集去重，同一集被两个源各下一份到同一目录（这正是 _stale_sweep_pending
+    # 那段注释警告的事）。在这里补做，窗口从 30 秒缩到几毫秒；标记被消费掉之后，看守协程那次会以
+    # sweep_leftovers=False 跑，只剩三个幂等操作，无害。
     try:
-        await asyncio.to_thread(worker.init_business_state, worker._startup_reset_pending)
+        await asyncio.to_thread(worker.init_business_state, worker._stale_sweep_pending)
+        await worker.sweep_leftovers_if_pending()    # 清扫要 await 问 qB，不能在上面那个线程里做（E-57）
     except Exception as e:
         log.exception("重连后补跑业务初始化失败")
         ui.notify(f"数据库通了，但初始化没跑成：{type(e).__name__}: {e}（看守协程 30 秒后会再试）",

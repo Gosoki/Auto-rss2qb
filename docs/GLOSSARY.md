@@ -294,3 +294,16 @@ R28 那条 P1 正是因为这三道判据的位数上界不一致。
 
 E-19 立的原则、E-3 把最后一条分叉（"从 qB 消失"）补齐。**已接受的代价**：一条下到 99% 后被用户在 qB 里删掉的种子，
 现在停在 stalled 等人工，而不是自动换源再下一份 —— 因为那一份半成品还在目录里，自动换源会往同一个目录再放一份。
+
+## 十八、E-57：『交付中』的占位，只有一个复位点了（R35）
+
+| 词 | 指什么 |
+|---|---|
+| **占位（placeholder）** | 交付协程进锁时把 `status` 置成 `downloading` 并记下 `prev_status`。归档标记与 qB 实时态**留在行上不动**（E-49），清理挪到交付成功那一刻 |
+| **残骸** | 落库是 `downloading`、但 `engine._delivering` 里没有它 —— 本进程没有协程在管这一行 |
+| **`engine.sweep_stale_delivering()`** | **唯一**的落定点（async）。先问 qB：里面有它 → 按已交付落定；没有 → 按 `prev_status` 还原；**连不上 → 一行都不动**。qB 关着时不必问 |
+| **`worker._stale_sweep_pending`** | "欠着一次清扫"。`init_business_state` 只记账（它是同步的、还跑在线程里，await 不了）；`worker.sweep_leftovers_if_pending()` 在协程里消费，持 `_sweep_lock` |
+
+**别再写第二个复位点**：`reset_downloading` 那三个函数（engine/anime/movies）在 R35 已删。
+理由是它同步、问不了 qB，于是对"崩在 `add_to_qb` 之后"的行会给出与清扫**相反**的结论 ——
+两个复位点、两种口径，正是本项目第①号缺陷形状。

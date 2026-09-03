@@ -872,11 +872,6 @@ def _set_status(mt_id: int, status: str) -> None:
     engine.set_torrent_status(MovieTorrent, mt_id, status)
 
 
-def reset_downloading() -> None:
-    """启动时把上次遗留的 downloading 复位为 pending。"""
-    engine.reset_downloading(MovieTorrent)
-
-
 async def download_movie_torrent(mt_id: int) -> bool:
     """交付一条种子。**整段包在 try/finally 里注销交付登记**（见 engine._delivering）。
 

@@ -906,7 +906,7 @@ def test_startup_runs_the_alias_rekey():
     src = (Path(__file__).resolve().parent.parent / "core/worker.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "init_business_state")
-    # (R34 对抗审计) 只查"有没有调"不够：挪进 `if reset_leftovers:` 之后，运行中掉线恢复 / 运行中切库
+    # (R34 对抗审计) 只查"有没有调"不够：挪进 `if sweep_leftovers:` 之后，运行中掉线恢复 / 运行中切库
     # 这两条路（都传 False）就不再补键。要求那条调用语句直接挂在函数体顶层。
     top = [st for st in fn.body if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
            and getattr(st.value.func, "attr", "") == "rekey_aliases"]
@@ -914,7 +914,7 @@ def test_startup_runs_the_alias_rekey():
 
 
 def test_init_business_state_rekeys_even_without_leftover_reset(clean_tables, monkeypatch):
-    """行为面：reset_leftovers=False（运行中切库 / 掉线恢复那两条路）也要补键。"""
+    """行为面：sweep_leftovers=False（运行中切库 / 掉线恢复那两条路）也要补键。"""
     from sqlmodel import select
 
     from core import anime as A
@@ -928,6 +928,6 @@ def test_init_business_state_rekeys_even_without_leftover_reset(clean_tables, mo
         s.commit()
     monkeypatch.setattr(A, "seed_source_groups", lambda: None)
     monkeypatch.setattr(W.engine, "backfill_legacy_progress_once", lambda: None)
-    W.init_business_state(reset_leftovers=False)
+    W.init_business_state(sweep_leftovers=False)
     with clean_tables.get_session() as s:
         assert s.exec(select(AnimeAlias).where(AnimeAlias.title == "入间同学入魔了！")).first() is not None

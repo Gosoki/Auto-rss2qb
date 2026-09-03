@@ -40,7 +40,6 @@ _INTENTIONAL = {
                     "归档目录走 MOVIE_QUARTER_FMT）。合并会把两个不同的概念挤进一个函数"),
     # ---- 门面：实现在 core/engine.py，两条线各一个薄包装（各自 docstring 写明「实现见 engine.*」）----
     "exclude_torrent": "实现在 core/engine.py，anime/movies 各转一层以带上自己的表",
-    "reset_downloading": "同上",
     "sync_qb_status": "同上",
     "unexclude_torrent": "同上",
     # ---- 同名但语义不同，已登记进 docs/GLOSSARY.md ----

@@ -449,7 +449,7 @@ def _db_panel(f: dict) -> None:
         # 【新库要补业务初始化】switch_data_engine 只负责建表/升版本。切到一个全新空库后
         # sourcegroup 是空的 → build_sources() 返回空列表 → 采集循环每轮抓 0 个源、
         # 一条日志都不报，用户只会觉得"切完就再也不更新了"，重启进程才恢复。
-        # 复位遗留 downloading 的条件严格按 _startup_reset_pending 走（理由见 worker.init_business_state）：
+        # 清扫遗留 downloading 的条件严格按 _stale_sweep_pending 走（理由见 worker.init_business_state）：
         #   · 常态（运行中切库）标志是 False → 不复位。可能有交付协程正卡在 await，把它的 downloading
         #     占位打回 pending 会当场解除集去重。
         #   · 『启动时库就不可用、用户到这里补全参数才恢复』标志是 True → 必须在这里【就地消费掉】。
@@ -465,7 +465,8 @@ def _db_panel(f: dict) -> None:
             # 业务引擎带 read_timeout=15 + connect_timeout=5，最坏能把整站冻几十秒。
             # 上面那句 switch_data_engine 早就是 io_bound 了 —— 同一个处理器里
             # 一句包了、下一句没包，正是 E-36 那条守卫要防的事（守卫为什么没报，见用例）。
-            await run.io_bound(worker.init_business_state, worker._startup_reset_pending)
+            await run.io_bound(worker.init_business_state, worker._stale_sweep_pending)
+            await worker.sweep_leftovers_if_pending()   # 清扫要 await 问 qB，不能在上面那个线程里做（E-57）
         except Exception as e:
             ui.notify(f"已切库，但业务初始化失败（源组可能为空）：{type(e).__name__}: {str(e)[:120]}",
                       type="warning")

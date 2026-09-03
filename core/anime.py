@@ -1036,7 +1036,7 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
                     return False
             t.status = "downloading"  # 原子占位：先落库再 await，后到的协程一进来就被短路挡掉
             # 【记下占位前的状态】(E-49) 协程活不到回写那一步（进程被杀 / 库抖）时行停在 downloading，
-            # sweep_stale_delivering / 启动时的 reset_downloading 按它还原，而不是一律写成 pending。
+            # sweep_stale_delivering 按它还原（先问 qB，见那里的 E-57 段），而不是一律写成 pending。
             # 归档标记与 qB 实时态【不在这里清】：清了就得靠回写放回去，崩溃时放不回。
             # 交付成功那一刻再清（见下面 save_path 那段），失败路径的 _keep_orig 照旧原样放回。
             t.prev_status = orig_status
@@ -1201,11 +1201,6 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
 
 def _set_status(torrent_id: int, status: str) -> None:
     engine.set_torrent_status(AnimeTorrent, torrent_id, status)
-
-
-def reset_downloading() -> None:
-    """启动时把上次异常退出遗留的 downloading 复位为 pending，好被重新下。"""
-    engine.reset_downloading(AnimeTorrent)
 
 
 def _revive_orphaned_skipped() -> None:

@@ -54,8 +54,8 @@ def sync_busy(model_cls) -> bool:
 # 切断慢查询 / 锁等待），异常直接冒出函数，行就**永久**停在 downloading ——
 #   · `_sync_qb_status` 显式跳过 downloading 行（"交付协程独占"）；
 #   · `downloading ∈ HAVE_STATUSES` ⇒ 集去重认定该集已有一份，flush/补下永不再挑；
-#   · `run_db_watch` 的恢复边沿调 `init_business_state(reset_leftovers=_startup_reset_pending)`，
-#     而运行中掉线那一支该标志恒为 False（有意为之，防止打断真在途的交付）⇒ 不复位。
+#   · `run_db_watch` 的恢复边沿调 `init_business_state(sweep_leftovers=_stale_sweep_pending)`，
+#     而运行中掉线那一支该标志恒为 False（有意为之，防止打断真在途的交付）⇒ 不清扫。
 # 只有重启进程才清得掉。而 R22 把 downloading 收进 `maintenance_blockers()` 之后又多一条：
 # 设置页的『切库』『迁移』从此**永久**被拒，提示还写着"等它跑完（最多几分钟）再来" ——
 # 它永远不会跑完。
@@ -154,29 +154,94 @@ def is_delivering(model_cls, torrent_id: int) -> bool:
     return (model_cls.__name__, int(torrent_id)) in _delivering
 
 
-def sweep_stale_delivering() -> int:
-    """把"落库是 downloading、但本进程并没有协程在管"的残骸复位到占位前的状态。返回复位数。
+def _settle_as_delivered(t, d: dict) -> None:
+    """把一条残骸按"其实已经交给 qB 了"落定 —— 与两条交付线成功段同口径。(E-57)
+
+    save_path 以 **qB 说的**为准：本地那次回写正是没成功的那一步，库里存的还是上一次的旧路径。
+    """
+    t.status = "sent"
+    t.save_path = d.get("save_path") or t.save_path
+    t.retry_count, t.retry_at, t.fail_reason = 0, None, ""
+    t.archived_at = None            # 重新交给 qB 了：从新完成点重算归档倒计时
+    t.prev_status = None
+    if config.QB_SYNC_STATUS:
+        # 开跟踪：清零实时态，让同步循环把它当『全新在下』重新跟起来（成功段就是这么写的）
+        t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 0.0, "", None, None
+    else:
+        # 关跟踪：没人会再更新它，必须当场落定，否则永远挂在『正在下载』区、has_inflight 恒真。
+        # 与 settle_sent 同口径（含 qb_synced_at 留空 —— 它是归档倒计时的基准，见那里的长注释）。
+        t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 1.0, "", None, None
+
+
+async def sweep_stale_delivering() -> int:
+    """把"落库是 downloading、但本进程并没有协程在管"的残骸落定。返回处理的行数。
 
     只有本进程知道自己在交付什么，所以这件事只能在本进程做，且必须靠 `_delivering` 判 ——
     单看状态列是分不出"在途"与"残骸"的，那正是这些行以前永远清不掉的原因。
+
+    【先问 qB，再决定落哪】(E-57，2026-09-03 拍板 A) 残骸有两种崩法，一列 `prev_status` 分不出：
+      · 崩在 `add_to_qb` **之前** —— qB 里没有这个种子，该按占位前的状态还原（E-49 要的那件事）；
+      · 崩在 `add_to_qb` **成功之后** —— 回写 save_path 那次 commit 撞上库抖动、或进程正好在那一瞬被杀。
+        种子已经在 qB 里下着了，而还原成 `sent+已归档` / `stalled` / `deleted` 等于**从此没有任何路径
+        再看它一眼**：progress=1.0 掉出在途闸、archived_at 非空又进不了归档轮，qB 那份下载无人跟踪。
+        （旧的"一律 pending"在这一点上反而自愈：flush 重发 → add 撞已存在的 hash → 幂等兜底判成功 → sent。）
+    判据取**事实**而不是记号：qB 里有没有这个 hash。两种崩法都答得对。
+
+    三种结局：
+      · qB 里有它   → `_settle_as_delivered`（与交付成功同口径，save_path 以 qB 为准）；
+      · qB 里没有它 → `_restore_from_placeholder`，即 E-49 的还原；
+      · qB 连不上   → **一行都不动**，本轮返回 0，下一轮再来。"连不上"与"里面没有"是两码事 ——
+        与全项目对这个信号的统一口径一致（`relocate` 连不上就一行不动、`sync_qb_status` 走 None 分支）。
+    qB 关掉时不必问：种子不可能在里面，直接还原。
+
+    【它自己也跨 await 持主键】读出 id → `await torrents_info` → 按 id 写回，正是 E-46 那个形状。
+    调用方一律在 `worker._sweep_lock` 里（周期巡检轮 / 启动补做那次），在途闸靠那把锁看见它；
+    出 await 之后按 id 重取并重核（状态还是不是 downloading、有没有新协程接手），不拿 await 之前的对象写。
     """
     from db.models import AnimeTorrent, MovieTorrent
 
-    n = 0
+    stale = []          # (model_cls, id, info_hash)
     with get_session() as s:
         for model_cls in (AnimeTorrent, MovieTorrent):
             for t in s.exec(select(model_cls).where(model_cls.status == "downloading")):
                 if is_delivering(model_cls, t.id):
                     continue
-                _restore_from_placeholder(t)       # 两个复位点同一个口径（启动时的 reset_downloading 也走它）
-                s.add(t)
-                n += 1
-        if n:
+                stale.append((model_cls, t.id, (t.info_hash or "").lower()))
+    if not stale:
+        return 0
+
+    info: dict = {}
+    if config.QB_ENABLED:
+        info = await qb.torrents_info([h for _, _, h in stale if h])
+        if info is None:
+            log.info("发现 %d 条僵死的『交付中』占位，但 qB 此刻连不上 —— 本轮一行都不动。"
+                     "问不到『种子在不在 qB 里』就分不清该还原还是该落已交付，下一轮再来", len(stale))
+            return 0
+
+    restored = settled = 0
+    with get_session() as s:
+        for model_cls, tid, h in stale:
+            t = s.get(model_cls, tid)
+            # 出 await 之后重核：这一行可能已经不是残骸了
+            if t is None or t.status != "downloading" or is_delivering(model_cls, tid):
+                continue
+            d = info.get(h) if h else None
+            if d is None:
+                _restore_from_placeholder(t)
+                restored += 1
+            else:
+                _settle_as_delivered(t, d)
+                settled += 1
+            s.add(t)
+        if restored or settled:
             s.commit()
-    if n:
-        log.warning("复位 %d 条僵死的『交付中』占位（多半是交付途中库抖了一下，"
-                    "回写没成功）——它们回到占位前的状态（待下的下一轮 flush 会重发）", n)
-    return n
+    if restored:
+        log.warning("复位 %d 条僵死的『交付中』占位（qB 里没有它们 —— 多半是交付途中库抖了一下、"
+                    "取种没走完）：回到占位前的状态，待下的下一轮 flush 会重发", restored)
+    if settled:
+        log.warning("%d 条僵死的『交付中』占位其实**已经交给 qB 了**（回写那一步没走完），"
+                    "按已交付落定并接管跟踪", settled)
+    return restored + settled
 
 
 def maintenance_blockers() -> list[str]:
@@ -644,18 +709,12 @@ def _restore_from_placeholder(t) -> None:
     所以这里只需把 status 放回去，别的都还在：deleted 不会变回自动队列、excluded 的排除不被撤销、
     stalled 保住 HAVE 身份（否则 flush 当场为同一集换源下第二份到同一目录）、已归档的 archived_at
     仍在。没有 prev_status（老库的残骸、或从 pending/error 出发的正常交付）就按老规矩落 pending。
+
+    【只在"qB 里确实没有这个种子"时才走这里】(E-57) 崩在 add_to_qb 成功之后的行要走
+    `_settle_as_delivered`，理由见 `sweep_stale_delivering`。唯一的判断点在那里，别在别处另做一份。
     """
     t.status = t.prev_status or "pending"
     t.prev_status = None
-
-
-def reset_downloading(model_cls) -> None:
-    """启动时把某种子表上次异常退出遗留的 downloading 复位到占位前的状态（多数是 pending，好被重新下）。"""
-    with get_session() as s:
-        for t in s.exec(select(model_cls).where(model_cls.status == "downloading")):
-            _restore_from_placeholder(t)
-            s.add(t)
-        s.commit()
 
 
 # 归档每轮处理上限 + 连续删除失败熔断阈值。归档幂等，分轮做不丢东西。

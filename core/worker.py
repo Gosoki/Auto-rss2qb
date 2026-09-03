@@ -142,27 +142,46 @@ async def poll_once() -> None:
 # 【本进程是否还欠一次"启动复位"】只有 main.py 在【启动时业务库就不可用】的那一支会置 True：
 # 那时 init_business_state 被跳过，而库从进程启动起就一直 down、所有后台循环都按 is_data_down() 空转，
 # 所以此刻库里的 downloading 必定是【上个进程】留下的残骸，复位它们是安全且必须的。
-# 默认 False：运行中掉线再恢复、以及切库，都可能有交付协程正卡在 await（取种最长 180s），
-# 打回 pending 会当场解除集去重 → 同一集被两个源各下一份到同一目录。
-_startup_reset_pending = False
+# 『欠着一次交付残骸清扫』。默认 False：运行中掉线再恢复、以及切库，都可能有交付协程正卡在
+# await（取种最长 180s），把它的 downloading 占位打回去会当场解除集去重 → 同一集被两个源各下一份
+# 到同一目录。只有"进程启动时库就不可用、现在才首次可用"那一种情形才欠着（那时所有后台循环都空转过，
+# 绝不可能有协程在半途）。清扫本身见 engine.sweep_stale_delivering —— 它要 await 问 qB，
+# 所以不能在 init_business_state（同步、还跑在线程里）里做，改由下面的 sweep_leftovers_if_pending 消费。
+_stale_sweep_pending = False
 
 
-def init_business_state(reset_leftovers: bool = True) -> None:
-    """业务库可用之后必做的初始化。三个操作都幂等，重复调用无害。
+def init_business_state(sweep_leftovers: bool = True) -> None:
+    """业务库可用之后必做的初始化。三个操作都幂等，重复调用无害。**同步**，调用方常把它丢线程。
 
-    reset_leftovers 的取值规则见上面 _startup_reset_pending 的说明：
-    只有"进程启动时库就不可用、现在才首次可用"这一种情形才该复位遗留的 downloading。
-    这些残骸没有第二条出路——sync_qb_status 显式跳过 downloading 行（交付协程独占），
+    sweep_leftovers 的取值规则见上面 _stale_sweep_pending 的说明。它在这里只**记账**、不动数据：
+    真正的清扫要先问 qB（E-57），而那是个 await —— 由 `sweep_leftovers_if_pending()` 在协程里做。
+    残骸没有第二条出路——sync_qb_status 显式跳过 downloading 行（交付协程独占），
     而 downloading ∈ HAVE_STATUSES，集去重闸会认定该集"已有一份"，flush/补下都不会再碰它。
     """
-    global _startup_reset_pending
+    global _stale_sweep_pending
     anime.seed_source_groups()          # 首启种入 ANi/Mikan 两个源组
-    if reset_leftovers:
-        anime.reset_downloading()       # 复位上次遗留的 downloading（TV）
-        movies.reset_downloading()      # 复位上次遗留的 downloading（剧场版）
-        _startup_reset_pending = False  # 复位成功才清；失败则下一次探测继续尝试
+    if sweep_leftovers:
+        _stale_sweep_pending = True     # 记账，等协程里补做（清扫要 await 问 qB）
     engine.backfill_legacy_progress_once()   # 一次性：历史 sent 标记为已完成
     anime.rekey_aliases()                    # 幂等：解析规则变了就给存量别名补新键（E-39）
+
+
+async def sweep_leftovers_if_pending() -> None:
+    """把欠着的那次『交付残骸清扫』做掉。幂等、随时可调；没欠着或库停摆时是空操作。(E-57)
+
+    【为什么不在 init_business_state 里做】清扫要先问 qB（`await torrents_info`）才分得清
+    "崩在交给 qB 之前"（该还原）与"崩在之后"（种子已在 qB 里下着，该落已交付）——
+    而 init_business_state 是同步的、三个调用点还都把它丢进了线程。所以拆成"记账 + 协程里消费"两步。
+
+    【持 `_sweep_lock`】与周期巡检轮同一把：清扫自己跨 await 持着业务库主键（E-46 的形状），
+    在途闸靠这把锁看见它。
+    """
+    global _stale_sweep_pending
+    if not _stale_sweep_pending or db.is_data_down():
+        return
+    async with _sweep_lock:
+        await engine.sweep_stale_delivering()
+    _stale_sweep_pending = False        # 做成了才清；失败则异常上抛、下一次调用继续尝试
 
 
 async def run_db_watch() -> None:
@@ -216,12 +235,12 @@ async def run_db_watch() -> None:
                 except Exception as e:
                     log.error("补读配置失败（下次探测再试）: %s", e)
             if was_down and not now_down:
-                # 补跑停摆期间漏掉的初始化。是否复位遗留的 downloading 看本进程欠不欠那一次：
+                # 补跑停摆期间漏掉的初始化。是否清扫遗留的 downloading 看本进程欠不欠那一次：
                 # 【启动时就停摆】→ 欠（main.py 跳过了初始化，且此刻不可能有交付协程在跑）；
-                # 【运行中掉线又回来】→ 不欠（可能有协程正卡在 await，打回 pending 会重复下载）。
+                # 【运行中掉线又回来】→ 不欠（可能有协程正卡在 await，动它的占位会重复下载）。
                 #
                 # 【必须上线程】(R28) 这个函数做的全是同步库往返（seed_source_groups /
-                # reset_downloading×2 / backfill_legacy_progress_once），而此刻 db.engine
+                # backfill_legacy_progress_once / rekey_aliases），而此刻 db.engine
                 # 可能指向 MySQL。上一行的 `probe_data_engine` 早就 `to_thread` 了，
                 # 另外两个调用点（设置页『切到 MySQL』、顶栏『立即重连』）也都上了线程 ——
                 # **只有这一条是裸的**：R27 修的是同一件事，只落到 pages/settings.py 一处，
@@ -229,7 +248,9 @@ async def run_db_watch() -> None:
                 # 这条路径还偏偏跑在"MySQL 刚回来、可能立刻又抖回去"那一刻：
                 # pool_pre_ping 重连 5 秒、慢查询 15 秒才切断，事件循环整段冻住，
                 # 而且它是**无人值守**的（另外两处是用户点了按钮在等）。
-                await asyncio.to_thread(init_business_state, _startup_reset_pending)
+                await asyncio.to_thread(init_business_state, _stale_sweep_pending)
+                # 记完账当场消费掉：清扫要 await 问 qB，所以它在协程里做而不在上面那个线程里。(E-57)
+                await sweep_leftovers_if_pending()
             was_down = now_down
         except Exception as e:          # 探测自己出岔子也别让看守协程死掉，否则永远发现不了恢复
             loop_error("数据库看守", e)
@@ -346,6 +367,11 @@ async def run_sweep() -> None:
     log.info("完结/断更巡检协程启动（%s，每 %d 分钟；断更阈值 %d 天）",
              "完结判定开" if config.ANIME_FINISH_ENABLED else "完结判定关",
              config.SWEEP_INTERVAL_MIN, config.ANIME_IDLE_DAYS)
+    # 【交付残骸的清扫要先做，不能等那个长睡】(E-57) 上个进程遗留的 downloading 占位既不被 sync 复查、
+    # 又占着 HAVE_STATUSES（集去重认定该集已有一份），等 3 小时才清是不行的 —— 以前这件事是
+    # init_business_state 里的 reset_downloading（同步、问不了 qB），现在统一走 sweep_stale_delivering。
+    # 完结判定/断更提醒仍然先睡后做（避免"每次重启都立刻重判一遍"），只有清扫提前。
+    await sweep_leftovers_if_pending()
     # 先睡后做：启动瞬间不抢资源，也避免"每次重启都立刻重判一遍"。
     await asyncio.sleep(max(60, config.SWEEP_INTERVAL_MIN * 60))
     while True:
@@ -494,7 +520,7 @@ async def run_all_once() -> tuple[bool, str]:
     采集暂停时跳过抓源（与 run_worker 同口径，暂停就是暂停）；数据库停摆时整个跳过（各后台循环都按
     db.is_data_down() 把门，这里不该是唯一的例外——那只会撞一串写库异常）。
     两段轮次各自看自己的锁：后台正在跑哪一段就跳过哪一段，另一段照做，不会因为剧场版在扫描就连采集也不跑。
-    刻意【不】做 reset_downloading：那是启动时清上次异常退出的残留，运行中 status=downloading 的都是真在下的
+    刻意【不】做残骸清扫：那是启动时清上次异常退出的残留，运行中 status=downloading 的都是真在下的
     种子，复位成 pending 会让 flush 认为该集『还没有』而另挑一个源重下一份。
     """
     if db.is_data_down():
