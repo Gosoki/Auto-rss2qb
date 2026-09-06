@@ -153,10 +153,6 @@ def quote(engine, name: str) -> str:
     return engine.dialect.identifier_preparer.quote(name)
 
 
-def is_sqlite(engine) -> bool:
-    return engine.dialect.name == "sqlite"
-
-
 def is_mysql(engine) -> bool:
     return engine.dialect.name in ("mysql", "mariadb")
 

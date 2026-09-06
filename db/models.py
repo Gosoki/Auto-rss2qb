@@ -148,7 +148,11 @@ class AnimeTorrent(SQLModel, table=True):
     qb_state: str = Field(default="")           # qB 原始态：downloading/stalledUP/pausedDL/error…（空=qB 未跟踪）
     qb_progress: float = Field(default=0.0)     # 完成度 0..1
     qb_dlspeed: int = Field(default=0)          # 下载速度 B/s
-    qb_size: int = Field(default=0)             # 种子总大小 B
+    # 种子总大小(字节)。sync 每轮采，但**目前没有任何界面读它**（R32 死代码普查记过一次）。
+    # 留着不删：删列要开 revision，而它是 qB 现成回传的字段，将来详情页/列表要显示体积就在这儿。
+    # 种子总大小(字节)。sync 每轮采，但**目前没有任何界面读它**（R32 死代码普查记过一次）。
+    # 留着不删：删列要开 revision，而它是 qB 现成回传的字段，将来详情页/列表要显示体积就在这儿。
+    qb_size: int = Field(default=0)
     qb_synced_at: datetime | None = Field(default=None)  # 最近一次从 qB 同步的时间
     qb_progress_at: datetime | None = Field(default=None)  # 进度上次推进的时间；长期不推进→标停滞(异常)判定用
     archived_at: datetime | None = Field(default=None)  # 完成归档时间：已从 qB 移除(留文件)、不再跟踪；空=未归档
@@ -222,7 +226,7 @@ class MovieTorrent(SQLModel, table=True):
     qb_state: str = Field(default="")
     qb_progress: float = Field(default=0.0)
     qb_dlspeed: int = Field(default=0)
-    qb_size: int = Field(default=0)
+    qb_size: int = Field(default=0)                        # 同番剧侧：只采不显，见那边的说明
     qb_synced_at: datetime | None = Field(default=None)
     qb_progress_at: datetime | None = Field(default=None)  # 进度上次推进的时间；长期不推进→标停滞(异常)判定用
     archived_at: datetime | None = Field(default=None)  # 完成归档时间：已从 qB 移除(留文件)、不再跟踪；空=未归档

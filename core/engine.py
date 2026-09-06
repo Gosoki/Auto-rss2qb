@@ -69,7 +69,13 @@ _delivering: set = set()
 
 @contextmanager
 def delivering(model_cls, torrent_id: int):
-    """声明"本协程正在交付这一行"。见 `_delivering` 处的说明。"""
+    """声明"本协程正在交付这一行"。见 `_delivering` 处的说明。
+
+    **两条交付线的唯一入口**(R35)：键在这里一处生成（`model_cls.__name__`，与查询侧
+    `is_delivering` 同源），注销由 with 语句保证。别在别处手写
+    `_delivering.add(("AnimeTorrent", id))` —— 那种字面量键与类名之间没有任何机制对齐，
+    写错一个字母就会让清扫把真在途的行当成残骸复位（守卫见 tests/test_engine_lifecycle.py）。
+    """
     key = (model_cls.__name__, int(torrent_id))
     _delivering.add(key)
     try:

@@ -149,9 +149,3 @@ def upgrade(engine, role: str, target: str = "head") -> None:
             command.upgrade(_config(engine, role, ddl), target)
         log.info("数据库版本升级[%s]：%s → %s", role, cur or "空库", current_revision(engine, role))
 
-
-def stamp_head(engine, role: str) -> None:
-    """只打版本戳、不执行任何 DDL。给"表已经建好了但没有版本记录"的库补票用。"""
-    with _LOCK:      # 同 upgrade：alembic 的模块代理是进程级的，不能有两个同时在跑
-        with _ddl_engine(engine) as ddl:
-            command.stamp(_config(engine, role, ddl), "head")

@@ -75,7 +75,7 @@ _FINALE = r"(?:\s*(?:END|FIN|COMPLETE|完|終|终|エンド))?"
 # 集号右界：行尾 / 标签块起始 / 【当分隔符用的】连字符。
 # 第三种是因为『[组] 番名 - 05 - [简日内嵌][AVC 8bit 1080P]』这类写法——集号后面【还有一个分隔符】
 # 才接标签块。旧的右界只认 行尾/左括号，这类标题整条落 -2（未识别）：不自动下、堆进"待识别"，
-# 而且 _EP_TAIL_RE 同样锚不到 → 番名脏成 '番名-05-'，别名键与 bgm 搜索词一起废掉。
+# 而且 _EP_TAIL（洗番名用的那条）同样锚不到 → 番名脏成 '番名-05-'，别名键与 bgm 搜索词一起废掉。
 # 连字符后面若紧跟一个【裸集号】(‘- 01 - 12’) 就不认：那是连续集范围(合集)，不是"集号+分隔符"。
 # 判据是"数字后面不再跟字母数字"——1080P/720P/4K 这些带字母尾巴的不算裸集号，
 # 所以 '- 05 - 1080P AVC' 这种没有标签块的写法照样能认出 05。
@@ -153,8 +153,8 @@ _EP_PATTERNS = [
 _EXT_RE = re.compile(r"\.(mp4|mkv|avi|ts|flv|rmvb|wmv|mov|m2ts|webm)\s*$", re.I)
 # 从番名里剥掉的集数段：锚定到『空格-空格数字(可带 v2)后接括号/行尾/分隔连字符』，别吃副标题里的 -2nd
 _EP_TAIL = (r"\s[-–—]\s*\d{1,4}(?:\.\d+)?(?:\s*[vV]\d+)?" + _FINALE + _EP_END)
-_EP_TAIL_RE = re.compile(_EP_TAIL, re.I)        # 预编译（_clean_for_search 用）
-# 【必须与 _EP_TAIL_RE 同样带 re.I】它们复用同一个 _EP_TAIL 字符串，而完结标记里有 END/FIN/Complete
+# 【_STRIP_PATTERNS / _SEARCH_STRIP_PATTERNS 都必须带 re.I】它们复用这个 _EP_TAIL 字符串，
+# 而完结标记里有 END/FIN/Complete
 # 这些字母：少了 re.I 就会出现"集号认出来了、番名却没洗干净"的半吊子——
 # '[ANi] Some Show - 24 Fin' 的集号是 24（_EP_PATTERNS 带 re.I），番名却留成 'SomeShow-24Fin'，
 # 而番名是别名键，等于给同一部番造了个新身份。

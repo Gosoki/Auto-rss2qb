@@ -806,10 +806,15 @@ async def test_the_sweep_never_touches_a_real_in_flight_delivery(clean_tables, c
 
 
 def test_both_delivery_paths_register_and_unregister():
-    """两条交付路径都必须登记 + 注销 —— 少一处，那条线上的残骸就永远清不掉。
+    """两条交付路径都必须把 inner 整段包在 `engine.delivering()` 里 —— 少一处，那条线上的残骸就永远清不掉。
 
-    注销放在**外层包装的 finally** 里：函数体从进锁到最后一次回写有一百多行、
-    多条 return 与 raise，任何一条漏掉注销都会让那一行被永久当成"正在交付中"。
+    【为什么判据是 with，不是"有 discard"】(R35) R28 记过一次假守卫：
+    `try: _r = await _inner(...); discard(...); return _r / finally: pass` —— 四条断言逐条成立、
+    全量一条不红，而异常路径从此不注销：交付回写撞上 OperationalError 时那一行永远留在 `_delivering` 里，
+    `sweep_stale_delivering()` 因 `is_delivering()` 为真永远跳过它（行永久停在 downloading、
+    ∈HAVE_STATUSES、集去重认定已有一份），`maintenance_blockers()` 又永远数到它 —— 切库/迁移被**永久**拒死。
+    R28 的修法是"把 discard 钉在 finally 体上"；R35 改用 `with`，那个变异从构造上就写不出来
+    （注销由语言保证），守卫只需要核"inner 的调用在 with 体内"。
     """
     import ast
     from pathlib import Path
@@ -823,26 +828,65 @@ def test_both_delivery_paths_register_and_unregister():
         fns = {n.name: n for n in ast.walk(tree)
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
         assert pub in fns and inner in fns, f"{mod} 少了包装或内层"
-        outer = ast.dump(fns[pub])
-        assert "discard" in outer and "_delivering" in outer, f"{mod}::{pub} 没注销交付登记"
-        # 【必须把 discard 钉在 finally 体上】(R28) 原来的两条断言是分开的：
-        # "outer 里有 discard" + "outer 里有带 finalbody 的 Try" —— 两条各自成立，
-        # 却**没有任何一条把它们绑在一起**。实测变异：把
-        # `try: return await _inner(...) / finally: discard(...)` 改成
-        # `try: _r = await _inner(...); discard(...); return _r / finally: pass`，
-        # 四条断言逐条仍然成立，全量 1197 一条红都没有 —— 而异常路径从此不注销，
-        # 交付回写撞上 OperationalError 时那一行永远留在 `_delivering` 里：
-        # `sweep_stale_delivering()` 因 `is_delivering()` 为真永远跳过它（行永久停在
-        # downloading、∈HAVE_STATUSES、集去重认定已有一份），`maintenance_blockers()`
-        # 又永远数到它 —— 切库/迁移被**永久**拒死。正是 R25 §一③ 那条 P1。
-        tries = [n for n in ast.walk(fns[pub]) if isinstance(n, ast.Try) and n.finalbody]
-        assert tries, f"{mod}::{pub} 没有 try/finally"
-        in_finally = any("discard" in ast.dump(node)
-                         for t in tries for node in t.finalbody)
-        assert in_finally, (
-            f"{mod}::{pub} 的 discard 不在 finally 体里 —— 异常路径上不会注销，"
-            "那一行会被永久当成『正在交付中』")
-        assert "_delivering" in ast.dump(fns[inner]), f"{mod}::{inner} 没登记交付"
+        withs = [n for n in ast.walk(fns[pub]) if isinstance(n, ast.With)
+                 and any(isinstance(i.context_expr, ast.Call)
+                         and getattr(i.context_expr.func, "attr",
+                                     getattr(i.context_expr.func, "id", "")) == "delivering"
+                         for i in n.items)]
+        assert withs, f"{mod}::{pub} 没有 `with engine.delivering(...)`"
+        # inner 的调用必须在 with 体内（写在外面等于没登记就跑了）
+        wrapped = any(any(isinstance(c, ast.Call)
+                          and getattr(c.func, "id", getattr(c.func, "attr", "")) == inner
+                          for c in ast.walk(w)) for w in withs)
+        assert wrapped, f"{mod}::{pub} 的 {inner}() 不在 `with engine.delivering(...)` 体内"
+        # 每个 await 也要在 with 里（`with: coro = _inner()` / `return await coro` 那种假包装）
+        inside = {id(a) for w in withs for a in ast.walk(w) if isinstance(a, ast.Await)}
+        awaits = [a for a in ast.walk(fns[pub]) if isinstance(a, ast.Await)]
+        assert awaits and all(id(a) in inside for a in awaits), \
+            f"{mod}::{pub} 有 await 落在 `with engine.delivering(...)` 外面"
+
+
+def test_nobody_hand_writes_a_delivering_key():
+    """(R35) 交付登记的键只许在 `engine.delivering()` 里一处生成，别处不许手写。
+
+    登记侧以前是 `_delivering.add(("AnimeTorrent", int(tid)))` 的**字符串字面量**，
+    而查询侧 `is_delivering` 用的是 `model_cls.__name__` —— 两边靠"字面量恰好等于类名"对齐，
+    没有任何机制守着。写错一个字母（或以后给模型改名）的后果不是"查不到"这么轻：
+    登记进去的键查不到 ⇒ `sweep_stale_delivering` 把**真在途**的行当成残骸复位 ⇒
+    集去重当场解除、同一集被另一个源下第二份到同一目录，而交付协程回来还会把它写回 sent。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    bad = []
+    for f in [*root.glob("core/*.py"), *root.glob("pages/*.py"), *root.glob("services/*.py"),
+              root / "main.py"]:
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr in ("add", "discard")):
+                continue
+            tgt = n.func.value
+            name = getattr(tgt, "attr", getattr(tgt, "id", ""))
+            if name != "_delivering" or f.name == "engine.py":
+                continue        # engine 自己那一处就是唯一的生成点
+            bad.append(f"{f.name}:{n.lineno} 手写了交付登记的键，应当走 engine.delivering()")
+    assert not bad, "\n  ".join(bad)
+    # 反向：engine 里那唯一一处，键必须来自 model_cls.__name__（不是字面量）
+    src = (root / "core/engine.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "delivering")
+    # 【判据落在真实的赋值节点上，不看 docstring】这条 docstring 里就写着
+    # `_delivering.add(("AnimeTorrent", id))` 当反例 —— 按 ast.dump 全文匹配会被自己的解释判红。
+    keys = [n.value for n in ast.walk(fn) if isinstance(n, ast.Assign)
+            and any(getattr(t, "id", "") == "key" for t in n.targets)]
+    assert len(keys) == 1, f"engine.delivering 里的 key 赋值不是恰好一处：{len(keys)}"
+    dumped = ast.dump(keys[0])
+    assert "__name__" in dumped, "engine.delivering 的键不再取 model_cls.__name__ 了？"
+    assert not [c for c in ast.walk(keys[0])
+                if isinstance(c, ast.Constant) and isinstance(c.value, str)], \
+        "engine.delivering 的键里出现了写死的表名"
 
 
 async def test_the_archive_and_sweep_rounds_block_maintenance():
@@ -936,7 +980,7 @@ async def test_a_crashing_delivery_still_unregisters(monkeypatch, clean_tables):
         tid = t.id
 
     async def boom(torrent_id, force=False):
-        ce._delivering.add(("AnimeTorrent", int(torrent_id)))   # 内层进锁时做的那一下
+        ce._delivering.add((AnimeTorrent.__name__, int(torrent_id)))   # 包装层登记的那一下
         raise RuntimeError("回写撞上库抖动")
 
     monkeypatch.setattr(A, "_download_anime_torrent_inner", boom)

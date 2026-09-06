@@ -942,16 +942,21 @@ async def process_item(item, known_hashes: set | None = None,
 
 
 async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool | None:
-    """交付一条种子。**整段包在 try/finally 里注销交付登记**（见 engine._delivering）。
+    """交付一条种子。**整段包在 `engine.delivering()` 里**（见 engine._delivering）。
 
     包装放在这一层而不是函数体内部：函数体从进锁到最后一次回写有一百多行、
     多条 return 与 raise，任何一条漏掉注销都会让那一行被永久当成"正在交付中" ——
     而 R24 之前它压根没有注销这回事，一次库抖动就把切库/迁移永久拒死。
+
+    【为什么是 with 而不是手写 try/finally + 手写键】(R35) 原来登记在内层锁里、注销在这一层的
+    finally 里，键是两处各写一遍的**字符串字面量** `("AnimeTorrent", id)`，而查询侧
+    `is_delivering` 用的是 `model_cls.__name__` —— 三处靠"字面量恰好等于类名"对齐，没有守卫。
+    写错一个字母的后果不是查不到而已：登记进去的键查不到 ⇒ `sweep_stale_delivering` 把**真在途**
+    的行当成残骸复位 ⇒ 集去重当场解除、同一集被另一个源下第二份到同一目录。
+    `delivering()` 一处生成键、语言保证注销，三个毛病一起没了。
     """
-    try:
+    with engine.delivering(AnimeTorrent, torrent_id):
         return await _download_anime_torrent_inner(torrent_id, force)
-    finally:
-        engine._delivering.discard(("AnimeTorrent", int(torrent_id)))
 
 
 async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) -> bool | None:
@@ -1043,8 +1048,7 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
             # 【登记"本协程真的在管这一行"】(R24) 落库的 downloading 只说明"某进程某一刻开始交付"，
             # 不说明"此刻真的有协程在管"。回写撞上库抖动时异常直接冒出去、行永久停在 downloading，
             # 而它既不被 sync 复查、又占着 HAVE_STATUSES、还把切库/迁移永久拒死。
-            # 注销在本函数的外层包装的 finally 里（见 download_anime_torrent 那一层）。
-            engine._delivering.add(("AnimeTorrent", int(torrent_id)))
+            # 登记与注销都在外层包装的 `with engine.delivering(...)` 里（R35 收敛到一处，见那里）。
             s.add(t)
             s.commit()
             url = t.download_url
@@ -2248,22 +2252,18 @@ def list_episodes(anime_id: int) -> list[AnimeTorrent]:
 
 
 
-def downloaded_count(anime_id: int) -> int:
-    """该番【删得掉的】文件数——供 UI 决定要不要显示『删除文件』、以及确认框里报几个。
+def downloaded_counts(anime_ids) -> dict:
+    """一次 SQL 取多部番【删得掉的】文件数 {anime_id: n}——供 UI 决定要不要显示『删除文件』、
+    以及确认框里报几个。
 
     含 stalled：半成品文件在盘、delete_anime_files 也会删它（deleted 文件已删，不计）。
     【不含 downloading】：那是交付中的占位，qB 里还没有这个 hash，删除路径会跳过它
     （见 delete_anime_torrent）。口径必须与删除路径逐字一致——否则确认框说"删 3 个"、
     实际只删掉 2 个，或者对一条 downloading 点删除得到『没删成』的假错误提示。
-    """
-    return downloaded_counts([anime_id]).get(anime_id, 0)
 
-
-def downloaded_counts(anime_ids) -> dict:
-    """一次 SQL 取多部番的可删文件数 {anime_id: n}（口径与 downloaded_count 完全一致，共用同一组判据）。
-
-    给列表页用：『已忽略』面板要为每部番决定显不显示『删除文件』，逐番调 downloaded_count
-    等于每番开一个 session 打一条 SQL（N+1），而这个面板会被任意操作和 30 秒定时器整体重建。
+    【只有批量这一份】给列表页用：『已忽略』面板要为每部番决定显不显示『删除文件』，
+    逐番各查一次等于每番开一个 session 打一条 SQL（N+1），而这个面板会被任意操作和
+    30 秒定时器整体重建。单番版 `downloaded_count` 曾经存在、后来没人调了，R35 删。
     """
     ids = list(anime_ids)
     if not ids:

@@ -481,8 +481,8 @@ def movie_torrents(movie_id: int) -> list[MovieTorrent]:
 def source_map() -> dict:
     """{片 id: [来源...]}，一次 DISTINCT 查齐（对齐番剧 source_map）。
 
-    列表页/待识别页逐片调 movie_sources 是 N+1：每片一个 session、一条 SQL；
-    片数一多（剧场版按年攒）渲染就线性变慢。这里一次查完，行数只与『片×来源』有关。
+    逐片查一次是 N+1：每片一个 session、一条 SQL；片数一多（剧场版按年攒）渲染就线性变慢。
+    这里一次查完，行数只与『片×来源』有关。(R27 换成这个之后，逐片版 `movie_sources` 就没人调了，R35 删。)
     """
     from collections import defaultdict
     with get_session() as s:
@@ -492,12 +492,6 @@ def source_map() -> dict:
         if mid:
             src[mid].add(source or "?")
     return {mid: sorted(v) for mid, v in src.items()}
-
-
-def movie_sources(movie_id: int) -> list[str]:
-    with get_session() as s:
-        rows = s.exec(select(MovieTorrent.source).where(MovieTorrent.movie_id == movie_id)).all()
-    return sorted({r for r in rows if r})
 
 
 def torrents_by_movie(movie_ids: list[int]) -> dict[int, list[MovieTorrent]]:
@@ -873,16 +867,15 @@ def _set_status(mt_id: int, status: str) -> None:
 
 
 async def download_movie_torrent(mt_id: int) -> bool:
-    """交付一条种子。**整段包在 try/finally 里注销交付登记**（见 engine._delivering）。
+    """交付一条种子。**整段包在 `engine.delivering()` 里**（见 engine._delivering）。
 
     包装放在这一层而不是函数体内部：函数体从进锁到最后一次回写有一百多行、
     多条 return 与 raise，任何一条漏掉注销都会让那一行被永久当成"正在交付中" ——
     而 R24 之前它压根没有注销这回事，一次库抖动就把切库/迁移永久拒死。
+    用 with 而不是手写 try/finally + 手写键的理由，与番剧侧逐字相同（见 download_anime_torrent）。
     """
-    try:
+    with engine.delivering(MovieTorrent, mt_id):
         return await _download_movie_torrent_inner(mt_id)
-    finally:
-        engine._delivering.discard(("MovieTorrent", int(mt_id)))
 
 
 async def _download_movie_torrent_inner(mt_id: int) -> bool:
@@ -911,8 +904,7 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
             # 【登记"本协程真的在管这一行"】(R24) 落库的 downloading 只说明"某进程某一刻开始交付"，
             # 不说明"此刻真的有协程在管"。回写撞上库抖动时异常直接冒出去、行永久停在 downloading，
             # 而它既不被 sync 复查、又占着 HAVE_STATUSES、还把切库/迁移永久拒死。
-            # 注销在本函数的外层包装的 finally 里（见 download_movie_torrent 那一层）。
-            engine._delivering.add(("MovieTorrent", int(mt_id)))
+            # 登记与注销都在外层包装的 `with engine.delivering(...)` 里（R35 收敛到一处）。
             s.add(t)
             s.commit()
             url = t.download_url
