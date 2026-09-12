@@ -28,7 +28,8 @@ log = logging.getLogger("autorss")
 
 # 复制顺序：父表在前。虽然模型没声明 FK，但 anime_id/movie_id 是逻辑外键，
 # 中断时按这个序至少不会留下"子行指向还没搬过来的父行"。
-TABLE_ORDER = ("sourcegroup", "anime", "anime_alias", "animetorrent", "movie", "movietorrent")
+TABLE_ORDER = ("sourcegroup", "anime", "anime_alias", "animetorrent", "movie", "movietorrent",
+               "alert_ack")
 
 _CHUNK = 500
 

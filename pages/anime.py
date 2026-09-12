@@ -9,7 +9,7 @@ from nicegui import ui
 
 import db
 from db.models import AnimeTorrent
-from core import anime, engine
+from core import alerts, anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail, restore_anime_gated, subscribe_gated
 from .layout import (busy_action, confirm, require_bind_confirm, ep_str, expand_collapse_bar,
@@ -137,49 +137,28 @@ def anime_page(t: str = ""):
             if not ov["config"]["qb"]:
                 warn_banner("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）")
 
-            # ── 疑似同一部番被拆成两条 ──
-            # 【只提示、不自动合】绑到不同 bgm subject 的两条，程序判不出哪条是对的；
-            # 自动合并会删行且不可逆（剧场版那边已经为此付过一次学费）。
-            # 而它又必须被看见：真库里那一对的其中一条被判了超期忽略，
-            # 挂在它下面的 5 集【永远不会被下】，而现有的身份守卫只认 bangumi_id 相同、看不到它。
-            for _d in anime.suspect_duplicate_anime():
-                _tail = ("；其中『%s』已被忽略，它下面的集不会下载"
-                         % (_d["a_name"] if _d["a_rejected"] else _d["b_name"])
-                         if (_d["a_rejected"] or _d["b_rejected"]) else "")
-                warn_banner(
-                    f"『{_d['a_name']}』(#{_d['a']}，bgm {_d['a_bgm']}) 与 "
-                    f"『{_d['b_name']}』(#{_d['b']}，bgm {_d['b_bgm']}) 共用番名 "
-                    f"「{'、'.join(_d['shared'])}」，多半是同一部番被拆成了两条{_tail}。"
-                    "去详情页核对 bgm 绑定：把错的那条改绑成对的 bgm，身份守卫会自动把它们合并。")
+            # ── 三类『只报不改』的巡检发现 ──
+            # 判据在 core/anime 的三个 suspect_*，身份/事实指纹、文案、已读过滤在 core/alerts。
+            # 【文案为什么不在这里】它要被用在三个地方：这条横幅、『已读的提示』列表里的存档、
+            # 以及巡检推送。留在页面里的话另外两处就得各抄一遍（第①号缺陷形状）。
+            # 三类各自"为什么只报不改"的长注释跟着搬到了 core/alerts 的 _dup/_mva/_wrb 上方。
+            _al = alerts.view()
+            for _a in _al["live"]:
+                _pre = ""
+                if _a["revived"]:
+                    _chg = "；".join(f"{k} {o} → {n}" for k, o, n in _a["revived"]["changed"])
+                    _pre = (f"【你在 {_a['revived']['at'].strftime('%m-%d %H:%M')} 标过已读，"
+                            f"之后：{_chg}】")
+                warn_banner(_pre + _a["text"], action=("知道了", "inbox", _ack_alert(_a)))
 
-            # ── 同一个 bgm subject 同时是一部番和一部剧场版 ──(R30)
-            # 拿真库反查不变量时发现的：`info_hash` 在两张种子表里各出现一次
-            # （两张表各有唯一约束、**跨表没有**）。今天那两条 anime 都是"超期忽略"、
-            # 不会自动下；可用户在『已忽略』页点一下『恢复订阅』，两边就会交付同一个 hash：
-            # qB 对已存在的 hash 返回失败 → 幂等兜底查到"它确实在 qB 里"判成功 →
-            # **两条记录都说自己已交付，而文件只落在其中一个目录**。
-            for _m in anime.suspect_movie_as_anime():
-                warn_banner(
-                    f"『{_m['a_name']}』(bgm {_m['bgm']}) 在番剧表(#{_m['a']}，{_m['a_state']}，"
-                    f"{_m['an']} 条种子)和剧场版(#{_m['m']}，{_m['mn']} 条)里**各有一条记录**。"
-                    "剧场版那条通常才是对的。别去点『恢复订阅』——两边会交付同一个种子，"
-                    "而 qB 只收一次：两条记录都会显示『已交付』，文件却只落在其中一个目录。"
-                    "去番剧表把这一条删掉，或确认它确实是电视版。")
-
-            # 【绑定可疑：与"番被拆成两条"同一个位置、同一种处理】(R26)
-            # `binding_looks_wrong` 全项目 4 个调用点全是"不让番【进入】追番中"的闸，
-            # 没有一处对已确认的番重算 —— 先确认、后收到矛盾种子的番会永久停在错状态，
-            # 而它仍显示"追番中"、集去重照常生效。只报不改（自动改会停掉整部番的自动下载）。
-            for _w in anime.suspect_wrong_binding():
-                _eps = "、".join(str(e) for e in _w["eps"])
-                _tot = f"共 {_w['total']} 集" if _w["total"] else "集数未知"
-                warn_banner(
-                    f"『{_w['name']}』(#{_w['id']}，bgm {_w['bgm']}，第 {_w['season']} 季·{_tot})"
-                    f" 下面有 {_w['bad']} 条种子的集号不可能属于所绑的这一季"
-                    + (f"（如第 {_eps} 集）" if _eps else "")
-                    + "——多半是 bgm 绑错了季。去详情页核对绑定；"
-                    "或者那批种子本就属于别的季，删掉它们即可。"
-                    "在这之前，它们会一直占着集去重、挡住真正的本季集。")
+            if _al["acked"]:
+                _gone = sum(1 for r in _al["acked"] if r["state"] == "gone")
+                with ui.row().classes("items-center gap-2 pl-1"):
+                    ui.label(f"已读的提示 {len(_al['acked'])} 条"
+                             + (f"（其中 {_gone} 条现在已经不成立了）" if _gone else "")
+                             ).classes("text-sm text-gray-400")
+                    ui.button("查看", icon="inbox", on_click=_open_acked).props(
+                        "flat dense").classes("btn-sm")
 
             # ── 订阅源组 ──
             ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
@@ -792,6 +771,67 @@ def anime_page(t: str = ""):
             _open_torrent_list(
                 "特别篇 / 未知集", "特别篇·OVA 与批量打包/集号没解析出来的种子，后台一律不自动下。点番名进详情页、对准那一条点『下载』（或忽略）。",
                 anime.unknown_episode_rows)
+
+        def _ack_alert(f):
+            """把一条发现收进『已读的提示』。f 是 core.alerts.view() 里的一项。"""
+            def h():
+                alerts.ack(f["ident"], f["kind"], f["fact"], f["text"])
+                ui.notify("已收进『已读的提示』")     # 只说已经发生的事，不预告"以后不会再看到"
+                overview_head.refresh()
+            return h
+
+        def _open_acked():
+            """『已读的提示』列表。
+
+            【必须是对话框，不能是就地展开】仪表盘的 overview_head 每 30 秒被
+            `ui.timer` 重建一次（见本文件底部）。放一个 ui.expansion 在里面的话，
+            用户展开去点『取消已读』，最多 30 秒就被合上 —— R27 已经为完全同构的
+            bug 付过一次学费（见 manage_panel 那段 docstring）。对话框活在
+            client.layout 上，不受面板重建影响。
+            """
+            list_dlg.clear()
+            rows = alerts.view()["acked"]
+            with list_dlg, ui.card().classes("w-full").style("max-width:720px"):
+                ui.label(f"已读的提示 · {len(rows)}").classes("text-base font-bold")
+                ui.label("这些是你点过『知道了』的巡检发现。它们的关键事实变了会自己回到上面 —— "
+                         "比如那条番从『超期忽略』变成『追番中』、改了 bgm 绑定、或者出问题的集号变了。"
+                         ).classes("text-xs text-gray-400")
+                if not rows:
+                    ui.label("（还没有收起过任何提示）").classes("text-gray-500 p-2")
+                for r in rows:
+                    with ui.column().classes("gap-0 w-full py-1").style(
+                            "border-bottom:1px solid rgba(255,255,255,.08)"):
+                        with ui.row().classes("items-center gap-2 w-full"):
+                            ui.badge(alerts.KINDS.get(r["kind"], r["kind"])).props("color=blue-grey")
+                            # 两句都是【此刻算出来的事实】，不写"已解决"——程序判不出用户是修好了还是删了
+                            ui.badge("现在仍然成立" if r["state"] == "fresh" else "现在已经不成立了"
+                                     ).props("color=blue-grey" if r["state"] == "fresh" else "color=green")
+                            ui.space()
+                            ui.button("取消已读", icon="undo",
+                                      on_click=_unack(r["ident"])).props("flat dense").classes("btn-sm")
+                        ui.label(r["summary"] or "—").classes("text-sm break-all")
+                        ui.label(f"标记于 {r['at'].strftime('%Y-%m-%d %H:%M')}").classes(
+                            "text-xs text-gray-500")
+                with ui.row().classes("items-center gap-3 w-full mt-1"):
+                    if any(r["state"] == "gone" for r in rows):
+                        ui.button("清掉已经不成立的", icon="delete_sweep",
+                                  on_click=_drop_gone).props("flat dense color=grey").classes("btn-sm")
+                    ui.space()
+                    ui.button("关闭", on_click=list_dlg.close).props("flat")
+
+        def _unack(ident):
+            def h():
+                alerts.unack(ident)
+                ui.notify("已取消已读，它回到了上面的提示里")
+                overview_head.refresh()
+                _open_acked()          # 就地重建列表，数字与行跟着变
+            return h
+
+        def _drop_gone():
+            n = alerts.drop_gone()
+            ui.notify(f"清掉了 {n} 条已经不成立的记录")
+            overview_head.refresh()
+            _open_acked()
 
         def _open_failed():
             _open_torrent_list(

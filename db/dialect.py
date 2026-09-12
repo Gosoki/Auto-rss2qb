@@ -65,6 +65,11 @@ _COL_LEN = {
     # MySQL 拦得住）。写入侧本来就 reason[:300]，定长 VARCHAR(300) 正好对上，没有截断风险。
     "animetorrent.fail_reason": 300,
     "movietorrent.fail_reason": 300,
+    # alert_ack 的三列同理（都是 NOT NULL DEFAULT ''，落 TEXT 会撞 MySQL 1101）。
+    # `ident` 不在这里：它参与唯一约束，由 _keyed_columns 自动按 _KEYED_LEN 给 VARCHAR(255)。
+    "alert_ack.kind": 16,
+    "alert_ack.fact": 1000,       # 最长的是 wrb 的坏集号集合，真库那条 24 个集号约 60 字符
+    "alert_ack.summary": 500,     # 横幅原话，中文长句
 }
 
 # 【写入侧要用到的列长】把上面那张表暴露出去：番名对照的键必须在【查询与插入两侧】按同一长度截断，

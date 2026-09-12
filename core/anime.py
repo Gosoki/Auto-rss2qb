@@ -522,12 +522,21 @@ def suspect_wrong_binding() -> list[dict]:
             if not _binding_looks_wrong_rows(a, rows):
                 continue
             bad = [t for t in rows if _episode_cannot_belong(a, t)]
+            _pos = {int(t.episode) for t in rows
+                    if isinstance(t.episode, (int, float)) and t.episode >= 1}
+            _bad_eps = {int(t.episode) for t in bad
+                        if isinstance(t.episode, (int, float)) and t.episode >= 1}
+            # 【trigger_eps 要把两条判据都覆盖】`_binding_looks_wrong_rows` 命中的可能是
+            # ① 集号不可能属于这一季，也可能是 ② total_episodes==1 却收到多个正片集号。
+            # 判据②命中时 bad 恒为空 —— 只拿坏集号当已读指纹的话，那一整类的指纹里
+            # 没有任何随事实变化的量，读过一次就**永远不会复活**（core/alerts 的指纹靠它）。
+            _trigger = set(_bad_eps)
+            if (a.total_episodes or 0) == 1 and len(_pos) > 1:
+                _trigger |= _pos
             out.append({"id": a.id, "name": display_of(a), "bgm": a.bangumi_id,
                         "season": a.season, "total": a.total_episodes,
-                        "bad": len(bad),
-                        "eps": sorted({int(t.episode) for t in bad
-                                       if isinstance(t.episode, (int, float))
-                                       and t.episode >= 1})[:8]})
+                        "bad": len(bad), "born": a.created_at, "trigger_eps": _trigger,
+                        "eps": sorted(_bad_eps)[:8]})
     return out
 
 
@@ -599,6 +608,9 @@ def suspect_movie_as_anime() -> list[dict]:
                 "a_state": ("追番中" if (a.confirmed and not a.rejected)
                             else "人工拒绝" if (a.confirmed and a.rejected)
                             else "超期忽略/待确认"),
+                # 原始位与出生时刻给 core/alerts 的已读指纹用（理由同 suspect_duplicate_anime）
+                "a_confirmed": bool(a.confirmed), "a_rejected": bool(a.rejected),
+                "a_born": a.created_at, "m_born": m.created_at,
                 "m": m.id, "m_name": m.display_name or m.title,
                 "an": len(s.exec(select(AnimeTorrent.id).where(
                     AnimeTorrent.anime_id == a.id)).all()),
@@ -654,10 +666,15 @@ def suspect_duplicate_anime() -> list[dict]:
             # 于是同 bgm_id 的两条会一直留着，正需要有人看见并到详情页走人工路径合并。
             # 两边都是 None 的那种同样要报：身份守卫全都要求 bangumi_id is not None，
             # 那一对没有任何人会去合，而原来那个等式对它恒成立、把最该报的一类静默跳过了。
+            # 【`*_born` 与 `*_confirmed` 是给 core/alerts 的已读指纹用的】前者是行的出生时刻
+            # （身份要靠它，因为 id 会被回收），后者是订阅态的原始位——展示串 `a_state` 那种
+            # 三态不是单射，拿它当指纹会漏掉"待确认 ↔ 超期忽略"这种真变化。理由见 core/alerts。
             out.append({"a": x, "b": y, "shared": sorted(t for t, _ in shared),
                         "a_name": display_of(ax), "b_name": display_of(ay),
                         "a_bgm": ax.bangumi_id, "b_bgm": ay.bangumi_id,
-                        "a_rejected": bool(ax.rejected), "b_rejected": bool(ay.rejected)})
+                        "a_rejected": bool(ax.rejected), "b_rejected": bool(ay.rejected),
+                        "a_confirmed": bool(ax.confirmed), "b_confirmed": bool(ay.confirmed),
+                        "a_born": ax.created_at, "b_born": ay.created_at})
     return out
 
 
@@ -1999,6 +2016,11 @@ async def sweep_idle() -> int:
     return len(stale)
 
 
+# 上一轮【通知过】的『绑定看着不对』番 id 集合。只在内存里：它回答的是"这条消息我说过了没有"，
+# 与 services.notify 的冷却同一性质（那边也是进程内的 _last_sent），重启后重新评估一遍是对的。
+_wb_notified: set = set()
+
+
 async def sweep_alerts() -> dict:
     """把"需要人工处理的积压"报一次：失败 / 停滞 / 待识别。返回各自的条数。
 
@@ -2034,7 +2056,12 @@ async def sweep_alerts() -> dict:
             return sorted(s.exec(select(model.id).where(model.status == status)))
         err_ids = (_ids(AnimeTorrent, "error"), _ids(MovieTorrent, "error"))
         stall_ids = (_ids(AnimeTorrent, "stalled"), _ids(MovieTorrent, "stalled"))
-    suspects = suspect_wrong_binding()      # 只读，自己开会话（与仪表盘用的是同一个函数）
+    # 【已读过滤要落在这里，不只落在仪表盘上】(R35) 三类发现里只有这一类有推送通道。
+    # 只让仪表盘认『知道了』的话，横幅没了而手机每 6 小时照旧响一次 —— 同一个决定只落一处，
+    # 正是本项目反复栽的那个形状。过滤走 core.alerts（判据/身份/指纹只有那一份）。
+    from core import alerts as _alerts           # 延迟导入：alerts 反过来 import 本模块
+    suspects = [w for w in suspect_wrong_binding()
+                if not _alerts.is_acked(_alerts.ident_of_wrb(w), _alerts.fact_of_wrb(w))]
 
     def _fingerprint(pair) -> str:
         """去重键：这一批到底是【哪几条】，而不是【有几条】。(R21)
@@ -2069,7 +2096,15 @@ async def sweep_alerts() -> dict:
     # "不让番【进入】追番中"的闸，没有一处对已确认的番重算 —— 于是先确认、后收到矛盾种子的
     # 那些番永久停在错状态（真库上 anime#6 挂着 24 条别季正片仍在追番中）。
     # 与失败/停滞同一套指纹去重：这一批没换人就不重复打扰。
-    if suspects:
+    # 【只在出现了"上一轮没通知过的那一条"时才发】(R35) 光按 id 集合换 key 是不够的：
+    # 用户点一次『知道了』会让集合从 {6,12,30} 变成 {12,30} —— 那是一个从没发过的新 key，
+    # 于是下一轮巡检**因为用户点了知道了而推一条新通知**（反向：取消已读会撞回刚发过的旧 key
+    # 被冷却静默）。集合变【小】从来不是"有新事情要你处理"，只有新成员才是。
+    # 这也正好把 _fingerprint 那段 docstring 的本意（"条数原地兜圈子也要说"）实现得更准：
+    # {a,b,c} → {a,b} → {a,b,d} 里的 d 是新成员，照常发。
+    global _wb_notified
+    _wb_ids = {x["id"] for x in suspects}
+    if suspects and (_wb_ids - _wb_notified):
         await notify_event(
             "backlog",
             "有 %d 部番的 bgm 绑定看着不对（集号不可能属于所绑的那一季）：%s。"
@@ -2077,6 +2112,7 @@ async def sweep_alerts() -> dict:
                 len(suspects), "、".join(f"#{x['id']}「{x['name']}」({x['bad']} 条)"
                                         for x in suspects[:4])),
             key=_fingerprint(([x["id"] for x in suspects], [])), cooldown=six_h)
+    _wb_notified = _wb_ids
     if stalls or m_stalls:
         await notify_event("stalled",
                            f"{_two_sides(stalls, m_stalls, '条种子长期无进度')}（qB 里可能没源了）",

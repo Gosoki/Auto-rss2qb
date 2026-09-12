@@ -55,6 +55,9 @@ def _sqlite_path(eng) -> str | None:
 
 # 业务表（判断一份备份里到底有没有番剧数据）。与 db.transfer.TABLE_ORDER 同一批表，
 # 但这里【故意不 import 它】：那边的顺序服务于外键，改动频繁；这里只需要"有没有"。
+# 【alert_ack 有意不在这张表里】这张清单回答的是"这份备份里到底**有没有番剧数据**"
+# （见下面 _peek 的长注释）。已读记录不是番剧数据：一份只有 alert_ack 的库该被判成"空的"，
+# 否则恢复流程会把它当成"有货"。加进来看着像"补齐"，实际是把那个判据弄松。
 _BUSINESS_TABLES = ("anime", "animetorrent", "movie", "movietorrent",
                     "sourcegroup", "anime_alias")
 

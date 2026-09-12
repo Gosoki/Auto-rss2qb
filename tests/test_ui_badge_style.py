@@ -309,6 +309,10 @@ _BUTTON_ROLES: dict[str, str] = {
     "flat dense color=primary +btn-sm": "行内次级操作，主色（重新下载 / 恢复 / 下载这一条）",
     "flat dense color=grey +btn-sm": "行内次级操作，灰（忽略 / 排除）",
     "flat dense color=negative +btn-sm": "行内危险操作（删这一集 / 这一版本的文件）",
+    # 【为什么这一档要单独有】(R35) 它长在 `warn_banner` 那个 amber 警告块**里面**，
+    # 是"就地把这条提示处置掉"的入口（『知道了』）。放 primary 蓝会在满块 amber 里割裂，
+    # 放无色档则读成"与正文同级"。颜色跟着它所在的块走，全站只有警告块这一处。
+    "flat dense color=amber +btn-sm": "警告块内的就地处置（横幅上的『知道了』）",
 
     # ── 图标按钮 ─────────────────────────────────────────────────
     "flat round dense": "面板级图标按钮（关掉整个详情面板）—— 与行内那档有意分两级",

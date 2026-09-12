@@ -310,10 +310,14 @@ def require_config_loaded() -> bool:
     return False
 
 
-def warn_banner(text: str) -> None:
+def warn_banner(text: str, action: tuple | None = None) -> None:
     """全站唯一的警告块：amber-400 文字 + 同色 12% 底 + Material warning 图标。
 
     需要用户注意的一律用这个块；图标由本函数出，文案里不要再带 ⚠️。
+
+    `action=(按钮文字, 图标, 回调)`：给"只报不改"那一类横幅配一个就地的处置入口；
+    不给就是原来的样子（另外 9 个调用点一个字都不用改）。**别再造第二个带按钮的横幅** ——
+    全站 10 处用的是同一个块，再抄一份就是"改了样式只改一处"的温床。
 
     【灰度只有两档，别再加第三档】（E-37，用户 2026-09-01 拍板"只剩下 2 种灰色就行"）
       · text-gray-400 —— 说明文、字段名、次要标签。默认用它。
@@ -330,7 +334,12 @@ def warn_banner(text: str) -> None:
         # 图标压到与 text-sm 同高(20px)并锁行高，才能跟首行文字齐平、也不被长文挤掉
         ui.icon("warning").classes("text-amber-400 shrink-0").style(
             "font-size:20px;line-height:20px")
-        ui.label(text).classes("text-sm text-amber-400 min-w-0")
+        # grow：把 action 按钮推到右端。不带 action 的调用点只是让文字块占满剩余宽度，外观不变。
+        ui.label(text).classes("text-sm text-amber-400 min-w-0 grow")
+        if action:
+            _lab, _icon, _cb = action
+            ui.button(_lab, icon=_icon, on_click=_cb).props(
+                "flat dense color=amber").classes("btn-sm shrink-0 self-start")
 
 
 def recent_table(rows, name_label: str, on_row_click=None) -> None:

@@ -22,6 +22,32 @@ class Setting(SQLModel, table=True):
     value: str = Field(default="")
 
 
+class AlertAck(SQLModel, table=True):
+    """用户对一条『只报不改』的巡检发现点过的『知道了』。判据与构造式见 core/alerts.py。
+
+    【为什么住业务库而不是 meta】它记的是"**这个业务库里**这一行我看过了"，ident 里就嵌着
+    anime.id / movie.id —— 那两个数只在某一个业务库内部有意义。项目里"用户说：这个别再显示"
+    的先例（`Anime.finish_optout`、种子的 `excluded` / `deleted` 终态）也全部落在业务行上。
+    住这里换来四件事：迁移整行搬走（TABLE_ORDER）、切库各自独立、备份恢复同步、id 有意义。
+    走 meta + `db.scoped_flag` 则相反：用户点一次『迁移数据』`data_identity` 就变，
+    数据一行没动而**全部已读复活** —— 那正是这个功能存在的理由。
+
+    `ident` 唯一：一条发现只有一条已读记录（重复点由 upsert 收敛）。
+    """
+    __tablename__ = "alert_ack"
+    __table_args__ = (UniqueConstraint("ident", name="uq_alert_ack_ident"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    kind: str = Field(default="")       # dup | mva | wrb，见 core/alerts.KINDS
+    # 身份：这一条**具体的发现**。变了＝另一条发现，本来就该重新显示。
+    ident: str = Field()
+    # 事实指纹：`k=v;k=v` 的人话串，与当前事实逐字不等就复活（并能逐字段讲出变了什么）
+    fact: str = Field(default="")
+    # 点『知道了』那一刻横幅上的原话。发现后来消失了，列表里还讲得清当时收的是什么。
+    summary: str = Field(default="")
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
 class SourceGroup(SQLModel, table=True):
     """一个订阅源组（字幕组）。worker 每轮据此重建源；策略/优先级可在 UI 改。"""
     __table_args__ = (UniqueConstraint("name", name="uq_sourcegroup_name"),)

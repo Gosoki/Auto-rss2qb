@@ -213,11 +213,14 @@ def _guard_every_session(monkeypatch):
 def clean_tables(testdb):
     """每个用例前清空业务表与内部标记，用例之间互不干扰。"""
     from sqlmodel import delete
-    from db.models import Anime, AnimeTorrent, AnimeAlias, Movie, MovieTorrent, Setting
-    _assert_throwaway(testdb.engine, "clean_tables（会 DELETE 六张业务表）")
+    from db.models import (AlertAck, Anime, AnimeTorrent, AnimeAlias, Movie, MovieTorrent,
+                           Setting)
+    _assert_throwaway(testdb.engine, "clean_tables（会 DELETE 七张业务表）")
     _assert_throwaway(testdb.meta_engine, "clean_tables 的 meta 侧")
     with testdb.get_session() as s:
-        for m in (AnimeTorrent, AnimeAlias, Anime, MovieTorrent, Movie):
+        # 【alert_ack 必须一起清】它是"用户说这条别再显示"的记录：留一行脏的，
+        # 下一个用例里那条告警就静默消失，而断言"告警在"的用例会**假绿**。
+        for m in (AnimeTorrent, AnimeAlias, Anime, MovieTorrent, Movie, AlertAck):
             s.exec(delete(m))
         s.commit()
     with testdb.get_meta_session() as s:
