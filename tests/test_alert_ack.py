@@ -425,3 +425,40 @@ def test_no_fingerprint_uses_a_display_string(kind):
             if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)}
     assert "a_state" not in keys, f"_{kind} 的指纹吃了展示串 a_state：{sorted(keys)}"
     assert keys, f"_{kind} 的指纹没有用到任何字段？"
+
+
+# ---------------------------------------------------------------- 端到端：真的去点那两个按钮
+
+_MAIN = "tests/render_main.py"
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_the_whole_loop_through_the_real_buttons(user, clean_tables, cfg):
+    """(R35 补) 真的点『知道了』→『查看』→『取消已读』，一路断言用户看得见什么。
+
+    【为什么必须有这一条】上面那些守卫全在 core 层，AST 那条只查了 `_open_acked` 用没用
+    `list_dlg` —— 而第一版把 `list_dlg.open()` 整个漏了：内容建好了、对话框没打开，
+    用户点『查看』**毫无反应**，18 条守卫一条都没红（真机上是用户报的）。
+    页面上的按钮只有真去点才测得到。
+    """
+    from nicegui import ui
+
+    cfg(QB_ENABLED=False)
+    _wrb_anime(clean_tables, title="绑错季的番")
+
+    await user.open("/?t=overview")
+    await user.should_see("多半是 bgm 绑错了季")          # 横幅在
+
+    user.find("知道了").click()
+    await user.should_not_see("多半是 bgm 绑错了季")      # 收起来了
+    await user.should_see("已读的提示 1 条")
+
+    user.find("查看").click()
+    # 【既断言内容、也断言对话框真的开着】只断言内容的话，未 open 的 dialog 内容仍在元素树里，
+    # 这条用例就会对"漏掉 open()"那个缺陷全绿 —— 正是它要防的那件事。
+    dlgs = [d for d in user.find(ui.dialog).elements if d.value]
+    assert dlgs, "点了『查看』，对话框没打开"
+    await user.should_see("绑错季的番")
+
+    user.find("取消已读").click()
+    await user.should_see("多半是 bgm 绑错了季")          # 立刻回到仪表盘

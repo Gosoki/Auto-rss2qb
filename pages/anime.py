@@ -818,6 +818,7 @@ def anime_page(t: str = ""):
                                   on_click=_drop_gone).props("flat dense color=grey").classes("btn-sm")
                     ui.space()
                     ui.button("关闭", on_click=list_dlg.close).props("flat")
+            list_dlg.open()      # 【别漏这一行】建完内容还要真的打开，否则点『查看』毫无反应
 
         def _unack(ident):
             def h():
