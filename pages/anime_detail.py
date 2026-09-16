@@ -120,8 +120,14 @@ async def maybe_relocate_anime(anime_id: int, old_path, after=None):
             ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
         return
     _extra = f"；另有 {len(arch)} 集已归档、无法代为移动（文件留在旧目录）" if arch else ""
-    if not await confirm("归档目录变了，移动已下文件？",
-                         f"{len(dl)} 集已下，移到新目录：{new_path}{_extra}",
+    # 两种来路两种话（R36 体检 logic-10）：目录真的变了 → "移到新目录"；目录没变、是盘上有 N 集落在别处
+    # （上次搬迁失败/被拒） → "搬回来"。后者正是 rows_in_wrong_dir 被抽出来的理由，以前算完就丢。
+    if new_path != old_path:
+        _title, _body = "归档目录变了，移动已下文件？", f"{len(dl)} 集已下，移到新目录：{new_path}{_extra}"
+    else:
+        _title, _body = ("有已下文件不在归档目录里，搬回去？",
+                         f"{len(stale)} 集的文件落在别处（上次没搬成），搬回当前归档目录：{new_path}{_extra}")
+    if not await confirm(_title, _body,
                          ok_label="移动文件", ok_icon="drive_file_move", ok_color="primary"):
         ui.notify("已更新记录，未移动文件（新集将下到新目录，旧文件留在原处）", type="warning")
         return
@@ -480,7 +486,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         ui.notify(f"版本限定『{v}』：只下原名含此词的版本（缺此版本的集不兜底）" if v
                   else "已取消版本限定", type="warning" if v else "positive")
 
-    async def _enrich(e=None):
+    async def _enrich(e):
         # 识别成功会写入 bgm 名/季号 → 归档目录随之改变，必须和绑定(_bind)、列表页那两条路径
         # 一样问一句要不要搬迁。剧场版侧的同名 _enrich 本来就是这么写的（pages/movies.py:213）；
         # 番剧详情页这条一直漏着，已下的集会被静默遗弃在旧目录、同一部番裂成两个文件夹。
@@ -494,7 +500,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                       type="positive" if ok else "warning")
             if ok:
                 await maybe_relocate_anime(anime_id, old_path, _after)
-        await busy_action(getattr(e, "sender", None), f"enrich:{anime_id}", _go, fail="识别失败")
+        await busy_action(e.sender, f"enrich:{anime_id}", _go, fail="识别失败")
 
     async def _bind():
         dlg = ui.dialog()

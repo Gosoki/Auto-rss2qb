@@ -130,8 +130,12 @@ async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
             ui.notify("归档目录已更新（无已下文件，新版本将下到新目录）", type="positive")
         return
     _extra = f"；另有 {len(arch)} 个版本已归档、无法代为移动（文件留在旧目录）" if arch else ""
-    if not await confirm("归档目录变了，移动已下文件？",
-                         f"{len(dl)} 个版本已下，移到新目录：{new_path}{_extra}",
+    if new_path != old_path:     # 两种来路两种话，理由见 pages/anime_detail.maybe_relocate_anime 同一处
+        _title, _body = "归档目录变了，移动已下文件？", f"{len(dl)} 个版本已下，移到新目录：{new_path}{_extra}"
+    else:
+        _title, _body = ("有已下文件不在归档目录里，搬回去？",
+                         f"{len(stale)} 个版本的文件落在别处（上次没搬成），搬回当前归档目录：{new_path}{_extra}")
+    if not await confirm(_title, _body,
                          ok_label="移动文件", ok_icon="drive_file_move", ok_color="primary"):
         ui.notify("已更新记录，未移动文件（新版本将下到新目录，旧文件留在原处）", type="warning")
         return
@@ -206,7 +210,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             else:
                 ui.button("忽略", icon="block", on_click=_reject).props(
                     "flat dense color=grey").classes("btn-sm")
-        ui.label(f"版本 / 种子（{len(ts)}）").classes("text-sm font-bold mt-2")
+        ui.label(f"版本（{len(ts)}）").classes("text-sm font-bold mt-2")
         if not ts:
             ui.label("（还没有种子）").classes("text-gray-500")
             return
@@ -268,7 +272,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         if refresh_outer:
             refresh_outer()
 
-    async def _enrich(e=None):
+    async def _enrich(e):
         # 走 busy_action：识别的时间预算是 120 秒，期间按钮毫无反应、用户会连点，
         # 于是并发跑好几轮并重复弹搬迁确认框（与番剧详情页同款理由）。
         async def _go():
@@ -279,7 +283,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                       type="positive" if ok else "warning")
             if ok:
                 await _maybe_relocate_movie(movie_id, old_path, _after)
-        await busy_action(getattr(e, "sender", None), f"mov-enrich:{movie_id}", _go, fail="识别失败")
+        await busy_action(e.sender, f"mov-enrich:{movie_id}", _go, fail="识别失败")
 
     async def _edit_year():
         """手动改归档年份 (E-33)。与番剧详情页的『编辑季度』对称，只是这里收的是【年份】。
@@ -325,7 +329,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         ui.notify(f"归档年份已改为 {v}", type="positive")
         await _maybe_relocate_movie(movie_id, old_path, _after)
 
-    async def _refresh_versions(e=None):
+    async def _refresh_versions(e):
         async def _go():
             r = await mov.refresh_movie_torrents(movie_id)
             if not r["ok"]:
@@ -335,7 +339,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             ui.notify(f"站上 {r['seen']} 个版本，新增 {r['added']} 个"
                       if r["added"] else f"站上 {r['seen']} 个版本，没有新的",
                       type="positive" if r["added"] else "info")
-        await busy_action(getattr(e, "sender", None), f"mov-refresh:{movie_id}", _go,
+        await busy_action(e.sender, f"mov-refresh:{movie_id}", _go,
                           fail="刷新版本失败")
 
     def _reject():
@@ -538,7 +542,7 @@ def movies_page(t: str = ""):
             return h
 
         def _bind_from_input(movie_id, inp):
-            async def h(e=None):
+            async def h(e):
                 bid = parse_bgm_id(inp.value or "")
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
@@ -558,12 +562,12 @@ def movies_page(t: str = ""):
                                           else "warning" if _rep.get("frozen") else "positive"))
                     if ok:
                         await _maybe_relocate_movie(movie_id, old_path, refresh_all)
-                await busy_action(getattr(e, "sender", None), f"mov-bind:{movie_id}", _go,
+                await busy_action(e.sender, f"mov-bind:{movie_id}", _go,
                                   fail="绑定失败")
             return h
 
         def _refail(movie_id):
-            async def h(e=None):
+            async def h(e):
                 # 与番剧侧的『重新识别』同一个形状：enrich_movie 走 bgm，同样是 120 秒预算，
                 # 同样会改名字/季度并可能触发搬迁确认。剧场版这边原来整条都没有防抖。
                 async def _go():
@@ -574,7 +578,7 @@ def movies_page(t: str = ""):
                               type="positive" if ok else "warning")
                     if ok:
                         await _maybe_relocate_movie(movie_id, old_path, refresh_all)
-                await busy_action(getattr(e, "sender", None), f"mov-refail:{movie_id}", _go,
+                await busy_action(e.sender, f"mov-refail:{movie_id}", _go,
                                   fail="重新识别失败")
             return h
 
@@ -632,7 +636,7 @@ def movies_page(t: str = ""):
         def overview_panel():
             ov = mov.overview()
             k = ov["kpi"]
-            # 影片维度四卡（粉字）与种子维度三卡（绿字）分组；数字保持语义色；待识别/已忽略点击跳 tab
+            # 影片维度四卡（单位：部）与版本维度四卡（单位：个）分组；数字保持语义色；待识别/已忽略点击跳 tab
             kpi_cards([("剧场版", k["total"], "", None),
                        ("已识别", k["matched"], "", None),
                        ("待识别", k["unmatched"], "red", lambda: tabs.set_value("fail")),
@@ -660,10 +664,10 @@ def movies_page(t: str = ""):
                     barline("未知年份" if yk == "未知" else f"{yk} 年",
                             tot, maxv, lw="w-36", text=f"{tot}")
 
-            # ── 种子状态 ──（剧场版逐版本人工下，无待确认/首选/备用概念，只列库态计数）
+            # ── 版本状态 ──（剧场版逐版本人工下，无待确认/首选/备用概念，只列库态计数）
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
-                ui.label("种子状态").classes("text-sm font-bold")
-                ui.label("各状态种子计数").classes("text-xs text-gray-400")
+                ui.label("版本状态").classes("text-sm font-bold")
+                ui.label("各状态版本计数").classes("text-xs text-gray-400")
             chips = [
                 ("已交付", ov["status"]["sent"], "green",
                  "已发送给 qB 的版本数（含仍在下的）。真正下完的看下方『已完成』"),
@@ -681,7 +685,7 @@ def movies_page(t: str = ""):
             ):
                 if ov["status"].get(_key):
                     chips.append((_lb, ov["status"][_key], _cl, _tip))
-            chips.append(("种子数", k["versions"], "blue-grey", "全部种子/版本数（各状态之和）"))
+            chips.append(("版本数", k["versions"], "blue-grey", "全部版本数（各状态之和）"))
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
                     b = ui.badge(f"{label} {val}").props(f"color={color}")
@@ -701,8 +705,9 @@ def movies_page(t: str = ""):
                 _sync.tooltip("立即向 qB 拉一次最新进度（不必等后台轮询）" if _qb_on
                               else "qB 未启用，去设置页开启后可同步")
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
-                ui.badge(f"已完成 {q['completed']}").props("color=green")
-                ui.badge(f"下载中 {q['downloading']}").props("color=blue")
+                ui.badge(f"已完成 {q['completed']}").props("color=green").tooltip(
+                    "qB 报告进度已满的版本数（真正下完的）")
+                ui.badge(f"下载中 {q['downloading']}").props("color=blue").tooltip("qB 里此刻正在下的版本数")
                 ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").tooltip(
                     "qB 里正在跟踪的种子数（已交付给 qB 的）")
                 if q["dlspeed"]:
@@ -735,7 +740,7 @@ def movies_page(t: str = ""):
                         "text-gray-500 text-sm")
                     return
                 if not rows:
-                    ui.label("暂无正在下载的种子").classes("text-gray-500 text-sm")
+                    ui.label("暂无正在下载的版本").classes("text-gray-500 text-sm")
                     return
                 with ui.column().classes("w-full gap-0"):
                     for r in rows:
@@ -749,7 +754,7 @@ def movies_page(t: str = ""):
 
         @ui.refreshable
         def recent_panel():
-            ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
+            ui.label("新入库（最近 50 个版本）").classes("text-sm font-bold mt-4 pl-1")
             rows = []
             for r in mov.recent_movie_rows(50):
                 text, color = _mov_live_status(r["status"], r["qb_state"], r["qb_progress"],
@@ -993,27 +998,36 @@ def movies_page(t: str = ""):
             reject_panel.refresh()
             sources_panel.refresh()
 
-        async def _qb_sync_now():
-            """『下载状态』的立刻刷新：主动向 qB 拉一次在下版本的进度，不必等后台轮询（对齐番剧页）。"""
+        async def _qb_sync_now(e):
+            """『下载状态』的立刻刷新：主动向 qB 拉一次在下版本的进度，不必等后台轮询（默认间隔可能上千秒）。
+
+            【走 busy_action】(R36 体检 ux-2) 这个按钮被按下的典型时机恰恰是"我觉得 qB 那边不对劲"，
+            也就是最可能走满 `_QB_TOTAL_TIMEOUT`（45 秒）的那一次 —— 以前从头到尾没碰过按钮元素，
+            同一行另外两个按钮都有反馈，只有它是 45 秒死键。异常也交给 busy_action 兜（fail=同步失败）。
+            """
             if not config.QB_ENABLED:
                 ui.notify("qB 未启用（去设置页开启『发送种子到 qB』）", type="warning")
                 return
             if engine.sync_busy(MovieTorrent):
-                ui.notify("已有一轮同步在跑，稍等片刻再看", type="info")   # 理由同番剧页
+                # 后台那一轮正在跑。不排队等它：sync 对"qB 里查不到的种子"要连续两轮 miss 才判死，
+                # 两轮压在一起会把宽限窗口抹平（见 engine._sync_locks）。这里直接告诉用户"已经在同步了"。
+                ui.notify("已有一轮同步在跑，稍等片刻再看", type="info")
                 return
-            try:
+
+            async def _go():
                 n = await mov.sync_qb_status(manual=True)
-            except Exception as e:                       # qB 连不上/超时：给可读提示，别掀翻页面
-                ui.notify(f"同步失败：{e}", type="negative")
-                return
-            overview_panel.refresh()
-            inflight_panel.refresh()
-            if n is None:
-                ui.notify("没能问到 qB（连不上或超时），本次一行都没改。"
-                          "检查设置页的 qB 地址与账号密码，或看日志页。", type="negative")
-            else:
-                ui.notify(f"已同步 {n} 个版本的进度" if n else "没有正在下载的版本",
-                          type="positive")
+                overview_panel.refresh()
+                inflight_panel.refresh()
+                if n is None:
+                    ui.notify("没能问到 qB（连不上或超时），本次一行都没改。"
+                              "检查设置页的 qB 地址与账号密码，或看日志页。", type="negative")
+                else:
+                    ui.notify(f"已同步 {n} 个版本的进度" if n else "没有正在下载的版本",
+                              type="positive")
+            # 先一句 toast 再转圈（核实意见）：这个按钮所在的面板每 30 秒被定时器重建，loading 只活到下一个
+            # tick；能盖住整段 45 秒的是 toast —— 与同页『刷新资料』的写法一致。
+            ui.notify("正在向 qB 拉最新进度…（qB 不通时最长约 45 秒）", type="info")
+            await busy_action(e.sender, "qb-sync-movie", _go, fail="同步失败")
 
         # ---- 标签 ----
         with ui.tabs().classes("w-full") as tabs:
@@ -1066,4 +1080,4 @@ def movies_page(t: str = ""):
             inflight_panel.refresh()
             recent_panel.refresh()   # overview tab 的第三块，进度数字同样会变（与番剧页同口径）
 
-        ui.timer(30.0, _refresh_live)
+        ui.timer(30.0, _refresh_live, immediate=False)   # 理由见 pages/anime.py 同一处（R36）

@@ -462,3 +462,117 @@ async def test_the_whole_loop_through_the_real_buttons(user, clean_tables, cfg):
 
     user.find("取消已读").click()
     await user.should_see("多半是 bgm 绑错了季")          # 立刻回到仪表盘
+
+
+async def test_wrong_binding_push_is_retried_when_it_did_not_go_out(clean_tables, cfg, monkeypatch):
+    """(R36 体检) 推送没送出去就不记账 —— 与 sweep_finished / sweep_idle 同口径。
+
+    第一版无条件记账：推送坏一次、限流丢一次，这条**新出现**的『绑定看着不对』就被永久吃掉，
+    只有重启或集合新增成员才会再说。
+    """
+    from core import anime as A
+    from services import notify
+
+    sent, answers = [], [False, True]
+
+    async def flaky_event(kind, text, key=None, cooldown=0):
+        sent.append(text)
+        return answers.pop(0) if answers else True
+    monkeypatch.setattr(A, "notify_event", flaky_event)
+    monkeypatch.setattr(A, "notify_enabled", lambda kind: True)
+    monkeypatch.setattr(A, "notify_cooldown_active", lambda *a: False)
+    cfg(NOTIFY_BACKLOG_MIN=999)
+    _wrb_anime(clean_tables)
+
+    notify._last_sent.clear(); A._wb_notified = set()
+    await A.sweep_alerts()                        # 第一轮：推送失败
+    assert sum("绑定看着不对" in t for t in sent) == 1
+    await A.sweep_alerts()                        # 第二轮：同一条仍在 → 必须再说一次
+    assert sum("绑定看着不对" in t for t in sent) == 2, "推送没送出去，第二轮却不再说了"
+    await A.sweep_alerts()                        # 第三轮：上一轮成功了 → 这回该静默
+    assert sum("绑定看着不对" in t for t in sent) == 2, "送出去之后还在重复说"
+
+
+async def test_a_member_that_vanished_during_a_failed_push_still_counts_as_new_when_it_returns(
+        clean_tables, cfg, monkeypatch):
+    """(核实意见) 推送没送出去时，已消失的成员也要从记账里剪掉 —— 否则它消失又复活（R35 的『复活』）时
+    还留在旧集合里、不算新成员，被静默。
+
+    形状：{A,B} 送达 → A 已读、C 出现、推送失败 → A 取消已读、C 已读 ⇒ 现在是 {A,B}，A 是回来的，必须再说。
+    """
+    from core import anime as A
+
+    sent, answers = [], [True, False, True]
+
+    async def flaky_event(kind, text, key=None, cooldown=0):
+        sent.append(text)
+        return answers.pop(0) if answers else True
+    monkeypatch.setattr(A, "notify_event", flaky_event)
+    monkeypatch.setattr(A, "notify_enabled", lambda kind: True)
+    monkeypatch.setattr(A, "notify_cooldown_active", lambda *a: False)
+    cfg(NOTIFY_BACKLOG_MIN=999)
+    ids = {t: _wrb_anime(clean_tables, title=t) for t in ("甲", "乙", "丙")}
+
+    def w_of(title):
+        return next(w for w in A.suspect_wrong_binding() if w["id"] == ids[title])
+
+    def ack(title):
+        w = w_of(title); alerts.ack(alerts.ident_of_wrb(w), "wrb", alerts.fact_of_wrb(w), "x")
+
+    def unack(title):
+        w = w_of(title); alerts.unack(alerts.ident_of_wrb(w))
+
+    def n_wrb():
+        return sum("绑定看着不对" in t for t in sent)
+
+    A._wb_notified = set()
+    ack("丙")
+    await A.sweep_alerts()                       # {甲,乙} 送达
+    assert n_wrb() == 1
+    ack("甲"); unack("丙")
+    await A.sweep_alerts()                       # {乙,丙}：丙是新成员 → 推送，但这次失败
+    assert n_wrb() == 2
+    unack("甲"); ack("丙")
+    await A.sweep_alerts()                       # {甲,乙}：甲是回来的 → 必须再说一次
+    assert n_wrb() == 3, "消失又复活的成员被当成『早就通知过』静默了（失败那一轮没剪掉它）"
+
+
+async def test_wrong_binding_push_retry_through_the_real_notify_machinery(clean_tables, cfg, monkeypatch):
+    """(核实意见) 上面两条 wrb 推送用例把 A.notify_event 整个替身掉了，对记账的三分支是瞎的。
+    这条只替身最底下的 `_send_once`，让 enabled / 冷却 / 限流全部真跑：
+      (a) 第 1 条发失败 → 下一轮重发，送达恰好 1 条；
+      (b) 之后『知道了』再『取消已读』、冷却过期 → 总送达仍是 1 条（不重造 R35 那条"取消已读反而收到推送"）。
+    """
+    from core import anime as A
+    from services import notify
+
+    delivered, answers = [], [False, True]
+
+    async def fake_send(message, base=""):
+        ok = answers.pop(0) if answers else True
+        if ok:
+            delivered.append(message)
+        return ok
+    monkeypatch.setattr(notify, "_send_once", fake_send)
+    cfg(NOTIFY_URL="http://push.local", NOTIFY_EVENTS=["backlog"], NOTIFY_BACKLOG_MIN=999)
+    notify._last_sent.clear(); notify.reset_state()
+    aid = _wrb_anime(clean_tables, title="绑错的番")
+    A._wb_notified = set()
+
+    await A.sweep_alerts()                                   # 第一次：底层发送失败
+    assert delivered == [], "第一次本该失败"
+    await A.sweep_alerts()                                   # 第二轮：必须重发且送达
+    assert sum("绑定看着不对" in m for m in delivered) == 1, delivered
+    await A.sweep_alerts()                                   # 第三轮：已通知过，静默
+    assert sum("绑定看着不对" in m for m in delivered) == 1
+
+    w = next(w for w in A.suspect_wrong_binding() if w["id"] == aid)
+    alerts.ack(alerts.ident_of_wrb(w), "wrb", alerts.fact_of_wrb(w), "x")
+    await A.sweep_alerts()                                   # 已读：集合空了
+    alerts.unack(alerts.ident_of_wrb(w))
+    await A.sweep_alerts()                                   # 取消已读：被 6 小时冷却挡下，且要记账
+    for k in list(notify._last_sent):
+        notify._last_sent[k] -= 7 * 3600                     # 冷却过期
+    await A.sweep_alerts()
+    assert sum("绑定看着不对" in m for m in delivered) == 1, \
+        f"取消已读 + 冷却过期后又推了一遍（R35 的回归）：{delivered}"

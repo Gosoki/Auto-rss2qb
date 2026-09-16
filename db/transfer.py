@@ -57,16 +57,22 @@ def same_database(a, b) -> bool:
 
 
 def count_rows(engine, tables=TABLE_ORDER) -> dict:
-    """各业务表的行数（表不存在记 0）。用于迁移前后比对与"目标库是否为空"的判断。"""
-    out = {}
-    insp = sa.inspect(engine)
-    with engine.connect() as conn:
-        for name in tables:
-            if not insp.has_table(name):
-                out[name] = 0
-                continue
-            out[name] = conn.execute(
-                sa.select(sa.func.count()).select_from(_table(name))).scalar_one()
+    """各业务表的行数（表不存在记 0）。用于迁移前后比对与"目标库是否为空"的判断。
+
+    【两次往返，不是 2N 次】(R36 体检) 原来逐表 has_table + 逐表 COUNT，7 张表 14 次往返，
+    跑在设置页的**同步构建路径**上（只为显示一句"N 行业务数据"）。SQLite 上不到 1 ms，
+    MySQL 上按 2.43 ms/往返算约 34 ms。现在：表名一次取齐在内存里判，COUNT 合成一条标量子查询。
+    返回值形状（{表名: 行数}，表不存在记 0）一字不变 —— 迁移前后的比对靠它。
+    """
+    have = set(sa.inspect(engine).get_table_names())
+    present = [n for n in tables if n in have]
+    out = {n: 0 for n in tables}
+    if present:
+        stmt = sa.select(*[sa.select(sa.func.count()).select_from(_table(n)).scalar_subquery().label(n)
+                           for n in present])
+        with engine.connect() as conn:
+            row = conn.execute(stmt).one()
+        out.update({n: int(row._mapping[n]) for n in present})
     return out
 
 

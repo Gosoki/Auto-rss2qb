@@ -14,6 +14,7 @@ from pages import layout as L
 
 class _Btn:
     """记录 props 调用的假按钮。"""
+    is_deleted = False      # 真元素有这个属性：busy_action 的 finally 只碰还活着的按钮（R36）
 
     def __init__(self):
         self.state = set()

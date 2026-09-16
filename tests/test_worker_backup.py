@@ -379,3 +379,93 @@ async def test_the_qb_sync_loop_drives_archiving_through_the_lock(clean_tables, 
     assert any("归档" in r for r in seen["blockers"]), (
         f"归档跑起来了，在途闸却没看见它：{seen['blockers']} —— "
         "驱动者绕过了 archive_round()，R27 补那把锁的理由当场作废")
+
+
+# ---------------- R36 体检：启动清扫抛异常，巡检协程不能整条死掉 ----------------
+
+async def test_run_sweep_survives_a_failing_startup_sweep(clean_tables, monkeypatch):
+    """(R36 体检 P2) 启动清扫抛一次异常，巡检协程不能整条死掉（而且要有日志）。
+
+    它是七条后台协程里唯一不在 try 里的非 sleep await；死掉之后残骸清扫/完结/断更/积压四段全没了，
+    进程生命周期内不恢复，且零日志（background_tasks 持强引用，Task.__del__ 永不执行）。
+    """
+    import asyncio
+    import logging
+
+    from core import worker as W
+
+    async def boom():
+        raise RuntimeError("库抖了一下")
+    rounds = []
+
+    async def fake_round():
+        rounds.append(1)
+    naps = []
+
+    async def fast_sleep(n):
+        naps.append(n)
+        if len(naps) >= 2:
+            raise asyncio.CancelledError()     # 跑完一轮就收工
+    monkeypatch.setattr(W, "sweep_leftovers_if_pending", boom)
+    monkeypatch.setattr(W, "sweep_round", fake_round)
+    monkeypatch.setattr(W.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(W.db, "is_data_down", lambda: False)
+    W._stale_sweep_pending = True
+    logged = []
+    monkeypatch.setattr(W, "loop_error", lambda what, e, **k: logged.append((what, e)))
+
+    task = asyncio.get_running_loop().create_task(W.run_sweep())
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert not (task.done() and not task.cancelled() and task.exception()), \
+        f"巡检协程因启动清扫的异常死掉了：{task.exception() if task.done() and not task.cancelled() else None}"
+    assert rounds, "启动清扫抛了异常之后，后面的巡检轮再也没跑"
+    assert logged and isinstance(logged[0][1], RuntimeError), "异常被吞了、没有日志"
+
+
+def test_a_dying_background_task_leaves_an_error_line():
+    """(R36 体检) 七条后台协程任何一条意外退出都要有一行 ERROR —— 以前是零日志（强引用让 __del__ 永不执行）。
+
+    不 import main（UI 用例把 NiceGUI 应用启动之后再 import main 会因加中间件而炸），不用 caplog：全量里跑到这儿时 'autorss' 日志器已经被别的用例/setup_logging 装配过，
+    经 root 传播的记录抓不稳；直接在 'autorss' 上挂一个 handler 最老实。
+    """
+    import asyncio
+    import logging
+
+    from core import worker as M
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.ERROR); self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    async def boom():
+        raise RuntimeError("库抖了一下")
+
+    async def run():
+        t = asyncio.get_running_loop().create_task(boom(), name="sweep")
+        t.add_done_callback(M.log_task_exit)
+        try:
+            await t
+        except RuntimeError:
+            pass
+        await asyncio.sleep(0)          # 让 done 回调跑完
+
+    grab, lg = Grab(), logging.getLogger("autorss")
+    lg.addHandler(grab)
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run())
+        finally:
+            loop.close()
+    finally:
+        lg.removeHandler(grab)
+    msgs = [r.getMessage() for r in grab.records]
+    assert any("sweep" in m and "意外退出" in m for m in msgs), (
+        f"协程死了却没有 ERROR：{msgs}（logger disabled={lg.disabled} level={lg.level} "
+        f"handlers={lg.handlers} root.level={logging.getLogger().level} manager.disable={logging.root.manager.disable}）")

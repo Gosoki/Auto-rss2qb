@@ -24,7 +24,7 @@ from core.logsetup import setup_logging
 from core.netguard import install as install_netguard
 from core import worker as worker_mod
 from core.worker import (init_business_state, run_backup, run_db_watch, run_movie_scan,
-                         run_qb_sync, run_reenrich_retry, run_sweep, run_worker)
+                         run_qb_sync, run_reenrich_retry, run_sweep, run_worker, log_task_exit)
 import db
 from db import apply_configured_backend, init_db
 
@@ -36,6 +36,7 @@ log = logging.getLogger("autorss")
 
 # 七条后台协程的句柄。理由见 on_startup 里的说明。
 background_tasks: list = []
+
 
 
 @app.on_startup
@@ -83,6 +84,8 @@ async def _startup():
         asyncio.create_task(run_backup(), name="backup"),        # 整库自动备份（独立频率；采集暂停/qB 掉线都不影响它）
         asyncio.create_task(run_sweep(), name="sweep"),          # 完结判定 + 断更提醒（回答"有没有【没发生】的事"）
     ])
+    for _t in background_tasks:
+        _t.add_done_callback(log_task_exit)   # 任何一条意外退出都留一行 ERROR（见 core.worker.log_task_exit）
 
 
 if __name__ in {"__main__", "__mp_main__"}:

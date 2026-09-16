@@ -1173,7 +1173,11 @@ def settings():
                 config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
                 # 通知的冷却/状态记忆是【进程内】的：不清的话，用户刚把某个事件勾上，
                 # 还要等冷却过期或状态再翻转一次才看得到效果——那看起来就像"设置没生效"。
-                notify.reset_state()
+                # 【只在真的改了 NOTIFY_* 时才清】(R36 体检) 以前保存任何一项（改个轮询间隔）都会把
+                # failed/stalled 的 6 小时冷却整个清掉 —— 下一轮巡检把同一批告警原样再推一遍。
+                # 同文件的『发送测试通知』按钮早就为此专门避开了 reset_state（见 reset_circuit）。
+                if any(k.startswith("NOTIFY_") for k in db_updates):
+                    notify.reset_state()
                 # 注：改开始使用日【不】自动重算已有番——由用户在设置里点『应用』按钮显式触发（更可控）
                 # qB 发送开着 → 保存后测一次连接：连不上就自动关掉开关（免得停在『开着却下不了』的迷惑态）
                 probe_failed = False

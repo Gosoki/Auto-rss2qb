@@ -257,8 +257,10 @@ class MovieTorrent(SQLModel, table=True):
     qb_progress_at: datetime | None = Field(default=None)  # 进度上次推进的时间；长期不推进→标停滞(异常)判定用
     archived_at: datetime | None = Field(default=None)  # 完成归档时间：已从 qB 移除(留文件)、不再跟踪；空=未归档
     # ---- 暂时性失败的自动重试（只给取种失败/关停中断，见 core.engine.RETRY_BACKOFF_MIN）----
-    retry_count: int = Field(default=0)     # 已重试次数；成功即清零，用满退避表就落 error 等人工
-    retry_at: datetime | None = Field(default=None)   # 早于此刻不重发（None=不在重试队列里）
+    # 【剧场版没有自动重试】这两列只为与 AnimeTorrent 同形而存在（engine._settle_as_delivered 一并清零），
+    # 恒为 0 / None：download_movie_torrent 失败即落终态、不排队重发（与 qb_size 同口径：留列不留行为）。
+    retry_count: int = Field(default=0)
+    retry_at: datetime | None = Field(default=None)
     fail_reason: str = Field(default="")    # 最近一次失败原因，详情页展示（成功即清空）
     # 【占位前的状态】(E-49) force 重下进锁时记下 status，交付成功/失败回写时清空。
     # 崩溃后行停在 downloading，sweep_stale_delivering 按它还原（None = 按老规矩落 pending）。

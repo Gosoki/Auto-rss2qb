@@ -16,7 +16,7 @@ from .layout import (busy_action, confirm, require_bind_confirm, ep_str, expand_
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, recent_table, season_label, source_options,
-                     warn_banner)
+                     warn_banner, poll_time_text, poll_stale)
 from .sources import render_sources
 
 
@@ -58,6 +58,8 @@ def anime_page(t: str = ""):
         # 【搜索词必须存在这里、不能只留在输入框控件上】面板是 @ui.refreshable，
         # 翻页/展开/详情弹窗关闭都会整体重建它，控件上的值会跟着没。
         manage_page = {"n": 1, "expand": None, "kw": ""}
+        confirm_page = {"expand": None}   # 待确认/已忽略也按季度分组、默认只开第一组：同样要一键展开（R36 ux-6）
+        reject_page = {"expand": None}
 
         def _manage_goto(e):
             manage_page["n"] = int(e.value)
@@ -119,7 +121,7 @@ def anime_page(t: str = ""):
             ps = ov["pending_split"]
 
             # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
-            # 番维度四卡（粉字）与种子维度四卡（绿字）各自打包，"|" 分组，窄了整组换行成上下布局；数字保持各自语义色
+            # 番维度四卡（单位：部）与种子维度四卡（单位：条）各自打包，"|" 分组，窄了整组换行成上下布局；数字保持各自语义色
             kpi_cards([("订阅中", k["tracking"], "", lambda: tabs.set_value("manage")),
                        ("待识别", k["fail"], "red", lambda: tabs.set_value("fail")),
                        ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm")),
@@ -324,8 +326,9 @@ def anime_page(t: str = ""):
                 _sync.tooltip("立即向 qB 拉一次最新进度（不必等后台轮询）" if _qb_on
                               else "qB 未启用，去设置页开启后可同步")
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
-                ui.badge(f"已完成 {q['completed']}").props("color=green")
-                ui.badge(f"下载中 {q['downloading']}").props("color=blue")
+                ui.badge(f"已完成 {q['completed']}").props("color=green").tooltip(
+                    "qB 报告进度已满的种子数（真正下完的）—— 上面『已交付』卡对照的就是它")
+                ui.badge(f"下载中 {q['downloading']}").props("color=blue").tooltip("qB 里此刻正在下的种子数")
                 ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").tooltip(
                     "qB 里正在跟踪的种子数（已交付给 qB 的）")
                 if q["dlspeed"]:
@@ -365,6 +368,26 @@ def anime_page(t: str = ""):
                     "后台每隔这么久抓一次源（设置页可改）")
                 ui.badge(f"缓冲窗口 {ov['config']['grace']}min").props("color=blue-grey").tooltip(
                     "一集首次发现后等这么久再下，给更高优先级的源补齐（设置页可改）")
+                # 【上次采集】(R36 体检 ux-5) 上面四枚全是配置的镜像，没有一枚说"实际发生过什么"：
+                # 6 条 feed 全 403 时仪表盘与正常时逐字相同。这两枚读的是 poll_once 每轮末写的运行时键
+                # （与剧场版页的 MOVIE_SCAN_LAST 同一条路），只有最近一轮，不做历史 —— 历史在日志里。
+                _pc = ov["config"]
+                _failed = _pc["poll_failed"]
+                _stale = poll_stale(_pc["poll_last"], _pc["poll"])
+                if not _pc["poll_last"]:
+                    _tip = "还没跑完过一轮采集"
+                else:
+                    _tip = f"上一轮采集结束于 {_pc['poll_last']}" + ("（全部源抓取成功）" if not _failed else "")
+                    if _pc["poll_ok_last"] and _pc["poll_ok_last"] != _pc["poll_last"]:
+                        _tip += f"；上次至少一个源抓到：{poll_time_text(_pc['poll_ok_last'])}"
+                    if _stale:
+                        _tip += (f"。已经超过两个轮询间隔（{_pc['poll']}s）没有完成新的一轮 —— "
+                                 "采集关着、业务库停摆、上一轮被维护打断都会这样")
+                ui.badge(f"上次采集 {poll_time_text(_pc['poll_last'])}").props(
+                    f"color={'red' if _stale else 'blue-grey'}").tooltip(_tip)
+                if _failed:
+                    ui.badge(f"{len(_failed)} 个源抓取失败").props("color=red").tooltip(
+                        "上一轮里这些源没抓到：" + "、".join(_failed) + " —— 原因看日志页的『抓取失败』行")
 
         @ui.refreshable
         def confirm_panel():
@@ -373,9 +396,11 @@ def anime_page(t: str = ""):
                 ui.label("没有待确认的番。（『待确认』策略的源组发现的番会出现在这里）").classes("text-gray-500 p-4")
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番查的 N+1
+            expand_collapse_bar(confirm_page, confirm_panel.refresh)
+            exp = confirm_page["expand"]   # None=只开第一组；True/False=一键全展开/收起
             for i, (q, items) in enumerate(group_by_quarter(pend)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                  value=(i == 0)).classes("w-full").props(remove="dense"):
+                                  value=(i == 0 if exp is None else exp)).classes("w-full").props(remove="dense"):
                     for a in items:
                         srcs = smap.get(a.id, [])
                         with ui.card().classes("w-full"):
@@ -411,9 +436,11 @@ def anime_page(t: str = ""):
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番 N+1
             dlmap = anime.downloaded_counts([a.id for a in rej])   # 同上：可删文件数也一次取齐
+            expand_collapse_bar(reject_page, reject_panel.refresh)
+            exp = reject_page["expand"]
             for i, (q, items) in enumerate(group_by_quarter(rej)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                  value=(i == 0)).classes("w-full").props(remove="dense"):
+                                  value=(i == 0 if exp is None else exp)).classes("w-full").props(remove="dense"):
                     for a in items:
                         with ui.card().classes("w-full"):
                             with ui.row().classes("items-center gap-3 flex-wrap"):
@@ -563,7 +590,8 @@ def anime_page(t: str = ""):
                 text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
                                           r["qb_synced_at"], r["qb_dlspeed"], in_plan, conf,
                                           episode=r["episode"],
-                                          auto_off=off_why.get(r["anime_id"], ""))
+                                          auto_off=off_why.get(r["anime_id"], ""),
+                                          retry_at=r.get("retry_at"))
                 rows.append({
                     "id": r["id"],
                     "detail_id": r["anime_id"],
@@ -896,7 +924,7 @@ def anime_page(t: str = ""):
             return h
 
         def _bind(anime_id, inp):
-            async def h(e=None):
+            async def h(e):
                 bid = parse_bgm_id(inp.value or "")
                 if bid is None:
                     ui.notify("请粘贴 bgm 链接或数字 ID", type="warning")
@@ -926,12 +954,12 @@ def anime_page(t: str = ""):
                                           else "warning" if _rep.get("frozen") else "positive"))
                     if ok:
                         await maybe_relocate_anime(anime_id, old_path, refresh_all)
-                await busy_action(getattr(e, "sender", None), f"bind:{anime_id}", _go,
+                await busy_action(e.sender, f"bind:{anime_id}", _go,
                                   fail="绑定失败")
             return h
 
         def _refail(anime_id):
-            async def h(e=None):
+            async def h(e):
                 # 走 busy_action：识别预算 120 秒，期间按钮无反应会被连点（同详情页理由）
                 async def _go():
                     old_path = anime.anime_save_path(anime_id)   # 同 _bind：识别成功会改归档目录
@@ -944,11 +972,11 @@ def anime_page(t: str = ""):
                               type="positive" if ok else "warning")
                     if ok:
                         await maybe_relocate_anime(anime_id, old_path, refresh_all)
-                await busy_action(getattr(e, "sender", None), f"refail:{anime_id}", _go,
+                await busy_action(e.sender, f"refail:{anime_id}", _go,
                                   fail="识别失败")
             return h
 
-        async def _download_all(e=None):
+        async def _download_all(e):
             # 【补下全部要防重入】它可能跑几十秒，而同文件 758 行的『重新识别』早就有现成写法。
             # 连点会叠出多轮并发补下：同一集被多轮各挑一次候选，qB 侧靠 409 兜着，
             # 但日志与"已触发 N 集"的数字会变得没法解释。
@@ -956,10 +984,15 @@ def anime_page(t: str = ""):
                 n = await anime.download_all_pending()
                 refresh_all()   # 含 manage_panel，好让季度小结的已下/待下计数也即时更新
                 ui.notify(f"已触发补下 {n} 集", type="positive")
-            await busy_action(getattr(e, "sender", None), "download-all", _go, fail="补下失败")
+            await busy_action(e.sender, "download-all", _go, fail="补下失败")
 
-        async def _qb_sync_now():
-            """『下载状态』的立刻刷新：主动向 qB 拉一次在下种子的进度，不必等后台轮询（默认间隔可能上千秒）。"""
+        async def _qb_sync_now(e):
+            """『下载状态』的立刻刷新：主动向 qB 拉一次在下种子的进度，不必等后台轮询（默认间隔可能上千秒）。
+
+            【走 busy_action】(R36 体检 ux-2) 这个按钮被按下的典型时机恰恰是"我觉得 qB 那边不对劲"，
+            也就是最可能走满 `_QB_TOTAL_TIMEOUT`（45 秒）的那一次 —— 以前从头到尾没碰过按钮元素，
+            同一行另外两个按钮都有反馈，只有它是 45 秒死键。异常也交给 busy_action 兜（fail=同步失败）。
+            """
             if not config.QB_ENABLED:
                 ui.notify("qB 未启用（去设置页开启『发送种子到 qB』）", type="warning")
                 return
@@ -968,21 +1001,23 @@ def anime_page(t: str = ""):
                 # 两轮压在一起会把宽限窗口抹平（见 engine._sync_locks）。这里直接告诉用户"已经在同步了"。
                 ui.notify("已有一轮同步在跑，稍等片刻再看", type="info")
                 return
-            try:
+
+            async def _go():
                 n = await anime.sync_qb_status(manual=True)
-            except Exception as e:                       # qB 连不上/超时：别让异常掀翻页面，给个可读提示
-                ui.notify(f"同步失败：{e}", type="negative")
-                return
-            _refresh_overview(charts=False)              # 刷计数区，不重建环图（保住图例排除态）
-            inflight_panel.refresh()                     # 『正在下载』列表的进度条也跟着更新
-            if n is None:
-                # 【None ≠ 0】没能问到 qB（连不上/超时）。上面那个 except 接不住它：
-                # 整条链从头到尾不抛异常（理由见 engine.sync_qb_status 的三态说明）。
-                ui.notify("没能问到 qB（连不上或超时），本次一行都没改。"
-                          "检查设置页的 qB 地址与账号密码，或看日志页。", type="negative")
-            else:
-                ui.notify(f"已同步 {n} 条种子的进度" if n else "没有正在下载的种子",
-                          type="positive")
+                _refresh_overview(charts=False)              # 刷计数区，不重建环图（保住图例排除态）
+                inflight_panel.refresh()                     # 『正在下载』列表的进度条也跟着更新
+                if n is None:
+                    # 【None ≠ 0】没能问到 qB（连不上/超时）。busy_action 的 except 接不住它：
+                    # 整条链从头到尾不抛异常（理由见 engine.sync_qb_status 的三态说明）。
+                    ui.notify("没能问到 qB（连不上或超时），本次一行都没改。"
+                              "检查设置页的 qB 地址与账号密码，或看日志页。", type="negative")
+                else:
+                    ui.notify(f"已同步 {n} 条种子的进度" if n else "没有正在下载的种子",
+                              type="positive")
+            # 先一句 toast 再转圈（核实意见）：这个按钮所在的面板每 30 秒被定时器重建，loading 只活到下一个
+            # tick；能盖住整段 45 秒的是 toast —— 与同页『刷新资料』的写法一致。
+            ui.notify("正在向 qB 拉最新进度…（qB 不通时最长约 45 秒）", type="info")
+            await busy_action(e.sender, "qb-sync-anime", _go, fail="同步失败")
 
         _reident_busy = {"v": False}   # 防抖：整轮 bgm 遍历可能跑几分钟，期间连点会叠出多轮并发请求
 
@@ -1096,4 +1131,7 @@ def anime_page(t: str = ""):
         tabs.on_value_change(_on_tab)
         _build_tab(start)   # 构建首屏 tab
 
-        ui.timer(30.0, refresh_timer)  # 只刷当前可见 tab 的实时区（见 refresh_timer）
+        # 【immediate=False】(R36 体检) NiceGUI 的 ui.timer 默认 immediate=True：回调在浏览器 socket 握手
+        # 那一刻就跑一次，而页面内容几十毫秒前刚构建完 —— 实测那一次把 34 条 SQL / 157 ms 的仪表盘
+        # 逐字重建了第二遍（前后 DOM 归一后完全相同）。首屏由构建给，定时器只管之后的 30 秒一刷。
+        ui.timer(30.0, refresh_timer, immediate=False)  # 只刷当前可见 tab 的实时区（见 refresh_timer）

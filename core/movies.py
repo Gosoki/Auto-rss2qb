@@ -61,6 +61,10 @@ def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
         return
     if keeper is not None and loser is not None:
         keeper.rejected = keeper.rejected or loser.rejected
+        # 季度：keeper 尚未落盘而 loser 已有在下/已下文件时采用 loser 的季度（与 _merge_anime 同一条护栏，
+        # R36 体检 logic-7 补齐）—— 否则合并后新版本去了 keeper 的年份目录，与已落盘的旧版本散在两处。
+        if loser.quarter and not _has_handled_torrents(s, keeper_id) and _has_handled_torrents(s, loser_id):
+            keeper.quarter = loser.quarter
         s.add(keeper)
     for t in s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == loser_id)):
         t.movie_id = keeper_id
@@ -837,8 +841,9 @@ def set_quarter(movie_id: int, quarter: str) -> bool:
 def movie_save_path(movie_id: int) -> str | None:
     """该剧场版当前的归档目录（build_save_path 结果：[子目录]/[季度]/片名）；算不出返回 None。
 
-    与 download_movie_torrent 【同口径】：都走 _movie_folder(m, 最新种子行)。缺 bgm 元数据时都回退种子原始标题，
-    故显示/relocate 目标与实际落地一致（B3）。剧场版不建 Season 子目录。
+    与 download_movie_torrent 同走 _movie_folder(m, t)，但 t 不同：这里是【最新种子行】，下载入口是【正在交付的
+    那一条】。已识别的片两者一致；缺 bgm 元数据时各自回退到自己那条种子的原始标题，不同版本可能落到不同目录 ——
+    B3 的承诺只对已识别的片成立（同番剧侧，见 DECISIONS E-62）。剧场版不建 Season 子目录。
     """
     with get_session() as s:
         m = s.get(Movie, movie_id)
@@ -911,6 +916,7 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
             info_hash = t.info_hash
             quarter = (m.quarter if m else "") or "unknown"
             folder = _movie_folder(m, t)   # 与 movie_save_path 同口径（B3）
+            version = f"{t.source} · {(t.raw_title or '')[:40]}"   # 推送里区分"是哪个版本"（R36 notify-7），还在会话里取
 
     # 与番剧侧对齐：失败不无条件写 error。终态(deleted/excluded)重下失败降级成 error 会丢掉
     # 『用户已处理』的语义；已归档重下失败降级则让那份仍在盘上的旧文件脱离 HAVE_STATUSES，
@@ -989,7 +995,7 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
     # 而且批量下 30 个版本 = 30 条不可关、不限流的推送。
     # 事件键是 'movie' 而不是 'delivered'：见 services/notify.EVENTS 里的说明。
     # 图标由事件表给（🎬），这里不再自己拼。
-    await notify_event("movie", folder)
+    await notify_event("movie", f"{folder}（{version}）")
     return True
 
 

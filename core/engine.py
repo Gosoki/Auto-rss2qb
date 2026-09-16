@@ -131,7 +131,9 @@ def in_flight(label: str):
 
 def in_flight_labels() -> list[str]:
     """当前登记着的页面工作（带计数），给 maintenance_blockers 与用例用。"""
-    return [f"{k}×{v}" if v > 1 else k for k, v in sorted(_in_flight.items())]
+    # tuple() 先快照：设置页把 maintenance_blockers 丢进 run.io_bound 的线程跑，事件循环那头正在增删登记，
+    # 直接遍历 dict 会 "changed size during iteration"（R36 体检 latent-3）
+    return [f"{k}×{v}" if v > 1 else k for k, v in sorted(tuple(_in_flight.items()))]
 
 
 async def wait_until_quiet(timeout: float = 30.0, poll: float = 0.5) -> list[str]:
@@ -263,7 +265,7 @@ def maintenance_blockers() -> list[str]:
     `db.maintenance()` 那把闸挡得住维护【期间】的读写，挡不住"await 跨过整个维护窗口、
     维护结束之后才回写"这一种。所以维护开始【之前】必须先确认没有这类协程在半途 ——
     这就是本函数。判据全部复用现成的、本来就在维护的信号，不新造状态：
-      · `status == "downloading"` 的行 ＝ 交付协程正在半途（进锁即置、成败都会自己写回）
+      · `_delivering` 里的登记 ＝ 交付协程正在半途（`with engine.delivering(...)`，注销由语言保证）
       · `sync_busy(...)`           ＝ qB 同步有一轮在 await 中
       · 两把轮次锁被持有 ＝ 采集轮 / 剧场版扫描轮正在半途 —— **它们同样跨 await 持主键**：
         `process_item` 里 `anime_id = await _resolve_anime(item)`（enrich 预算 120 秒）
@@ -272,44 +274,31 @@ def maintenance_blockers() -> list[str]:
         采集轮卡在 enrich 的 await 上时闸放行，切库之后种子带着旧库的主键写进了新库）。
         收进判据之后，调用方不必再记得任何事。
 
-    【库连不上时，只跳过那两条 COUNT，内存里的信号照列】(R22 定、R33 改)
+    【本函数不读库：四类信号全是内存里的】(R22 定、R33 改、R36 收口)
     `switch_data_engine` 的 docstring 明写"切回本地 SQLite"是 fatal/停摆时的**唯一自救出口**
-    （"至少要让连接层回到本地，好让用户看得到设置页"）。而本函数要对着 `db.engine` 发两条 COUNT ——
-    正是那台连不上的 MySQL。R22 的第一版没接异常：MySQL 一挂，这个新加的预检就把自救出口堵死了
-    （实测弹"切换失败"，engine 一步都没动）。R22 于是在 except 里整个 `return []`。
-    R33 对抗审计的探针打穿了它：**锁 / sync_busy / in_flight 是内存信号，与库能不能读无关**，
-    却被一起吞掉 —— MySQL 抖动时用户走自救出口，此刻一个页面操作正停在 qB 的 await 上（删除 45s、
-    绑定 bgm 120s），三道预检全拿到 []，切库放行，await 回来后按 MySQL 的主键把 `deleted`
-    写进了 SQLite 的另一行。"库都连不上，本来也不可能有在途交付"这句只对 COUNT 那一段成立。
-    现在：COUNT 读不了就跳过它（自救出口在没有在途工作时照样开着），内存信号一条不少。
+    （"至少要让连接层回到本地，好让用户看得到设置页"）。R22 的第一版对着 `db.engine` 发 COUNT 数
+    downloading 行 —— 正是那台连不上的 MySQL，一挂就把自救出口堵死；R22 在 except 里整个 `return []`，
+    R33 的探针又打穿了它：锁 / sync_busy / in_flight 是内存信号，与库能不能读无关，却被一起吞掉 ——
+    MySQL 抖动时一个页面操作正停在 qB 的 await 上，三道预检全拿到 []，切库放行，await 回来后按
+    MySQL 的主键把 `deleted` 写进了 SQLite 的另一行。R33 改成"COUNT 读不了就只跳过它"。
+    R36 体检再进一步：交付中的协程本来就登记在 `_delivering`（R35 起两条线都走 `with delivering(...)`），
+    状态列只是登记的影子 —— 别的写入点一改它闸就瞎（settle_inflight_off 就曾这样），而登记不会。
+    于是在途交付直接数登记，函数从此不碰业务库，"库连不上"这一整类顾虑不复存在。
     代价：在途工作跑完之前（页面操作 ≤ 180 秒；采集轮可能几分钟）自救出口会说"现在不能"——
     那正是它该说的：此刻切了，那个协程就会把旧库的主键写进新库。
     """
-    from sqlalchemy.exc import DBAPIError, SQLAlchemyError
-
     from db.models import AnimeTorrent, MovieTorrent
 
     reasons = []
-    try:
-        with get_session() as s:
-            for model_cls, what in ((AnimeTorrent, "番剧"), (MovieTorrent, "剧场版")):
-                # 【只数"真的有协程在管"的】落库的 downloading 里可能混着残骸
-                # （交付途中库抖了一下、回写没成功），而残骸永远不会消失 ——
-                # 只按状态列数的话，一条残骸就把切库/迁移永久拒死。见 _delivering 处的说明。
-                n = sum(1 for t in s.exec(select(model_cls.id).where(
-                    model_cls.status == "downloading")) if is_delivering(model_cls, t))
-                if n:
-                    reasons.append(f"有 {n} 条{what}种子正在交付中（取种最长 180 秒）")
-    except (SQLAlchemyError, DBAPIError) as e:
-        # 只跳过 COUNT 这一段，**不 return**：下面的锁 / sync_busy / in_flight 是内存信号，
-        # 库读不读得了都得列（理由见 docstring 的 R33 段）。交付中的行这里数不到，
-        # 但交付协程本身在 _delivering 里 —— 下面按它列。
-        log.info("在途预检读不了业务库（%s: %.80s）—— 跳过按状态列计数，只看内存里的信号",
-                 type(e).__name__, e)
-        for model_cls, what in ((AnimeTorrent, "番剧"), (MovieTorrent, "剧场版")):
-            n = sum(1 for k, _ in _delivering if k == model_cls.__name__)
-            if n:
-                reasons.append(f"有 {n} 条{what}种子正在交付中（取种最长 180 秒；库读不了，按本进程登记数的）")
+    # 【在途交付恒以 _delivering 为准，不再查状态列】(R36 体检) 以前先 COUNT status=downloading 的行、
+    # 再用 is_delivering 过滤，只在"库读不了"时才退到 _delivering。可状态列只是登记的**影子**：
+    # settle_inflight_off 这类写入点一旦把占位改成别的状态，闸就数不到那条协程了，而它还在 await 里。
+    # R35 起两条交付线都走 `with engine.delivering(...)`（注销由语言保证），_delivering 从此是唯一真相，
+    # 这里读它就够 —— 顺带这个函数不再碰业务库，"库连不上会不会堵死自救出口"那一整段顾虑也不复存在。
+    for model_cls, what in ((AnimeTorrent, "番剧"), (MovieTorrent, "剧场版")):
+        n = sum(1 for k, _ in tuple(_delivering) if k == model_cls.__name__)   # 快照：本函数常在 io_bound 线程里跑
+        if n:
+            reasons.append(f"有 {n} 条{what}种子正在交付中（取种最长 180 秒）")
     for model_cls, what in ((AnimeTorrent, "番剧"), (MovieTorrent, "剧场版")):
         if sync_busy(model_cls):
             reasons.append(f"{what}的 qB 状态同步正在跑")
@@ -691,11 +680,19 @@ def settle_inflight_off() -> int:
 
     off 之后 sync 内层循环不再运行(见 worker.run_qb_sync 的 while 条件)，这批『on 模式交付、进度未满』的行
     再无路径推进 → 会永久满足 _inflight_where、恒挂『正在下载』区、has_inflight 恒真。此处一次性落定，语义与
-    settle_sent/『off=发送即已下』一致。settle_sent 只对【新交付】单条生效，故切换时刻的旧行须靠这里兜。"""
+    settle_sent/『off=发送即已下』一致。settle_sent 只对【新交付】单条生效，故切换时刻的旧行须靠这里兜。
+
+    【交付中的占位行（downloading）不碰】(R36 体检) 它**有**路径推进 —— 它自己的协程：成功走 settle_sent
+    （此刻已是 off，正好落 sent+1.0），失败走 _fail。而 _inflight_where 的 TRACKED 含 downloading，
+    这里以前是全项目 8 处"旁人让路"里唯一漏掉的一处。后果有两层：① 占位一被改成 sent，
+    `maintenance_blockers` 就数不到它 —— 用户在同一个设置页先保存（关跟踪）再点『切库』，在途闸放行，
+    协程回来把旧库的主键写进新库；② 协程在取种的 await 里被杀时，残骸已是 sent+progress=1.0，
+    清扫再也看不见它：qB 里没有、盘上没有，库里记着"已下完"，那一集永久漏投且零告警。"""
     n = 0
     with get_session() as s:
         for model_cls in (AnimeTorrent, MovieTorrent):
-            for t in s.exec(select(model_cls).where(*_inflight_where(model_cls))):
+            for t in s.exec(select(model_cls).where(*_inflight_where(model_cls),
+                                                    model_cls.status != "downloading")):
                 # qb_synced_at 留空，理由同 settle_sent：它是归档倒计时的基准，而这里并没有
                 # 真的看到"下完"——写 now() 会让这批行在跟踪重新打开后被追溯归档、砍掉还在下的种子。
                 t.status, t.qb_progress, t.qb_state, t.qb_synced_at = "sent", 1.0, "", None
@@ -1310,6 +1307,10 @@ def _recheck_where(model_cls, states=None):
     """
     return (
         model_cls.status.in_(TRACKED_STATUSES),
+        # 交付中的占位行旁人让路（R36 体检）：rows 那一半在调用方 Python 里过滤了，补查这一半没有 ——
+        # 同一个不变式两边口径不一致（GLOSSARY 第②号形状）。E-49 之后占位段不再清旧的 qb_state，
+        # 一条 missingFiles/moving 的旧态会带进占位窗口，进了补查就可能被镜像分支改成 sent。
+        model_cls.status != "downloading",
         model_cls.qb_state.in_(list(states if states is not None else _QB_NEEDS_RECHECK)),
         or_(model_cls.qb_progress >= 1.0,
             func.coalesce(model_cls.qb_state, "").in_(_QB_SETTLED_LIST)),
@@ -1839,7 +1840,9 @@ def qb_summary(model_cls) -> dict:
         # 『已完成』按【进度满】判，不按 qB 态判：种子一到 100% 就脱离 in-flight、此后不再同步，
         # 其 qb_state 会永久冻结在最后一次同步到的值。开了 temp_path 时完成瞬间是 moving(搬运中)，
         # 若按做种态判就会把这些行永久算作『跟踪中但未完成』，仪表盘已完成数长期少记。进度是唯一可靠依据。
-        # 唯一例外 missingFiles：进度虽记着 1.0，但文件已从盘上消失，不该报成『已完成』（只在跟踪数里体现）。
+        # 排除 _QB_NEEDS_RECHECK（missingFiles + 7 个过渡态）：missingFiles 进度虽记着 1.0 但文件已从盘上消失，
+        # 不该报成『已完成』；过渡态（checking/moving/queued…）的 progress 本来就可能还没落定 ——
+        # 它们由 _recheck_where 无条件补查收敛，少记只持续一轮。两类都只在跟踪数里体现。
         completed = s.exec(select(func.count()).select_from(model_cls).where(
             model_cls.status.in_(TRACKED_STATUSES),
             model_cls.status != "downloading",

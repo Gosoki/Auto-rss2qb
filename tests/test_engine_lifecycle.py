@@ -685,8 +685,9 @@ def test_the_blocker_list_covers_every_lock_that_spans_an_await():
     assert known, "一把轮次锁都没找到，用例的前提坏了"
 
     src = inspect.getsource(ce.maintenance_blockers)
-    # 两条交付锁豁免：交付本身已经由 `status == "downloading"` 那一条判据覆盖
-    # （进锁即置位、成败都会自己写回），而这两把锁只在【无 await 的那一小段】里持有。
+    # 两条交付锁豁免：交付本身已经由 `_delivering` 登记覆盖（`with engine.delivering(...)` 整段包住
+    # inner，R36 起在途闸直接数登记、不再看 status 列 —— 状态列只是登记的影子，别的写入点一改它闸就瞎），
+    # 而这两把锁只在【无 await 的那一小段】里持有。
     # 番剧侧 core/anime.py 叫 _download_lock、剧场版侧 core/movies.py 叫 _dl_lock ——
     # 名字不一样这件事本身也记在 GLOSSARY 的对称实现那一节。
     exempt = {"_download_lock", "_dl_lock"}
@@ -697,37 +698,32 @@ def test_the_blocker_list_covers_every_lock_that_spans_an_await():
 
 
 def test_the_blocker_check_does_not_kill_the_escape_hatch(monkeypatch):
-    """库连不上时，在途预检必须返回空表而不是抛异常。
+    """库连不上时，在途预检必须照常返回而不是抛异常 —— 而且它根本不该去碰库。
 
     `switch_data_engine` 的 docstring 明写"切回本地 SQLite"是 fatal/停摆时的
     **唯一自救出口**（"至少要让连接层回到本地，好让用户看得到设置页"）。
-    而这个预检要对着 `db.engine` 发两条 COUNT —— 正是那台连不上的 MySQL。
-    第一版没接异常：MySQL 一挂，这个 R21 新加的预检就把自救出口堵死了
-    （实测弹『切换失败』，engine 一步都没动）。
-
-    库都连不上，本来也不可能有在途交付；真正的把关在 `db.maintenance(blocked_by=...)`。
+    R22 的第一版对着 `db.engine` 发 COUNT：MySQL 一挂，预检就把自救出口堵死了
+    （实测弹『切换失败』，engine 一步都没动）；R33 改成 COUNT 读不了就只跳过它。
+    R36 体检收口：在途交付直接数 `_delivering` 登记（状态列只是登记的影子），预检从此
+    是纯内存判断 —— 所以这里的判据从"走到了那个 except"改成"一次 get_session 都没调"。
+    变异：把 COUNT 加回去（called 变 1）或把结果改成 raise，都当场红。
     """
     from sqlalchemy.exc import OperationalError
 
     from core import engine as ce
 
+    called = {"n": 0}
+
     def boom():
+        called["n"] += 1
         raise OperationalError("SELECT 1", {}, Exception("Can't connect to MySQL server"))
 
     # 【必须打在 core.engine 上，不是 db 上】engine 是 `from db import get_session` 直接绑的名字，
-    # 打 db.get_session 根本不影响它 —— 第一版就是这么写的，于是 boom 一次都没被调用，
-    # 用例测的是"正常路径返回空表"，而那是恒真的。变异（把 return [] 改成 raise）没被抓到才发现。
+    # 打 db.get_session 根本不影响它 —— 早年第一版就是这么写的，于是 boom 一次都没被调用。
     monkeypatch.setattr(ce, "get_session", boom)
-    called = {"n": 0}
-    orig = boom
-
-    def counting():
-        called["n"] += 1
-        return orig()
-    monkeypatch.setattr(ce, "get_session", counting)
 
     assert ce.maintenance_blockers() == [], "库连不上时预检抛了异常，自救出口被堵死"
-    assert called["n"] == 1, "补丁没生效 —— 这条用例根本没走到那个 except"
+    assert called["n"] == 0, "在途预检又去读业务库了 —— 库连不上时它会把自救出口堵死"
 
 
 def test_migrate_does_not_take_the_locks_it_is_judged_by():
@@ -2186,3 +2182,76 @@ def test_run_sweep_consumes_the_pending_sweep_before_its_first_long_nap():
     assert consume is not None, "run_sweep 里没有 await sweep_leftovers_if_pending()"
     assert sleep is not None, "找不到那个长睡，守卫的前提坏了"
     assert consume < sleep, "欠着的残骸清扫排在长睡之后 —— 那一集要等一整轮巡检才补得下来"
+
+
+# ---------------- R36 体检：交付中的占位行，旁人一律让路 ----------------
+
+async def test_settle_inflight_off_leaves_a_delivering_placeholder_alone(clean_tables, cfg):
+    """(R36 体检 P2) 关跟踪那一下不能把交付中的占位改成 sent —— 它是全项目第 8 处让路点。
+
+    后果两层：① 占位一变 sent，在途闸就数不到它，同一设置页先保存再点『切库』会被放行；
+    ② 协程在取种 await 里被杀时残骸已是 sent+1.0，清扫看不见它，那一集永久漏投且零告警。
+    """
+    from core import engine as ce
+    from db.models import Anime, AnimeTorrent, Movie, MovieTorrent
+
+    cfg(QB_ENABLED=True, QB_SYNC_STATUS=True)
+    with clean_tables.get_session() as s:
+        a = Anime(title="T", season=1, confirmed=True)
+        m = Movie(title="M", quarter="2026")
+        s.add(a); s.add(m); s.commit(); s.refresh(a); s.refresh(m)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="a" * 40, raw_title="x", episode=1,
+                           status="downloading", prev_status="pending"))       # 交付中的占位
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="b" * 40, raw_title="y", episode=2,
+                           status="sent", qb_progress=0.4))                      # 真在下的
+        s.add(MovieTorrent(movie_id=m.id, info_hash="c" * 40, raw_title="z",
+                           status="downloading", prev_status="stalled"))
+        s.commit()
+        ph_a = s.exec(select(AnimeTorrent).where(AnimeTorrent.info_hash == "a" * 40)).one().id
+        ph_m = s.exec(select(MovieTorrent)).one().id
+
+    with ce.delivering(AnimeTorrent, ph_a), ce.delivering(MovieTorrent, ph_m):
+        assert ce.maintenance_blockers(), "前提：交付中，闸该说话"
+        assert ce.settle_inflight_off() == 1, "只该落定那条真在下的 sent 行"
+        with clean_tables.get_session() as s:
+            ta = s.get(AnimeTorrent, ph_a); tm = s.get(MovieTorrent, ph_m)
+            assert (ta.status, ta.prev_status) == ("downloading", "pending"), "番剧占位被改写了"
+            assert (tm.status, tm.prev_status) == ("downloading", "stalled"), "剧场版占位被改写了"
+        assert ce.maintenance_blockers(), "关跟踪之后在途闸失明了 —— 切库会被放行"
+
+
+def test_the_gate_counts_deliveries_from_the_registry_not_the_status_column(clean_tables):
+    """在途闸以 `_delivering` 为准：状态列只是登记的影子，别的写入点改了它，闸不能跟着瞎。"""
+    from core import engine as ce
+    from db.models import Anime, AnimeTorrent
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="T", season=1, confirmed=True)
+        s.add(a); s.commit(); s.refresh(a)
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="d" * 40, raw_title="x", episode=1,
+                           status="sent", qb_progress=1.0))     # 状态列已经不是 downloading
+        s.commit()
+        tid = s.exec(select(AnimeTorrent)).one().id
+    assert ce.maintenance_blockers() == []
+    with ce.delivering(AnimeTorrent, tid):
+        got = ce.maintenance_blockers()
+        assert any("交付中" in r for r in got), f"登记着却数不到：{got}"
+    assert ce.maintenance_blockers() == []
+
+
+def test_recheck_where_skips_the_delivering_placeholder(clean_tables):
+    """补查那一半也要让路：占位行带着旧的 missingFiles/moving 进补查，会被镜像分支改成 sent。"""
+    from core import engine as ce
+    from db.models import Anime, AnimeTorrent
+
+    with clean_tables.get_session() as s:
+        a = Anime(title="T", season=1, confirmed=True)
+        s.add(a); s.commit(); s.refresh(a)
+        for h, st in (("e", "missingFiles"), ("f", "moving")):
+            s.add(AnimeTorrent(anime_id=a.id, info_hash=h * 40, raw_title="x", episode=1,
+                               status="downloading", qb_state=st, qb_progress=1.0))
+        s.add(AnimeTorrent(anime_id=a.id, info_hash="g" * 40, raw_title="y", episode=2,
+                           status="sent", qb_state="missingFiles", qb_progress=1.0))   # 正向控制
+        s.commit()
+        picked = {t.info_hash[0] for t in s.exec(select(AnimeTorrent).where(*ce._recheck_where(AnimeTorrent)))}
+    assert picked == {"g"}, f"补查选中了交付中的占位行：{sorted(picked)}"

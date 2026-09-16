@@ -49,7 +49,10 @@ class ParsedItem:
 class Source:
     name = "base"
 
-    async def fetch(self) -> list[ParsedItem]:
+    async def fetch(self, content_cache: dict | None = None) -> list[ParsedItem]:
+        """取回并解析。content_cache 的语义见 RssSource.fetch —— 这是 worker.poll_once 调用的契约，
+        任何源类（含测试里的桩）都要收这个可选参数；poll_once 的宽 except 会把签名不匹配吞成
+        一行"抓取失败"，那个源就静默地永远 0 条（核实时实测）。"""
         raise NotImplementedError
 
 
@@ -137,13 +140,26 @@ class RssSource(Source):
         raise NotImplementedError
 
     # ---- 以下是两个源共用的全部逻辑 ----
-    async def fetch(self) -> list[ParsedItem]:
+    async def fetch(self, content_cache: dict | None = None) -> list[ParsedItem]:
+        """取回并解析 feed。
+
+        `content_cache`：**同一轮采集内**按 URL 复用取回的字节（{url: bytes}），由 worker.poll_once
+        每轮新建、轮末即弃。(R36 体检) 真库 6 个源组里有两对 feed URL 完全相同 —— 喵萌简中/繁中、
+        Mikan 兜底/后备 —— 只有 title_filter / subgroups 不同。以前每轮抓 6 次、其中 2 次是白打：
+        每天 144 次第三方请求、12 MB 出站、且采集轮多持 `_poll_lock` 约 2 秒/轮。
+        缓存的是**字节**不是解析结果：过滤（`_parse`）仍各组各跑，语义一个字不变。
+        """
         import config
         from services import fetch as _fetch
-        async with httpx.AsyncClient(**config.http_client_kwargs(30, url=self.rss_url)) as client:
-            # 走带上限+总超时的取回：feed 地址是用户填的、内容来自第三方，
-            # 裸 client.get + resp.content 既能被涓流响应永久挂住，也能被超大 body 撑爆内存
-            content = await _fetch.get_bytes(client, self.rss_url)
+        if content_cache is not None and self.rss_url in content_cache:
+            content = content_cache[self.rss_url]
+        else:
+            async with httpx.AsyncClient(**config.http_client_kwargs(30, url=self.rss_url)) as client:
+                # 走带上限+总超时的取回：feed 地址是用户填的、内容来自第三方，
+                # 裸 client.get + resp.content 既能被涓流响应永久挂住，也能被超大 body 撑爆内存
+                content = await _fetch.get_bytes(client, self.rss_url)
+            if content_cache is not None:
+                content_cache[self.rss_url] = content
         # 【解析整段丢线程】(R21) feedparser.parse 与随后的逐条 parse_title/candidate_names
         # 全是**纯 CPU 的同步代码**，跑在事件循环上。实测 980KB / 4000 条的 feed：
         # feedparser 971ms + 逐条解析 481ms = **连续阻塞 1.45 秒**（真实的 Mikan 长寿番组

@@ -112,8 +112,9 @@ ui.button.default_props("no-caps")
 # ---- 全站术语表：改文案前先看这里，UI 上同一个东西只能有一个叫法 ----
 #   TV 周更 → 「番剧」        （不用"动漫/动画/anime"）
 #   剧场版/OVA → 「剧场版」    （不用"电影/影片/OVA・剧场版"）
-#   一条可下载的种子 → 「种子」（剧场版侧历史上叫"版本"，见 docs 里待裁决项 Q9）
-#   status=pending → 「待下」  （剧场版侧显示成"可下载"，同上）
+#   一条可下载的种子 → 「种子」。剧场版侧【有意】叫「版本」（Q9 已定 B，见 docs/GLOSSARY.md §一）：
+#     一部剧场版真的有多个发布版本、逐个人工挑，与番剧"一集一份"语义不同，两侧不统一。
+#   status=pending → 「待下」  （剧场版侧显示成"可下载"，同一个区分）
 #   review 策略 → 「人工审核」  rejected → 「已忽略」  未匹配 bgm → 「待识别」
 #     ↑ 这一项曾经三个叫法：术语表写「未识别」、tab 与 KPI 用「待识别」、番剧卡片写「未匹配」。
 #       统一取「待识别」——tab、KPI、空状态文案、以及各处 tooltip 里的"去『待识别』手动绑定"都是它。
@@ -203,8 +204,9 @@ def barline(label, value, maxv, color="oklch(70.7% 0.165 254.624)", lw="w-32", t
 
 
 def kpi_cards(cards) -> None:
-    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') / (…, on_click) / (…, on_click, 标签色带深浅如'pink-300'), ...]；
-    给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签色用来把同类卡分组。
+    """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') / (…, on_click), ...]；
+    给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签一律 gray-400
+    （曾有第 5 元素"标签色"用来分组，全站没有一个调用点传过，R36 体检删掉 —— 分组只靠 "|"）。
     列表里放字符串 "|" 会把左右拆成两组：每组内卡等宽铺满、左右平衡（仿番剧列表 flex:1），够宽时并排，窄了整组换行成上下布局。"""
     groups: list[list] = [[]]
     for card in cards:
@@ -216,7 +218,6 @@ def kpi_cards(cards) -> None:
     def _card(card, grow: bool) -> None:
         label, val, hi, *rest = card
         on_click = rest[0] if rest else None
-        label_color = rest[1] if len(rest) > 1 else None   # 说明文字颜色，缺省灰
         c = ui.card().classes("items-center px-3 py-2" + (
             " cursor-pointer hover:bg-white/5" if on_click else ""))
         if grow:
@@ -236,8 +237,7 @@ def kpi_cards(cards) -> None:
                                            else "text-gray-500" if not val else "text-gray-400")
             ui.label(str(val)).classes(cls).style(  # 预留 5 位数宽度：数字增减时卡不抖、各卡等宽
                 "min-width:5ch;text-align:center;font-variant-numeric:tabular-nums")
-            ui.label(label).classes(
-                "text-xs " + (f"text-{label_color}" if label_color else "text-gray-400"))
+            ui.label(label).classes("text-xs text-gray-400")
         if on_click:
             c.on("click", on_click)
 
@@ -462,6 +462,33 @@ def platform_badge(obj) -> None:
         ui.badge(p).props("color=deep-purple").tooltip("bgm 判定的类型（非 TV）")
 
 
+def poll_time_text(iso: str) -> str:
+    """运行时键里的 ISO 时间 → 徽标短文案：今天只给 HH:MM，别的日子给 MM-DD HH:MM，空给『从未』。"""
+    if not iso:
+        return "从未"
+    try:
+        from datetime import datetime as _dt
+        t = _dt.fromisoformat(iso)
+    except ValueError:
+        return iso
+    return t.strftime("%H:%M") if t.date() == _dt.now().date() else t.strftime("%m-%d %H:%M")
+
+
+def poll_stale(iso: str, interval_s: int) -> bool:
+    """『上次采集』是不是已经陈旧：超过两个轮询间隔没有完成新的一轮。空（从未）不算陈旧 —— 那一格另有文案。
+
+    采集关着 / 业务库停摆 / 上一轮被维护打断（半轮不记）都会让时间戳冻住，这一格必须能变红，
+    否则"坏了"和"好着"又长得一模一样（核实意见）。
+    """
+    if not iso:
+        return False
+    try:
+        from datetime import datetime as _dt
+        return (_dt.now() - _dt.fromisoformat(iso)).total_seconds() > 2 * max(60, int(interval_s or 0))
+    except ValueError:
+        return False
+
+
 def ep_str(e) -> str:
     if e == -1:
         return "特别"
@@ -525,7 +552,7 @@ SEVERITY_COLOR = {"error": "red", "stalled": "deep-orange"}
 
 def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
                 qb_dlspeed=0, in_plan=None, confirmed=True, episode=None,
-                auto_off: str = "") -> tuple[str, str]:
+                auto_off: str = "", retry_at=None) -> tuple[str, str]:
     """新入库/正在下载：把一条种子压成 (文案, 徽标色)，复刻详情页那套阶梯。
 
     有 qB 实时态 → 『下载中 X% ↓速度』/『做种 100%』(完成绿、在下蓝)；否则 in_plan 非空(番剧)时
@@ -562,6 +589,10 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
                                   "grey" if auto_off == "已忽略" else "teal")
             if not confirmed:
                 return "待确认", "orange"
+            if retry_at:
+                # 暂时性失败排队中（retry_at 非空）：它仍是待下、也不在本轮计划里，但说它是『备用项』
+                # （同集已有更优版本）是错的 —— 详情页对同一行说的是『重试中』。(R36 体检 logic-5)
+                return "重试中", "orange"
             return ("将下载", "blue") if in_plan else ("备用项", "blue-grey")
         if status == "error":
             return ("失败·可补下", "orange") if in_plan else ("失败", "red")
@@ -742,6 +773,7 @@ _HEAD_BASE_CSS = (
     # 键盘用户永远打不开这个菜单（≥1024px 时汉堡是隐藏的，没有第二条路）。
     ".jumpdd .jumpmenu{display:none}"
     ".jumpdd:hover .jumpmenu,.jumpdd:focus-within .jumpmenu{display:block}"
+    ".jumpdd>[tabindex]:focus-visible{outline:2px solid rgba(255,255,255,.45);outline-offset:-2px;border-radius:6px}"
     ".jumplist{background:#1b1e24;border:1px solid rgba(255,255,255,.14);border-radius:8px;"
     "overflow:hidden;padding:4px 0;box-shadow:0 8px 24px rgba(0,0,0,.45)}"
     ".jumplist .jitem{display:block;padding:6px 18px;font-size:14px;line-height:1.5;"
@@ -941,6 +973,11 @@ async def _db_reconnect() -> None:
 #   · movies『立即扫描』——真正的并发保险在服务端 worker._scan_lock（页面级防抖挡不住
 #     后台自动扫描和第二个标签页），但按钮上的 loading 已经补上了。
 # 也就是说：**去重粒度不是"这一个按钮"的场合可以不用它，但 loading 一律要有**。
+# 【"一律要有"曾经有一半是假的】(R36 体检) 走 busy_action 的调用点里 8 个把处理器写成 `(e=None)`，
+# NiceGUI 因此不带参调用、e 恒 None、这里拿到 btn=None —— 去重与异常兜底都在，只有 loading 从没亮过，
+# 而现有 tests/test_ui_busy 测的是 busy_action 自己（传进来的 btn 是桩），对签名坑免疫。
+# 现在签名是 `(e)`，守卫是真点按钮看 _props（tests/test_health_r36）。更稳的写法是建按钮时把元素捕进
+# 闭包传进来、不依赖框架的签名嗅探（3.15 起 handle_event 加了 expect_args，说明那是内部细节）—— 待改。
 # 【为什么当初要收】站里本来有三种各自正确的写法，各自只落在一两处，
 # 而**十二个**同样耗时的按钮一件都没做：最长的是绑定 bgm / 重新识别那几个——
 # _RESOLVE_BUDGET 是 120 秒，期间按钮毫无反应，用户会连点，于是并发跑好几轮、
@@ -958,6 +995,12 @@ async def busy_action(btn, key: str, coro_fn, *, ok: str = "", fail: str = "操�
 
     【为什么不做成装饰器】这些处理器的参数五花八门（有的要 refresh 外层、有的要接着问
     搬迁确认），闭包传进来最省事，也不必改各处的签名。
+
+    【调用方的签名必须是 `async def h(e)`，不能是 `h(e=None)`】(R36 体检 ux-1) NiceGUI 的
+    `handle_event` 用 `helpers.expects_arguments(handler)` 决定传不传事件，判据是"有没有【无默认值】
+    的形参"：`(e=None)` 会被 `handler()` 不带参调用，`e` 恒为 None，这里拿到的 btn 就是 None ——
+    loading 那一支整段跳过，8 个 120~240 秒级的按钮按下去全都毫无反应。一个 `=None` 的差别。
+    守卫：tests/test_health_r36 按 AST 钉"把 e.sender 交给 busy_action 的处理器至少有一个无默认值形参"。
     """
     if _BUSY.get(key):
         ui.notify("上一次还没跑完，请稍候", type="info")
@@ -976,7 +1019,9 @@ async def busy_action(btn, key: str, coro_fn, *, ok: str = "", fail: str = "操�
         return None
     finally:
         _BUSY.pop(key, None)
-        if btn is not None:
+        # coro_fn 里常有 refresh 把这颗按钮所在的区整个重建（overview_tail 每 30 秒也会）：
+        # 旧元素已删就别再碰它（核实意见）。
+        if btn is not None and not btn.is_deleted:
             btn.props(remove="loading")
 
 
@@ -1030,8 +1075,10 @@ def frame(active: str = ""):
                 # 【鼠标悬浮即显示、移开即收起】，不用点击。不再单独设断点——整条内联导航已是 ≥1024 才出现，
                 # 窄屏时它和导航一起收进汉堡（汉堡菜单里已列了同样的外链），不会出现两边都够不着的空档。
                 with ui.element("div").classes("relative jumpdd"):
+                    # tabindex=0：触发行本身可聚焦，下面 CSS 里 `.jumpdd:focus-within` 那条兜底才是活的
+                    # —— 键盘 Tab 到它、或 ≥1024px 的触屏点一下（没有 hover）都能打开。(R36 体检 ux-7)
                     with ui.row().classes("items-center gap-0.5 text-sm px-2 cursor-pointer "
-                                          "text-gray-400 hover:text-white transition-colors"):
+                                          "text-gray-400 hover:text-white transition-colors").props("tabindex=0"):
                         ui.label("跳转到")
                         ui.icon("open_in_new").style("font-size:14px")
                     # jumpmenu 默认 display:none，父 .jumpdd:hover 时 display:block；pt-1 透明桥补触发行与菜单的缝。

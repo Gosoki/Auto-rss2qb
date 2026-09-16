@@ -5,6 +5,7 @@
 由 flush_ready_downloads 按『缓冲窗口 + 优先级』对每集只下一份。
 """
 import asyncio
+import functools
 import logging
 import re
 from collections import Counter
@@ -102,8 +103,33 @@ def _is_auto(kind: str) -> bool:
     return kind == "auto"
 
 
+def _ep_text(e) -> str:
+    """推送正文里的集号：整数集不带 .0，半集照实（3.5），特别篇/未知集用仪表盘同一套词。"""
+    if e is None:
+        return "?"
+    if e == -1:
+        return "特别篇"
+    if e < 0:
+        return "未知集"
+    return str(int(e)) if float(e).is_integer() else str(e)
+
+
+@functools.lru_cache(maxsize=1024)
 def _parse_date(s):
-    """把 'YYYY-MM-DD'(或 'YYYY-MM'/'YYYY') 解析成 date；解析不出返回 None。"""
+    """把 'YYYY-MM-DD'(或 'YYYY-MM'/'YYYY') 解析成 date；解析不出返回 None。
+
+    【带缓存】(R36 体检) `_binding_looks_wrong_rows` 对每一行种子调 `_episode_cannot_belong`，
+    后者第一句就是解析这部番的 air_date —— 同一个字符串有多少条种子就 strptime 多少遍，
+    仪表盘一次渲染 1636 次、约 33 ms（真库 100 番）。库里不同的 air_date 只有几十个，缓存后
+    `suspect_wrong_binding` 34 → 12 ms。输入是不可变的 str，返回 date 也不可变，缓存安全。
+
+    【装饰器只许在这一层，不许上飘】它是纯函数：唯一输入就是入参串，不读 config、不查库。
+    上面任何一层（`_aired_before_start` 体内读 `config.ANIME_START_DATE`、`binding_looks_wrong` 查库）
+    都不能加缓存 —— 缓存键会漏掉真实输入，改了开始使用日旧结论照旧返回，而现有用例一条都抓不到
+    （核实时实测）。守卫：tests/test_perf_r36 改 ANIME_START_DATE 后 `_aired_before_start` 必须翻转。
+    切库不用 cache_clear：str → date 的映射与哪个库无关。maxsize 别改成无上限的 functools.cache ——
+    设置页的输入校验也走这里，长驻进程不该有无界缓存。
+    """
     s = (s or "").strip()
     for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
         try:
@@ -1074,6 +1100,9 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
             # 季度/番名/季号统一由 _anime_path_parts 算（与 anime_save_path 同口径，B2）：季度/季号以 bgm 纠正后的
             # Anime 为准（种子行是入库快照、重识别后会过时；有下载时 keep_path 已锁死 a.quarter 与名字）；名字优先 bgm 日文原名。
             quarter, folder_name, season = _anime_path_parts(a, t)
+            # 推送正文用的名字在这儿定（还在会话里）：bgm 纠正后的展示名，没识别的番才退回种子解析名。
+            # (R36 体检 notify-6) 以前是 `t.anime_title[集号]`：同一部番三种写法、跨季同集号分不清。
+            shown = display_of(a) if a is not None else title
 
     # 失败落定态：从用户终态(deleted/excluded) force 重下若失败，恢复原终态而非 error——
     # 否则 deleted→error 会让该集不再含任何 _HANDLED 状态，被 _revive_orphaned_skipped 复活 skipped 兄弟、
@@ -1216,7 +1245,8 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
     else:
         engine.settle_sent(AnimeTorrent, torrent_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
     log.info("已加入qB - %s 第%s季 第%s集", title, season, episode)
-    await notify_event("delivered", f"{title}[{episode}]")
+    await notify_event("delivered", f"{shown} 第{season}季 第{_ep_text(episode)}集" if season
+                       else f"{shown} 第{_ep_text(episode)}集")
     return True
 
 
@@ -1449,7 +1479,10 @@ def overview() -> dict:
         "groups": [(g.name, g.site, g.policy, g.priority, g.enabled)
                    for g in sorted(groups, key=lambda g: -g.priority)],
         "config": {"qb": config.QB_ENABLED, "poll_on": config.ANIME_POLL_ENABLED,
-                   "poll": config.ANIME_POLL_INTERVAL, "grace": config.ANIME_DOWNLOAD_GRACE_MIN},
+                   "poll": config.ANIME_POLL_INTERVAL, "grace": config.ANIME_DOWNLOAD_GRACE_MIN,
+                   # 采集轮末写的运行时键（R36 ux-5）：上一轮结束 / 上次至少一个源抓到 / 上一轮没抓到的源名
+                   "poll_last": config.ANIME_POLL_LAST, "poll_ok_last": config.ANIME_POLL_OK_LAST,
+                   "poll_failed": [x for x in (config.ANIME_POLL_FAILED or "").split("\n") if x]},
         "qb": engine.qb_summary(AnimeTorrent),
     }
 
@@ -1561,6 +1594,7 @@ def recent_anime_rows(limit: int = 50) -> list[dict]:
         "qb_progress": t.qb_progress,
         "qb_synced_at": t.qb_synced_at,
         "qb_dlspeed": t.qb_dlspeed,
+        "retry_at": t.retry_at,          # 仪表盘 live_status 要靠它说『重试中』而不是『备用项』（R36 logic-5）
         "raw": t.raw_title or "",
     } for t in ts]
 
@@ -1785,6 +1819,12 @@ async def sweep_finished() -> int:
     UNSUB=off 时它也【永久退出断更巡检】，而用户不点那个按钮就永远好不了。
     所以每轮把两个方向都算一遍。finish_optout 的番两个方向都不碰（那是用户的显式意志）。
     """
+    # 【闩要在任何早退之前读】(R36 体检 logic-2) `_finish_backfilled()` 顺带做旧全局键 `_FINISH_BACKFILL_DONE`
+    # 的认领（db.adopt_legacy_flag：认到就改成带业务库身份的新名并删旧键）。以前它在两道早退之后
+    # （没候选 / 没命中没撤销），于是"从来没有过命中"的库永远不认领 —— 旧键一直躺在 meta 里，等哪天
+    # 切到另一个业务库、那边恰好有命中，就被那个库认走：一个从没回填过的库被当成回填过了，首批完结通知静默。
+    # 兄弟路径 sweep_idle 的同款闩也是先读后判（见那里）。
+    first_ever = not _finish_backfilled()
     with get_session() as s:
         # 【这里【绝不能】换成 subscribed_where()】看着像是同一个判据的手抄，其实不是：
         # subscribed_where 会在开了停订时附加 `finished_at IS NULL`，而本函数的候选集【必须】
@@ -1817,7 +1857,6 @@ async def sweep_finished() -> int:
     # 闩永远不落；等到季末某一轮真有 6 部同时完结时，那一轮被当成"首轮回填"整批静默，
     # finished_at 照写、停订照生效，用户一条通知都收不到。
     # 兄弟路径 sweep_idle 的同款闩是【无条件】落库的（见那里）。
-    first_ever = not _finish_backfilled()
     backfill = first_ever and len(hits) > 5
     now = datetime.now()
     done, undone = [], []
@@ -2105,14 +2144,25 @@ async def sweep_alerts() -> dict:
     global _wb_notified
     _wb_ids = {x["id"] for x in suspects}
     if suspects and (_wb_ids - _wb_notified):
-        await notify_event(
+        _wb_key = _fingerprint(([x["id"] for x in suspects], []))
+        ok = await notify_event(
             "backlog",
             "有 %d 部番的 bgm 绑定看着不对（集号不可能属于所绑的那一季）：%s。"
             "去详情页核对绑定，或删掉那批不属于本季的种子" % (
                 len(suspects), "、".join(f"#{x['id']}「{x['name']}」({x['bad']} 条)"
                                         for x in suspects[:4])),
-            key=_fingerprint(([x["id"] for x in suspects], [])), cooldown=six_h)
-    _wb_notified = _wb_ids
+            key=_wb_key, cooldown=six_h)
+        # 【没发出去就不记账】(R36 体检) `notify_event` 返回 False 有四种含义（没送出去 / 未订阅 /
+        # 被冷却 / 被限流），只有"没送出去"与"被限流"该下一轮重来 —— 与同文件 sweep_finished 的
+        # may_mark 同一口径。R35 第一版无条件记账，推送坏一次这条新告警就被永久吃掉。
+        if ok or not notify_enabled("backlog") or notify_cooldown_active("backlog", _wb_key, six_h):
+            _wb_notified = _wb_ids
+        else:
+            # 没送出去：新成员留着下轮再说，但已消失的成员要剪掉 —— 否则它消失又复活（R35 的『复活』）时
+            # 还留在旧集合里、不算新成员，被静默。（核实意见）
+            _wb_notified = _wb_notified & _wb_ids
+    else:
+        _wb_notified = _wb_ids          # 没有新成员：集合照旧同步（缩小时也要跟上，否则取消已读后不会再说）
     if stalls or m_stalls:
         await notify_event("stalled",
                            f"{_two_sides(stalls, m_stalls, '条种子长期无进度')}（qB 里可能没源了）",
@@ -2199,8 +2249,10 @@ def confirmed_anime_ids(ids) -> set:
 def auto_off_reasons(ids) -> dict:
     """给定番 id，返回 {id: 「为什么后台不会自动下它」}；会自动下的番不出现在结果里。
 
-    值取自 `pending_breakdown` 用的同一套词：『待确认』/『已忽略』/『已完结』。
-    **判序也与它一致**（未确认 → 已忽略 → 已完结），这样渲染侧与统计侧不会给出两种说法。
+    值域：『已忽略』/『待确认』/『已完结』。判序是 **rejected → not confirmed → finished**：
+    超期忽略是 (rejected=1, confirmed=0) 两位同时成立，必须先判 rejected 才与详情页
+    `not cur.confirmed and not cur.rejected → cur.rejected → cur.finished_at` 那三档对齐。
+    与 `pending_breakdown` 只在『已完结』这一档同源（那边没有『已忽略』档：被拒绝番的待下种子归『备用』）。
 
     【为什么需要它】`confirmed_anime_ids` 只回答"会不会下"，回答不了"为什么不下"。
     于是渲染侧只能把三种情况统统显示成『待确认』，并把用户指去『待确认』tab——
@@ -3176,7 +3228,9 @@ def _torrent_rows(*where) -> list[dict]:
 
 
 def unknown_episode_rows() -> list[dict]:
-    """待下里 episode==-2（批量/无法解析集号，flush 不自动下）的种子，供 KPI『未知集』点开手动处理。"""
+    """待下里 `episode < 0` 的种子（特别篇 -1 与 批量/未知集 -2，两类后台都不自动下），供 KPI『特别篇/未知集』
+    点开手动处理。口径必须与 pending_breakdown 的 unknown 桶（auto_downloadable_ep）一致 —— 卡片数 == 列表条数
+    的唯一依据就是这两处同谓词。"""
     return _torrent_rows(AnimeTorrent.status == "pending", AnimeTorrent.episode < 0)
 
 
@@ -3440,8 +3494,10 @@ async def sync_qb_status(manual: bool = False) -> int | None:
 def anime_save_path(anime_id: int) -> str | None:
     """该番当前的归档目录（build_save_path 结果：[子目录]/[季度]/番名/[Season N]）；算不出返回 None。
 
-    与 download_anime_torrent 【同口径】：都走 _anime_path_parts(a, 最新种子行)。缺 bgm 元数据(未识别)时
-    两处都回退到种子解析名，故显示/relocate 目标与实际落地一致（B2）。
+    与 download_anime_torrent 同走 _anime_path_parts(a, t)，但 t 不同：这里是【最新种子行】，下载入口是
+    【正在交付的那一条】。已识别的番两者一致（季度/名字全取自 Anime）；**未识别的番**回退到各自种子的解析名，
+    不同来源的种子可能算出不同目录 —— 显示/relocate 目标与实际落地在这一类上并不严格一致（B2 的承诺
+    只对已识别的番成立；要不要让下载也按最新行算，见 DECISIONS E-62）。
     """
     with get_session() as s:
         a = s.get(Anime, anime_id)

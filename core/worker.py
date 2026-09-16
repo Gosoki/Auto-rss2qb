@@ -4,6 +4,8 @@
 抓取入库后，统一由 flush_ready_downloads 按『缓冲窗口 + 优先级』决定下哪些。
 """
 import asyncio
+from collections import Counter
+from datetime import datetime
 import logging
 import time
 
@@ -30,6 +32,7 @@ log = logging.getLogger("autorss")
 # 剧场版"）。合成一把的话，一次十几分钟的整年扫描会把 TV 采集连同 flush_ready_downloads 整段憋住。
 # 后台协程【等】自己那把锁（本来就在定时循环里，晚一点无所谓）；手动入口【不等】，直接回报"已有一轮在跑"。
 _poll_lock = asyncio.Lock()    # 采集一轮：抓所有源 + 放行到点的下载
+_build_skipped: list[str] = []   # build_sources 最近一次跳过的组名；poll_once 把它并进 ANIME_POLL_FAILED（R36 ux-5）
 _scan_lock = asyncio.Lock()    # 剧场版整年扫描
 # 【下面这两把是 R27 补的，补的不是并发、是"在途闸看得见"】
 # `engine.maintenance_blockers()` 逐条列出"跨 await 持业务库主键"的后台线，
@@ -49,6 +52,7 @@ _sweep_lock = asyncio.Lock()     # 完结/断更/积压巡检一轮（含交付�
 
 def build_sources() -> list:
     """据 DB 里启用的源组构建本轮的源实例（按优先级从高到低）。"""
+    _build_skipped.clear()      # 本轮构造阶段就被跳过的组名（配置坏了 / 未知站点），给仪表盘的『抓取失败』计数
     srcs = []
     for g in list_source_groups(enabled_only=True):
         subs = [x.strip() for x in (g.subgroups or "").split(",") if x.strip()]
@@ -56,6 +60,7 @@ def build_sources() -> list:
         cls = SOURCES.get(g.site)
         if cls is None:
             log.warning("未知源类型 %s（组 %s），跳过", g.site, g.name)
+            _build_skipped.append(g.name)
             continue
         # 【每个组各自兜住】build_sources 是在 poll_once 的 for 语句【之外】求值的，
         # 所以下面那个 per-source 的 try 够不着这里：一个组构造失败（feed 为空让
@@ -69,7 +74,27 @@ def build_sources() -> list:
             srcs.append(cls(g.name, url, g.policy, g.priority, subs, tfilter))
         except Exception as e:
             log.error("源组『%s』配置有问题，本轮跳过它（其余源照抓）：%s", g.name, e)
+            _build_skipped.append(g.name)
     return srcs
+
+
+def log_task_exit(t: asyncio.Task) -> None:
+    """(R36 体检) 后台协程任何一条意外退出都要有一行 ERROR。main.py 把它挂在七条 Task 的 done 回调上。
+
+    住在这里不住 main.py：测试要能在 NiceGUI 应用已启动之后导入它（import main 会在应用启动后加中间件而炸）。
+
+    以前是零日志：background_tasks 持强引用 ⇒ Task.__del__ 永不执行 ⇒ asyncio 那句
+    'Task exception was never retrieved' 永远不打。一条线死了（R36 在 run_sweep 上就抓到一处：
+    启动清扫抛一次异常整条巡检永久死掉）用户只会觉得"好几天没更新了"。逐条协程去包 try 必然漏一处，
+    挂在 Task 上的这一个回调对七条一视同仁。
+    """
+    if t.cancelled():
+        return
+    e = t.exception()
+    if e is not None:
+        log.error("后台协程 %s 意外退出：%s: %s", t.get_name(), type(e).__name__, e, exc_info=e)
+    else:
+        log.warning("后台协程 %s 退出了 —— 它们本该永远跑着", t.get_name())
 
 
 def loop_error(what: str, e: BaseException, **kw) -> None:
@@ -79,7 +104,8 @@ def loop_error(what: str, e: BaseException, **kw) -> None:
     而它可能落在任意一条后台循环的轮次中间 —— 那不是"异常"，是**计划内的**、
     用户自己点出来的、秒级的暂停。逐条报成 `ERROR ...异常` 会在日志页顶出一片红，
     掩盖同一时间段里真正的错误。
-    本项目有 13 处这样的记账点，逐处判必然漏一处（第①号形状），所以收成一个函数。
+    本项目有十几处这样的记账点（数字别写死，每加一条后台线就会变），逐处判必然漏一处（第①号形状），
+    所以收成一个函数。
     """
     if isinstance(e, db.DatabaseBusy):
         log.info("%s：%s —— 整库维护中，这一轮跳过，维护结束后自动继续", what, e)
@@ -92,10 +118,25 @@ async def poll_once() -> None:
     # 别去白取种（详见 anime.process_item 的 qb_alive 说明）。探测本身就是 flush 前那一次，
     # 顺带把状态型通知的翻转也发了，所以不额外增加请求。
     qb_alive = await anime.qb_precheck()
-    for source in build_sources():
+    # 【本轮内同 URL 的 feed 只抓一次】(R36 体检，见 RssSource.fetch) 真库两对源组同 URL。
+    # 缓存的字节只活到"后面再没有源要用这个 URL"为止就弹掉：一轮可能跑几个小时（D-06），
+    # 别让 4 个 feed 的字节整轮挂着。键是 feed URL —— Mikan『我的番组』把 token 放在 query 里，
+    # 这个 dict 的键【不许进日志/诊断输出】（脱敏口径见下面 fetch.redact 那段）。
+    sources = build_sources()
+    feed_cache: dict = {}
+    uses_left = Counter(getattr(s, "rss_url", None) for s in sources)
+    # 本轮"没抓到"的源名，轮末写进 ANIME_POLL_FAILED 给仪表盘看。分母要含构造阶段就被跳过的组
+    # （feed 为空 / 未知站点），不然配置坏了的源组在徽标上是隐形的（核实意见）。
+    failed_sources: list[str] = list(_build_skipped)
+    fetched_any = False              # 本轮至少一个源抓到了 → 轮末更新 ANIME_POLL_OK_LAST
+    for source in sources:
+        _url = getattr(source, "rss_url", None)
+        uses_left[_url] -= 1
         try:
-            items = await source.fetch()
+            items = await source.fetch(content_cache=feed_cache)
+            fetched_any = True
         except Exception as e:
+            failed_sources.append(source.name)
             # 【必须脱敏】httpx 自己抛的 HTTPStatusError/ConnectError 的 str() 带完整 URL，
             # 而 Mikan『我的番组』订阅地址把 token 放在 query 里 ——
             # 随便一次 403/500 就把 ?token=… 整条写进 data/autorss.log（滚动 5 份）
@@ -103,6 +144,9 @@ async def poll_once() -> None:
             log.error("抓取失败 %s: %s: %s", source.name, type(e).__name__,
                       fetch.redact(e)[:200])
             continue
+        finally:
+            if uses_left[_url] <= 0:
+                feed_cache.pop(_url, None)   # 后面没有源再用它了，字节不必整轮挂着
         # 【本源这一批的 hash 一次查完】RSS 一轮的条目绝大多数是上一轮就见过的，
         # 逐条各开一个 session 去查等于把 100 次数据库往返摊在采集主链路上
         # （本地 SQLite 约 42ms/100 条；远程 MySQL 是每轮 0.4~2 秒的裸阻塞）。
@@ -137,6 +181,19 @@ async def poll_once() -> None:
             log.info("缓冲窗口放行下载 %d 集", n)
     except Exception as e:
         loop_error("放行下载", e)
+    # 【落一行"这一轮发生了什么"】(R36 体检 ux-5) 抓取失败以前只进日志 —— /logs 是 200 条环形缓冲，
+    # 真库每天 400+ 行、约 10 小时就冲掉；一天看一次的用户在页面上看不到夜里的失败，6 条 feed 全 403 时
+    # 仪表盘与正常时逐字相同。与剧场版的 MOVIE_SCAN_LAST 同一条路：运行时键、只记最近一轮、不做历史。
+    # 写不进去只警告，不影响采集本身。【只在整轮正常跑完时写】维护早退（DatabaseBusy）/整轮异常到不了这里 ——
+    # 半轮不能记成一轮；"很久没有新的一轮"由仪表盘按 2×轮询间隔判陈旧上红（核实意见两面都顾到）。
+    try:
+        _now = datetime.now().isoformat(timespec="seconds")
+        _upd = {"ANIME_POLL_LAST": _now, "ANIME_POLL_FAILED": "\n".join(failed_sources)}
+        if fetched_any:
+            _upd["ANIME_POLL_OK_LAST"] = _now
+        config.set_many(_upd)
+    except Exception as e:
+        log.warning("记录本轮采集结果失败（仪表盘的『上次采集』不会更新）：%s", e)
 
 
 # 【本进程是否还欠一次"启动复位"】只有 main.py 在【启动时业务库就不可用】的那一支会置 True：
@@ -371,7 +428,17 @@ async def run_sweep() -> None:
     # 又占着 HAVE_STATUSES（集去重认定该集已有一份），等 3 小时才清是不行的 —— 以前这件事是
     # init_business_state 里的 reset_downloading（同步、问不了 qB），现在统一走 sweep_stale_delivering。
     # 完结判定/断更提醒仍然先睡后做（避免"每次重启都立刻重判一遍"），只有清扫提前。
-    await sweep_leftovers_if_pending()
+    # 【要包 try】(R36 体检) 这是七条后台协程里唯一一个不在 try 里的非 sleep await。它每次正常启动都真的
+    # 会对两张种子表发 SELECT（MySQL 上可以抛 gone away / read_timeout），抛一次整条巡检协程就死掉 ——
+    # 且**零日志**：main.background_tasks 持强引用，Task.__del__ 永不执行，asyncio 那句
+    # "exception was never retrieved" 也永远不打。死掉之后失去的是巡检全部四段（残骸清扫 / 完结 / 断更 / 积压）。
+    # 失败也无妨：欠账（_stale_sweep_pending）留着不清，长睡之后的 sweep_round 每轮都会再跑一次残骸清扫
+    # （那一段自带 try）—— 残骸最终会清掉，只是这个标志位不会被清；它唯一的后续影响是下一次"运行中掉线
+    # 又回来"的恢复边沿会多跑一次清扫，而"打断真在途的交付"已被 _delivering 登记挡住。（核实意见）
+    try:
+        await sweep_leftovers_if_pending()
+    except Exception as e:
+        loop_error("巡检·启动残骸清扫", e, exc_info=True)
     # 先睡后做：启动瞬间不抢资源，也避免"每次重启都立刻重判一遍"。
     await asyncio.sleep(max(60, config.SWEEP_INTERVAL_MIN * 60))
     while True:

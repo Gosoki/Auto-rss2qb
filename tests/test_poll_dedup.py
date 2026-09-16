@@ -152,7 +152,7 @@ async def test_poll_once_runs_end_to_end(clean_tables, monkeypatch, cfg):
     class FakeSource:
         name = "假源"
 
-        async def fetch(self):
+        async def fetch(self, content_cache=None):   # 与 RssSource.fetch 同签名（R36 每轮 feed 缓存）
             return items
 
     async def fake_process(item, known_hashes=None, qb_alive=None):
@@ -201,7 +201,7 @@ async def test_poll_once_bails_out_of_the_whole_round_on_maintenance(clean_table
     class FakeSource:
         name = "假源"
 
-        async def fetch(self):
+        async def fetch(self, content_cache=None):   # 与 RssSource.fetch 同签名（R36 每轮 feed 缓存）
             return items
 
     async def fake_process(item, known_hashes=None, qb_alive=None):

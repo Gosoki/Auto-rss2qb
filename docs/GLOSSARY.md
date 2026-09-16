@@ -326,3 +326,16 @@ E-19 立的原则、E-3 把最后一条分叉（"从 qB 消失"）补齐。**已
 "横幅没了、手机每 6 小时照旧响"。而推送那一路还有一个反直觉的要求：**归档动作本身不能触发推送**——
 去重键是 id 集合哈希，归档一条会让集合变小、撞出一个从没发过的新 key。所以判据是"有没有**新成员**"，
 不是"集合变没变"。
+
+## 二十、R36 体检：几个新词与两处口径收口
+
+| 词 | 指什么 |
+|---|---|
+| **`_delivering` 是唯一真相，`status == "downloading"` 只是它的影子** | 在途闸 `maintenance_blockers()` 从 R36 起直接数 `_delivering` 登记（`with engine.delivering(...)`，注销由语言保证），不再 COUNT 状态列。理由：状态列会被别的写入点改掉（`settle_inflight_off` 就曾把交付中的占位写成 sent，闸当场数不到那条协程），登记不会。顺带这个函数不再碰业务库，"库连不上会不会堵死自救出口"那一整类顾虑（R22/R33）不复存在。守卫：`test_the_blocker_check_does_not_kill_the_escape_hatch` 断言一次 `get_session` 都没调。 |
+| **"旁人让路"的第 8 处** | 『交付中的占位行（downloading）其他写入点一律不碰』这条不变式，全项目原有 7 处（`_sync_qb_status` rows / `qb_summary` / `has_active_downloading` / `relocate` / 两条 `_delete_*_torrent_inner` / `_recheck_where` 的调用方），`settle_inflight_off` 是漏掉的第 8 处，`_recheck_where` 本身是把调用方的 Python 过滤下推成 SQL 条件。 |
+| **`content_cache` / `feed_cache`（每轮 feed 缓存）** | `RssSource.fetch(content_cache=)`：同一轮采集内按 feed URL 复用取回的**字节**（不是解析结果，过滤仍各组各跑）。由 `worker.poll_once` 每轮新建，按"后面还有没有源要用这个 URL"逐个释放。键是 feed URL，Mikan『我的番组』的 token 就在里面 —— **这个 dict 的键不许进日志**。任何 `Source` 子类（含测试桩）都要收这个可选参数：poll_once 的宽 except 会把签名不匹配吞成一行"抓取失败"。 |
+| **`ANIME_POLL_LAST` / `ANIME_POLL_OK_LAST` / `ANIME_POLL_FAILED`（运行时键）** | 采集轮末写的三个 Setting 键（与 `MOVIE_SCAN_LAST` 同一条路，非用户填）：上一轮结束时间、上次至少一个源抓到的那一轮、上一轮没抓到的源名（换行分隔，含构造阶段就被跳过的组）。**只在整轮正常跑完时写**（维护早退的半轮不记）；仪表盘按 2×轮询间隔判陈旧上红（`layout.poll_stale`），所以采集关着 / 库停摆 / 上一轮被打断都能看出来。只有最近一轮，没有历史 —— 历史在日志里。 |
+| **`log_task_exit`（core/worker.py，main.py 挂上）** | 七条后台协程挂的同一个 done 回调：任何一条意外退出都留一行 ERROR。以前是零日志（`background_tasks` 持强引用 ⇒ `Task.__del__` 永不执行 ⇒ asyncio 那句 "exception was never retrieved" 永远不打）。 |
+| **`(e)` 不是 `(e=None)`** | NiceGUI 按"有没有无默认值形参"决定传不传事件；`async def h(e=None)` 会被不带参调用、`e` 恒 None、`busy_action` 拿到 `btn=None`、loading 永远不亮。8 个 120~240 秒级按钮曾全是这样。守卫按 AST 钉着。 |
+| **剧场版侧面向用户一律叫『版本』** | Q9=B 早已定（§一），但 pages/layout.py 的术语表注释还写着"待裁决"、/movies 上『种子状态』『种子数』『暂无正在下载的种子』混着用 —— 本轮统一；内部字段名/表名不动。 |
+| **`_parse_date` 的缓存只许在它这一层** | 它是纯函数（唯一输入是入参串）。上面任何一层（`_aired_before_start` 读 config、`binding_looks_wrong` 查库）加缓存都会让缓存键漏掉真实输入，且现有用例抓不到（核实时实测）。守卫：改 `ANIME_START_DATE` 后 `_aired_before_start` 必须翻转。 |
