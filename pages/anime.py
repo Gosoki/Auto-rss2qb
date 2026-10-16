@@ -414,6 +414,8 @@ def anime_page(t: str = ""):
                                     ui.badge(sl).props("color=purple")
                                 platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
                                 ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
+                                _rs, _rd = anime.confirm_reason_text(a.confirm_reason)
+                                ui.label("原因: " + _rs).classes("text-xs text-orange-400").tooltip(_rd)
                             with ui.row().classes("items-stretch gap-3 flex-wrap"):
                                 # 预填当前锁定源：这个番可能是【补齐/绑定 bgm 打回来的】、本来就设过锁，
                                 # 下拉恒空会让用户点一下『确认下载』就把锁静默解掉（选中值会被写回）。

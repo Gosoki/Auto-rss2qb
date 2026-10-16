@@ -291,6 +291,7 @@ def apply_start_date_filter() -> int:
                 s.add(a); changed += 1
             elif not out and a.rejected and not a.confirmed:    # 不再超期 + 当前是超期忽略 → 释放回待确认
                 a.rejected = False
+                a.confirm_reason = "released"
                 s.add(a); changed += 1
         if changed:
             s.commit()
@@ -401,6 +402,7 @@ async def _resolve_anime(item) -> int:
             anime = Anime(
                 title=item.anime_title, season=item.season, quarter=item.quarter,
                 confirmed=auto,
+                confirm_reason=(None if auto else "unmatched" if _is_auto(item.policy) else "review"),
             )
             _apply_bgm(anime, info)   # 落 air_date 等 bgm 字段（下面判超期要用）
             # 【匹配到了错误的季 → 留给人工，别让它掉进任何一个自动结论】
@@ -411,6 +413,7 @@ async def _resolve_anime(item) -> int:
             # 单看前者会误伤 15% 的正常番（它们只是用了全系列绝对编号）。
             if _episode_cannot_belong(anime, item):
                 anime.confirmed, anime.rejected = False, False   # → 『待确认』，等人工看一眼
+                anime.confirm_reason = "wrong_season"
                 log.warning("bgm 可能匹配到了错误的季，留待人工确认：%s（绑到 bgm %s『%s』"
                             "首播 %s 共 %s 集，而本条是第 %s 集、发布于 %s）",
                             item.anime_title, anime.bangumi_id, anime.display_name or anime.title,
@@ -1564,6 +1567,25 @@ def episode_progress(anime_ids) -> dict:
     return {aid: (len(have.get(aid, ())), len(eps)) for aid, eps in seen.items()}
 
 
+# 进『待确认』的原因：键落库（Anime.confirm_reason），文案只在这里。{键: (短标签, 悬停说明)}
+# 每个把番打回待确认的地方各写一个键；以后再加这样的入口，记得在这里配一条。
+CONFIRM_REASONS = {
+    "review": ("人工审核源发现", "发现它的源组策略是『人工审核』，按策略要你点头才下。"),
+    "unmatched": ("当时没识别出 bgm", "自动源发现的，但入库时没认出是哪部番（进了待识别），"
+                                     "后来重试/重新识别才匹配上 bgm，还没转成追番。"),
+    "wrong_season": ("疑似绑错季", "种子的集号/发布时间与所绑 bgm 那一季对不上，多半认错了季——"
+                                  "确认前先到详情页核对 bgm，不对就重新绑定。"),
+    "bind": ("手动绑定了 bgm", "你手动绑定/换绑了 bgm，核对无误后点确认下载。"),
+    "backfill": ("补齐入库了新种子", "『补齐该源/自动补齐』搜到了新种子，先过目再下；确认前后台暂停自动下新集。"),
+    "released": ("超期忽略已解除", "改了『开始使用日』之后它不再算超期，从超期忽略放回来等你决定。"),
+}
+
+
+def confirm_reason_text(reason: str | None) -> tuple[str, str]:
+    """待确认原因的（短标签, 悬停说明）。空/未知键 = 本列上线前就进了待确认。"""
+    return CONFIRM_REASONS.get(reason or "", ("未记录", "这部番在开始记录原因之前就进了待确认，当时的原因没留下。"))
+
+
 def pending_confirm() -> list[Anime]:
     """待确认：已匹配 bgm 但未确认、未拒绝的番。未匹配的在『待识别』，绑定后才来这里。"""
     with get_session() as s:
@@ -2503,6 +2525,7 @@ def _merge_anime(s, loser_id: int, keeper_id: int) -> None:
             # "这个 bgm 绑定多半错了，等人看一眼"，没人看过就不该恢复自动下载。
             # 落『待确认』而不是『已忽略』：前者在列表里看得见、一键就能确认，后者是静默的。
             keeper.confirmed, keeper.rejected = False, False
+            keeper.confirm_reason = "wrong_season"
         elif active:
             keeper.confirmed, keeper.rejected = True, False
         else:
@@ -2763,6 +2786,7 @@ async def _bind_anime_bgm_inner(anime_id: int, bgm_id: int, report: dict | None 
         if a is None:
             return False
         a.confirmed = False  # 绑定后进『待确认』，等人工确认下载
+        a.confirm_reason = "bind"
         # 【显式绑定要能真的纠正名字与季度】原本是 keep_path=_has_handled_torrents(...)，理由写的是
         # "有已下集才保留，避免散目录"。但那个判据太宽：番一旦下过任何一集（连 deleted 都算）就再也
         # 改不动番名/季度，只有 bangumi_id 被换成新番的——身份与名字/目录长期互相矛盾，而这是【全项目
@@ -3475,6 +3499,8 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False) -> di
             except IntegrityError:
                 s.rollback()
         if ingested and not a_now.rejected:   # 有新货且未忽略(实时态) → 转待确认，复用审核流、别自动下
+            if a_now.confirmed:   # 本来就在待确认的不覆写：原先那个原因（如疑似绑错季）仍然成立、更要紧
+                a_now.confirm_reason = "backfill"
             a_now.confirmed = False
             s.add(a_now)
             s.commit()
