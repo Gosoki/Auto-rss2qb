@@ -97,6 +97,9 @@ def test_single_work_unknown_counts_as_special(clean_tables, cfg):
     rows = A.unknown_episode_rows()
     assert len(rows) == b["unknown"], "卡片数必须等于点开的列表条数"
     assert {r["name"] for r in rows} == {t for t, _, w in cases if w == "unknown"}
+    sp = A.special_episode_rows()
+    assert len(sp) == b["special"], "特别篇小计必须等于点开的列表条数"
+    assert {r["name"] for r in sp} == {t for t, _, w in cases if w == "special"}
 
 
 def test_finished_bucket_only_counts_when_unsub_is_on(clean_tables, mixed_library, cfg):

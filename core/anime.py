@@ -3269,13 +3269,22 @@ def single_work_ids() -> set:
                 if engine.is_single_work(p, n)}
 
 
-def unknown_episode_rows() -> list[dict]:
-    """待下里的真『未知集』：后台不自动下、又不按特别篇算的那些（特别篇判据见 engine.is_special_ep），
-    供 KPI『未知集』点开手动处理。口径必须与 pending_breakdown 的 unknown 桶一致 —— 卡片数 == 列表条数
-    的唯一依据就是这两处同谓词。"""
+def _neg_episode_rows(special: bool) -> list[dict]:
+    """待下里后台不自动下的 -1/-2，按 engine.is_special_ep 分成『特别篇』(special=True) 与『未知集』两份。
+    口径必须与 pending_breakdown 的 special/unknown 两个桶一致 —— 小计数 == 点开的列表条数的唯一依据。"""
     sw = single_work_ids()
     return [r for r in _torrent_rows(AnimeTorrent.status == "pending", AnimeTorrent.episode < 0)
-            if not engine.is_special_ep(r["episode"], r["anime_id"] in sw)]
+            if engine.is_special_ep(r["episode"], r["anime_id"] in sw) == special]
+
+
+def unknown_episode_rows() -> list[dict]:
+    """真『未知集』：集号没解析出来、又不按特别篇算——KPI『未知集』点开手动处理。"""
+    return _neg_episode_rows(special=False)
+
+
+def special_episode_rows() -> list[dict]:
+    """『特别篇』：特别篇(-1) 与单部作品名下的 -2——状态区『特别篇』小计点开，方便找到再手动下。"""
+    return _neg_episode_rows(special=True)
 
 
 def failed_rows() -> list[dict]:

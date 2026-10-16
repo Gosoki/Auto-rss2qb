@@ -291,10 +291,12 @@ def anime_page(t: str = ""):
                     "若那部番其实还没完（bgm 的总集数少记了），去详情页点『继续订阅』")]
                   if ps.get("finished") else []),
                 ("未知集", ps["unknown"], "purple",
-                 "集号没解析出来的（批量打包/命名怪）：后台不自动下。去详情页点『第?集』补集号、设为特别篇，或排除"),
+                 "集号没解析出来的（批量打包/命名怪）：后台不自动下。点开看是哪几条，"
+                 "去详情页点『第?集』补集号、设为特别篇，或排除", _open_unknown),
                 # 特别篇只作提示、不是待办：它们本来就不该自动下，堆着也不用管，所以只在非零时露出、用中性色
                 *([("特别篇", ps["special"], "blue-grey",
-                    "特别篇·OVA，以及剧场版/WEB 等单部作品：后台不自动下，不用处理；要哪条就到详情页对准它点『下载』")]
+                    "特别篇·OVA，以及剧场版/WEB 等单部作品：后台不自动下，不用处理。"
+                    "点开看是哪几条，要哪条就到详情页对准它点『下载』", _open_special)]
                   if ps.get("special") else []),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
                  "同集已有别版在下/已下被去重，或忽略番的积压；换源兜底时可能被复活"),
@@ -312,10 +314,12 @@ def anime_page(t: str = ""):
                     chips.append((_lb, ov["status"][_key], _cl, _tip))
             chips.append(("种子数", k["torrents"], "grey", "全部种子数（各状态之和）"))
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
-                for label, val, color, tip in chips:
+                for label, val, color, tip, *click in chips:   # 可选第 5 项：点开明细的回调
                     b = ui.badge(f"{label} {val}").props(f"color={color}")
                     if tip:
                         b.tooltip(tip)
+                    if click:
+                        b.classes("cursor-pointer").on("click", click[0])
             # ── 下载状态 ──（qB 实时态，独立成区；后台每 QB_SYNC_INTERVAL 秒刷，也可点『立刻刷新』手动拉一次）
             # qB 未启用也照常显示：qb_summary 只查库、不打 qB 接口，此时列的是最后已知进度，只把手动同步按钮禁掉。
             q = ov["qb"]
@@ -777,7 +781,7 @@ def anime_page(t: str = ""):
         _LIST_PAGE_SIZE = 50   # 弹窗每页条数：挂机久了这两类可能上百条，一次建几百个元素会明显卡
 
         def _open_torrent_list(title, desc, fetch, page: int = 1):
-            """未知集 / 失败异常 的明细弹窗。分页而不是一次全渲染——总数照实显示在标题里。"""
+            """未知集 / 特别篇 / 失败异常 的明细弹窗。分页而不是一次全渲染——总数照实显示在标题里。"""
             list_dlg.clear()
             rows = fetch()
             shown, pages, page = paginate(rows, page, _LIST_PAGE_SIZE)
@@ -810,6 +814,12 @@ def anime_page(t: str = ""):
                 "未知集", "批量打包/集号没解析出来的种子，后台不自动下。点番名进详情页：点『第?集』补集号或设为特别篇，"
                 "要它就对准那一条点『下载』，不要就排除。（特别篇与剧场版/WEB 单部作品不在这里，它们不用处理）",
                 anime.unknown_episode_rows)
+
+        def _open_special():
+            _open_torrent_list(
+                "特别篇", "特别篇·OVA，以及 bgm 判定为剧场版/WEB 等单部作品（总共 1 集）名下没有集号的种子。"
+                "后台不自动下，也不用处理；要哪条就点番名进详情页、对准它点『下载』。其实是正片的，点集号改回来。",
+                anime.special_episode_rows)
 
         def _ack_alert(f):
             """把一条发现收进『已读的提示』。f 是 core.alerts.view() 里的一项。"""
