@@ -12,7 +12,7 @@ from db.models import AnimeTorrent
 from core import alerts, anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail, restore_anime_gated, subscribe_gated
-from .layout import (busy_action, confirm, require_bind_confirm, ep_str, expand_collapse_bar,
+from .layout import (busy_action, confirm, require_bind_confirm, ep_label, expand_collapse_bar,
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, recent_table, season_label, source_options,
@@ -128,7 +128,7 @@ def anime_page(t: str = ""):
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
                        "|",
                        ("已交付", k["done"], "green", None),
-                       ("特别篇/未知集", ps["unknown"], "purple", _open_unknown),
+                       ("未知集", ps["unknown"], "purple", _open_unknown),
                        # 名字与下方 chip『失败数』(仅 error) 区分开：这张卡是"需要处理的总数"，
                        # 含长期停滞，和点开后的 failed_rows()/弹窗标题『失败 / 异常』一致
                        ("失败/异常", ov["status"]["error"] + ov["status"]["stalled"], "red",
@@ -278,7 +278,7 @@ def anime_page(t: str = ""):
                 _dla.set_enabled(config.QB_ENABLED)
                 _dla.tooltip("订阅中所有待下集立即下" if config.QB_ENABLED
                              else "qB 未启用，去设置页开启后可下载")
-            # 待下拆 将下载/备用/待确认/未知（库态『下载中』恒≈0、与 qB 实时态重复不单列）；失败、种子总数一并列出，与 KPI 卡呼应
+            # 待下拆 将下载/备用/待确认/未知集/特别篇（库态『下载中』恒≈0、与 qB 实时态重复不单列）；失败、种子总数一并列出，与 KPI 卡呼应
             chips = [
                 # sent = 已发给 qB（含仍在下的）；真正下完的数在下方 qB 实时区的『已完成』
                 ("已交付", ov["status"]["sent"], "green",
@@ -290,8 +290,12 @@ def anime_page(t: str = ""):
                     "番已判定完结、且设置里开了『判完结后停止自动下新集』，所以这些不会自动下。"
                     "若那部番其实还没完（bgm 的总集数少记了），去详情页点『继续订阅』")]
                   if ps.get("finished") else []),
-                ("特别篇/未知集", ps["unknown"], "purple",
-                 "特别篇·OVA 与批量/未知集：后台一律不自动下，需在详情页对准那一条点『下载』"),
+                ("未知集", ps["unknown"], "purple",
+                 "集号没解析出来的（批量打包/命名怪）：后台不自动下。去详情页点『第?集』补集号、设为特别篇，或排除"),
+                # 特别篇只作提示、不是待办：它们本来就不该自动下，堆着也不用管，所以只在非零时露出、用中性色
+                *([("特别篇", ps["special"], "blue-grey",
+                    "特别篇·OVA，以及剧场版/WEB 等单部作品：后台不自动下，不用处理；要哪条就到详情页对准它点『下载』")]
+                  if ps.get("special") else []),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
                  "同集已有别版在下/已下被去重，或忽略番的积压；换源兜底时可能被复活"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的种子"),
@@ -438,6 +442,7 @@ def anime_page(t: str = ""):
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番 N+1
             dlmap = anime.downloaded_counts([a.id for a in rej])   # 同上：可删文件数也一次取齐
+            sw = anime.single_work_ids() if dels or excls else set()   # 集号标 SP 用（单部作品的 -2）
             expand_collapse_bar(reject_page, reject_panel.refresh)
             exp = reject_page["expand"]
             for i, (q, items) in enumerate(group_by_quarter(rej)):
@@ -477,7 +482,7 @@ def anime_page(t: str = ""):
                             ui.label(d["name"]).classes(
                                 "shrink-0 cursor-pointer text-blue-400 hover:underline").on(
                                 "click", lambda aid=d["anime_id"]: open_detail(aid))
-                            ui.label(f"第{ep_str(d['episode'])}集").classes("shrink-0 text-gray-400")
+                            ui.label(ep_label(d["episode"], d["anime_id"] in sw)).classes("shrink-0 text-gray-400")
                             ui.label(d["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
                             _rb = ui.button("重新下载", icon="download",
                                             on_click=_redownload(d["id"])).props(
@@ -498,7 +503,7 @@ def anime_page(t: str = ""):
                             ui.label(x["name"]).classes(
                                 "shrink-0 cursor-pointer text-blue-400 hover:underline").on(
                                 "click", lambda aid=x["anime_id"]: open_detail(aid))
-                            ui.label(f"第{ep_str(x['episode'])}集").classes("shrink-0 text-gray-400")
+                            ui.label(ep_label(x["episode"], x["anime_id"] in sw)).classes("shrink-0 text-gray-400")
                             ui.label(x["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
                             ui.button("恢复", icon="undo", on_click=_unexclude(x["id"])).props(
                                 "flat dense color=primary").classes("btn-sm").tooltip(
@@ -554,6 +559,7 @@ def anime_page(t: str = ""):
                 if not rows:
                     ui.label("暂无正在下载的种子").classes("text-gray-500 text-sm")
                     return
+                sw = anime.single_work_ids()
                 with ui.column().classes("w-full gap-0"):
                     for r in rows:
                         text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
@@ -562,7 +568,7 @@ def anime_page(t: str = ""):
                         # 徽标永远钉在右侧，不会被挤到下一行左边去
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1 no-wrap").style(
                                 "border-bottom:1px solid rgba(255,255,255,.08)"):
-                            ui.label(f'{r["name"]}  第{ep_str(r["episode"])}集').classes(
+                            ui.label(f'{r["name"]}  {ep_label(r["episode"], r["anime_id"] in sw)}').classes(
                                 "grow break-all min-w-0")
                             ui.badge(text).props(f"color={color}").classes("shrink-0")
 
@@ -582,6 +588,7 @@ def anime_page(t: str = ""):
             # ——后台自动下从不重试 error，用同一个集合会标反。
             # 两者只差"候选含不含 error"，分开调会把番元数据、种子行、"已有一份"的键全部重算一遍。
             plan_ids, backfill_ids = anime.download_plans_for_ids(confirmed)
+            sw = anime.single_work_ids()   # 单部作品的 -2 按特别篇标（SP / 『特别篇』徽标）
             rows = []
             for r in raw:
                 if r["status"] in engine.DOWNLOADABLE_STATUSES:
@@ -593,12 +600,13 @@ def anime_page(t: str = ""):
                                           r["qb_synced_at"], r["qb_dlspeed"], in_plan, conf,
                                           episode=r["episode"],
                                           auto_off=off_why.get(r["anime_id"], ""),
-                                          retry_at=r.get("retry_at"))
+                                          retry_at=r.get("retry_at"),
+                                          single_work=r["anime_id"] in sw)
                 rows.append({
                     "id": r["id"],
                     "detail_id": r["anime_id"],
                     "time": r["time"],
-                    "name": f'{r["name"]}  第{ep_str(r["episode"])}集',
+                    "name": f'{r["name"]}  {ep_label(r["episode"], r["anime_id"] in sw)}',
                     "src": r["source"],
                     "raw": r["raw"] or "—",
                     "status": text,
@@ -799,7 +807,8 @@ def anime_page(t: str = ""):
 
         def _open_unknown():
             _open_torrent_list(
-                "特别篇 / 未知集", "特别篇·OVA 与批量打包/集号没解析出来的种子，后台一律不自动下。点番名进详情页、对准那一条点『下载』（或忽略）。",
+                "未知集", "批量打包/集号没解析出来的种子，后台不自动下。点番名进详情页：点『第?集』补集号或设为特别篇，"
+                "要它就对准那一条点『下载』，不要就排除。（特别篇与剧场版/WEB 单部作品不在这里，它们不用处理）",
                 anime.unknown_episode_rows)
 
         def _ack_alert(f):

@@ -1,6 +1,6 @@
 """仪表盘拆桶的不变量。
 
-`pending_breakdown` 的 docstring 承诺"五者之和 = 待下总数"。这类"卡片数字加起来要对得上"的
+`pending_breakdown` 的 docstring 承诺"六者之和 = 待下总数"。这类"卡片数字加起来要对得上"的
 承诺最容易在加桶时被破坏，而破坏之后没有任何报错——只是某一类种子从此在面板上消失。
 本项目已经出过一次：特别篇曾掉进『备用项』，而那张卡的说明是"同集已有更优版本"。
 """
@@ -53,19 +53,50 @@ def _pending_total(db):
 
 @pytest.mark.parametrize("unsub", [False, True])
 def test_buckets_sum_to_pending_total(clean_tables, mixed_library, cfg, unsub):
-    """(R5) 五者之和必须等于待下总数——两种停订开关下都要成立。"""
+    """(R5) 六者之和必须等于待下总数——两种停订开关下都要成立。"""
     cfg(ANIME_FINISH_UNSUB=unsub)
     b = A.pending_breakdown()
     total = _pending_total(clean_tables)
-    assert sum((b["will"], b["backup"], b["unconfirmed"], b["unknown"], b["finished"])) == total, b
+    assert sum((b["will"], b["backup"], b["unconfirmed"], b["unknown"], b["special"],
+                b["finished"])) == total, b
 
 
-def test_specials_go_to_unknown_not_backup(clean_tables, mixed_library, cfg):
-    """特别篇(-1)与未知集(-2)必须进『特别篇/未知集』这一档。
-    掉进『备用项』的话，那张卡的说明"同集已有更优版本"是纯粹的误导——本项目已经踩过一次。"""
+def test_specials_and_unknown_get_their_own_buckets(clean_tables, mixed_library, cfg):
+    """特别篇(-1)进『特别篇』、未知集(-2)进『未知集』，各自一档、都不进『备用项』。
+    掉进『备用项』的话，那张卡的说明"同集已有更优版本"是纯粹的误导——本项目已经踩过一次。
+    两者分开是因为特别篇不用处理，混在未知集里会让那张待办卡永远清不掉。"""
     cfg(ANIME_FINISH_UNSUB=False)
     b = A.pending_breakdown()
-    assert b["unknown"] == 8, "4 部番 × 2 条（-1 与 -2）"
+    assert b["special"] == 4, "4 部番 × 1 条 -1"
+    assert b["unknown"] == 4, "4 部番 × 1 条 -2"
+
+
+def test_single_work_unknown_counts_as_special(clean_tables, cfg):
+    """bgm 判为单部作品（非 TV 且只有 1 集）的番，它名下的 -2 按特别篇算，不进未知集。
+    TV 番的 -2、类型未知的番的 -2 照旧是未知集。卡片数必须仍等于点开的列表条数。"""
+    cfg(ANIME_FINISH_UNSUB=False)
+    now = datetime.now()
+    with clean_tables.get_session() as s:
+        cases = [
+            ("剧场版", dict(platform="剧场版", total_episodes=1), "special"),
+            ("WEB单集", dict(platform="WEB", total_episodes=1, confirmed=True), "special"),
+            ("忽略的剧场版", dict(platform="剧场版", total_episodes=1, rejected=True), "special"),
+            ("TV单集", dict(platform="TV", total_episodes=1), "unknown"),
+            ("WEB多集", dict(platform="WEB", total_episodes=12), "unknown"),
+            ("类型未知", dict(platform=None, total_episodes=1), "unknown"),
+        ]
+        for i, (title, kw, _) in enumerate(cases):
+            a = Anime(title=title, season=1, quarter="26C", **kw)
+            s.add(a); s.commit(); s.refresh(a)
+            s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{i + 1:040x}", raw_title=f"[X] {title}",
+                               episode=-2, status="pending", source="X", created_at=now))
+        s.commit()
+    b = A.pending_breakdown()
+    want = {k: sum(1 for *_, w in cases if w == k) for k in ("special", "unknown")}
+    assert (b["special"], b["unknown"]) == (want["special"], want["unknown"]), b
+    rows = A.unknown_episode_rows()
+    assert len(rows) == b["unknown"], "卡片数必须等于点开的列表条数"
+    assert {r["name"] for r in rows} == {t for t, _, w in cases if w == "unknown"}
 
 
 def test_finished_bucket_only_counts_when_unsub_is_on(clean_tables, mixed_library, cfg):
@@ -85,7 +116,8 @@ def test_orphan_and_rejected_go_to_backup(clean_tables, mixed_library, cfg):
 
 def test_breakdown_keys_are_stable(clean_tables, mixed_library):
     """页面按键名取值。少一个键就是 KeyError（白屏），多一个键无害但要有人知道。"""
-    assert set(A.pending_breakdown()) == {"will", "backup", "unconfirmed", "unknown", "finished"}
+    assert set(A.pending_breakdown()) == {"will", "backup", "unconfirmed", "unknown", "special",
+                                          "finished"}
 
 
 def test_auto_off_reasons_matches_pending_breakdown_wording(clean_tables, cfg):
@@ -129,6 +161,9 @@ def test_live_status_judges_unknown_episodes_first(cfg):
     # 一部"待确认"番的特别篇：pending_breakdown 把它算进『未知』，渲染侧也必须
     assert live_status("pending", in_plan=False, episode=-1, auto_off="待确认")[0] == "特别篇"
     assert live_status("pending", in_plan=False, episode=-2, auto_off="已忽略")[0] == "未知集"
+    # 单部作品的 -2 与 pending_breakdown 一样按特别篇算
+    assert live_status("pending", in_plan=False, episode=-2, auto_off="已忽略",
+                       single_work=True)[0] == "特别篇"
 
 
 def test_internal_marker_names_actually_exist_in_production_code():

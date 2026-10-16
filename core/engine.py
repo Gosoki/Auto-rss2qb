@@ -384,6 +384,26 @@ def auto_downloadable_ep(ep) -> bool:
     return isinstance(ep, (int, float)) and ep >= 0
 
 
+def is_single_work(platform, total_episodes) -> bool:
+    """bgm 判定这部番是【单部作品】：类型不是 TV（剧场版/WEB/OVA…）且总共只有 1 集。
+
+    这类作品整部就一个文件，标题里本来就没有集号，解析必然落 -2——再怎么改解析器也认不出来。
+    真库实测（2026-10）未知集 9 条里有 8 条是它（缎带英雄、绽放的巴黎之星、剧场版草莓王子）。
+    类型未知（None）不算：判不了就不判。
+    """
+    return bool(platform) and platform != "TV" and total_episodes == 1
+
+
+def is_special_ep(ep, single_work: bool = False) -> bool:
+    """这条种子按【特别篇】显示/计数（集号处标 SP）：解析出的特别篇(-1)，或单部作品名下的 -2。
+
+    只管显示与仪表盘分桶，**不改库里的集号、也不影响下不下**——两类都仍被 auto_downloadable_ep 挡在
+    自动/批量路径外。剩下的 -2 才是真『未知集』：集号没解析出来、需要人工补集号或排除。
+    仪表盘计数、点开的列表、详情页、新入库表都按这一个判据分，别各写一份。
+    """
+    return ep == -1 or (ep == -2 and single_work)
+
+
 # 【暂时性失败】的重试退避（分钟）。第 n 次失败后等 RETRY_BACKOFF_MIN[n] 分钟再发，用满就落 error 等人工。
 # 只给两类用：取种失败（nyaa/Mikan 超时、502、DNS…）和关停中断（重启时正在交付的那几条）——
 # 它们与种子本身无关，重发大概率就好了。其余一律不进队列，重试没有意义甚至有害：

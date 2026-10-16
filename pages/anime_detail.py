@@ -4,7 +4,7 @@ from nicegui import ui
 from core import anime, engine
 import config
 from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, require_bind_confirm,
-                     ep_str, meta_card,
+                     ep_label, ep_str, meta_card,
                      name_of, parse_bgm_id,
                      qb_live_text, season_label, source_options, torrent_status_cn,
                      warn_banner)
@@ -165,9 +165,14 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     ui.badge(_sl).props("color=purple")
                 if cur.rejected:
                     ui.badge("超期忽略" if not cur.confirmed else "已忽略").props("color=grey")
+                elif cur.confirmed:
+                    ui.badge("已确认").props("color=green")
+                elif cur.bangumi_id is None:
+                    # 还没识别出 bgm 的属于『待识别』，原因文案（如"后来才匹配上 bgm"）对它不成立，不带
+                    ui.badge("待确认").props("color=orange")
                 else:
-                    ui.badge("已确认" if cur.confirmed else "待确认").props(
-                        f"color={'green' if cur.confirmed else 'orange'}")
+                    _rs, _rd = anime.confirm_reason_text(cur.confirm_reason)
+                    ui.badge(f"待确认 · {_rs}").props("color=orange").tooltip(_rd)
                 if cur.finished_at:
                     # 停订与否由全局开关决定，所以徽标的 tooltip 必须说清【当前这台机器上】它意味着什么，
                     # 否则用户看到"已完结"无从判断后台还会不会继续下。
@@ -312,21 +317,26 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # stalled 也算有着落(不再误报缺集，B4)；deleted 不算(删了同集新 hash 会当将下载来下)。
         covered = {t.episode for t in eps
                    if t.id in plan or t.id in backfill_plan or t.status in anime.HAVE_STATUSES}
+        # 单部作品（剧场版/WEB 等只有 1 集）的 -2 按特别篇算、标 SP —— 与仪表盘同一判据（engine.is_special_ep）
+        _single = engine.is_single_work(cur.platform, cur.total_episodes)
         for t in eps:
-            ep_txt = f"第{ep_str(t.episode)}集"
+            ep_txt = ep_label(t.episode, _single)
+            _sp = engine.is_special_ep(t.episode, _single)
             with ui.column().classes("w-full gap-0 py-1").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
                 # 第一行：集号 · 字幕组 · 时间 同一行居中（天然竖直齐平），状态/按钮 space() 推到最右
                 with ui.row().classes("items-center gap-3 w-full text-sm flex-wrap"):
                     if t.status in engine.DOWNLOADABLE_STATUSES:  # 待下/失败的集号都可点改：不止 -2，
-                        _neg = t.episode == -2                            # 解析也可能写错正整数(把分辨率/季号当集号)
+                        _neg = t.episode == -2 and not _sp                # 解析也可能写错正整数(把分辨率/季号当集号)
                         ui.label(ep_txt).classes(
                             "shrink-0 cursor-pointer hover:underline"
-                            + (" text-blue-400" if _neg else "")).on(
+                            + (" text-blue-400" if _neg else " text-purple-400" if _sp else "")).on(
                             "click", _set_ep(t.id)).tooltip(
-                            "集号没解析出来；点这里改" if _neg else "集号不对？点这里改")
+                            "集号没解析出来；点这里补集号或设为特别篇" if _neg
+                            else "特别篇（SP）；其实是正片？点这里改集号" if _sp else "集号不对？点这里改")
                     else:
-                        ui.label(ep_txt).classes("shrink-0")              # 主要信息：集号（已下等不可改）
+                        ui.label(ep_txt).classes(                         # 主要信息：集号（已下等不可改）
+                            "shrink-0" + (" text-purple-400" if _sp else ""))
                     ui.label(t.source or "—").classes("shrink-0")         # 主要信息：字幕组（同色）
                     ui.label(engine.torrent_time(t)).classes(
                         "shrink-0 text-gray-500 text-xs")                 # 次要：时间(12px)
@@ -345,11 +355,16 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         # 它们连"排队重试"都不会有（见 core.anime.auto_downloadable_ep 与 _retry），
                         # 所以措辞里绝不能出现"会自动重试"——那是我们做不到的承诺。
                         if t.episode is not None and t.episode < 0:
-                            _neg_lab, _neg_tip = (
-                                ("未知集", "批量/集号没解析出来，后台不自动下。点左边『第?集』改集号，或下方排除")
-                                if t.episode == -2 else
-                                ("特别篇", "特别篇/OVA 不自动下（多组多版本，自动挑一份常挑错）。要它就点右边『下载』"))
-                            ui.badge(_neg_lab).props("color=purple").tooltip(
+                            # 特别篇不用处理（中性色），未知集才要人工补集号（紫色）——与仪表盘两个桶同口径
+                            _neg_lab, _neg_col, _neg_tip = (
+                                ("特别篇", "blue-grey",
+                                 ("bgm 判定这部是单部作品（剧场版/WEB 等，总共 1 集），这条标题里本来就没有集号，按特别篇算。"
+                                  if t.episode == -2 else "特别篇/OVA。")
+                                 + "后台不自动下（多组多版本，自动挑一份常挑错），不用处理；要它就点右边『下载』")
+                                if _sp else
+                                ("未知集", "purple",
+                                 "批量/集号没解析出来，后台不自动下。点左边『第?集』补集号或设为特别篇，或下方排除"))
+                            ui.badge(_neg_lab).props(f"color={_neg_col}").tooltip(
                                 _neg_tip
                                 + (_retry_tip.replace("后重试", "后仍不会自动重发，需人工下")
                                    if t.retry_at else ""))
@@ -739,22 +754,26 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             dlg = ui.dialog()
             with dlg, ui.card().classes("gap-2"):
                 ui.label("改集号").classes("font-bold")
-                ui.label("这条集号没解析出来（批量/命名怪）。填对集号，它就进正常下载+去重流程。"
-                         "支持 .5（如 12.5）。").classes("text-xs text-gray-400")
+                ui.label("填对集号，它就进正常下载+去重流程，支持 .5（如 12.5）。"
+                         "是特别篇/OVA/总集篇就点『设为特别篇』：不再挂在未知集，也不会自动下。").classes(
+                    "text-xs text-gray-400")
                 num = ui.number("集号", value=1, min=0, step=1, format="%g").props("autofocus")
                 num.on("keydown.enter", lambda: dlg.submit(num.value))
                 with ui.row().classes("gap-2 justify-end w-full"):
+                    ui.button("设为特别篇", on_click=lambda: dlg.submit(-1)).props("flat color=purple")
+                    ui.space()
                     ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                     ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("unelevated color=primary")
             val = await dlg
             if val is None:
                 return
-            if val < 0:
+            if val < 0 and val != -1:   # -1 只能经『设为特别篇』按钮来；输入框里的负数一律不收
                 ui.notify("集号要 ≥ 0", type="warning")
                 return
             ok = anime.set_torrent_episode(torrent_id, float(val))
             _after()
-            ui.notify(f"已改为第 {ep_str(float(val))} 集" if ok else "改不了（已下载的种子不改集号）",
+            ui.notify(("已设为特别篇（SP）" if val == -1 else f"已改为第 {ep_str(float(val))} 集") if ok
+                      else "改不了（已下载的种子不改集号）",
                       type="positive" if ok else "warning")
         return h
 

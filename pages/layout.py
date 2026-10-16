@@ -491,10 +491,16 @@ def poll_stale(iso: str, interval_s: int) -> bool:
 
 def ep_str(e) -> str:
     if e == -1:
-        return "特别"
+        return "SP"
     if e == -2:
         return "?"
     return str(int(e)) if float(e).is_integer() else str(e)
+
+
+def ep_label(e, single_work: bool = False) -> str:
+    """列表里的集号文案：正集『第3集』、未知集『第?集』、特别篇『SP』（不套『第…集』，以前拼出来是『第特别集』）。
+    single_work：番是单部作品，其 -2 也按特别篇标 SP（判据见 engine.is_special_ep）。"""
+    return "SP" if engine.is_special_ep(e, single_work) else f"第{ep_str(e)}集"
 
 
 # qB 原始态 → 中文：词表（分类 + 中文名）统一在 core.engine._QB_STATES，本层只负责翻译，
@@ -552,13 +558,14 @@ SEVERITY_COLOR = {"error": "red", "stalled": "deep-orange"}
 
 def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
                 qb_dlspeed=0, in_plan=None, confirmed=True, episode=None,
-                auto_off: str = "", retry_at=None) -> tuple[str, str]:
+                auto_off: str = "", retry_at=None, single_work: bool = False) -> tuple[str, str]:
     """新入库/正在下载：把一条种子压成 (文案, 徽标色)，复刻详情页那套阶梯。
 
     有 qB 实时态 → 『下载中 X% ↓速度』/『做种 100%』(完成绿、在下蓝)；否则 in_plan 非空(番剧)时
     区分待下『将下载/备用』、失败『可补下/失败』；再否则按 torrent_status_cn（刚交付未同步→下载中）。
     in_plan=None 表示不区分首选/备用（剧场版没有集去重，用这个）。
-    confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。"""
+    confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。
+    single_work：番是单部作品，其 -2 按『特别篇』而不是『未知集』显示（判据见 engine.is_special_ep）。"""
     # 同 qb_live_text：人工终态与停滞的 qB 残留态是陈旧的，别拿它盖住真实 status
     if status in engine.MANUAL_TERMINAL_STATUSES or status == "stalled":
         return (torrent_status_cn(status, qb_progress, qb_synced_at),
@@ -580,7 +587,9 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
             # 那边把 -1/-2 列为【最先判】，理由写得很清楚："不论番确不确认"，
             # 否则卡片数与点开的列表条数对不上。这里以前先判 confirmed，两处结论相反。
             if episode is not None and episode < 0:
-                return ("特别篇" if episode == -1 else "未知集"), "purple"
+                # 特别篇不用处理（中性色、只作提示），未知集才要人工补集号——与仪表盘两个桶同一判据
+                return (("特别篇", "blue-grey") if engine.is_special_ep(episode, single_work)
+                        else ("未知集", "purple"))
             if auto_off:
                 # 番级原因（待确认/已忽略/已完结）：三者都不会自动下，但**指引不同**。
                 # 以前一律显示『待确认』并把用户指去那个 tab，而已忽略/已完结的番不在里面，

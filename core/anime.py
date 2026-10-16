@@ -103,15 +103,16 @@ def _is_auto(kind: str) -> bool:
     return kind == "auto"
 
 
-def _ep_text(e) -> str:
-    """推送正文里的集号：整数集不带 .0，半集照实（3.5），特别篇/未知集用仪表盘同一套词。"""
+def _ep_text(e, single_work: bool = False) -> str:
+    """推送正文里的集号段：『第3集』『第3.5集』；特别篇/未知集用仪表盘同一套词、不套『第…集』
+    （以前套了，推出来是『第特别篇集』）。single_work：番是单部作品，其 -2 按特别篇算（见 engine.is_special_ep）。"""
     if e is None:
-        return "?"
-    if e == -1:
+        return "第?集"
+    if engine.is_special_ep(e, single_work):
         return "特别篇"
     if e < 0:
         return "未知集"
-    return str(int(e)) if float(e).is_integer() else str(e)
+    return f"第{int(e) if float(e).is_integer() else e}集"
 
 
 @functools.lru_cache(maxsize=1024)
@@ -1106,6 +1107,7 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
             # 推送正文用的名字在这儿定（还在会话里）：bgm 纠正后的展示名，没识别的番才退回种子解析名。
             # (R36 体检 notify-6) 以前是 `t.anime_title[集号]`：同一部番三种写法、跨季同集号分不清。
             shown = display_of(a) if a is not None else title
+            single = a is not None and engine.is_single_work(a.platform, a.total_episodes)
 
     # 失败落定态：从用户终态(deleted/excluded) force 重下若失败，恢复原终态而非 error——
     # 否则 deleted→error 会让该集不再含任何 _HANDLED 状态，被 _revive_orphaned_skipped 复活 skipped 兄弟、
@@ -1248,8 +1250,8 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False) ->
     else:
         engine.settle_sent(AnimeTorrent, torrent_id)  # 关跟踪：发送即已下，落定 qb_progress=1、脱离 in-flight
     log.info("已加入qB - %s 第%s季 第%s集", title, season, episode)
-    await notify_event("delivered", f"{shown} 第{season}季 第{_ep_text(episode)}集" if season
-                       else f"{shown} 第{_ep_text(episode)}集")
+    await notify_event("delivered", f"{shown} 第{season}季 {_ep_text(episode, single)}" if season
+                       else f"{shown} {_ep_text(episode, single)}")
     return True
 
 
@@ -1632,6 +1634,7 @@ def inflight_anime_rows(limit: int = 50) -> list[dict]:
                   s.exec(select(Anime).where(Anime.id.in_(ids)))} if ids else {})
     return [{
         "id": t.id,
+        "anime_id": t.anime_id,
         "name": names.get(t.anime_id) or (t.anime_title or "?"),
         "episode": t.episode,
         "status": t.status,
@@ -3198,29 +3201,35 @@ def _plans_for_ids(anime_ids, modes: tuple) -> dict:
 
 
 def pending_breakdown() -> dict:
-    """把『待下』(pending)拆成 将下载/备用/待确认/未知，供仪表盘种子状态区看清那一大坨到底是什么。
-    · 未知   = 特别篇(-1) 与 批量/未知集(-2)——后台一律不自动下（见 auto_downloadable_ep），需人工在详情页
-              对准那一条点『下载』。【最先判】不论番确不确认，与 unknown_episode_rows（点开的列表）同口径，
-              卡片数=列表条数——否则特别篇会掉进『备用项』，而那张卡的说明是『同集已有更优版本』，纯属误导。
+    """把『待下』(pending)拆成 将下载/备用/待确认/未知集/特别篇，供仪表盘种子状态区看清那一大坨到底是什么。
+    · 未知集 = 集号没解析出来(-2)、又不是单部作品——需人工补集号或排除。【最先判】不论番确不确认，
+              与 unknown_episode_rows（点开的列表）同口径，卡片数=列表条数。
+    · 特别篇 = 特别篇(-1) 与 单部作品名下的 -2（判据见 engine.is_special_ep）——同样后台不自动下，
+              但不用处理（要就到详情页对准那一条点『下载』），所以与未知集分开，只作提示、不进待办。
+              两类都【最先判】：否则会掉进『备用项』，而那张卡的说明是『同集已有更优版本』，纯属误导。
     · 将下载 = 已确认番·本集首选（download_plan 会挑中，会自动下；只有正集会被标）
     · 备用   = 已确认番·同集已有更优版本（不会自动下）；含已拒绝番/孤儿的残留
     · 待确认 = 番还没确认（要点确认才下）；集号 -2 的已归入『未知』，不重复计
     · 已完结 = 番已判完结且开了停订（不会自动下）——【必须单列】，否则它们会掉进『备用项』，
               而那张卡的说明是"同集已有更优版本"，纯属误导。
-    五者之和 = 待下总数。复用批量 download_plan_for_ids，仅几条查询、只在仪表盘打开时算。"""
+    六者之和 = 待下总数。复用批量 download_plan_for_ids，仅几条查询、只在仪表盘打开时算。"""
     with get_session() as s:
         conf = {aid: (c, fin) for aid, c, fin in s.exec(
             select(Anime.id, Anime.confirmed, Anime.finished_at).where(Anime.rejected.is_not(True)))}
         pend = list(s.exec(select(AnimeTorrent.id, AnimeTorrent.anime_id, AnimeTorrent.episode)
                            .where(AnimeTorrent.status == "pending")))
     plan = download_plan_for_ids({aid for aid, (c, _) in conf.items() if c})
-    will = backup = unconfirmed = unknown = finished = 0
+    sw = single_work_ids()
+    will = backup = unconfirmed = unknown = special = finished = 0
     unsub = config.ANIME_FINISH_UNSUB
     for tid, aid, ep in pend:
         row = conf.get(aid)
         c = row[0] if row else None
-        if not auto_downloadable_ep(ep):   # 特别篇/未知集最先判：不论番确不确认，后台都不自动下、都得人工处理。
-            unknown += 1         # 放最前才与点开的列表(unknown_episode_rows)同口径，卡片数=列表条数。
+        if not auto_downloadable_ep(ep):   # 特别篇/未知集最先判：不论番确不确认，后台都不自动下。
+            if engine.is_special_ep(ep, aid in sw):
+                special += 1
+            else:                # 与点开的列表(unknown_episode_rows)同一个判据，卡片数=列表条数。
+                unknown += 1
         elif row is None:        # 番已拒绝/孤儿 → 不会自动下
             backup += 1
         elif not c:              # 番未确认
@@ -3232,7 +3241,7 @@ def pending_breakdown() -> dict:
         else:                    # 已确认·非首选（同集有更优）
             backup += 1
     return {"will": will, "backup": backup, "unconfirmed": unconfirmed,
-            "unknown": unknown, "finished": finished}
+            "unknown": unknown, "special": special, "finished": finished}
 
 
 def _torrent_rows(*where) -> list[dict]:
@@ -3247,15 +3256,26 @@ def _torrent_rows(*where) -> list[dict]:
         "id": t.id,
         "anime_id": t.anime_id,
         "name": names.get(t.anime_id) or (t.anime_title or "?"),
+        "episode": t.episode,
         "raw": t.raw_title or "",
     } for t in ts]
 
 
+def single_work_ids() -> set:
+    """bgm 判为单部作品的番 id（判据见 engine.is_single_work）。全表百来行，整表扫一次、Python 里判，
+    别在 SQL 里抄一份判据。"""
+    with get_session() as s:
+        return {aid for aid, p, n in s.exec(select(Anime.id, Anime.platform, Anime.total_episodes))
+                if engine.is_single_work(p, n)}
+
+
 def unknown_episode_rows() -> list[dict]:
-    """待下里 `episode < 0` 的种子（特别篇 -1 与 批量/未知集 -2，两类后台都不自动下），供 KPI『特别篇/未知集』
-    点开手动处理。口径必须与 pending_breakdown 的 unknown 桶（auto_downloadable_ep）一致 —— 卡片数 == 列表条数
+    """待下里的真『未知集』：后台不自动下、又不按特别篇算的那些（特别篇判据见 engine.is_special_ep），
+    供 KPI『未知集』点开手动处理。口径必须与 pending_breakdown 的 unknown 桶一致 —— 卡片数 == 列表条数
     的唯一依据就是这两处同谓词。"""
-    return _torrent_rows(AnimeTorrent.status == "pending", AnimeTorrent.episode < 0)
+    sw = single_work_ids()
+    return [r for r in _torrent_rows(AnimeTorrent.status == "pending", AnimeTorrent.episode < 0)
+            if not engine.is_special_ep(r["episode"], r["anime_id"] in sw)]
 
 
 def failed_rows() -> list[dict]:
