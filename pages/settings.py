@@ -900,17 +900,18 @@ def settings():
                 _num("NOTIFY_BACKLOG_MIN", "待识别积压到几部才提醒", config.NOTIFY_BACKLOG_MIN)
 
             ui.separator()
-            _section("完结 / 断更巡检",
-                     "完结判定：bgm 给出总集数、且 1~总集数【每一集都在手】才算完结（有集号歧义段的番一律不判）。\n"
-                     "『判完结后停止自动下新集』默认关——判据虽保守，但 bgm 的总集数少记一集是真实存在的，"
-                     "那会让最后一集永远下不下来。建议先让它跑一阵、看『已完结』标得对不对再开。\n"
+            _section("下齐 / 断更巡检",
+                     "下齐判定：bgm 给出总集数、且 1~总集数【每一集都在手】才算已下齐（有集号歧义段的番一律不判）。"
+                     "系统确认不了一部番是不是真的播完了，所以只叫『已下齐』不叫『完结』。\n"
+                     "『下齐后停止自动下新集』默认关——判据虽保守，但 bgm 的总集数少记一集是真实存在的，"
+                     "那会让最后一集永远下不下来。建议先让它跑一阵、看『已下齐』标得对不对再开。\n"
                      "断更提醒：一部追番中的番多少天没有新种子就说一声——那是发现『源失效/字幕组停更』的"
                      "唯一自动手段（那类故障不报错，表现只是『好几天没更新了』）。")
             with ui.element("div").classes("field-grid w-full"):
                 f["ANIME_FINISH_ENABLED"] = ui.switch(
-                    "判定完结（只标记+通知）", value=config.ANIME_FINISH_ENABLED)
+                    "判定已下齐（只标记+通知）", value=config.ANIME_FINISH_ENABLED)
                 f["ANIME_FINISH_UNSUB"] = ui.switch(
-                    "判完结后停止自动下新集", value=config.ANIME_FINISH_UNSUB)
+                    "下齐后停止自动下新集", value=config.ANIME_FINISH_UNSUB)
                 _num("ANIME_IDLE_DAYS", "断更提醒阈值（天，0=关）", config.ANIME_IDLE_DAYS)
                 # 【给下限】这一项没有"0=关"的语义（关完结/断更各有自己的开关），
                 # 而 run_sweep 里是 max(60, ...) 秒——填 0 会变成每 60 秒来一次全表扫描。

@@ -345,7 +345,7 @@ def _apply_bgm(a: Anime, info: dict | None, keep_path: bool = False) -> None:
         # 24 集、或先前少记了一集，都会走到这里。巡检的 stale 分支本来也会撤销，
         # 但那要等下一个周期；而这中间用户看到的是一个【已经知道不对】的完结徽标，
         # 且开了停订的话新集会被一直挡在门外。与合并两部番时的处理同口径（见 _merge_anime）。
-        log.info("总集数 %s → %s，撤销完结标记：%s", old_total, a.total_episodes, display_of(a))
+        log.info("总集数 %s → %s，撤销已下齐标记：%s", old_total, a.total_episodes, display_of(a))
         a.finished_at = None
     # 季号以 bgm 规范名为准：ANi 罗马音标题常写 "Season 3" 本地解析不到而回 1，
     # 而 bgm 规范名带『第三季』，能纠正（名字没季标记则保留本地解析值）。
@@ -1832,8 +1832,11 @@ def _mark_finish_backfilled() -> None:
     _mark_backfilled(_FINISH_BACKFILL_KEY)
 
 
-async def sweep_finished() -> int:
+async def sweep_finished(only_ids=None) -> int:
     """维护 finished_at：集齐的打标记、不再集齐的【撤销】标记。返回本轮新判定的部数。
+
+    only_ids：只判这几部（详情页『重新识别』后对那一部立刻判一次，见 _manual_enrich_inner）；
+    默认 None＝全库，由巡检周期调用。两种调用走的是同一套判据、同一套先通知后落标记的流程。
 
     只打标记；是否据此停止自动下新集由 config.ANIME_FINISH_UNSUB 决定（默认关）。
 
@@ -1855,9 +1858,11 @@ async def sweep_finished() -> int:
         # subscribed_where 会在开了停订时附加 `finished_at IS NULL`，而本函数的候选集【必须】
         # 包含【已经标记过完结】的番——撤销那一半正是要在它们身上跑。换过去之后，
         # 已标记的番再也进不了候选，撤销静默死掉、FIN-LATCH 当场复活，而全部用例照绿。
-        cands = list(s.exec(select(Anime).where(
-            Anime.confirmed == True, Anime.rejected.is_not(True),   # noqa: E712
-            Anime.finish_optout.is_not(True))))
+        conds = [Anime.confirmed == True, Anime.rejected.is_not(True),   # noqa: E712
+                 Anime.finish_optout.is_not(True)]
+        if only_ids is not None:
+            conds.append(Anime.id.in_(list(only_ids)))
+        cands = list(s.exec(select(Anime).where(*conds)))
     if not cands:
         return 0
     cov = episode_coverage([a.id for a in cands])
@@ -1941,7 +1946,7 @@ async def sweep_finished() -> int:
             may_mark = (ok or not notify_enabled("finished")
                         or notify_cooldown_active("finished", str(a.id), _cd))
             if not may_mark:
-                log.info("完结通知没送出去（限流/熔断中/推送失败），本轮不落完结标记，"
+                log.info("已下齐通知没送出去（限流/熔断中/推送失败），本轮不落已下齐标记，"
                          "下一轮巡检会重新判、重新通知：%s", display_of(a))
                 continue
         with get_session() as s:
@@ -1955,11 +1960,11 @@ async def sweep_finished() -> int:
         done.append(a)
 
     if backfill:
-        log.info("完结判定：首轮回填 %d 部（不推送，避免把限流额度占满）", len(done))
+        log.info("下齐判定：首轮回填 %d 部（不推送，避免把限流额度占满）", len(done))
     if undone:
-        log.info("完结判定：%d 部不再集齐，已撤销完结标记（删过文件/失败/总集数变了）", len(undone))
+        log.info("下齐判定：%d 部不再集齐，已撤销已下齐标记（删过文件/失败/总集数变了）", len(undone))
     if done:
-        log.info("完结判定：%d 部集齐（%s）", len(done),
+        log.info("下齐判定：%d 部已下齐（%s）", len(done),
                  "已停订" if config.ANIME_FINISH_UNSUB else "仅标记")
     return len(done)
 
@@ -2035,7 +2040,7 @@ async def sweep_idle() -> int:
                     n += 1
             s.commit()
         if n:
-            log.info("断更巡检：首轮回填 %d 部早已静默的番（不推送；含已完结/已忽略的）", n)
+            log.info("断更巡检：首轮回填 %d 部早已静默的番（不推送；含已下齐/已忽略的）", n)
         _mark_backfilled(_IDLE_BACKFILL_KEY)
         _done = set(done_ids)
         for a in subs:
@@ -2274,10 +2279,10 @@ def confirmed_anime_ids(ids) -> set:
 def auto_off_reasons(ids) -> dict:
     """给定番 id，返回 {id: 「为什么后台不会自动下它」}；会自动下的番不出现在结果里。
 
-    值域：『已忽略』/『待确认』/『已完结』。判序是 **rejected → not confirmed → finished**：
+    值域：『已忽略』/『待确认』/『已下齐·停订』。判序是 **rejected → not confirmed → finished**：
     超期忽略是 (rejected=1, confirmed=0) 两位同时成立，必须先判 rejected 才与详情页
     `not cur.confirmed and not cur.rejected → cur.rejected → cur.finished_at` 那三档对齐。
-    与 `pending_breakdown` 只在『已完结』这一档同源（那边没有『已忽略』档：被拒绝番的待下种子归『备用』）。
+    与 `pending_breakdown` 只在『已下齐·停订』这一档同源（那边没有『已忽略』档：被拒绝番的待下种子归『备用』）。
 
     【为什么需要它】`confirmed_anime_ids` 只回答"会不会下"，回答不了"为什么不下"。
     于是渲染侧只能把三种情况统统显示成『待确认』，并把用户指去『待确认』tab——
@@ -2296,7 +2301,7 @@ def auto_off_reasons(ids) -> dict:
             elif not confirmed:
                 out[aid] = "待确认"
             elif finished is not None and config.ANIME_FINISH_UNSUB:
-                out[aid] = "已完结"
+                out[aid] = "已下齐·停订"
     return out
 
 
@@ -2894,8 +2899,17 @@ async def _manual_enrich_inner(anime_id: int, freeze_empty_path: bool = False,
     同一个按钮名在两个页面上行为不同，而差别只有在几小时后"它怎么还没识别出来"时才显形。
     """
     reset_enrich_tries(anime_id)
-    return await enrich_anime(anime_id, freeze_empty_path=freeze_empty_path,
-                              keep_binding=keep_binding)
+    ok = await enrich_anime(anime_id, freeze_empty_path=freeze_empty_path,
+                            keep_binding=keep_binding)
+    if ok:
+        # 【识别完立刻对这一部判一次完结】bgm 改了总集数（如 12→11）时，_apply_bgm 只会【撤销】旧的完结标记，
+        # 补判要等 3 小时一轮的巡检——用户刚点完『重新识别』，看到的是集都下齐了却没有『已完结』。
+        # 只判这一部、不扫全库；判不出来或出错都不影响识别本身的结果，巡检周期照常兜底。
+        try:
+            await sweep_finished({anime_id})
+        except Exception:
+            log.exception("重新识别后判已下齐失败（不影响识别结果，等下一轮巡检）：anime=%s", anime_id)
+    return ok
 
 
 def reset_enrich_tries(anime_id: int) -> None:
@@ -3210,7 +3224,7 @@ def pending_breakdown() -> dict:
     · 将下载 = 已确认番·本集首选（download_plan 会挑中，会自动下；只有正集会被标）
     · 备用   = 已确认番·同集已有更优版本（不会自动下）；含已拒绝番/孤儿的残留
     · 待确认 = 番还没确认（要点确认才下）；集号 -2 的已归入『未知』，不重复计
-    · 已完结 = 番已判完结且开了停订（不会自动下）——【必须单列】，否则它们会掉进『备用项』，
+    · 已下齐·停订 = 番已按 bgm 总集数下齐且开了停订（不会自动下）——【必须单列】，否则它们会掉进『备用项』，
               而那张卡的说明是"同集已有更优版本"，纯属误导。
     六者之和 = 待下总数。复用批量 download_plan_for_ids，仅几条查询、只在仪表盘打开时算。"""
     with get_session() as s:

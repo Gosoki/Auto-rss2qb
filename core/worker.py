@@ -403,7 +403,7 @@ async def sweep_round() -> None:
     """
     async with _sweep_lock:
         for name, fn in (("交付残骸清扫", engine.sweep_stale_delivering),
-                         ("完结判定", anime.sweep_finished),
+                         ("下齐判定", anime.sweep_finished),
                          ("断更提醒", anime.sweep_idle),
                          ("积压告警", anime.sweep_alerts)):
             try:
@@ -421,8 +421,8 @@ async def run_sweep() -> None:
     尤其是断更检测——源失效/字幕组停更时采集轮看起来一切正常（抓到 0 条不是错误），
     只有这条巡检会说话。数据库停摆时跳过。
     """
-    log.info("完结/断更巡检协程启动（%s，每 %d 分钟；断更阈值 %d 天）",
-             "完结判定开" if config.ANIME_FINISH_ENABLED else "完结判定关",
+    log.info("下齐/断更巡检协程启动（%s，每 %d 分钟；断更阈值 %d 天）",
+             "下齐判定开" if config.ANIME_FINISH_ENABLED else "下齐判定关",
              config.SWEEP_INTERVAL_MIN, config.ANIME_IDLE_DAYS)
     # 【交付残骸的清扫要先做，不能等那个长睡】(E-57) 上个进程遗留的 downloading 占位既不被 sync 复查、
     # 又占着 HAVE_STATUSES（集去重认定该集已有一份），等 3 小时才清是不行的 —— 以前这件事是

@@ -401,6 +401,28 @@ def rating_label(score) -> str | None:
     return _BGM_RATING_TIERS.get(round(score)) if score else None
 
 
+def cover_thumb(url) -> str:
+    """bgm 封面原图 → c 尺寸（150×212），给列表/卡片的小图用。
+
+    库里存的是 bgm 接口给的 large 原图，实测 80~500KB 一张；c 尺寸 8~20KB，两者路径只差
+    `/pic/cover/l/` ↔ `/pic/cover/c/`，换个地址就行、不用再请求 bgm。图由浏览器直接去 bgm 图床拉，
+    不经过本服务；图床缓存头 30 天。详情页的大图仍用原图。不是 bgm 图床的地址原样返回。"""
+    if url and "/pic/cover/l/" in url:
+        return url.replace("/pic/cover/l/", "/pic/cover/c/", 1)
+    return url or ""
+
+
+def finished_tip(a, resub_hint: str) -> str:
+    """『已下齐』徽标的悬停说明，详情页与番剧卡片共用。停订与否由全局开关决定，所以必须说清
+    【当前这台机器上】它意味着什么，否则用户看到"已下齐"无从判断后台还会不会继续下。
+    【叫"下齐"不叫"完结"】系统确认不了一部番真的播完了，判据只是"按 bgm 总集数，1~N 集都在手"。
+    resub_hint：在当前位置怎么找到『继续订阅』（详情页就在右边、卡片上要进详情页）。"""
+    return (f"按 bgm 总集数，1~{a.total_episodes} 集全部到手（判定于 {a.finished_at.strftime('%Y-%m-%d %H:%M')}）。"
+            + (f"已停止自动下新集——若这部番其实还没完（bgm 的总集数少记了），{resub_hint}。"
+               if config.ANIME_FINISH_UNSUB
+               else "仅作标记，后台仍会继续下新集（『下齐后停止自动下新集』开关在设置页）。"))
+
+
 def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
     """详情元信息卡：封面 + bgm 链接（图下） + 两列 kv 网格 + 右上角豆瓣式评分（分+评价） + 简介。
     番剧/剧场版详情共用，kv_pairs=[(标签, 值)...] 各页自备（字段集略不同）。"""
@@ -1107,9 +1129,10 @@ def frame(active: str = ""):
     # 业务库停摆时全站挂一条：任何页面都看得见，别让人对着一个"看着正常"的空界面猜。
     already_notified = db.is_data_down()
     if already_notified:
-        with ui.column().classes("w-full max-w-5xl mx-auto px-2 pt-2 gap-1"):
+        with ui.column().classes("w-full max-w-7xl mx-auto px-2 pt-2 gap-1"):
             _db_down_notice()
-    with ui.column().classes("w-full max-w-5xl mx-auto p-2") as body:
+    # 全站内容宽度 max-w-7xl（1280px）：番剧表卡片一行 6 张左右；所有页面同宽，切页面不跳边框。
+    with ui.column().classes("w-full max-w-7xl mx-auto p-2") as body:
         try:
             yield header_right
         except db.DatabaseBusy as e:

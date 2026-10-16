@@ -4,7 +4,7 @@ from nicegui import ui
 from core import anime, engine
 import config
 from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, require_bind_confirm,
-                     ep_label, ep_str, meta_card,
+                     ep_label, ep_str, finished_tip, meta_card,
                      name_of, parse_bgm_id,
                      qb_live_text, season_label, source_options, torrent_status_cn,
                      warn_banner)
@@ -174,14 +174,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     _rs, _rd = anime.confirm_reason_text(cur.confirm_reason)
                     ui.badge(f"待确认 · {_rs}").props("color=orange").tooltip(_rd)
                 if cur.finished_at:
-                    # 停订与否由全局开关决定，所以徽标的 tooltip 必须说清【当前这台机器上】它意味着什么，
-                    # 否则用户看到"已完结"无从判断后台还会不会继续下。
-                    ui.badge("已完结").props("color=teal").tooltip(
-                        f"1~{cur.total_episodes} 集全部到手（判定于 "
-                        f"{cur.finished_at.strftime('%Y-%m-%d %H:%M')}）。"
-                        + ("已停止自动下新集——若这部番其实还没完（bgm 的总集数少记了），"
-                           "点右边的『继续订阅』。" if config.ANIME_FINISH_UNSUB
-                           else "仅作标记，后台仍会继续下新集（『判完结后停止自动下新集』开关在设置页）。"))
+                    ui.badge("已下齐").props("color=teal").tooltip(finished_tip(cur, "点右边的『继续订阅』"))
             if on_close:
                 ui.button(icon="close", on_click=on_close).props("flat round dense").classes(
                     "shrink-0")
@@ -200,8 +193,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 if cur.finished_at:
                     ui.button("继续订阅", icon="autorenew", on_click=_resubscribe).props(
                         "unelevated dense color=primary").classes("btn-sm").tooltip(
-                        "清掉完结标记并【不再自动判它完结】。bgm 的总集数少记一集时用这个——"
-                        "否则下一轮巡检立刻又会把它判回完结。")
+                        "清掉『已下齐』标记并【不再自动判它下齐】。bgm 的总集数少记一集时用这个——"
+                        "否则下一轮巡检立刻又会把它判回已下齐。")
                 ui.button("忽略本番", icon="block", on_click=_reject).props(
                     "flat dense color=grey").classes("btn-sm")
 
@@ -393,9 +386,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             #    因为整部番不在候选里。这条假承诺比前一条更糟：它让人干等。
                             # 判序与 core.anime.pending_breakdown 的『已完结』单列一档对齐（那边是对的）。
                             ui.badge("已停订·不自动下").props("color=teal").tooltip(
-                                "这部番已判完结，且设置页开着『完结后停止自动下新集』，所以它的新集"
+                                "这部番已按 bgm 总集数下齐，且设置页开着『下齐后停止自动下新集』，所以它的新集"
                                 "一律不自动下（含失败后的自动重发）。要这一集就点右边『下载』；"
-                                "若其实还没完结，点上方的『继续订阅』。")
+                                "若其实还没播完，点上方的『继续订阅』。")
                         elif t.retry_at:   # 暂时性失败排队中：它仍是待下，但要让人看见"为什么还没下"
                             ui.badge(f"重试中·第{t.retry_count}次").props("color=orange").tooltip(
                                 f"{t.fail_reason or '暂时性失败'} · "
@@ -426,7 +419,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             # 已忽略/已停订的番 _bf 本来就是 False，也走这里 —— 让 tooltip 说清是哪道闸，
                             # 而不是一句"下载失败过"。
                             _gate = ("这部番还没确认" if not cur.confirmed else
-                                     "这部番在『已忽略』里" if cur.rejected else "这部番已判完结并停订")
+                                     "这部番在『已忽略』里" if cur.rejected else "这部番已下齐并停订")
                             ui.badge("失败").props("color=red").tooltip(
                                 _why + f"{_gate}，『补下』不会挑它；要这一集就点右边『下载』{_tried}")
                         else:
@@ -617,8 +610,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if n is None:
             return
         _after()
-        ui.notify(f"已继续订阅，补下 {n} 集（此后不再自动判它完结）" if n
-                  else "已继续订阅（此后不再自动判它完结）", type="positive")
+        ui.notify(f"已继续订阅，补下 {n} 集（此后不再自动判它下齐）" if n
+                  else "已继续订阅（此后不再自动判它下齐）", type="positive")
 
     async def _download():
         """『下载该源』/『补下全部』：把这部番下的 pending/error 补一遍。
@@ -642,7 +635,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                    if not cur.confirmed else
                    "这部番已被【忽略】，先『恢复订阅』"
                    if cur.rejected else
-                   "这部番已判【完结】且开着停订，先点『继续订阅』")
+                   "这部番已【下齐】且开着停订，先点『继续订阅』")
             ui.notify(f"没有触发下载：{why}", type="warning")
         elif anime.download_plan(anime_id, for_backfill=True):
             # 【0 集还有第三种成因，别都说成"没得下"】(R31) 闸没挡住、候选也确实存在，

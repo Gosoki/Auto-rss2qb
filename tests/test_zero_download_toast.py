@@ -229,7 +229,7 @@ async def test_movie_detail_explains_a_stalled_row_and_does_not_call_it_a_failur
 
 @pytest.mark.nicegui_main_file(_MAIN)
 async def test_an_unsubscribed_because_finished_animes_error_row_names_that_gate(user, clean_tables, cfg):
-    """(R34 对抗审计) is_subscribed 的第三种情形：已判完结 + 开了停订。文案要说"已判完结并停订"。"""
+    """(R34 对抗审计) is_subscribed 的第三种情形：已下齐 + 开了停订。文案要说"已下齐并停订"。"""
     from datetime import datetime
 
     from db.models import Anime, AnimeTorrent
@@ -245,4 +245,4 @@ async def test_an_unsubscribed_because_finished_animes_error_row_names_that_gate
         aid = a.id
     await user.open(f"/detail/{aid}")
     badge, tip = _tooltip_of(user, "失败")
-    assert badge.props.get("color") == "red" and "已判完结并停订" in tip, (badge.props, tip)
+    assert badge.props.get("color") == "red" and "已下齐并停订" in tip, (badge.props, tip)

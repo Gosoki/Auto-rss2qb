@@ -139,7 +139,7 @@ def test_auto_off_reasons_matches_pending_breakdown_wording(clean_tables, cfg):
         rows = {
             "待确认": Anime(title="a", quarter="26A", confirmed=False),
             "已忽略": Anime(title="b", quarter="26A", confirmed=True, rejected=True),
-            "已完结": Anime(title="c", quarter="26A", confirmed=True, finished_at=datetime.now()),
+            "已下齐·停订": Anime(title="c", quarter="26A", confirmed=True, finished_at=datetime.now()),
         }
         normal = Anime(title="d", quarter="26A", confirmed=True)
         for r in rows.values():

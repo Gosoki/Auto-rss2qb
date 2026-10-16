@@ -319,7 +319,7 @@ def maintenance_blockers() -> list[str]:
                        # · 归档：读 (id, hash) → await qb.delete(45s 上限) → 按 id 写回 archived_at
                        # · 巡检：读 Anime.id → await notify_event(每条 NOTIFY_TIMEOUT) → 按 id 写 finished_at
                        (_w._archive_lock, "完成归档轮"),
-                       (_w._sweep_lock, "完结/断更/积压巡检轮")):
+                       (_w._sweep_lock, "下齐/断更/积压巡检轮")):
         if lock.locked():
             reasons.append(f"{what}正在跑（它跨 await 持着业务库主键）")
     # 【第八类：页面驱动的工作】(R33) 见 `in_flight` 处的说明。这些既没有锁、也不是我们

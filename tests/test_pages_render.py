@@ -74,11 +74,11 @@ async def test_manage_list_shows_episode_progress(user: User, clean_tables):
 
 
 @pytest.mark.nicegui_main_file(_MAIN)
-async def test_finished_badge_is_gone(user: User, clean_tables, cfg):
-    """(R20) 『已完结』不再显示——它的信息量被『已下/可下』覆盖了（12/12 就是完结）。
+async def test_downloaded_badge_shows_without_unsub(user: User, clean_tables, cfg):
+    """卡片左上角显示『已下齐』（2026-10 用户要求：番剧表改卡片后，下齐的番要一眼看得出来）。
 
-    但开了停订时仍要出徽标：那是【行为变化】不是状态描述，在此之前这部番在列表里
-    与正常追番的番长得一模一样，而它已经不再自动下新集了。
+    叫"下齐"不叫"完结"：系统确认不了真播完，判据只是"按 bgm 总集数 1~N 集都在手"。
+    没开停订时只写『已下齐』，不带『停订』——那时它照常自动下新集。
     """
     from datetime import datetime
 
@@ -97,14 +97,14 @@ async def test_finished_badge_is_gone(user: User, clean_tables, cfg):
     cfg(ANIME_FINISH_UNSUB=False)
     await user.open("/?t=manage")
     tree = str(user.current_layout)
-    assert "已完结" not in tree, "『已完结』徽标还在"
-    assert "已停订" not in tree, "没开停订却出了『已停订』"
+    assert "已下齐" in tree, "集都下齐了却没有『已下齐』徽标"
+    assert "已下齐·停订" not in tree, "没开停订却标了『停订』"
     assert "2/2" in tree, "进度比值没显示"
 
 
 @pytest.mark.nicegui_main_file(_MAIN)
 async def test_unsubscribed_badge_appears_when_the_switch_is_on(user: User, clean_tables, cfg):
-    """开了停订时必须出徽标——它标的是"这部番不再自动下新集了"，是行为不是状态。"""
+    """开了停订时徽标必须写明『停订』——它标的是"这部番不再自动下新集了"，是行为不是状态。"""
     from datetime import datetime
 
     from db.models import Anime, AnimeTorrent
@@ -121,7 +121,7 @@ async def test_unsubscribed_badge_appears_when_the_switch_is_on(user: User, clea
 
     cfg(ANIME_FINISH_UNSUB=True)
     await user.open("/?t=manage")
-    assert "已停订" in str(user.current_layout), "开了停订却没有任何标记"
+    assert "已下齐·停订" in str(user.current_layout), "开了停订却没写明『停订』"
 
 
 # ---------------- (R22) 维护窗口里，七个页面仍然要渲染得出来 ----------------

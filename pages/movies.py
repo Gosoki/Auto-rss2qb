@@ -12,7 +12,7 @@ import db
 from db.models import MovieTorrent
 from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN
-from .layout import (SEVERITY_COLOR, WEEKDAY_CN, barline, busy_action, confirm, require_bind_confirm,
+from .layout import (SEVERITY_COLOR, WEEKDAY_CN, barline, busy_action, confirm, cover_thumb, require_bind_confirm,
                      require_config_loaded,
                      expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
@@ -610,7 +610,7 @@ def movies_page(t: str = ""):
             with ui.card().classes("w-full"):
                 with ui.row().classes("gap-3 items-start no-wrap w-full"):
                     if m.cover_url:
-                        ui.image(m.cover_url).classes("rounded").style("min-width:4rem;width:4rem")
+                        ui.image(cover_thumb(m.cover_url)).classes("rounded").style("min-width:4rem;width:4rem")
                     with ui.column().classes("gap-1 grow min-w-0"):
                         with ui.row().classes("items-center gap-2 flex-wrap"):
                             ui.badge(m.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定

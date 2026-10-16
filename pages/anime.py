@@ -12,7 +12,8 @@ from db.models import AnimeTorrent
 from core import alerts, anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail, restore_anime_gated, subscribe_gated
-from .layout import (busy_action, confirm, require_bind_confirm, ep_label, expand_collapse_bar,
+from .layout import (busy_action, confirm, cover_thumb, finished_tip, require_bind_confirm, ep_label,
+                     expand_collapse_bar,
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_badge, recent_table, season_label, source_options,
@@ -48,12 +49,27 @@ _TABS_DEF = (("overview", "仪表盘", "dashboard"), ("manage", "番剧表", "mo
 ANIME_TAB_LABELS = {k: name for k, name, _ in _TABS_DEF}   # 设置页『默认标签页』下拉直接用它
 _TAB_KEYS = tuple(ANIME_TAB_LABELS)
 
+# 番剧表的卡片网格：按容器宽度自动排列数（桌面多列、手机 2 列）；番名最多两行，悬停看全名（title 属性）。
+_HEAD_ANIME_CSS = (
+    "<style>"
+    # width:100% 必须写：季度折叠块的内容区是 align-items:flex-start 的 flex 列，不写的话网格只按
+    # 内容收缩成 3 列、右边大片空着（auto-fill 要靠一个确定的宽度才排得出列数）。
+    # 列宽下限写成 min(固定宽, 50%-8px)：屏再窄也至少两列，不会掉成一列、封面撑满整屏。
+    ".anime-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(160px,calc(50% - 8px)),1fr));"
+    "gap:16px;padding:8px 4px;width:100%}"
+    ".anime-card:hover{border-color:rgba(255,255,255,.28)!important}"
+    ".anime-card-title{font-size:17px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;"
+    "overflow:hidden;line-height:1.35;min-height:2.7em;word-break:break-all}"
+    "</style>"
+)
+
 
 @ui.page("/")
 def anime_page(t: str = ""):
     """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。
     默认空串：顶栏导航进来（无 ?t=）时留给下面按 ANIME_DEFAULT_TAB 决定默认停哪个 tab。"""
     with frame("manage"):  # 本页用 tab + 30s 定时刷新，不往顶栏右侧放自定义动作
+        ui.add_head_html(_HEAD_ANIME_CSS)
         # 番剧表：分页页码 + 一键展开/收起意图（None=按默认）+ 搜索词。
         # 【搜索词必须存在这里、不能只留在输入框控件上】面板是 @ui.refreshable，
         # 翻页/展开/详情弹窗关闭都会整体重建它，控件上的值会跟着没。
@@ -190,7 +206,7 @@ def anime_page(t: str = ""):
             # 关键：把最新选择写进当前环图元素的 props 并推给前端。定时器每 30s 刷 head/tail，
             # 前端据此重挂载环图时读的是元素 props——props 不更新就会用建图时的旧 selected 把排除态刷回来。
             el = e.sender
-            el.options.setdefault("legend", {})["selected"] = dict(_legend_sel)
+            el.options["baseOption"]["legend"]["selected"] = dict(_legend_sel)   # 配置分 base/media，图例在 base 里
             el.update()
 
         @ui.refreshable
@@ -236,30 +252,38 @@ def anime_page(t: str = ""):
                         ui.label("—").classes("text-gray-500 text-sm")
                     else:
                         # 环图：各源的种子占比（悬停切片→环心显示源名+数量）。ov['by_source']=[(源,种子数)…]
+                        # 图例显示【全名】、不截断：环图与图例按像素排（环心 100px，图例从 205px 起），
+                        # 宽屏下最长的组名（"豌豆字幕组&风之圣殿字幕组&LoliHouse" 约 220px）也是一行；放不下的源照旧翻页。
+                        # 图表本身不足 480px 宽（窄屏、两列堆叠时）走 media：环图按比例放、长名换行而不是截断。
                         ui.echart({
-                            # Tailwind -400 十色（sRGB hex；ECharts canvas 不吃 oklch）
-                            "color": ["#50a2ff", "#a684ff", "#00d492", "#ff8904", "#ff6467",
-                                      "#00d3f3", "#fb64b6", "#9ae600", "#c27aff", "#00d5be"],
-                            "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} 种子 · {d}%"},
-                            "legend": {"type": "scroll", "orient": "vertical", "right": "2%",
-                                       # 组名可以很长（"豌豆字幕组&风之圣殿字幕组&LoliHouse"），不截就把环图挤扁。
-                                       # 108px ≈ 8 个汉字 + 省略号（图例字号默认 12）。按【像素】截而不是按字数：
-                                       # 中英混排时各行收在同一竖线上，比"都留 8 个字"齐整。全名仍在——悬停切片，环心会显示。
-                                       "top": "middle", "textStyle": {"color": "#99a1af",  # gray-400(灰2)
-                                                                      "width": 108,
-                                                                      "overflow": "truncate",
-                                                                      "ellipsis": "…"},
-                                       "selected": dict(_legend_sel)},  # 回填用户的图例排除态
-                            "series": [{
-                                "name": "种子来源", "type": "pie",
-                                "radius": ["45%", "72%"], "center": ["32%", "50%"],
-                                "avoidLabelOverlap": False,
-                                "itemStyle": {"borderColor": "#1a1c22", "borderWidth": 2},
-                                "label": {"show": False, "position": "center"},
-                                "emphasis": {"label": {"show": True, "color": "#d1d5dc",
-                                                       "fontSize": 14, "fontWeight": "bold",
-                                                       "formatter": "{b}\n{c}"}},
-                                "data": [{"name": src, "value": tot} for src, tot in ov["by_source"]],
+                            "baseOption": {
+                                # Tailwind -400 十色（sRGB hex；ECharts canvas 不吃 oklch）
+                                "color": ["#50a2ff", "#a684ff", "#00d492", "#ff8904", "#ff6467",
+                                          "#00d3f3", "#fb64b6", "#9ae600", "#c27aff", "#00d5be"],
+                                "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} 种子 · {d}%"},
+                                "legend": {"type": "scroll", "orient": "vertical", "left": 205,
+                                           "top": "middle",
+                                           "textStyle": {"color": "#99a1af",  # gray-400(灰2)
+                                                         "width": 240, "overflow": "break"},
+                                           "selected": dict(_legend_sel)},  # 回填用户的图例排除态
+                                "series": [{
+                                    "name": "种子来源", "type": "pie",
+                                    "radius": ["45%", "72%"], "center": [100, "50%"],
+                                    "avoidLabelOverlap": False,
+                                    "itemStyle": {"borderColor": "#1a1c22", "borderWidth": 2},
+                                    "label": {"show": False, "position": "center"},
+                                    "emphasis": {"label": {"show": True, "color": "#d1d5dc",
+                                                           "fontSize": 14, "fontWeight": "bold",
+                                                           "formatter": "{b}\n{c}"}},
+                                    "data": [{"name": src, "value": tot} for src, tot in ov["by_source"]],
+                                }],
+                            },
+                            "media": [{
+                                "query": {"maxWidth": 480},
+                                "option": {
+                                    "legend": {"left": "50%", "textStyle": {"width": 140}},
+                                    "series": [{"center": ["25%", "50%"]}],
+                                },
                             }],
                         }).classes("w-full").style("height:220px").on(
                             "chart:legendselectchanged", _remember_legend, args=["selected"])
@@ -286,8 +310,8 @@ def anime_page(t: str = ""):
                 ("将下载", ps["will"], "blue", "已确认番·本集首选，会自动下（特别篇/未知集不在其列，需手动下）"),
                 ("备用项", ps["backup"], "blue-grey", "同集已有『将下载/已下』的更优版本，不会自动下"),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
-                *([("已完结", ps["finished"], "teal",
-                    "番已判定完结、且设置里开了『判完结后停止自动下新集』，所以这些不会自动下。"
+                *([("已下齐·停订", ps["finished"], "teal",
+                    "番已按 bgm 总集数下齐、且设置里开了『下齐后停止自动下新集』，所以这些不会自动下。"
                     "若那部番其实还没完（bgm 的总集数少记了），去详情页点『继续订阅』")]
                   if ps.get("finished") else []),
                 ("未知集", ps["unknown"], "purple",
@@ -409,32 +433,32 @@ def anime_page(t: str = ""):
             for i, (q, items) in enumerate(group_by_quarter(pend)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
                                   value=(i == 0 if exp is None else exp)).classes("w-full").props(remove="dense"):
-                    for a in items:
-                        srcs = smap.get(a.id, [])
-                        with ui.card().classes("w-full"):
-                            with ui.row().classes("items-center gap-3 flex-wrap"):
-                                ui.badge("待确认").props("color=orange")
-                                ui.label(name_of(a)).classes(
-                                    "text-lg cursor-pointer text-blue-400 hover:underline").on(
-                                    "click", lambda aid=a.id: open_detail(aid))
-                                sl = season_label(a)
-                                if sl:
-                                    ui.badge(sl).props("color=purple")
-                                platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标提示
-                                ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
-                                _rs, _rd = anime.confirm_reason_text(a.confirm_reason)
-                                ui.label("原因: " + _rs).classes("text-xs text-orange-400").tooltip(_rd)
-                            with ui.row().classes("items-stretch gap-3 flex-wrap"):
-                                # 预填当前锁定源：这个番可能是【补齐/绑定 bgm 打回来的】、本来就设过锁，
-                                # 下拉恒空会让用户点一下『确认下载』就把锁静默解掉（选中值会被写回）。
-                                # 与详情页那个【同一个控件】逐字对齐：同样的 source_options、
-                                # 同样绑 pref_source，宽度类与占位文案也该一样。
-                                # min-w-48 是个裸的硬地板（窄屏不收缩也不满宽），是这轮统一漏下的最后一个。
-                                sel = ui.select(source_options(srcs, "下载源：按优先级·多源兜底"),
-                                                value=(a.pref_source or "")).classes(
-                                    "w-full sm:w-auto sm:min-w-52")
-                                ui.button("确认下载", on_click=_approve(a.id, sel)).props("unelevated color=primary")
-                                ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
+                    with ui.element("div").classes("anime-grid"):
+                        for a in items:
+                            _confirm_card(a, smap.get(a.id, []))
+
+        def _confirm_card(a, srcs):
+            # 待确认一张卡：封面/番名点开详情，下面是操作区。整张卡【不】可点——里面有下拉框和按钮，
+            # 点它们会冒泡成"打开详情"。操作区用 mt-auto 压到卡底，同一行的卡按钮对齐。
+            with ui.card().tight().classes("anime-card w-full"):
+                _card_cover(a, status=("待确认", "orange", None), sources=srcs).classes(
+                    "cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
+                with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
+                    _card_title(a).classes("cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
+                    _rs, _rd = anime.confirm_reason_text(a.confirm_reason)
+                    ui.label("原因: " + _rs).classes("text-xs text-orange-400").tooltip(_rd)
+                    with ui.column().classes("w-full gap-2 mt-auto pt-1"):
+                        # 预填当前锁定源：这个番可能是【补齐/绑定 bgm 打回来的】、本来就设过锁，
+                        # 下拉恒空会让用户点一下『确认下载』就把锁静默解掉（选中值会被写回）。
+                        # 与详情页那个【同一个控件】对齐：同样的 source_options、同样绑 pref_source。
+                        # 卡片窄，空选项只写"按优先级"（全写会截成"下载源：按优…"），完整含义放悬停里说
+                        sel = ui.select(source_options(srcs, "按优先级"),
+                                        value=(a.pref_source or "")).classes("w-full")
+                        sel.tooltip("下载源：不选＝按优先级、多源兜底；选一个组＝锁定只下这个组")
+                        with ui.row().classes("w-full gap-2 items-center"):
+                            ui.button("确认下载", on_click=_approve(a.id, sel)).props(
+                                "unelevated color=primary").classes("grow")
+                            ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
         @ui.refreshable
         def reject_panel():
@@ -452,27 +476,9 @@ def anime_page(t: str = ""):
             for i, (q, items) in enumerate(group_by_quarter(rej)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
                                   value=(i == 0 if exp is None else exp)).classes("w-full").props(remove="dense"):
-                    for a in items:
-                        with ui.card().classes("w-full"):
-                            with ui.row().classes("items-center gap-3 flex-wrap"):
-                                ui.badge("已忽略").props("color=grey")
-                                ui.label(name_of(a)).classes(
-                                    "text-lg cursor-pointer text-blue-400 hover:underline").on(
-                                    "click", lambda aid=a.id: open_detail(aid))
-                                sl = season_label(a)
-                                if sl:
-                                    ui.badge(sl).props("color=purple")
-                                ui.label("来源: " + (" · ".join(smap.get(a.id, [])) or "—")).classes(
-                                    "text-xs text-gray-400")
-                            with ui.row().classes("items-stretch gap-3 flex-wrap"):
-                                ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
-                                    "unelevated color=primary")
-                                nf = dlmap.get(a.id, 0)
-                                if nf:  # 只有确实下过文件才给『删除文件』
-                                    ui.button("删除文件", icon="delete_forever",
-                                              on_click=_del_files(a.id, name_of(a), nf)).props(
-                                        "flat color=negative").tooltip(
-                                        "连同 qB 里的硬盘文件一起删（不可撤销）")
+                    with ui.element("div").classes("anime-grid"):
+                        for a in items:
+                            _reject_card(a, smap.get(a.id, []), dlmap.get(a.id, 0))
 
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（deleted 是终态、不会自动重下）
             if dels:
@@ -512,6 +518,26 @@ def anime_page(t: str = ""):
                             ui.button("恢复", icon="undo", on_click=_unexclude(x["id"])).props(
                                 "flat dense color=primary").classes("btn-sm").tooltip(
                                 "放回待下，重新参与下载/去重")
+
+        def _reject_card(a, srcs, nf):
+            # 已忽略一张卡：同待确认，封面/番名点开详情、操作区压到卡底。封面不置灰——这一页全是已忽略，灰了反而看不清。
+            with ui.card().tight().classes("anime-card w-full"):
+                # 与详情页同一套词：超期忽略(rejected 且 confirmed=False，按开始使用日自动判) / 已忽略(人工)
+                status = (("超期忽略", "grey", "开播早于『开始使用日』，自动判的忽略。"
+                                             "改开始使用日或点『恢复订阅』都能放回来")
+                          if not a.confirmed else ("已忽略", "grey", None))
+                _card_cover(a, status=status, sources=srcs).classes(
+                    "cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
+                with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
+                    _card_title(a).classes("cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
+                    with ui.row().classes("w-full gap-2 items-center mt-auto pt-1"):
+                        ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
+                            "unelevated color=primary").classes("grow")
+                        if nf:  # 只有确实下过文件才给『删除文件』；卡片窄，只留图标，说明放 tooltip
+                            ui.button(icon="delete_forever",
+                                      on_click=_del_files(a.id, name_of(a), nf)).props(
+                                "flat round color=negative").tooltip(
+                                f"删除已下的 {nf} 个文件：连同 qB 里的硬盘文件一起删（不可撤销）")
 
         @ui.refreshable
         def fail_panel():
@@ -699,9 +725,9 @@ def anime_page(t: str = ""):
                     if fl["built"]:
                         return
                     fl["built"] = True
-                    with box:
+                    with box, ui.element("div").classes("anime-grid"):
                         for a in qi:
-                            _anime_row(a, src_map.get(a.id), prog_map.get(a.id))
+                            _anime_card(a, src_map.get(a.id), prog_map.get(a.id))
 
                 if _open:
                     _fill()
@@ -1059,60 +1085,88 @@ def anime_page(t: str = ""):
                 ui.notify(f"完成：{cnt} 部刷到了 bgm 资料", type="positive")
             return h
 
-        def _anime_row(a, sources=None, prog=None):
-            # 块级容器 + 行内徽标/标题：徽标贴着标题同排，标题过长时标题自己换行（徽标不再被挤到单独一行）。
-            # 【display 不在这里定】徽标的 display 由 pages/layout.py 的全局规则一处定成
-            # inline-flex（那是"字在框里居中"的布局保证）。这里只负责 vertical-align 与间距。
-            # 早先这 6 处各挂了一个 inline-block，而 !important 的全局规则把它整个顶掉——
-            # 类是死的，注释里"q-badge 默认 display:inline"这句自全局 CSS 落地起就不再成立，
-            # 下一个人照着它在别处"统一"只会重复一遍无效操作。
-            with ui.element("div").classes("pl-2 py-2 leading-relaxed"):
-                if sources:   # 源徽标放最前：多源(>1)蓝 / 单源(==1)灰
+        def _card_cover(a, *, dim: bool = False, status=None, sources=None, prog=None):
+            """卡片的封面区，番剧表/待确认/已忽略三处共用。四个角的徽标只在这里摆，三处位置一致：
+              · 左上：状态 status=(文案, 颜色, 悬停说明或 None)，下面叠『已下齐』——上下叠放而不是并排，
+                两个同时出现（判下齐后又被忽略/打回待确认）时也不会和右上角的季号挤在一起；
+              · 右上：季号，下面叠 bgm 判定的非 TV 类型（WEB/剧场版/OVA…）；
+              · 左下：多源/单源（悬停看来源）；右下：已下/可下（只有番剧表给 prog）。
+            dim：封面置灰（番剧表里的已忽略番）。返回容器，调用方可再挂点击。
+
+            【封面】c 尺寸小图（见 layout.cover_thumb），浏览器直连 bgm 图床、不经过本服务也不调 bgm 接口；
+            q-img 默认 loading=lazy，只拉滚到附近的图；ratio 先占住高度，图慢慢来时网格不跳。"""
+            box = ui.element("div").classes("relative w-full")
+            with box:
+                _thumb = cover_thumb(a.cover_url)
+                if _thumb:
+                    _img = ui.image(_thumb).props("ratio=0.707 no-spinner").classes("w-full")
+                    if dim:
+                        _img.style("filter:grayscale(1);opacity:.45")
+                else:
+                    with ui.element("div").classes(
+                            "w-full flex items-center justify-center text-gray-500").style(
+                            "aspect-ratio:150/212;background:rgba(255,255,255,.04)"):
+                        ui.icon("image_not_supported", size="28px")
+                if status or a.finished_at:
+                    with ui.column().classes("absolute top-1 left-1 gap-1 items-start"):
+                        if status:
+                            _b = ui.badge(status[0]).props(f"color={status[1]}")
+                            if status[2]:
+                                _b.tooltip(status[2])
+                        if a.finished_at:
+                            # 开了『判完结后停止自动下新集』时写明停订：那是行为变化，不写的话它和正常追番的番
+                            # 长得一样，用户只会觉得"它好久没更新了"。说明与详情页同一份（layout.finished_tip）。
+                            ui.badge("已下齐·停订" if config.ANIME_FINISH_UNSUB else "已下齐").props(
+                                "color=teal").tooltip(finished_tip(a, "进详情页点『继续订阅』"))
+                sl = season_label(a)
+                _p = getattr(a, "platform", None)
+                if sl or (_p and _p != "TV"):
+                    with ui.column().classes("absolute top-1 right-1 gap-1 items-end"):
+                        if sl:
+                            ui.badge(sl).props("color=purple")
+                        platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标
+                if sources:   # 多源(>1)蓝 / 单源(==1)灰
                     n = len(sources)
                     _lab, _c = (f"多源 {n}", "blue") if n > 1 else (f"单源 {n}", "blue-grey")
-                    ui.badge(_lab).props(f"color={_c}").classes(
-                        "align-middle mr-2").tooltip("来源: " + " · ".join(sources))
-                if a.rejected:                       # 状态徽标（互斥，最多一个）
-                    ui.badge("已忽略").props("color=grey").classes("align-middle mr-2")
-                elif not a.confirmed:
-                    ui.badge("待确认").props("color=orange").classes("align-middle mr-2")
-                elif a.finished_at and config.ANIME_FINISH_UNSUB:
-                    # 【只在真的会改变行为时才出徽标】"已完结"本身不显示——它的信息量被右边那个
-                    # 『已下/可下』覆盖了（12/12 就是完结）。但开了停订时这部番【不再自动下新集】，
-                    # 那是行为变化不是状态描述：在此之前它在列表里与正常追番的番长得一模一样，
-                    # 用户唯一能察觉的迹象是"它好久没更新了"，而那与源失效、字幕组断更完全同形。
-                    ui.badge("已停订").props("color=teal").classes("align-middle mr-2").tooltip(
-                        "判定为完结并已停止自动下新集（设置页『完结后停止自动下新集』）——"
-                        "若其实还没完（bgm 总集数少记了），进详情页点『继续订阅』。")
-                color = "text-gray-500 line-through" if a.rejected else "text-blue-400"
-                ui.label(name_of(a)).classes(
-                    f"text-lg inline align-middle cursor-pointer {color} hover:underline").on(
-                    "click", lambda aid=a.id: open_detail(aid))
+                    ui.badge(_lab).props(f"color={_c}").classes("absolute bottom-1 left-1").tooltip(
+                        "来源: " + " · ".join(sources))
                 # 【已下/可下】分子＝已发给 qB 的不同正集号数，分母＝库里见过的不同正集号数。
                 # 按【集号】数而不是按种子条数：同一集常有好几个源各一份，按条数数出来的比值没有意义。
-                # 它把两类问题一眼摊开：
                 #   · 分子 < 分母 → 有集号还没到手（锁定源锁太死 / 关键词没匹配上 / 卡在缓冲窗口）
                 #   · 分母 > bgm 记的总集数 → 集号本身就不对（别的季的正片挂到了这条记录下面）
                 if prog:
                     _have, _seen = prog
                     _tot = a.total_episodes or 0
                     _over = bool(_tot and _seen > _tot)
-                    _c = "red" if _over else ("orange" if _have < _seen else "blue-grey")
+                    # 红＝集号超出 bgm 记载、橙＝还有集没到手、蓝＝正常（都到手了）
+                    _c = "red" if _over else ("orange" if _have < _seen else "blue")
                     ui.badge(f"{_have}/{_seen}").props(f"color={_c}").classes(
-                        "align-middle ml-2").tooltip(
+                        "absolute bottom-1 right-1").tooltip(
                         f"已下 {_have} 集 / 库里有 {_seen} 集的种子"
                         + (f"；bgm 记 {_tot} 集" if _tot else "；bgm 未给总集数")
                         + ("。集号超出 bgm 记载——多半有别的季的正片挂到了这条记录下面，"
                            "进详情页看『各源的集号范围』" if _over else
                            ("。还有集号没到手：可能是锁定源锁太死、版本关键词没匹配上，"
                             "或还在缓冲窗口里" if _have < _seen else "。都到手了")))
-                sl = season_label(a)
-                if sl:
-                    ui.badge(sl).props("color=purple").classes("align-middle ml-2")
-                p = getattr(a, "platform", None)   # 内联原 platform_badge：bgm 判定非 TV(剧场版/OVA…)紫标，好带上行内排版类
-                if p and p != "TV":
-                    ui.badge(p).props("color=deep-purple").classes(
-                        "align-middle ml-2").tooltip("bgm 判定的类型（非 TV）")
+            return box
+
+        def _card_title(a, struck: bool = False):
+            """卡片上的番名：最多两行（.anime-card-title），悬停看全名。struck：灰色删除线（已忽略）。"""
+            _nm = name_of(a)
+            lbl = ui.label(_nm).classes(
+                "anime-card-title " + ("text-gray-500 line-through" if struck else "text-blue-400"))
+            lbl.props["title"] = _nm          # 两行截断后，悬停看全名
+            return lbl
+
+        def _anime_card(a, sources=None, prog=None):
+            # 一部番一张卡：封面（四角徽标）+ 番名。整张卡可点进详情（徽标的 tooltip 照常悬停可看）。
+            status = (("已忽略", "grey", None) if a.rejected else
+                      ("待确认", "orange", None) if not a.confirmed else None)
+            with ui.card().tight().classes("anime-card cursor-pointer w-full").on(
+                    "click", lambda aid=a.id: open_detail(aid)):
+                _card_cover(a, dim=a.rejected, status=status, sources=sources, prog=prog)
+                with ui.column().classes("px-3 py-2 gap-1.5 w-full"):
+                    _card_title(a, struck=a.rejected)
 
         # ---- 页面布局 ----
         with ui.tabs().classes("w-full") as tabs:
