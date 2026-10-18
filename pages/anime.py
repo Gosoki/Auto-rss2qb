@@ -73,9 +73,12 @@ def anime_page(t: str = ""):
         # 番剧表：分页页码 + 一键展开/收起意图（None=按默认）+ 搜索词。
         # 【搜索词必须存在这里、不能只留在输入框控件上】面板是 @ui.refreshable，
         # 翻页/展开/详情弹窗关闭都会整体重建它，控件上的值会跟着没。
-        manage_page = {"n": 1, "expand": None, "kw": ""}
-        confirm_page = {"expand": None}   # 待确认/已忽略也按季度分组、默认只开第一组：同样要一键展开（R36 ux-6）
-        reject_page = {"expand": None}
+        # open：用户手动开合过的折叠块 {季度键: 开/合}。详情弹窗里的操作（确认下载/补齐/忽略…）会整体重建
+        # 这几个面板，不记的话重建后一律回到"只开最新一季"——正看着别的季度，一点操作它就被收起来了。
+        # 点『全部展开/收起』时清空（expand_collapse_bar），以最后那次全局操作为准。
+        manage_page = {"n": 1, "expand": None, "kw": "", "open": {}}
+        confirm_page = {"expand": None, "open": {}}   # 待确认/已忽略也按季度分组、默认只开第一组：同样要一键展开（R36 ux-6）
+        reject_page = {"expand": None, "open": {}}
 
         def _manage_goto(e):
             manage_page["n"] = int(e.value)
@@ -432,7 +435,9 @@ def anime_page(t: str = ""):
             exp = confirm_page["expand"]   # None=只开第一组；True/False=一键全展开/收起
             for i, (q, items) in enumerate(group_by_quarter(pend)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                  value=(i == 0 if exp is None else exp)).classes("w-full").props(remove="dense"):
+                                  value=confirm_page["open"].get(q, i == 0 if exp is None else exp)).classes(
+                        "w-full").props(remove="dense").on_value_change(
+                        lambda e, q=q: confirm_page["open"].__setitem__(q, e.value)):
                     with ui.element("div").classes("anime-grid"):
                         for a in items:
                             _confirm_card(a, smap.get(a.id, []))
@@ -475,15 +480,19 @@ def anime_page(t: str = ""):
             exp = reject_page["expand"]
             for i, (q, items) in enumerate(group_by_quarter(rej)):
                 with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                  value=(i == 0 if exp is None else exp)).classes("w-full").props(remove="dense"):
+                                  value=reject_page["open"].get(q, i == 0 if exp is None else exp)).classes(
+                        "w-full").props(remove="dense").on_value_change(
+                        lambda e, q=q: reject_page["open"].__setitem__(q, e.value)):
                     with ui.element("div").classes("anime-grid"):
                         for a in items:
                             _reject_card(a, smap.get(a.id, []), dlmap.get(a.id, 0))
 
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（deleted 是终态、不会自动重下）
             if dels:
-                with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline").classes(
-                        "w-full mt-2"):
+                with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline",
+                                  value=reject_page["open"].get("__deleted", False)).classes(
+                        "w-full mt-2").on_value_change(
+                        lambda e: reject_page["open"].__setitem__("__deleted", e.value)):
                     ui.label("你手动删掉文件的种子（终态，不会自动重下）。需要就点『重新下载』找回。").classes(
                         "text-xs text-gray-500 p-1")
                     for d in dels:
@@ -503,8 +512,10 @@ def anime_page(t: str = ""):
 
             # 已排除的种子：独立折叠，可『恢复』放回待下（excluded 是主动从待下排除的终态）
             if excls:
-                with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block").classes(
-                        "w-full mt-2"):
+                with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block",
+                                  value=reject_page["open"].get("__excluded", False)).classes(
+                        "w-full mt-2").on_value_change(
+                        lambda e: reject_page["open"].__setitem__("__excluded", e.value)):
                     ui.label("你从待下里主动排除的种子（不自动下、RSS 再遇到也不重收）。点『恢复』放回待下。").classes(
                         "text-xs text-gray-500 p-1")
                     for x in excls:
@@ -714,7 +725,7 @@ def anime_page(t: str = ""):
             if kw and exp is None:
                 exp = True
             for i, (q, items) in enumerate(groups):
-                _open = exp if exp is not None else i == 0
+                _open = manage_page["open"].get(q, exp if exp is not None else i == 0)
                 # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
                 _exp = ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
                                     value=_open).classes("w-full").props(remove="dense")
@@ -729,10 +740,14 @@ def anime_page(t: str = ""):
                         for a in qi:
                             _anime_card(a, src_map.get(a.id), prog_map.get(a.id))
 
+                def _toggle(e, q=q, f=_fill):
+                    manage_page["open"][q] = e.value     # 记住手动开合，面板重建后照此恢复
+                    if e.value:
+                        f()
+
                 if _open:
                     _fill()
-                else:
-                    _exp.on_value_change(lambda e, f=_fill: f() if e.value else None)
+                _exp.on_value_change(_toggle)
 
         def _refresh_overview(charts):
             # 刷新仪表盘：head(计数)+tail(种子状态/qB实时)恒刷；charts(图表)仅 charts=True 时刷。

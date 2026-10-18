@@ -652,6 +652,7 @@ def expand_collapse_bar(state: dict, refresh) -> None:
     """
     def _set(v):
         state["expand"] = v
+        state.get("open", {}).clear()   # 逐个手动开合的记忆作废：以这次全局展开/收起为准
         refresh()
     with ui.row().classes("items-center gap-4 pl-1 pb-2"):
         for text, val in (("全部展开", True), ("全部收起", False)):

@@ -456,6 +456,10 @@ def movies_page(t: str = ""):
     默认空串：顶栏导航进来（无 ?t=）时留给下面按 MOVIE_DEFAULT_TAB 决定默认停哪个 tab。"""
     with frame("movies"):
         list_page = {"n": 1, "expand": None}  # 剧场版列表：分页页码 + 一键展开/收起意图（None=默认全开）
+        # 用户手动开合过的折叠块 {年份键/底部折叠键: 开/合}。详情弹窗里的操作会整体重建面板，不记的话
+        # 重建后一律回到默认（只开最新年、底部折叠全收）。点『全部展开/收起』时清空。与番剧页同口径。
+        list_page["open"] = {}
+        rej_open: dict = {}
         detail_dlg = ui.dialog()
 
         def _list_goto(e):
@@ -822,7 +826,7 @@ def movies_page(t: str = ""):
             tmap = mov.torrents_by_movie(
                 [m.id for _, qs in shown for _, grp in qs for m in grp])  # 本页种子一次查齐
             for i, (year, quarters) in enumerate(shown):
-                year_open = exp if exp is not None else i == 0   # 一级(年份)可折叠，默认仅最新年展开
+                year_open = list_page["open"].get(year, exp if exp is not None else i == 0)   # 默认仅最新年展开
                 year_total = sum(len(grp) for _, grp in quarters)
                 _yt = "未知年份" if year == "未知" else f"{year} 年"   # year 已是四位年（见 _group_by_year_quarter）
                 # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
@@ -844,10 +848,14 @@ def movies_page(t: str = ""):
                             for m in grp:
                                 _movie_card(m, tmap.get(m.id, []))
 
+                def _toggle(e, y=year, f=_fill):
+                    list_page["open"][y] = e.value     # 记住手动开合，面板重建后照此恢复
+                    if e.value:
+                        f()
+
                 if year_open:
                     _fill()
-                else:
-                    year_exp.on_value_change(lambda e, f=_fill: f() if e.value else None)
+                year_exp.on_value_change(_toggle)
 
         @ui.refreshable
         def fail_panel():
@@ -902,7 +910,9 @@ def movies_page(t: str = ""):
 
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（与番剧侧对称）
             if dels:
-                with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline").classes(
+                with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline",
+                                  value=rej_open.get("deleted", False)).on_value_change(
+                        lambda e: rej_open.__setitem__("deleted", e.value)).classes(
                         "w-full mt-2"):
                     ui.label("你手动删掉文件的剧场版版本（终态，不会自动重下）。需要就点『重新下载』找回。").classes(
                         "text-xs text-gray-500 p-1")
@@ -922,7 +932,9 @@ def movies_page(t: str = ""):
 
             # 已排除的种子：独立折叠，可『恢复』放回可下（与番剧侧对称）
             if excls:
-                with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block").classes(
+                with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block",
+                                  value=rej_open.get("excluded", False)).on_value_change(
+                        lambda e: rej_open.__setitem__("excluded", e.value)).classes(
                         "w-full mt-2"):
                     ui.label("你从可下里主动排除的剧场版版本（不显示为可下、RSS 再遇到也不重收）。点『恢复』放回。").classes(
                         "text-xs text-gray-500 p-1")
