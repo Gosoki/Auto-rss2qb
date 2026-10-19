@@ -7,7 +7,7 @@ import logging
 from nicegui import ui
 
 from core.logsetup import LOG_PATH, ring
-from pages.layout import frame
+from pages.layout import frame, page_visibility
 
 # 级别过滤档位：文案 → 最低 levelno（该值及以上才显示）
 _LEVELS = {"全部": 0, "警告以上": logging.WARNING, "仅错误": logging.ERROR}
@@ -61,4 +61,14 @@ def logs_page():
                         "white-space:pre-wrap;word-break:break-all")
 
         view()
-        ui.timer(5.0, lambda: state["auto"] and view.refresh())  # 自动刷新时每 5s 拉一次最新
+        seen = {"seq": ring.seq}
+
+        def _tick():
+            # 自动刷新时每 5s 看一次：标签页在后台、或这 5 秒没有新日志，就不重建（r37 #23：
+            # 以前每 5 秒把 200 行整块重建一遍，不管有没有变化、有没有人在看）
+            if not (state["auto"] and vis["on"]) or ring.seq == seen["seq"]:
+                return
+            seen["seq"] = ring.seq
+            view.refresh()
+        vis = page_visibility(_tick)
+        ui.timer(5.0, _tick)

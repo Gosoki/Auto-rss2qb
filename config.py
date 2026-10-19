@@ -128,7 +128,8 @@ _SPEC = {
     # 想收哪些事件（键见 services/notify.EVENTS）。【留空 = 全关】，不是全开——
     # 这与本项目别处"留空=不限"（字幕组白名单、标题关键词）恰好相反，设置页上写明了。
     # 默认值含 delivered，所以老库升级后【行为一字不变】（load_from_db 只补缺键）。
-    "NOTIFY_EVENTS": (list, "delivered,movie,failed,stalled,finished,idle,qb_down,db_down,backlog"),
+    "NOTIFY_EVENTS": (list, "delivered,movie,failed,stalled,finished,idle,qb_down,db_down,backlog,"
+                            "poll_stall,source_down,feed_gap,lock_lag"),
     "NOTIFY_MAX_PER_HOUR": (int, 20),       # 全事件合计的限流上限（0=不限）。被丢弃的条数会挂在下一条消息尾巴上
     "NOTIFY_BACKLOG_MIN": (int, 5),         # 『待识别』积压到几部才提醒
     # ---- 完结 / 断更巡检（见 core.anime.sweep_finished / sweep_idle）----
@@ -139,7 +140,15 @@ _SPEC = {
     "ANIME_FINISH_UNSUB": (bool, False),
     "ANIME_IDLE_DAYS": (int, 14),           # 一部追番中的番多少天没有新种子就提醒（0=关）
     "ANIME_GAP_SLACK_WEEKS": (int, 2),      # 缺集提示：按开播日推算"应已播到第几集"时少算几周（休播一周/字幕组晚发不误报）
+    "ANIME_GAP_MAX_EPISODES": (int, 100),   # 缺集提示：应播集数超过这么多的长番不判（航海王这类只收最近几集，报缺上千集是噪音）
+    "ANIME_LOCK_LAG_DAYS": (int, 7),        # 锁定源落后提醒：别的组已有后续集、锁定源过了这么多天还没跟上才提醒（0=关）
     "SWEEP_INTERVAL_MIN": (int, 180),       # 完结/断更巡检的间隔（分钟）
+    # ---- 采集健康（见 core/health.py；r37：容器停了 15 天全程零提醒）----
+    "ALERT_POLL_STALL_MIN": (int, 90),      # 采集开着却这么多分钟没有任何动静 → 停摆提醒（实际取它与 3 个轮询间隔的较大者）
+    "ALERT_POLL_PAUSED_HOURS": (int, 6),    # 采集开关关着超过这么多小时 → 提醒（RSS 只留最近一段，关久了会漏集；0=不提醒）
+    "ALERT_SOURCE_FAIL_ROUNDS": (int, 3),   # 同一个源组连续这么多轮抓取失败 → 提醒
+    "HEARTBEAT_URL": (str, ""),             # 外部心跳：每轮采集成功后 GET 一次（Uptime Kuma 推送监控 / healthchecks.io）。
+                                            # 整台机器/容器停了时程序自己什么都做不了，只有外部监控能发现；空=不发
     "NOTIFY_TIMEOUT": (int, 10),
     "ENRICH_TIMEOUT": (int, 15),
     "ENRICH_RETRY_TIMES": (int, 3),          # bgm 请求瞬时失败(超时/连接)的即时重试次数
@@ -159,6 +168,8 @@ _SPEC = {
     "ANIME_POLL_LAST": (str, ""),           # 上一轮采集结束时间（ISO，运行时更新；非用户填）(R36 ux-5)
     "ANIME_POLL_FAILED": (str, ""),         # 上一轮抓取失败的源名（换行分隔，空=全部成功；运行时更新；非用户填）
     "ANIME_POLL_OK_LAST": (str, ""),        # 上次至少有一个源抓到的那一轮结束时间（ISO，运行时更新；非用户填）
+    "SOURCE_FEED_SEEN": (str, ""),          # 每个 feed 上次成功抓取的时刻（JSON，键是 URL 摘要；运行时更新；非用户填）
+    "FEED_GAPS": (str, ""),                 # 检测到的 RSS 断档、用户还没点『知道了』的（JSON；运行时更新；非用户填）
     # ---- 自动备份（整库快照，走 VACUUM INTO；见 db/backup.py）----
     # 这是全项目唯一"出事就没救"的空白的补丁：我们有迁移、有 Alembic、有停摆自愈，
     # 但在此之前【没有任何一份可回滚的数据副本】。默认开——备份的价值全在"没想起来时它已经在做了"。
@@ -463,11 +474,33 @@ def _merge_new_notify_events(have: dict) -> None:
         _v["NOTIFY_EVENTS"] = merged
 
 
-def set_many(updates: dict) -> None:
-    """把设置写进数据库并即时更新内存（热生效）。updates: {键: 字符串值}，非 _SPEC 键忽略。"""
+# 后台每轮自己写的运行时键：改动不进『设置已修改』日志（每 20 分钟一行只会把真改动冲掉）
+_RUNTIME_KEYS = {"MOVIE_SCAN_LAST", "ANIME_POLL_LAST", "ANIME_POLL_FAILED", "ANIME_POLL_OK_LAST",
+                 "BACKUP_LAST", "SOURCE_FEED_SEEN", "FEED_GAPS"}
+# 值里带密钥的键：日志只说"改了"，不写值（NOTIFY_URL 的 Bark/Server酱 密钥在路径里，PROXY_URL 可内嵌口令）
+_SECRET_KEYS = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD", "QB_CALLBACK_TOKEN",
+                "NOTIFY_URL", "PROXY_URL", "HEARTBEAT_URL"}
+
+
+def _log_value(k: str, v) -> str:
+    if k in _SECRET_KEYS:
+        return "***" if v else "（空）"
+    if k == "MIKAN_RSS_URL" and "token=" in str(v).lower():
+        from services.fetch import redact
+        return redact(v)
+    return repr(v)
+
+
+def set_many(updates: dict) -> dict:
+    """把设置写进数据库并即时更新内存（热生效）。updates: {键: 字符串值}，非 _SPEC 键忽略。
+
+    返回【真的变了】的键：{键: (旧值, 新值)}（按类型转换后比较）。用户改的那些同时记一行
+    『设置已修改』日志（密码类打码、运行时键不记）—— 以前改了什么、什么时候改的无从查起
+    （r37 审计：09-27 采集停了半个月，事后没法判断是不是开关被关了）。
+    """
     from db import get_meta_session
     from db.models import Setting
-    applied = {}
+    applied, changed = {}, {}
     with get_meta_session() as s:   # 同 load_from_db：配置恒走本地 SQLite
         for k, raw in updates.items():
             if k not in _SPEC:
@@ -479,8 +512,15 @@ def set_many(updates: dict) -> None:
                 row.value = str(raw)
                 s.add(row)
             applied[k] = _coerce(_SPEC[k][0], raw)
+            if applied[k] != _v.get(k):
+                changed[k] = (_v.get(k), applied[k])
         s.commit()               # 先落库成功
     _v.update(applied)           # 再更新内存：commit 抛异常时不会留下未持久化、重启即回退的幽灵值
+    shown = [f"{k}: {_log_value(k, o)} → {_log_value(k, n)}"
+             for k, (o, n) in changed.items() if k not in _RUNTIME_KEYS]
+    if shown:
+        log.info("设置已修改：%s", "；".join(shown))
+    return changed
 
 
 def update_env(updates: dict) -> None:

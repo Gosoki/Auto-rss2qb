@@ -20,7 +20,8 @@ from .layout import busy_action, confirm, frame, reload_other_tabs, require_conf
 
 _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "NOTIFY_MAX_PER_HOUR", "NOTIFY_BACKLOG_MIN", "ANIME_IDLE_DAYS", "ANIME_GAP_SLACK_WEEKS",
-            "SWEEP_INTERVAL_MIN",
+            "ANIME_GAP_MAX_EPISODES", "ANIME_LOCK_LAG_DAYS", "SWEEP_INTERVAL_MIN",
+            "ALERT_POLL_STALL_MIN", "ALERT_POLL_PAUSED_HOURS", "ALERT_SOURCE_FAIL_ROUNDS",
             "ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
             "QB_IDLE_RECHECK_MIN", "QB_STALL_TIMEOUT_MIN", "QB_ARCHIVE_AFTER_DAYS",
@@ -30,6 +31,8 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
+# 改了这几项才在保存时测一次 qB 连接（r37 #5）
+_QB_CONN_KEYS = {"QB_ENABLED", "QB_URL", "QB_USERNAME", "QB_PASSWORD"}
 
 
 def qb_callback_curl(tok: str, port: int) -> str:
@@ -98,7 +101,7 @@ def _bad_proxy(v: str) -> str:
             import socksio  # noqa: F401
         except ImportError:
             return ("socks5 代理需要额外装 socksio（pip install httpx[socks]）；"
-                    "没装的话每个出站客户端在**建连接那一步**就抛 ImportError，"
+                    "没装的话每个出站客户端在建连接那一步就抛 ImportError，"
                     "而各处只接 httpx.HTTPError 的 except 都拦不住它")
     return ""
 
@@ -909,7 +912,10 @@ def settings():
                      "断更提醒：一部追番中的番多少天没有新种子就说一声——那是发现『源失效/字幕组停更』的"
                      "唯一自动手段（那类故障不报错，表现只是『好几天没更新了』）。\n"
                      "缺集提示：按开播日、每周一集推算到今天应已播到第几集，库里没见过的集在番剧卡片上标橙色。"
-                     "余量＝推算时少算几周，休播一周或字幕组晚发几天都不误报；调大更不容易误报，但发现得更晚。")
+                     "余量＝推算时少算几周，休播一周或字幕组晚发几天都不误报；调大更不容易误报，但发现得更晚。"
+                     "应播集数超过『长番上限』的不判（航海王这类只收最近几集，报缺上千集是噪音）。\n"
+                     "锁定源落后：锁了下载源的番，别的组已经发了锁定源之后的集、锁定源过了这么多天还没跟上，"
+                     "就在详情页和仪表盘提醒（只提醒，不改下载行为；0=关）。")
             with ui.element("div").classes("field-grid w-full"):
                 f["ANIME_FINISH_ENABLED"] = ui.switch(
                     "判定已下齐（只标记+通知）", value=config.ANIME_FINISH_ENABLED)
@@ -917,9 +923,27 @@ def settings():
                     "下齐后停止自动下新集", value=config.ANIME_FINISH_UNSUB)
                 _num("ANIME_IDLE_DAYS", "断更提醒阈值（天，0=关）", config.ANIME_IDLE_DAYS)
                 _num("ANIME_GAP_SLACK_WEEKS", "缺集提示余量（周）", config.ANIME_GAP_SLACK_WEEKS, 0, 8)
+                _num("ANIME_GAP_MAX_EPISODES", "缺集提示长番上限（集）", config.ANIME_GAP_MAX_EPISODES, 1, 10000)
+                _num("ANIME_LOCK_LAG_DAYS", "锁定源落后提醒（天，0=关）", config.ANIME_LOCK_LAG_DAYS, 0, 90)
                 # 【给下限】这一项没有"0=关"的语义（关完结/断更各有自己的开关），
                 # 而 run_sweep 里是 max(60, ...) 秒——填 0 会变成每 60 秒来一次全表扫描。
                 _num("SWEEP_INTERVAL_MIN", "巡检间隔（分钟，最少 5）", config.SWEEP_INTERVAL_MIN, 5, 1440)
+
+            ui.separator()
+            _section("采集健康",
+                     "采集停了、暂停太久、某个源连着抓不到、两轮之间有一段发布滚出了 RSS —— 这些都会在每个页面顶上挂一条，"
+                     "并推送（通知事件里的『采集停摆』『源抓取失败』『RSS 断档』）。RSS 只保留最近一段"
+                     "（Mikan 约 1 天、nyaa 约一周），所以停久了就是在静默漏集。\n"
+                     "停摆阈值实际取它与 3 个轮询间隔中的较大者。\n"
+                     "外部心跳：整台机器或容器停了的时候程序自己什么都做不了（2026-09 停过 15 天，全程没有任何提醒），"
+                     "只有外部监控收不到心跳才会响。填 Uptime Kuma 的『推送』监控地址或 healthchecks.io 的 ping 地址，"
+                     "每轮采集成功后 GET 一次；空=不发。")
+            _text("HEARTBEAT_URL", "外部心跳地址（空=不发）", config.HEARTBEAT_URL,
+                  "https://uptime.example.com/api/push/<token>  或  https://hc-ping.com/<uuid>")
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ALERT_POLL_STALL_MIN", "停摆提醒（分钟没动静）", config.ALERT_POLL_STALL_MIN, 10, 10080)
+                _num("ALERT_POLL_PAUSED_HOURS", "暂停提醒（小时，0=不提醒）", config.ALERT_POLL_PAUSED_HOURS, 0, 720)
+                _num("ALERT_SOURCE_FAIL_ROUNDS", "源连续失败几轮提醒", config.ALERT_SOURCE_FAIL_ROUNDS, 1, 100)
 
             ui.separator()
             _section("Web 访问",
@@ -1175,45 +1199,39 @@ def settings():
             if db_updates:
                 sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
                 qb_was_on = config.QB_ENABLED
-                config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效
+                changed = config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效；返回真的变了的键
                 # 通知的冷却/状态记忆是【进程内】的：不清的话，用户刚把某个事件勾上，
                 # 还要等冷却过期或状态再翻转一次才看得到效果——那看起来就像"设置没生效"。
                 # 【只在真的改了 NOTIFY_* 时才清】(R36 体检) 以前保存任何一项（改个轮询间隔）都会把
                 # failed/stalled 的 6 小时冷却整个清掉 —— 下一轮巡检把同一批告警原样再推一遍。
                 # 同文件的『发送测试通知』按钮早就为此专门避开了 reset_state（见 reset_circuit）。
-                if any(k.startswith("NOTIFY_") for k in db_updates):
+                if any(k.startswith("NOTIFY_") for k in changed):
                     notify.reset_state()
                 # 注：改开始使用日【不】自动重算已有番——由用户在设置里点『应用』按钮显式触发（更可控）
-                # qB 发送开着 → 保存后测一次连接：连不上就自动关掉开关（免得停在『开着却下不了』的迷惑态）
-                probe_failed = False
-                if config.QB_ENABLED:
+                # 【只在真改了 qB 连接设置时才测一次连接，连不上也【不】自动关开关】(r37 #5)
+                # 以前是：qB 发送开着 → 保存【任何一项】（改个站点名、轮询间隔）都测一次，测失败就把
+                # QB_ENABLED 永久写成 false。qB 恰好在重启就被关了；之后 qb_down 永远不触发（开关关着），
+                # 种子静默堆在待下，唯一的信号是保存那一刻的一条 toast。
+                # 现在：开关保持用户设的值，连不上只弹一条常驻警告；之后的状态由 qb_down 通知与仪表盘负责。
+                if config.QB_ENABLED and any(k in changed for k in _QB_CONN_KEYS):
                     # 【先解除登录冷却】用户刚改完账号密码，不该还被自己上一次失败的负缓存挡着——
-                    # 那会让"密码明明改对了"的这次保存照样报连不上，然后把开关自动关掉。
+                    # 那会让"密码明明改对了"的这次保存照样报连不上。
                     # 冷却是为了别把 qB 的失败登录封禁计数撞满，不是惩罚用户的显式操作。
                     await engine.qb.reset_cooldown()
                     client = await engine.qb._login()
                     if client is None:
-                        probe_failed = True
-                        config.set_many({"QB_ENABLED": "false"})
-                        if "QB_ENABLED" in f:
-                            f["QB_ENABLED"].value = False   # 表单开关同步关掉
-                        ui.notify("连不上 qB，已自动关闭『发送到 qB』开关（检查地址/端口/账号密码）",
-                                  type="warning")
+                        ui.notify("已保存，但现在连不上 qB（检查地址/端口/账号密码，或 qB 正在重启）。"
+                                  "『发送到 qB』仍开着：种子留在待下，qB 一恢复就自动继续。",
+                                  type="warning", timeout=0, close_button="知道了")
                     else:
                         await client.aclose()
                         engine.qb_kick.set()      # 连上了：立即唤醒同步循环自查，别等一个保底周期
                 # 关跟踪/关发送 → 落定切换时刻仍在下的旧种子，
                 # 否则它们再无路径推进、永久卡『正在下载』、has_inflight 恒真。
                 #
-                # 【只对用户显式关闭落定，探测失败自动关的不落定】(probe_failed)：
-                # 收表单收的是【全量】而不是差量，所以改个站点名/轮询间隔都会走上面那次 qB 探测；
-                # 而那是一次性单发 _login()，不复用会话、不重试、任何失败（网络抖动/qB 正在重启）
-                # 都塌缩成 None。据此把在下种子写成 status=sent + qb_progress=1.0 后，它们永久掉出
-                # _inflight_where，把开关重新打开 sync 也不会再拉它们，UI 从此谎报 100% 已完成。
-                # 对照 sync_qb_status 对同样的失败信号是"本轮不动、不改任何状态"——两条路径不该互相打架。
-                # 探测失败只是把开关关掉+弹警告，等用户看到提示自己处理；真要落定就由他显式关一次。
+                # 只对用户显式关闭落定（探测失败不再自动关开关，见上，所以这里关掉的一定是用户自己关的）。
                 explicit_off = ((sync_was_on and not config.QB_SYNC_STATUS)
-                                or (qb_was_on and not config.QB_ENABLED and not probe_failed))
+                                or (qb_was_on and not config.QB_ENABLED))
                 if explicit_off:
                     engine.settle_inflight_off()
             if env_updates:

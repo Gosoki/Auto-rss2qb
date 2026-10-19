@@ -1021,6 +1021,10 @@ _STRADDLERS = {
         "_delete_anime_torrent_inner":    "in_flight",     # 读 → await qb.delete → _set_status(id)
         "_download_pending_for_anime_inner": "in_flight",  # 读 id 列表 → await 预检 → 逐个交付
         "relocate_anime":                 "in_flight",     # 真正跨 await 的在 engine.relocate
+        # (r37) 锁源缺集『只补这几集』、补齐挑定别的组后的下发、批量重识别末尾统一判一次下齐
+        "_download_locked_out_inner":     "in_flight",
+        "_download_new_rows":             "caller:_backfill_source_inner",
+        "_reenrich_scope_inner":          "lock:_enrich_lock",
     },
     "core/engine.py": {
         "archive_old_completed":          "lock:_archive_lock",

@@ -19,7 +19,7 @@ from .layout import (busy_action, confirm, cover_box, cover_title, ep_ranges_tex
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_spec, recent_table, season_label, source_options, sources_spec,
-                     warn_banner, poll_time_text, poll_stale)
+                     warn_banner, poll_time_text, poll_stale, page_visibility)
 from .sources import render_sources
 
 
@@ -64,7 +64,9 @@ def anime_page(t: str = ""):
         # 点『全部展开/收起』时清空（expand_collapse_bar），以最后那次全局操作为准。
         manage_page = {"n": 1, "expand": None, "kw": "", "open": {}}
         confirm_page = {"expand": None, "open": {}}   # 待确认/已忽略也按季度分组、默认只开第一组：同样要一键展开（R36 ux-6）
-        reject_page = {"expand": None, "open": {}}
+        # extra：已忽略页最底下那两个折叠块（已删除/已排除的种子）的开合，【不放进 open】——
+        # 『全部展开/收起』只管季度，会把 open 整个清掉（r37 #16：顺手把用户展开的那两块也收了）
+        reject_page = {"expand": None, "open": {}, "extra": {}}
 
         def _manage_goto(e):
             manage_page["n"] = int(e.value)
@@ -105,6 +107,10 @@ def anime_page(t: str = ""):
             # 回第一页：paginate 本身会把越界页码夹回合法范围，所以不重置也不会出空页——
             # 但那样是"夹到结果集的最后一页"，搜完落在最后一页上，人以为没搜到。
             manage_page["n"] = 1
+            # 【换了搜索词就忘掉上一次的『全部展开/收起』】(r37 #15) 那是对【上一份】列表的意图：
+            # 以前点过一次『全部收起』之后再搜，命中的季度照样收着（顶上写着"匹配 1 部"，卡片藏在折叠里）。
+            # 搜索期间再点『全部收起』仍然有效 —— 那是对这一份结果的意图。
+            manage_page["expand"] = None
             manage_panel.refresh()
 
         # ---- 刷新（页面局部，闭包内共享）----
@@ -120,7 +126,7 @@ def anime_page(t: str = ""):
             return _ov_snap["v"]
 
         @ui.refreshable
-        def overview_head():   # KPI + 订阅源组（计数，随定时器刷新，无交互态可丢）
+        def overview_head():   # KPI（计数，随定时器刷新，无交互态可丢）
             ov = _overview()
             k = ov["kpi"]
             ps = ov["pending_split"]
@@ -144,11 +150,15 @@ def anime_page(t: str = ""):
             if not ov["config"]["qb"]:
                 warn_banner("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）")
 
+        @ui.refreshable
+        def alerts_panel():
             # ── 三类『只报不改』的巡检发现 ──
             # 判据在 core/anime 的三个 suspect_*，身份/事实指纹、文案、已读过滤在 core/alerts。
             # 【文案为什么不在这里】它要被用在三个地方：这条横幅、『已读的提示』列表里的存档、
             # 以及巡检推送。留在页面里的话另外两处就得各抄一遍（第①号缺陷形状）。
             # 三类各自"为什么只报不改"的长注释跟着搬到了 core/alerts 的 _dup/_mva/_wrb 上方。
+            # 【单独一个面板、不跟 30 秒定时器】(r37 #21) 它占仪表盘每轮一半的数据量（约 0.9 MB），
+            # 而这些发现只在入库/绑定之后才会变：只在建页、用户操作（refresh_all）、点『知道了』时刷。
             _al = alerts.view()
             for _a in _al["live"]:
                 _pre = ""
@@ -167,14 +177,6 @@ def anime_page(t: str = ""):
                     ui.button("查看", icon="inbox", on_click=_open_acked).props(
                         "flat dense").classes("btn-sm")
 
-            # ── 订阅源组 ──
-            ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
-            with ui.row().classes("gap-2 flex-wrap pl-1"):
-                for name, site, policy, priority, enabled in ov["groups"]:
-                    pol = "自动下载" if policy == "auto" else "人工审核"
-                    tail = "" if enabled else " · 停用"
-                    ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
-                        f"color={'blue' if enabled else 'grey'}")   # 启用=蓝，停用=灰
 
         # 环图图例选择的持久化：用户点图例排除某字幕组后存下选择态，重建时塞回 legend.selected，
         # 任何刷新路径（定时器/用户操作/重识别）重建环图都不会把排除的源刷回来。
@@ -201,6 +203,14 @@ def anime_page(t: str = ""):
         @ui.refreshable
         def charts_panel():   # 图表单独一个 refreshable：不被 30s 定时器刷，避免环图重建丢交互态（悬停/图例翻页）
             ov = _overview()
+            # ── 订阅源组 ──（只在源组增删改后才变，跟图表一样不必 30 秒一刷）
+            ui.label("订阅源组").classes("text-sm font-bold mt-3 pl-1")
+            with ui.row().classes("gap-2 flex-wrap pl-1"):
+                for name, site, policy, priority, enabled in ov["groups"]:
+                    pol = "自动下载" if policy == "auto" else "人工审核"
+                    tail = "" if enabled else " · 停用"
+                    ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
+                        f"color={'blue' if enabled else 'grey'}")   # 启用=蓝，停用=灰
             # ── 下载番剧 / 种子来源（左右分开，窄屏自动堆叠）──
             with ui.row().classes("w-full gap-6 flex-wrap mt-3 pl-1"):   # pl-1 跟其他区块(订阅源组/种子状态)左对齐，别突出去
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
@@ -298,6 +308,11 @@ def anime_page(t: str = ""):
                  "已发送给 qB 的种子数（含仍在下载的）。真正下完的看下方『已完成』"),
                 ("将下载", ps["will"], "blue", "已确认番·本集首选，会自动下（特别篇/未知集不在其列，需手动下）"),
                 ("备用项", ps["backup"], "blue-grey", "同集已有『将下载/已下』的更优版本，不会自动下"),
+                # 被锁定源挡住、这一集一份都没有的（r37 #2）：以前混在『备用项』里，说法正好相反
+                *([("锁源缺集", ps["locked"], "orange",
+                    "番锁了下载源，这些是别的组发的、锁定源还没跟上的集——这一集一份都没下。"
+                    "点开看是哪几部，去详情页『只补这几集』或把下载源改回按优先级", _open_locked)]
+                  if ps.get("locked") else []),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
                 *([("已下齐·停订", ps["finished"], "teal",
                     "番已按 bgm 总集数下齐、且设置里开了『下齐后停止自动下新集』，所以这些不会自动下。"
@@ -414,7 +429,7 @@ def anime_page(t: str = ""):
         def confirm_panel():
             pend = anime.pending_confirm()
             if not pend:
-                ui.label("没有待确认的番。（『待确认』策略的源组发现的番会出现在这里）").classes("text-gray-500 p-4")
+                ui.label("没有待确认的番。（『人工审核』策略的源组发现的番、补齐入库了新种子的番会出现在这里）").classes("text-gray-500 p-4")
                 return
             smap = anime.source_map()   # 批量取来源，避免逐番查的 N+1
             expand_collapse_bar(confirm_page, confirm_panel.refresh)
@@ -496,9 +511,9 @@ def anime_page(t: str = ""):
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（deleted 是终态、不会自动重下）
             if dels:
                 with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline",
-                                  value=reject_page["open"].get("__deleted", False)).classes(
+                                  value=reject_page["extra"].get("__deleted", False)).classes(
                         "w-full mt-2").on_value_change(
-                        lambda e: reject_page["open"].__setitem__("__deleted", e.value)):
+                        lambda e: reject_page["extra"].__setitem__("__deleted", e.value)):
                     ui.label("你手动删掉文件的种子（终态，不会自动重下）。需要就点『重新下载』找回。").classes(
                         "text-xs text-gray-500 p-1")
                     for d in dels:
@@ -519,9 +534,9 @@ def anime_page(t: str = ""):
             # 已排除的种子：独立折叠，可『恢复』放回待下（excluded 是主动从待下排除的终态）
             if excls:
                 with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block",
-                                  value=reject_page["open"].get("__excluded", False)).classes(
+                                  value=reject_page["extra"].get("__excluded", False)).classes(
                         "w-full mt-2").on_value_change(
-                        lambda e: reject_page["open"].__setitem__("__excluded", e.value)):
+                        lambda e: reject_page["extra"].__setitem__("__excluded", e.value)):
                     ui.label("你从待下里主动排除的种子（不自动下、RSS 再遇到也不重收）。点『恢复』放回待下。").classes(
                         "text-xs text-gray-500 p-1")
                     for x in excls:
@@ -648,7 +663,8 @@ def anime_page(t: str = ""):
                                           episode=r["episode"],
                                           auto_off=off_why.get(r["anime_id"], ""),
                                           retry_at=r.get("retry_at"),
-                                          single_work=r["anime_id"] in sw)
+                                          single_work=r["anime_id"] in sw,
+                                          locked_out=r.get("locked_out", False))
                 rows.append({
                     "id": r["id"],
                     "detail_id": r["anime_id"],
@@ -712,8 +728,8 @@ def anime_page(t: str = ""):
             animes = [a for a in all_animes if _kw_hit(a, kw)] if kw else all_animes
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.source_map()
-            prog_map = anime.episode_progress([a.id for a in animes])   # 一条 SQL，与 source_map 同形
-            gap_map = anime.episode_gaps(animes)    # 按开播日推算应播、库里却没见过的集（缺集提示）
+            # 已下/可下 + 缺集提示（按开播日推算应播、库里却没见过的集）：共用一次分集统计
+            prog_map, gap_map = anime.progress_and_gaps(animes)
             yrs = max(1, config.ANIME_PAGE_YEARS)  # 防 0（每页 0 季会除零）
             groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], yrs * 4)
             manage_page["n"] = page
@@ -731,7 +747,8 @@ def anime_page(t: str = ""):
             for i, (q, items) in enumerate(groups):
                 if kw:
                     # 【搜索期间一律展开、也不记开合】命中的番散在各季，收着的季度里搜到了也看不见
-                    # （顶上写着"匹配 1 部"，卡片却藏在折叠里）。只有刚点过『全部收起』才照它收着。
+                    # （顶上写着"匹配 1 部"，卡片却藏在折叠里）。只有在【这次搜索里】点过『全部收起』才照它收着
+                    # （换搜索词时 _manage_search 会把 expand 清回 None）。
                     # 不记：搜索时的开合是临时的，清空搜索后要回到平时的开合状态。
                     opened, remember = (exp if exp is not None else True), (lambda v: None)
                 else:
@@ -748,7 +765,8 @@ def anime_page(t: str = ""):
             _ov_snap.clear()          # 本轮取最新数据，下面三个面板共用这一份
             try:
                 overview_head.refresh()
-                if charts:
+                if charts:            # 用户操作之后：横幅与图表一起刷（定时器两者都不碰，见 alerts_panel）
+                    alerts_panel.refresh()
                     charts_panel.refresh()
                 overview_tail.refresh()
             finally:
@@ -793,9 +811,11 @@ def anime_page(t: str = ""):
             # 两个后果：① MySQL 掉线时首页每 30 秒撞一次库，而建连接是同步调用、上界 5 秒，
             #   事件循环每 30 秒被冻 5 秒，每开一个标签页翻一倍；
             # ② R21 之后维护期 is_data_down() 也为真，这些刷新会在 refresh 里抛 DatabaseBusy。
-            if db.is_data_down():
+            if db.is_data_down() or not _vis["on"]:     # 标签页在后台：不刷（回到前台时 page_visibility 补一次）
                 return
             _refresh_live(tabs.value)
+
+        _vis = page_visibility(lambda: refresh_timer())
 
         def refresh_all():
             """用户操作之后的刷新：【只立刻刷当前看着的 tab】，其余建过的 tab 记成待刷新、切过去时再刷。
@@ -859,6 +879,12 @@ def anime_page(t: str = ""):
                 "要它就对准那一条点『下载』，不要就排除。（特别篇与剧场版/WEB 单部作品不在这里，它们不用处理）",
                 anime.unknown_episode_rows)
 
+        def _open_locked():
+            _open_torrent_list(
+                "锁源缺集", "这些番锁了下载源，锁定的组停更或远远落后，别的组已经发了后面的集，但因为锁了源一集都不会下。"
+                "点番名进详情页：『只补这几集』用别的组补上（不改锁），或把下载源改回按优先级。",
+                anime.locked_out_rows)
+
         def _open_special():
             _open_torrent_list(
                 "特别篇", "特别篇·OVA，以及 bgm 判定为剧场版/WEB 等单部作品（总共 1 集）名下没有集号的种子。"
@@ -870,7 +896,7 @@ def anime_page(t: str = ""):
             def h():
                 alerts.ack(f["ident"], f["kind"], f["fact"], f["text"])
                 ui.notify("已收进『已读的提示』")     # 只说已经发生的事，不预告"以后不会再看到"
-                overview_head.refresh()
+                alerts_panel.refresh()
             return h
 
         def _open_acked():
@@ -917,14 +943,14 @@ def anime_page(t: str = ""):
             def h():
                 alerts.unack(ident)
                 ui.notify("已取消已读，它回到了上面的提示里")
-                overview_head.refresh()
+                alerts_panel.refresh()
                 _open_acked()          # 就地重建列表，数字与行跟着变
             return h
 
         def _drop_gone():
             n = alerts.drop_gone()
             ui.notify(f"清掉了 {n} 条已经不成立的记录")
-            overview_head.refresh()
+            alerts_panel.refresh()
             _open_acked()
 
         def _open_failed():
@@ -1129,9 +1155,16 @@ def anime_page(t: str = ""):
                 _tot = a.total_episodes or 0
                 _over = bool(_tot and _seen > _tot)
                 _den = _seen + len(missing or ())
-                # 红＝集号超出 bgm 记载、橙＝缺集或还有集没到手、蓝＝正常（都到手了）
-                _c = "red" if _over else ("orange" if _have < _den else "blue")
-                if missing:
+                _sub = anime.is_subscribed(a)
+                # 红＝集号超出 bgm 记载、橙＝缺集或还有集没到手、蓝＝正常（都到手了）；
+                # 没在追的番（待确认/已忽略/已下齐停订）没到手是预期的，不标橙（r37 #18）
+                _c = "red" if _over else ("blue" if _have >= _den else "orange" if _sub else "blue-grey")
+                if not _sub and _have < _den and not _over:
+                    _tip = (f"已下 {_have} 集 / 库里有 {_seen} 集的种子"
+                            + (f"；bgm 记 {_tot} 集" if _tot else "")
+                            + "。这部番没在追（待确认 / 已忽略 / 已下齐停订），后台不会自动下它；"
+                              "要追就进详情页确认或恢复订阅")
+                elif missing:
                     _tip = (f"已下 {_have} 集 / 应有 {_den} 集：缺第 {ep_ranges_text(missing)} 集"
                             "——按 bgm 开播日推算早该播了，库里却一条种子都没有。"
                             "采集停过一阵（RSS 只留最近几天）或锁定的源中途断更都会这样；"
@@ -1156,10 +1189,15 @@ def anime_page(t: str = ""):
 
         def _anime_card(a, sources=None, prog=None, missing=None):
             # 一部番一张卡：封面（四角徽标）+ 番名。整张卡可点进详情（徽标的 tooltip 照常悬停可看）。
-            status = (("已忽略", "grey", None) if a.rejected else
+            # 与详情页、已忽略页同一套词（r37 #18）：超期忽略(rejected 且未确认，按开始使用日自动判) / 已忽略(人工)；
+            # 还没识别出 bgm 的叫『待识别』（与剧场版卡片同色），不是『待确认』
+            status = ((("超期忽略", "grey", "开播早于『开始使用日』，自动判的忽略。改开始使用日或点『恢复订阅』都能放回来")
+                       if not a.confirmed else ("已忽略", "grey", None)) if a.rejected else
+                      ("待识别", "red", "bgm 没匹配上，去『待识别』手动绑定") if a.bangumi_id is None else
                       ("待确认", "orange", None) if not a.confirmed else None)
-            with ui.card().tight().classes("cover-card cursor-pointer w-full").on(
-                    "click", lambda aid=a.id: open_detail(aid)):
+            with ui.card().tight().classes("cover-card cursor-pointer w-full").props("tabindex=0").on(
+                    "click", lambda aid=a.id: open_detail(aid)).on(
+                    "keydown.enter", lambda aid=a.id: open_detail(aid)):
                 _card_cover(a, dim=a.rejected, status=status, sources=sources, prog=prog, missing=missing)
                 with ui.column().classes("px-3 py-2 gap-1.5 w-full"):
                     _card_title(a, struck=a.rejected)
@@ -1171,7 +1209,7 @@ def anime_page(t: str = ""):
         # 懒加载：首屏只构建当前 tab 的内容；切到别的 tab 首次才建（6 个面板 → 1 个，砍首屏构建/推送）。
         # 面板都是 @ui.refreshable，未构建过的 .refresh() 是安全 no-op，所以刷新逻辑无需改动。
         _builders = {
-            "overview": lambda: (_ov_snap.clear(), overview_head(), charts_panel(),
+            "overview": lambda: (_ov_snap.clear(), overview_head(), alerts_panel(), charts_panel(),
                                  overview_tail(), inflight_panel(), recent_panel(),
                                  _ov_snap.clear()),
             "manage": _build_manage_tab, "confirm": confirm_panel,

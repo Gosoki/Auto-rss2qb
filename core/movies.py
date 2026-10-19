@@ -680,7 +680,7 @@ async def _enrich_movie_inner(movie_id: int) -> bool:
         if clash:
             names = "、".join(f"#{o.id}「{o.display_name or o.title}」" for o in clash)
             log.warning("识别把 #%s「%s」认成了 bgm %s，而 %s 已经占着它 —— "
-                        "**本次不写绑定**（写进去会让下一轮扫描的 _upsert_movie 按它删掉正主那一行）。"
+                        "本次不写绑定（写进去会让下一轮扫描的 _upsert_movie 按它删掉正主那一行）。"
                         "要合并请到 /movies 走带回显的『绑定 bgm』",
                         m.id, m.display_name or m.title, new_bgm, names)
             dup_bgm, dup_me, dup_names = new_bgm, (m.display_name or m.title), names

@@ -86,6 +86,7 @@ class RingHandler(logging.Handler):
     def __init__(self, capacity: int):
         super().__init__()
         self.buf: deque = deque(maxlen=capacity)
+        self.seq = 0               # 累计写进来过几条：/logs 页据此判断"有没有新日志"，没有就不重建
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -95,6 +96,7 @@ class RingHandler(logging.Handler):
             self.handleError(record)
             return
         self.buf.append(item)      # deque(maxlen) 满则挤掉最老的，天然限长
+        self.seq += 1
 
     def snapshot(self) -> list:
         """线程安全地取当前缓冲快照（后台协程在写、页面在读）。"""

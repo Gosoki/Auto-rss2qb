@@ -133,6 +133,14 @@ def head_revision() -> str | None:
     return ScriptDirectory(str(_ROOT / "alembic")).get_current_head()
 
 
+def _known_revision(rev: str) -> bool:
+    """代码里有没有这一版迁移（没有＝库是被更新版本的程序升级过的）。"""
+    try:
+        return ScriptDirectory(str(_ROOT / "alembic")).get_revision(rev) is not None
+    except Exception:
+        return False
+
+
 def upgrade(engine, role: str, target: str = "head") -> None:
     """把 engine 升到 target（默认最新；已经在那一版则什么都不做）。全新库会一路建过去。
 
@@ -145,6 +153,12 @@ def upgrade(engine, role: str, target: str = "head") -> None:
         cur = current_revision(engine, role)
         if cur == (head_revision() if target == "head" else target):
             return
+        # 【库比代码新】(r37 #13) 这个库被更新版本的程序升级过（比如在别的机器上跑了新版、或回滚了代码）。
+        # alembic 自己的报错是 "Can't locate revision identified by 'xxxx'"，用户看不懂、也不知道该干什么。
+        if cur is not None and not _known_revision(cur):
+            raise RuntimeError(
+                f"数据库[{role}]的版本 {cur} 比当前程序新——它被更新版本的 Auto-rss2qb 升级过。"
+                "请把程序更新到最新版（git pull 后重新部署）再启动；不要用旧版本连这个库。")
         with _ddl_engine(engine) as ddl:
             command.upgrade(_config(engine, role, ddl), target)
         log.info("数据库版本升级[%s]：%s → %s", role, cur or "空库", current_revision(engine, role))

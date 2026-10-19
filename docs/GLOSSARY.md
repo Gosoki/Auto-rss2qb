@@ -30,7 +30,7 @@
 |---|---|
 | `AnimeTorrent.quarter` | 入库时的解析快照，**不权威**。决定保存目录的是 `Anime.quarter` |
 | `Anime.finished_at` | 只是个**标记**。停不停订由 `config.ANIME_FINISH_UNSUB` 决定 |
-| `Anime.finish_optout` | 用户点过『继续订阅』＝此后不再自动判完结。**必需**，否则那个按钮点了没用（判据是状态式的，下一轮立刻重判） |
+| `Anime.finish_optout` | 用户点过『继续订阅』＝此后不再自动判已下齐（界面上不叫『完结』：系统确认不了是不是真播完了）。**必需**，否则那个按钮点了没用（判据是状态式的，下一轮立刻重判） |
 | `is_subscribed_row` | **不是**完整判据（曾有人按名字这么以为）。完整判据是 `subscribed_where()` |
 | `Movie.mikan_id` | Mikan 番组 id，用于『刷新版本』按钮按需重拉该片的种子 RSS |
 | `download_anime_torrent` 的返回值 | 三态：`True`=已接受 / `False`=明确拒绝 / `None`=够不着（不可判定），不要当布尔用 |
@@ -274,7 +274,8 @@ R28 那条 P1 正是因为这三道判据的位数上界不一致。
 | 新入库、等 flush 放行 | `retry_at IS NULL`，番在 `subscribed_where()` 里 | flush / 详情页『将下载』 |
 | 暂时性失败、排队重试 | `retry_at IS NOT NULL` | flush 到点重发 / 详情页『重试中·第N次』 |
 | 番待确认 / 已忽略 / 已停订，永远不会自动下 | 番的 `confirmed` / `rejected` / `finished_at` | 详情页三条橙/灰徽标（R31） |
-| 特别篇 / 未知集，永远不会自动下 | `episode < 0`（`auto_downloadable_ep`） | 详情页紫徽标 |
+| 特别篇 / 未知集，永远不会自动下 | `episode < 0`（`auto_downloadable_ep`） | 详情页徽标：特别篇 blue-grey（不用处理）、未知集紫色（要人工补集号） |
+| 锁了下载源、被锁挡住的别的组的集 | 番 `pref_source` 非空，这条 `source` 不同、集号大于锁定源最大集号、该集没下过 | 仪表盘『锁源缺集』/ 详情页『锁源缺集』（r37 以前叫『备用项』，说法相反） |
 | relocate 搬不动、被清回来等重下 | `save_path` 空 + qB 实时态被清 | 下一轮 flush |
 
 **为什么不拆成五个状态词**：状态词表是"逐层包含"的（`TRACKED ⊂ HAVE`、`DOWNLOADABLE`、`MANUAL_TERMINAL`），

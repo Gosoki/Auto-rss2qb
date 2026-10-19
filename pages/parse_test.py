@@ -38,7 +38,7 @@ def _ep_label(e) -> str:
     if e == -1:
         return "特别篇 (-1)"
     if e == -2:
-        return "未识别 (-2)——不会自动下，进『待识别』"
+        return "未知集 (-2)——不会自动下，进仪表盘的『未知集』，要人工补集号"
     return f"第 {ep_str(e)} 集"
 
 
@@ -89,7 +89,7 @@ def parse_test_page():
                     "现在会被丢弃；但『多括号回退』可恢复为 “" + mb[0] + "”——打开上面的开关即可捕获",
                     "info", "blue")
             elif not name:
-                verdict, icon, color = "会被丢弃：番名解析为空（多括号回退也没把握，落『待识别』）", "warning", "orange"
+                verdict, icon, color = "会被丢弃：番名解析为空（多括号回退也没把握），不会入库", "warning", "orange"
             else:
                 verdict, icon, color = "会被采集入库", "check_circle", "green"
 

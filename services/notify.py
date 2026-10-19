@@ -30,6 +30,11 @@ EVENTS: dict[str, tuple[str, str]] = {
     "qb_down": ("qB 连不上", "🔌"),       # 状态型：进/出各一条
     "db_down": ("数据库停摆", "💥"),      # 状态型
     "backlog": ("待识别积压", "❓"),      # 状态型（阈值上穿/下穿）
+    # ---- r37：采集健康（判据见 core/health.py）----
+    "poll_stall": ("采集停摆", "⏸️"),     # 状态型：采集开着却很久没动静 / 暂停太久
+    "source_down": ("源抓取失败", "🚫"),  # 状态型：有源组连续 N 轮抓不到
+    "feed_gap": ("RSS 断档", "🕳️"),       # 一次性：两轮之间有一段发布滚出了 RSS，可能漏集
+    "lock_lag": ("锁定源落后", "🔒"),     # 别的组已有后续集，锁定的源迟迟不跟（core.anime.locked_out_episodes）
 }
 
 # (事件, key) → 上次发送时刻（monotonic）。进程内，重启即忘。

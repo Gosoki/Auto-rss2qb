@@ -53,12 +53,12 @@ def _pending_total(db):
 
 @pytest.mark.parametrize("unsub", [False, True])
 def test_buckets_sum_to_pending_total(clean_tables, mixed_library, cfg, unsub):
-    """(R5) 六者之和必须等于待下总数——两种停订开关下都要成立。"""
+    """(R5) 七者之和必须等于待下总数——两种停订开关下都要成立。"""
     cfg(ANIME_FINISH_UNSUB=unsub)
     b = A.pending_breakdown()
     total = _pending_total(clean_tables)
     assert sum((b["will"], b["backup"], b["unconfirmed"], b["unknown"], b["special"],
-                b["finished"])) == total, b
+                b["finished"], b["locked"])) == total, b
 
 
 def test_specials_and_unknown_get_their_own_buckets(clean_tables, mixed_library, cfg):
@@ -120,7 +120,7 @@ def test_orphan_and_rejected_go_to_backup(clean_tables, mixed_library, cfg):
 def test_breakdown_keys_are_stable(clean_tables, mixed_library):
     """页面按键名取值。少一个键就是 KeyError（白屏），多一个键无害但要有人知道。"""
     assert set(A.pending_breakdown()) == {"will", "backup", "unconfirmed", "unknown", "special",
-                                          "finished"}
+                                          "finished", "locked"}
 
 
 def test_auto_off_reasons_matches_pending_breakdown_wording(clean_tables, cfg):

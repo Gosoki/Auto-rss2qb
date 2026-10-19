@@ -11,12 +11,12 @@ import time
 
 from core import anime
 import config
-from core import engine, movies
+from core import engine, health, movies
 import db
 from db.models import AnimeTorrent
 from core.anime import flush_ready_downloads, list_source_groups, process_item
 from services import fetch
-from services.notify import state as notify_state
+from services.notify import event as notify_event, state as notify_state
 from sources import SOURCES
 from sources.nyaa import nyaa_feed_url
 
@@ -122,8 +122,13 @@ async def poll_once() -> None:
     # 缓存的字节只活到"后面再没有源要用这个 URL"为止就弹掉：一轮可能跑几个小时（D-06），
     # 别让 4 个 feed 的字节整轮挂着。键是 feed URL —— Mikan『我的番组』把 token 放在 query 里，
     # 这个 dict 的键【不许进日志/诊断输出】（脱敏口径见下面 fetch.redact 那段）。
+    health.touch()
     sources = build_sources()
+    health.forget_sources({s.name for s in sources} | set(_build_skipped))
+    for _n in _build_skipped:
+        health.record_source(_n, False, "源组配置有问题（未知站点 / feed 为空）")
     feed_cache: dict = {}
+    new_gaps: list[dict] = []        # 本轮发现的 RSS 断档（见 core/health.check_window）
     uses_left = Counter(getattr(s, "rss_url", None) for s in sources)
     # 本轮"没抓到"的源名，轮末写进 ANIME_POLL_FAILED 给仪表盘看。分母要含构造阶段就被跳过的组
     # （feed 为空 / 未知站点），不然配置坏了的源组在徽标上是隐形的（核实意见）。
@@ -137,6 +142,7 @@ async def poll_once() -> None:
             fetched_any = True
         except Exception as e:
             failed_sources.append(source.name)
+            health.record_source(source.name, False, f"{type(e).__name__}: {fetch.redact(e)[:100]}")
             # 【必须脱敏】httpx 自己抛的 HTTPStatusError/ConnectError 的 str() 带完整 URL，
             # 而 Mikan『我的番组』订阅地址把 token 放在 query 里 ——
             # 随便一次 403/500 就把 ?token=… 整条写进 data/autorss.log（滚动 5 份）
@@ -145,8 +151,17 @@ async def poll_once() -> None:
                       fetch.redact(e)[:200])
             continue
         finally:
+            health.touch()
             if uses_left[_url] <= 0:
                 feed_cache.pop(_url, None)   # 后面没有源再用它了，字节不必整轮挂着
+        health.record_source(source.name, True)
+        # 【窗口溢出】这一轮 feed 里最老的一条都比上次成功抓取还晚 → 中间那段已经滚出 RSS（r37 #1）
+        _gap = health.check_window(_url or source.name, getattr(source, "oldest_entry_time", None))
+        if _gap:
+            new_gaps.append(health.gap_record(source.name, *_gap))
+            log.warning("RSS 断档：源 %s 在 %s ~ %s 之间的发布已滚出 feed（这段时间没抓到），可能漏集",
+                        source.name, _gap[0].astimezone().strftime("%m-%d %H:%M"),
+                        _gap[1].astimezone().strftime("%m-%d %H:%M"))
         # 【本源这一批的 hash 一次查完】RSS 一轮的条目绝大多数是上一轮就见过的，
         # 逐条各开一个 session 去查等于把 100 次数据库往返摊在采集主链路上
         # （本地 SQLite 约 42ms/100 条；远程 MySQL 是每轮 0.4~2 秒的裸阻塞）。
@@ -171,6 +186,7 @@ async def poll_once() -> None:
             except Exception as e:
                 loop_error(f"处理 {getattr(item, 'anime_title', '?')}", e)
             finally:
+                health.touch()
                 if getattr(item, "info_hash", ""):
                     known.add(item.info_hash)   # 同一 feed 内的重复条目不再重复识别（理由见上）
         log.info("源 %s：%d 条，新增 %d", source.name, len(items), new)
@@ -188,12 +204,38 @@ async def poll_once() -> None:
     # 半轮不能记成一轮；"很久没有新的一轮"由仪表盘按 2×轮询间隔判陈旧上红（核实意见两面都顾到）。
     try:
         _now = datetime.now().isoformat(timespec="seconds")
-        _upd = {"ANIME_POLL_LAST": _now, "ANIME_POLL_FAILED": "\n".join(failed_sources)}
+        _upd = {"ANIME_POLL_LAST": _now, "ANIME_POLL_FAILED": "\n".join(failed_sources),
+                "SOURCE_FEED_SEEN": health.seen_snapshot()}
         if fetched_any:
             _upd["ANIME_POLL_OK_LAST"] = _now
+        if new_gaps:
+            _upd["FEED_GAPS"] = health.gaps_with(new_gaps)
         config.set_many(_upd)
     except Exception as e:
         log.warning("记录本轮采集结果失败（仪表盘的『上次采集』不会更新）：%s", e)
+    health.touch()
+    if new_gaps:
+        # 一次性事件、绕开普通限流桶：恢复那一轮的交付通知很可能把每小时的额度打满，而这条比它们都要紧
+        await notify_event("feed_gap", "RSS 断档，这段时间的发布可能漏了：" + "；".join(
+            health.gap_text(g) for g in new_gaps) + "。去番剧表看缺集提示，用『补齐该源』补", bypass_rate=True)
+    if fetched_any:
+        await _heartbeat()
+
+
+async def _heartbeat() -> None:
+    """外部心跳：每轮采集成功后 GET 一次 HEARTBEAT_URL（r37 #8）。整台机器/容器停了的时候
+    程序自己什么都做不了（09-27 那 15 天就是这样），只有外部监控收不到心跳才会响。失败只记一行，不影响采集。"""
+    url = config.HEARTBEAT_URL
+    if not url:
+        return
+    import httpx
+    try:
+        async with httpx.AsyncClient(**config.http_client_kwargs(10, url=url)) as client:
+            await fetch.get_bytes(client, url, cap=16 * 1024, timeout=10)
+    except fetch.TooLarge:
+        pass
+    except Exception as e:
+        log.warning("外部心跳没发出去：%s: %s", type(e).__name__, fetch.redact(e)[:120])
 
 
 # 【本进程是否还欠一次"启动复位"】只有 main.py 在【启动时业务库就不可用】的那一支会置 True：
@@ -222,6 +264,7 @@ def init_business_state(sweep_leftovers: bool = True) -> None:
     engine.backfill_legacy_progress_once()   # 一次性：历史 sent 标记为已完成
     anime.rekey_aliases()                    # 幂等：解析规则变了就给存量别名补新键（E-39）
     anime.backfill_confirm_reasons()         # 幂等：给早先就在待确认里的番补推断的原因
+    anime.repair_truncated_episodes()        # 幂等：S01E1174 早年被截成 117 的存量行改回四位
 
 
 async def sweep_leftovers_if_pending() -> None:
@@ -292,6 +335,8 @@ async def run_db_watch() -> None:
                     log.info("已补读数据库里的配置（启动时那次没跑成）")
                 except Exception as e:
                     log.error("补读配置失败（下次探测再试）: %s", e)
+            if not now_down:              # 库停摆时那边有自己的告警，采集健康不用再判
+                await _check_poll_health()
             if was_down and not now_down:
                 # 补跑停摆期间漏掉的初始化。是否清扫遗留的 downloading 看本进程欠不欠那一次：
                 # 【启动时就停摆】→ 欠（main.py 跳过了初始化，且此刻不可能有交付协程在跑）；
@@ -313,6 +358,20 @@ async def run_db_watch() -> None:
         except Exception as e:          # 探测自己出岔子也别让看守协程死掉，否则永远发现不了恢复
             loop_error("数据库看守", e)
         await asyncio.sleep(30)
+
+
+async def _check_poll_health() -> None:
+    """采集停摆 / 暂停太久 / 源连续失败 → 状态型通知（只在翻转时各发一条）。挂在看守协程的 30 秒节拍上：
+    采集循环自己卡住时它发现不了自己，而看守协程是独立的一条。判据见 core/health.py。"""
+    try:
+        problem = health.poll_problem()
+        await notify_state("poll_stall", problem is not None, problem or "", "采集恢复正常")
+        bad = health.failing_sources()
+        await notify_state("source_down", bool(bad),
+                           "源抓取连续失败：" + "；".join(f"{n} 连续 {c} 轮（{r}）" for n, c, r in bad),
+                           "源抓取恢复正常")
+    except Exception as e:
+        loop_error("采集健康检查", e)
 
 
 async def run_worker() -> None:
@@ -406,7 +465,8 @@ async def sweep_round() -> None:
         for name, fn in (("交付残骸清扫", engine.sweep_stale_delivering),
                          ("下齐判定", anime.sweep_finished),
                          ("断更提醒", anime.sweep_idle),
-                         ("积压告警", anime.sweep_alerts)):
+                         ("积压告警", anime.sweep_alerts),
+                         ("锁源落后提醒", anime.sweep_lock_lag)):
             try:
                 r = fn()
                 if asyncio.iscoroutine(r):    # 清扫是同步的（一条 SQL），其余三段是协程

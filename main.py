@@ -100,5 +100,6 @@ if __name__ in {"__main__", "__mp_main__"}:
     # 一旦被设成 '*'，网段白名单与本机免 token 会同时失守。这里显式关掉，把它变成本项目自己的契约。
     # 实测关掉后 WebSocket / 静态资源 / socket.io 全部正常；日后真上反向代理且要拿真实客户端 IP，
     # 正确做法是显式写 forwarded_allow_ips="<代理IP>"，而不是把 proxy_headers 打开。
+    # language：Quasar 自带文案（断线重连提示、表格分页等）用中文，不再冒出英文（r37）
     ui.run(title="autorss", host=WEB_HOST, port=WEB_PORT, show=False, reload=False,
-           proxy_headers=False)
+           proxy_headers=False, language="zh-CN")

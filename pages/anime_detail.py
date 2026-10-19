@@ -304,7 +304,16 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             warn_banner(
                 f"缺第 {ep_ranges_text(_miss)} 集：按 bgm 开播日推算早该播了，库里却一条种子都没有。"
                 "采集停过一阵（RSS 只留最近几天，停久了那几集就滚出去了）或锁定的源中途断更都会这样。"
-                "把上面的『下载源』换成还在更新的组，再点『补齐该源』去搜。")
+                "点『补齐该源』去搜：当前下载源搜不到时，会列出别的组有哪些集，挑一个就能补。")
+        # 【锁定源落后】别的组已有后续集、锁定源迟迟不跟（判据见 core.anime.locked_out_episodes）
+        _lo = anime.locked_out_episodes([cur]).get(cur.id)
+        if _lo:
+            warn_banner(
+                f"锁定的下载源『{cur.pref_source}』停在第 {_lo['lock_max']} 集，"
+                f"{'、'.join(_lo['groups'])} 已经发了第 {ep_ranges_text(_lo['eps'])} 集，"
+                "因为锁了源一集都不会下。可以只用别的组补上锁定源之后这几集（不改锁），或改回按优先级。",
+                action=[("只补这几集", "download", _download_locked_out),
+                        ("改回按优先级", "lock_open", _unlock_source)])
         if not eps:
             ui.label("（还没有种子）").classes("text-gray-500")
             return
@@ -407,8 +416,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             ui.badge("备用项").props("color=blue-grey").tooltip(
                                 "同集已有『将下载/已下』的更优版本；要这条就点右边下载")
                         else:  # 该集没有任何将下/已下版本——被锁定源/版本过滤光了=真·缺集
-                            ui.badge("缺集·仅非锁源").props("color=orange").tooltip(
-                                "这一集在当前锁定源/版本下没有可下的，只剩被过滤掉的版本；要它就点右边下载")
+                            # 与仪表盘/新入库同一个词（r37 #2：那两处以前叫它『备用项』，说法正好相反）
+                            ui.badge("锁源缺集").props("color=orange").tooltip(
+                                "这一集在当前锁定源/版本下没有可下的，只剩被过滤掉的版本；"
+                                "要它就点右边下载，或用上方横幅的『只补这几集』")
                     elif t.status == "error":
                         # error 行问的是『点补下会不会挑它』——后台自动下从不重试 error，
                         # 故这里必须用 backfill_plan，不能用只含 pending 的 plan
@@ -482,7 +493,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
     # ---- 事件 ----
     def _set_source(e):
         anime.set_pref_source(anime_id, e.value or "")
-        body.refresh()
+        # 【连外层一起刷】(r37 #11) 待确认卡片上的『下载源』下拉是建面板时的快照：只刷详情的话，回到卡片
+        # 点『确认下载』会把卡片上那个旧值（往往是"按优先级"）带回去，把刚锁的源静默解掉。
+        _after()
         if e.value:
             ui.notify(f"已锁定：之后只下 {e.value}（缺集不兜底，自己来点下载）", type="warning")
         else:
@@ -699,7 +712,69 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             # 归属检查跳掉的那些要单独说：它与两个补齐按钮的松紧【无关】，换另一个按钮再点结果一样，
             # 不点明的话用户只会以为"过滤太严"而白试一遍。
             _st = f"；其中 {res['stolen']} 条对照表显示属于别的番（详见 /logs）" if res.get("stolen") else ""
-            ui.notify(f"没有新种子可补（搜到 {res['found']}，都已有或被季号/名字过滤{_st}）", type="info")
+            ui.notify(f"当前下载源没有新种子可补（搜到 {res['found']}，都已有或被季号/名字过滤{_st}）"
+                      + ("；别的组有，见弹出的列表" if res.get("others") else ""), type="info")
+        if res.get("others"):
+            await _offer_other_groups(res["others"])
+
+    async def _download_locked_out():
+        plan = anime.locked_out_candidates(anime_id)
+        if not plan:
+            ui.notify("没有可补的集（别的组的那几集已经下过了，或都不在待下里）", type="info")
+            return
+        if not await confirm(
+                "用别的组补锁定源之后的集？",
+                f"第 {ep_ranges_text(sorted(int(e) for e in plan))} 集各下一份（每集按源优先级挑："
+                + "、".join(sorted({ts[0].source for ts in plan.values()})) + "）。"
+                "下载源仍锁着，以后的新集还是只下锁定的组。",
+                ok_label="补这几集", ok_icon="download", ok_color="primary"):
+            return
+        n = await anime.download_locked_out(anime_id)
+        _after()
+        ui.notify(f"已下发 {n} 集" if n else "一集都没放行——多半是 qB 此刻连不上，去 /logs 看最近的 WARNING",
+                  type="positive" if n else "warning")
+
+    def _unlock_source():
+        anime.set_pref_source(anime_id, "")
+        _after()
+        ui.notify("已改回『按优先级』：多源自动挑、缺集用别的源兜底；下一轮采集就会补下被挡住的集",
+                  type="positive")
+
+    async def _offer_other_groups(others):
+        """补齐后：别的组还有本番没下过的集 → 列出来让用户挑一个补（r37 #10）。"""
+        dlg = ui.dialog()
+        with dlg, ui.card().classes("gap-2 w-full max-w-xl"):
+            ui.label("别的组还有本番没下过的集").classes("font-bold")
+            ui.label("这些是搜索时顺带看到的别的组，没有入库。挑一个组：只把它这几集入库、各下一份，"
+                     "不改下载源，也不把番打回待确认。看一眼原名再挑——同名的别的作品偶尔也会混进来。").classes(
+                "text-xs text-gray-400")
+            for o in others:
+                with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                    with ui.column().classes("gap-0 min-w-0 grow"):
+                        ui.label(f"{o['group']} · {o['site']} · 第 {ep_ranges_text(o['eps'])} 集").classes(
+                            "text-sm")
+                        ui.label(o["sample"]).classes("text-xs text-gray-500 break-all")
+                    _b = ui.button("补这个组", on_click=lambda o=o: dlg.submit(o)).props(
+                        "flat dense color=primary").classes("btn-sm shrink-0")
+                    _b.set_enabled(config.QB_ENABLED)
+            with ui.row().classes("justify-end w-full"):
+                ui.button("关闭", on_click=lambda: dlg.submit(None)).props("flat")
+        pick = await dlg
+        if not pick:
+            return
+        ui.notify(f"正在补 {pick['group']}…", type="info")
+        # 这里还在外层 _run_backfill 的占位里（_backfill_running 持着本番 id），不必再占一次
+        res = await anime.backfill_source(anime_id, group=pick["group"], site=pick["site"])
+        _after()
+        if res.get("error"):
+            ui.notify(res["error"], type="warning")
+        elif res.get("downloaded"):
+            ui.notify(f"{pick['group']}：入库 {res['ingested']} 条，已下发 {res['downloaded']} 集", type="positive")
+        elif res.get("ingested"):
+            ui.notify(f"{pick['group']}：入库 {res['ingested']} 条，但一集都没放行——多半是 qB 此刻连不上",
+                      type="warning")
+        else:
+            ui.notify(f"{pick['group']}：没有可补的（那几集已下过，或刚被别处补上）", type="info")
 
     async def _backfill_loose():
         await _run_backfill(False)

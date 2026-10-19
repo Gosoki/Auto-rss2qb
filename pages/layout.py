@@ -12,7 +12,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 
 import config
 import db
-from core import engine, worker
+from core import engine, health, worker
 from sources.parse import quarter_sort_key
 
 log = logging.getLogger("autorss")
@@ -238,7 +238,8 @@ def kpi_cards(cards) -> None:
                 "min-width:5ch;text-align:center;font-variant-numeric:tabular-nums")
             ui.label(label).classes("text-xs text-gray-400")
         if on_click:
-            c.on("click", on_click)
+            # tabindex + 回车：键盘也能点（r37：可点的 KPI 卡以前是键盘够不着的 div）
+            c.props("tabindex=0").on("click", on_click).on("keydown.enter", on_click)
 
     if len(groups) == 1:                   # 单组（如剧场版页）：维持原来的自由换行、左对齐
         with ui.row().classes("gap-3 flex-wrap p-1"):
@@ -309,12 +310,13 @@ def require_config_loaded() -> bool:
     return False
 
 
-def warn_banner(text: str, action: tuple | None = None) -> None:
+def warn_banner(text: str, action: tuple | list | None = None) -> None:
     """全站唯一的警告块：amber-400 文字 + 同色 12% 底 + Material warning 图标。
 
     需要用户注意的一律用这个块；图标由本函数出，文案里不要再带 ⚠️。
 
-    `action=(按钮文字, 图标, 回调)`：给"只报不改"那一类横幅配一个就地的处置入口；
+    `action=(按钮文字, 图标, 回调)`：给"只报不改"那一类横幅配一个就地的处置入口；要两个就传一个列表
+    （锁定源落后：『只补这几集』『改回按优先级』）。
     不给就是原来的样子（另外 9 个调用点一个字都不用改）。**别再造第二个带按钮的横幅** ——
     全站 10 处用的是同一个块，再抄一份就是"改了样式只改一处"的温床。
 
@@ -335,8 +337,7 @@ def warn_banner(text: str, action: tuple | None = None) -> None:
             "font-size:20px;line-height:20px")
         # grow：把 action 按钮推到右端。不带 action 的调用点只是让文字块占满剩余宽度，外观不变。
         ui.label(text).classes("text-sm text-amber-400 min-w-0 grow")
-        if action:
-            _lab, _icon, _cb = action
+        for _lab, _icon, _cb in ([action] if isinstance(action, tuple) else (action or [])):
             ui.button(_lab, icon=_icon, on_click=_cb).props(
                 "flat dense color=amber").classes("btn-sm shrink-0 self-start")
 
@@ -349,8 +350,10 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
         columns=[
             {"name": "time", "label": "时间", "field": "time", "align": "left"},
             {"name": "name", "label": name_label, "field": "name", "align": "left"},
+            # 窄屏隐去次要列。【用 Quasar 的 gt-xs，不用 hidden sm:table-cell】(r37) Quasar 的 .hidden 带
+            # !important，压过了 sm:table-cell —— 这一列以前在任何宽度下都不显示。gt-xs 只在 <600px 时 display:none。
             {"name": "src", "label": "来源", "field": "src", "align": "left",
-             "classes": "hidden sm:table-cell", "headerClasses": "hidden sm:table-cell"},  # 窄屏隐去次要列
+             "classes": "gt-xs", "headerClasses": "gt-xs"},
             {"name": "status", "label": "状态", "field": "status", "align": "left"},
         ],
         rows=rows, row_key="id",
@@ -644,14 +647,16 @@ SEVERITY_COLOR = {"error": "red", "stalled": "deep-orange"}
 
 def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
                 qb_dlspeed=0, in_plan=None, confirmed=True, episode=None,
-                auto_off: str = "", retry_at=None, single_work: bool = False) -> tuple[str, str]:
+                auto_off: str = "", retry_at=None, single_work: bool = False,
+                locked_out: bool = False) -> tuple[str, str]:
     """新入库/正在下载：把一条种子压成 (文案, 徽标色)，复刻详情页那套阶梯。
 
     有 qB 实时态 → 『下载中 X% ↓速度』/『做种 100%』(完成绿、在下蓝)；否则 in_plan 非空(番剧)时
     区分待下『将下载/备用』、失败『可补下/失败』；再否则按 torrent_status_cn（刚交付未同步→下载中）。
     in_plan=None 表示不区分首选/备用（剧场版没有集去重，用这个）。
     confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。
-    single_work：番是单部作品，其 -2 按『特别篇』而不是『未知集』显示（判据见 engine.is_special_ep）。"""
+    single_work：番是单部作品，其 -2 按『特别篇』而不是『未知集』显示（判据见 engine.is_special_ep）。
+    locked_out：这条被锁定源挡住、这一集一份都没有 → 『锁源缺集』，不是『备用项』（判据见 core.anime.locked_out_torrent_ids）。"""
     # 同 qb_live_text：人工终态与停滞的 qB 残留态是陈旧的，别拿它盖住真实 status
     if status in engine.MANUAL_TERMINAL_STATUSES or status == "stalled":
         return (torrent_status_cn(status, qb_progress, qb_synced_at),
@@ -688,7 +693,9 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
                 # 暂时性失败排队中（retry_at 非空）：它仍是待下、也不在本轮计划里，但说它是『备用项』
                 # （同集已有更优版本）是错的 —— 详情页对同一行说的是『重试中』。(R36 体检 logic-5)
                 return "重试中", "orange"
-            return ("将下载", "blue") if in_plan else ("备用项", "blue-grey")
+            if in_plan:
+                return "将下载", "blue"
+            return ("锁源缺集", "orange") if locked_out else ("备用项", "blue-grey")
         if status == "error":
             return ("失败·可补下", "orange") if in_plan else ("失败", "red")
     # 【严重度配色对所有渲染路径一致】兜底这一支以前一律给中性灰，于是 error 在
@@ -708,6 +715,26 @@ def paginate(seq: list, page: int, size: int):
     return seq[(page - 1) * size:page * size], total, page
 
 
+def page_visibility(on_visible=None) -> dict:
+    """页面在不在前台：返回 {"on": bool}，定时器回调先看它再决定刷不刷。(r37 #20)
+
+    NiceGUI 的 ui.timer 在服务端跑，浏览器标签页切到后台它也照跑。番剧页默认停在仪表盘，打开站点就会
+    留一个：每 30 秒 38 条 SQL / 约 1.7 MB 数据、MySQL 上约 150 ms 卡在事件循环上 —— 一个没人看的标签页
+    一天约 4.9 GB 的库→应用流量。浏览器的 visibilitychange 告诉服务端前后台；回到前台时调 on_visible
+    立刻补刷一次（不必等下一个 30 秒）。"""
+    state = {"on": True}
+
+    def _h(e):
+        v = e.args[0] if isinstance(e.args, (list, tuple)) and e.args else e.args
+        was, state["on"] = state["on"], bool(v)
+        if state["on"] and not was and on_visible is not None:
+            on_visible()
+    ui.on("autorss_visibility", _h)
+    ui.add_body_html("<script>document.addEventListener('visibilitychange',"
+                     "()=>{try{emitEvent('autorss_visibility',!document.hidden)}catch(e){}});</script>")
+    return state
+
+
 def expand_collapse_bar(state: dict, refresh) -> None:
     """一行『全部展开 / 全部收起』小按钮：把展开意图记进 state['expand']（True/False）再刷新面板。
 
@@ -721,8 +748,8 @@ def expand_collapse_bar(state: dict, refresh) -> None:
     with ui.row().classes("items-center gap-4 pl-1 pb-2"):
         for text, val in (("全部展开", True), ("全部收起", False)):
             ui.label(text).classes(
-                "cursor-pointer text-sm text-gray-500 hover:text-white transition-colors").on(
-                "click", lambda v=val: _set(v))
+                "cursor-pointer text-sm text-gray-500 hover:text-white transition-colors").props(
+                "tabindex=0").on("click", lambda v=val: _set(v)).on("keydown.enter", lambda v=val: _set(v))
 
 
 async def confirm(title: str, note: str = "", ok_label: str = "确定",
@@ -898,7 +925,9 @@ _HEAD_COVER_CSS = (
     "gap:16px;padding:8px 4px;width:100%}"
     ".cover-card:hover{border-color:rgba(255,255,255,.28)!important}"
     ".cover-card-title{font-size:17px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;"
-    "overflow:hidden;line-height:1.35;min-height:2.7em;word-break:break-all}"
+    # overflow-wrap:anywhere 而不是 word-break:break-all：后者把 "Chainsmoker" 这种英文词从中间拆开，
+    # 前者只在一个词本身放不下时才断（中文本来就逐字换行，不受影响）
+    "overflow:hidden;line-height:1.35;min-height:2.7em;overflow-wrap:anywhere}"
     "</style>"
 )
 
@@ -988,6 +1017,34 @@ _HEAD_BADGE_CSS = (
     # （author !important 胜过 inline 非 important），以及调用点顺手加的 Tailwind 工具类。
     ".q-btn.btn-sm{font-size:12px!important}"
     "}</style>")
+
+
+def _health_notices() -> None:
+    """采集停摆 / 暂停太久 / 源连续失败 / RSS 断档：全站挂一条（判据见 core/health.py，r37 #1 #7）。
+
+    以前这些只体现在仪表盘 tab 的『上次采集』徽标上，恢复后第一轮跑完就变回灰色；生产上推送地址又是空的，
+    于是容器停了 15 天、回来之后漏了哪段，全程没有任何地方说过一个字。挂在 frame() 上，任何页面都看得见。"""
+    lines = []
+    if (p := health.poll_problem()):
+        lines.append(p)
+    if (bad := health.failing_sources()):
+        lines.append("源抓取连续失败：" + "；".join(f"{n} 连续 {c} 轮（{r}）" for n, c, r in bad)
+                     + "。去『订阅源』看看地址还对不对、站点是不是挂了。")
+    gaps = health.gaps()
+    if not (lines or gaps):
+        return
+    tail = "（没配推送地址，这些只在页面上看得见。）" if not config.NOTIFY_URL else ""
+    with ui.column().classes("w-full max-w-7xl mx-auto px-2 pt-2 gap-1"):
+        for ln in lines:
+            warn_banner(ln + tail)
+        if gaps:
+            def _ack():
+                health.clear_gaps()
+                ui.navigate.reload()
+            warn_banner("RSS 断档：下面这段时间的发布在两轮采集之间滚出了 feed、没抓到，可能漏集——"
+                        + "；".join(health.gap_text(g) for g in gaps)
+                        + "。去番剧表看缺集提示，用『补齐该源』补；补完点『知道了』。" + tail,
+                        action=("知道了", "done", _ack))
 
 
 def _db_down_notice(detail: str = "") -> None:
@@ -1211,6 +1268,11 @@ def frame(active: str = ""):
     if already_notified:
         with ui.column().classes("w-full max-w-7xl mx-auto px-2 pt-2 gap-1"):
             _db_down_notice()
+    else:
+        try:
+            _health_notices()
+        except Exception as e:          # 提示块自己出错不能连累整个页面
+            log.warning("采集健康提示渲染失败：%s: %s", type(e).__name__, e)
     # 全站内容宽度 max-w-7xl（1280px）：番剧表卡片一行 6 张左右；所有页面同宽，切页面不跳边框。
     with ui.column().classes("w-full max-w-7xl mx-auto p-2") as body:
         try:

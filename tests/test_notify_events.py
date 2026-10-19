@@ -184,7 +184,8 @@ def test_event_keys_are_stable():
     表现是"这类通知突然一条都不来了"，且设置页看上去一切正常。加键时把它列进来即可。
     """
     assert set(N.EVENTS) == {"delivered", "movie", "failed", "stalled", "finished",
-                             "idle", "qb_down", "db_down", "backlog"}
+                             "idle", "qb_down", "db_down", "backlog",
+                             "poll_stall", "source_down", "feed_gap", "lock_lag"}   # r37 新增
 
 
 def test_default_subscription_preserves_old_behaviour():

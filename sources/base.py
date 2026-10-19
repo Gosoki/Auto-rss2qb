@@ -56,7 +56,11 @@ class Source:
         raise NotImplementedError
 
 
-def warn_if_not_a_feed(feed, what: str) -> None:
+class NotAFeed(Exception):
+    """取回的不是 RSS/Atom（维护页、Cloudflare 拦截页、空 body）。采集轮把它记成这个源【抓取失败】。"""
+
+
+def warn_if_not_a_feed(feed, what: str) -> bool:
     """取回来的东西不像个 feed 就告警。【bozo 一个人不够，必须连 version 一起看】。
 
     bozo 只说"XML 解析过程出过毛病"，也就是【良构与否】，而不是【是不是一个 feed】。
@@ -81,13 +85,32 @@ def warn_if_not_a_feed(feed, what: str) -> None:
 
     【两条解析路径都要调它】RssSource.fetch 与 mikan.fetch_bangumi_torrents。
     本文件类 docstring 里那句"改通用行为时记得看一眼那边"已经因此漏过一次。
+
+    返回"是不是 feed"。RssSource 拿到 False 会抛 NotAFeed（r37 #6）：以前这里只打一行 WARNING、
+    按 0 条照常返回，采集轮把它记成"抓取成功"，仪表盘 tooltip 照样写『全部源抓取成功』。
     """
     if not feed.get("version"):
         log.warning("%s 取回的内容【不是 RSS/Atom】（HTTP 200 但站点返回了别的东西——"
-                    "改版、维护页、或被 Cloudflare 一类挡住了）：feedparser 认不出格式，"
-                    "本轮按 0 条处理", what)
-    elif feed.bozo:
+                    "改版、维护页、或被 Cloudflare 一类挡住了）：feedparser 认不出格式", what)
+        return False
+    if feed.bozo:
         log.warning("%s Feed 解析异常（bozo），尽力处理已解析条目", what)
+    return True
+
+
+def _oldest_published(entries, tz) -> datetime | None:
+    """feed 里【所有】条目（过滤之前）最早的发布时间，换成带时区的 UTC。给采集轮的"窗口溢出"检测用：
+    这一轮最老的一条都比上一轮成功抓取还晚，说明中间那段已经滚出了 RSS（r37 #1）。
+    pubDate 按该站的时区基准解释（同 TZ 的说明）；不给时区的站按 UTC 算。没有可用时间返回 None。"""
+    times = []
+    for e in entries:
+        try:
+            pp = e.get("published_parsed")
+            if pp:
+                times.append(datetime(*pp[:6], tzinfo=tz or timezone.utc))
+        except Exception:
+            continue
+    return min(times).astimezone(timezone.utc) if times else None
 
 
 class RssSource(Source):
@@ -131,6 +154,7 @@ class RssSource(Source):
         self.priority = priority
         self.subgroups = subgroups or []        # 字幕组白名单（子串匹配组名，空=全部）
         self.title_filter = title_filter or []  # 标题关键词过滤（标题需含其一，空=不限）
+        self.oldest_entry_time = None           # 上一次 fetch 时 feed 里最老一条的发布时间（UTC，过滤之前）
 
     # ---- 子类覆写点 ----
     def _hash_of(self, entry) -> str:
@@ -173,7 +197,10 @@ class RssSource(Source):
         feed = feedparser.parse(content)
         # 【两个源都要告警】以前只有 nyaa 这一半有，mikan 那半静悄悄——
         # feed 结构坏掉时（站点改版、返回错误页）表现同样是"0 条"，但没人知道为什么。
-        warn_if_not_a_feed(feed, self.name)
+        # 【不是 feed 就抛】采集轮据此把它记进『抓取失败』，补齐的搜索各自兜住、按 0 条算。
+        if not warn_if_not_a_feed(feed, self.name):
+            raise NotAFeed("站点返回的不是 RSS/Atom（维护页 / 被拦截 / 空响应）")
+        self.oldest_entry_time = _oldest_published(feed.entries, self.TZ)
         out = []
         for entry in feed.entries:
             item = self._parse(entry)

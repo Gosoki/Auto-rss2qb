@@ -849,7 +849,34 @@ def search_query_names(raw_title: str) -> list[str]:
     out: list[str] = []
     for c in cands:
         for part in _split_langs(_PROMO_RE.sub("", c)):
-            part = _EP_LEFT_RE.sub("", _TAG_BLK_RE.sub("", part)).strip(" -–—_[]【】()（）★")
+            part = _EP_LEFT_RE.sub("", _TAG_BLK_RE.sub("", part))
+            # (r37) 三处会让搜索词废掉的残留：
+            #  · Nix-Raws 的『Chainsmoker Cat S01E05』—— 带着 S01E05 只能搜到那一集，补齐要的是整季；
+            #  · 没配对的括号『尼古喵喵 (邪竜解放版』（分语言段时把右括号切到了别的段）；
+            #  · 段首的『-』：nyaa 把空格后的 '-' 当排除符，『PSYREN -决战游戏』一条都搜不到。
+            part = _SXXEYY_RE.sub("", part)
+            part = _drop_unpaired_brackets(part)
+            part = _DASH_WORD_RE.sub(r"\1", part).strip(" -–—_[]【】()（）★")
             if len(part.replace(" ", "")) >= 2 and part not in out:
                 out.append(part)
     return out
+
+
+_SXXEYY_RE = re.compile(r"\s*\bS\d{1,2}E\d{1,4}\b.*$", re.I)
+_DASH_WORD_RE = re.compile(r"(^|\s)[-–—]+(?=\S)")
+_BRACKET_PAIRS = {")": "(", "）": "（", "]": "[", "】": "【"}
+
+
+def _drop_unpaired_brackets(s: str) -> str:
+    """删掉没配对的括号（只删括号本身，里面的字留着）。"""
+    stack, drop = [], set()
+    for i, ch in enumerate(s):
+        if ch in "(（[【":
+            stack.append(i)
+        elif ch in _BRACKET_PAIRS:
+            if stack and s[stack[-1]] == _BRACKET_PAIRS[ch]:
+                stack.pop()
+            else:
+                drop.add(i)
+    drop |= set(stack)
+    return "".join(ch for i, ch in enumerate(s) if i not in drop)

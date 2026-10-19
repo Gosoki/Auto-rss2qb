@@ -13,6 +13,7 @@ from db.models import MovieTorrent
 from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN
 from .layout import (SEVERITY_COLOR, WEEKDAY_CN, barline, busy_action, confirm, cover_box, cover_title,
+                     page_visibility,
                      require_bind_confirm, sources_spec,
                      require_config_loaded,
                      expand_collapse_bar, frame,
@@ -631,9 +632,11 @@ def movies_page(t: str = ""):
                     ui.label(f"放送 {m.air_date or '—'}").classes("text-xs text-gray-400")
                     # no-wrap + 不带图标：卡片窄，带图标的『下载』会把『忽略』挤到下一行
                     with ui.row().classes("w-full gap-2 items-center no-wrap mt-auto pt-1"):
-                        ui.button("下载",
+                        # 【叫『挑版本』不叫『下载』】(r37 #19) 它只是打开详情、自己挑一个版本下 ——
+                        # 叫『下载』会让人以为点了就开始下，而触屏上看不到解释它的 tooltip
+                        ui.button("挑版本",
                                   on_click=lambda mid=m.id: open_detail(mid)).props(
-                            "unelevated color=primary").classes("grow").tooltip("打开详情，自己挑版本下载")
+                            "unelevated color=primary").classes("grow").tooltip("打开详情，自己挑一个版本下载")
                         ui.button("忽略", on_click=_reject(m.id)).props("flat color=grey")
 
         # ---- 面板 ----
@@ -896,18 +899,22 @@ def movies_page(t: str = ""):
                     "text-gray-500 p-4")
                 return
             _smap = mov.source_map()   # 批量取来源，避免逐片查的 N+1
-            for m in rej:
-                with ui.card().classes("w-full"):
-                    with ui.row().classes("items-center gap-3 flex-wrap"):
-                        ui.badge("已忽略").props("color=grey")
-                        ui.label(name_of(m)).classes(
-                            "text-lg cursor-pointer text-blue-400 hover:underline").on(
-                            "click", lambda mid=m.id: open_detail(mid))
-                        ui.label("来源: " + (" · ".join(_smap.get(m.id, [])) or "—")).classes(
-                            "text-xs text-gray-400")
-                    with ui.row().classes("items-stretch gap-3 flex-wrap"):
-                        ui.button("恢复订阅", icon="undo", on_click=_restore(m.id)).props(
-                            "unelevated color=primary")
+            # 与番剧侧的已忽略页同一个样子（r37 #19）：封面卡片、操作区压到卡底
+            if rej:
+                with ui.element("div").classes("cover-grid w-full"):
+                    for m in rej:
+                        with ui.card().tight().classes("cover-card w-full"):
+                            cover_box(m.cover_url,
+                                      top_left=[("已忽略", "grey", None)],
+                                      top_right=[(m.mikan_type or "剧场版", "deep-purple", "Mikan 判定的类型")],
+                                      bottom_left=[sources_spec(_smap.get(m.id, []))]).classes(
+                                "cursor-pointer").on("click", lambda mid=m.id: open_detail(mid))
+                            with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
+                                cover_title(name_of(m)).classes("cursor-pointer").on(
+                                    "click", lambda mid=m.id: open_detail(mid))
+                                with ui.row().classes("w-full gap-2 items-center no-wrap mt-auto pt-1"):
+                                    ui.button("恢复订阅", icon="undo", on_click=_restore(m.id)).props(
+                                        "unelevated color=primary").classes("grow")
 
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（与番剧侧对称）
             if dels:
@@ -972,7 +979,11 @@ def movies_page(t: str = ""):
                                            value=round(config.MOVIE_SCAN_INTERVAL / 3600, 1),
                                            min=1, format="%g").classes("w-40")
                     ui.button("保存", icon="save", on_click=lambda: _save_scan(f)).props("unelevated color=primary")
-                last = config.MOVIE_SCAN_LAST or "从未"
+                last = config.MOVIE_SCAN_LAST
+                try:      # 存的是 ISO 原串（2026-10-19T09:18:33），显示成人话
+                    last = datetime.fromisoformat(last).strftime("%m-%d %H:%M") if last else "从未"
+                except ValueError:
+                    pass
                 ui.label(f"上次扫描：{last}").classes("text-xs text-gray-400")
                 ui.label("剧场版桶更新不频繁，间隔别设太小；改动即时生效，到点自动扫。").classes(
                     "text-xs text-gray-500")
@@ -1087,10 +1098,11 @@ def movies_page(t: str = ""):
             """
             if tabs.value != "overview" or "overview" not in _built:
                 return
-            if db.is_data_down():     # 停摆时别每 30s 白撞一次库（每次都要等连接超时）
+            if db.is_data_down() or not _vis["on"]:   # 停摆时别每 30s 白撞一次库；标签页在后台不刷（r37 #20）
                 return
             overview_panel.refresh()
             inflight_panel.refresh()
             recent_panel.refresh()   # overview tab 的第三块，进度数字同样会变（与番剧页同口径）
 
+        _vis = page_visibility(lambda: _refresh_live())
         ui.timer(30.0, _refresh_live, immediate=False)   # 理由见 pages/anime.py 同一处（R36）

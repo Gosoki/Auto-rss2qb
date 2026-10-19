@@ -5,11 +5,17 @@
 """
 from datetime import datetime
 
+from sqlmodel import select
+
 from core import anime as A
 from db.models import Anime, AnimeTorrent, SourceGroup
 
 
 def _setup(s):
+    # clean_tables 不清源组表：别的用例（seed_source_groups）留下的同名组会撞唯一约束，先清掉
+    for g in s.exec(select(SourceGroup)):
+        s.delete(g)
+    s.commit()
     s.add(SourceGroup(name="ANi", site="nyaa", feed="u=ANi", policy="auto", priority=100))
     s.add(SourceGroup(name="Mikan(兜底)", site="mikan", feed="classic", policy="auto", priority=20,
                       subgroups="ANi,喵萌奶茶屋"))
