@@ -1550,6 +1550,12 @@ def episode_progress(anime_ids) -> dict:
       · `33/33` 而 bgm 记着 12 集 —— 集号本身就不对（别的季的正片挂到了这条记录下面），
         真库的 anime#6 就是这个样子。所以 tooltip 里要把 bgm 的总集数一起给出来。
     """
+    return {aid: (len(have), len(seen)) for aid, (have, seen) in _episode_sets(anime_ids).items()}
+
+
+def _episode_sets(anime_ids) -> dict:
+    """{番 id: (已下的正集号集合, 库里见过的正集号集合)}。episode_progress（列表上的比值）与
+    episode_gaps（缺集提示）共用这一份，口径见 episode_progress 的 docstring。"""
     ids = {i for i in anime_ids if i}
     if not ids:
         return {}
@@ -1557,16 +1563,66 @@ def episode_progress(anime_ids) -> dict:
         rows = list(s.exec(select(
             AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.status).where(
             AnimeTorrent.anime_id.in_(ids), AnimeTorrent.episode >= 1).distinct()))
-    have: dict = {}
-    seen: dict = {}
+    out: dict = {}
     for aid, ep, status in rows:
         if not (isinstance(ep, (int, float)) and float(ep).is_integer()):
             continue          # 小数集不计，理由同 episode_coverage
         k = int(ep)
-        seen.setdefault(aid, set()).add(k)
+        have, seen = out.setdefault(aid, (set(), set()))
+        seen.add(k)
         if status in HAVE_STATUSES:
-            have.setdefault(aid, set()).add(k)
-    return {aid: (len(have.get(aid, ())), len(eps)) for aid, eps in seen.items()}
+            have.add(k)
+    return out
+
+
+def expected_aired(a, today=None) -> int | None:
+    """按 bgm 开播日、每周一集推算：到今天【至少】应该已经播到第几集。判不了返回 None。
+
+    少算 ANIME_GAP_SLACK_WEEKS 周（默认 2）：休播一周、字幕组晚几天发，都不该被说成"缺集"。
+    判不了的情形：没有总集数/开播日；有集号歧义段（两套编号混着，集号对不上"第几集"）。
+    周更模型与 _cannot_have_aired_all 同一个。"""
+    t = a.total_episodes or 0
+    aired = _parse_date(a.air_date)
+    if t <= 0 or aired is None or ambiguous_range(a) is not None:
+        return None
+    weeks = ((today or datetime.now().date()) - aired).days // 7
+    return max(0, min(t, weeks + 1 - max(0, config.ANIME_GAP_SLACK_WEEKS)))
+
+
+def missing_episodes(a, seen, today=None) -> list:
+    """追番中的番：按开播日推算【应已播出】、库里却【一条种子都没见过】的正集号（升序）；没有缺口返回 []。
+
+    为什么需要它：列表上的『已下/可下』只数库里见过的集，从没进过库的集它看不见——
+    采集停过一阵（ANi 的 RSS 只留最近约 9 天，停久了那几集就滚出去了）、锁定的源中途断更
+    （ANi 发到第 7 集就不发了），比值照样是满的、蓝色的，看着一切正常。
+
+    宁可漏报，不误报——这几种一律不判：
+      · 不是追番中（待确认/已忽略的番本来就不下，报缺集是噪音）；
+      · 推算不了（见 expected_aired）；
+      · 库里一集正片都没见过：只有特别篇/没集号的种子（剧场版、WEB 这类单部作品就是这样），
+        拿"缺第 1 集"说它是误报；
+      · 集号对不上本季：有超出总集数的集号（别的季的正片挂进来，已有红色徽标），
+        或最小的集号比"应播集数"还大出余量以上（第二部分用绝对编号写 13、14 时，"缺第 1 集"是假的）。"""
+    if a is None or not a.confirmed or a.rejected or not seen:
+        return []
+    e = expected_aired(a, today)
+    if not e:
+        return []
+    if (max(seen) > (a.total_episodes or 0)
+            or min(seen) > e + max(0, config.ANIME_GAP_SLACK_WEEKS)):
+        return []
+    return [k for k in range(1, e + 1) if k not in seen]
+
+
+def episode_gaps(animes) -> dict:
+    """{番 id: 缺的正集号列表}，只含有缺口的番。判据见 missing_episodes；一条 SQL。"""
+    sets = _episode_sets([a.id for a in animes])
+    out = {}
+    for a in animes:
+        miss = missing_episodes(a, sets.get(a.id, (set(), set()))[1])
+        if miss:
+            out[a.id] = miss
+    return out
 
 
 # 进『待确认』的原因：键落库（Anime.confirm_reason），文案只在这里。{键: (短标签, 悬停说明)}

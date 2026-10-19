@@ -12,7 +12,8 @@ from db.models import AnimeTorrent
 from core import alerts, anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail, restore_anime_gated, subscribe_gated
-from .layout import (busy_action, confirm, cover_thumb, finished_tip, require_bind_confirm, ep_label,
+from .layout import (busy_action, confirm, cover_thumb, ep_ranges_text, finished_tip, require_bind_confirm,
+                     ep_label,
                      expand_collapse_bar,
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
@@ -707,6 +708,7 @@ def anime_page(t: str = ""):
             animes.sort(key=lambda a: (_state_rank(a), a.id))  # 追番中在上，待确认、已拒绝垫底
             src_map = anime.source_map()
             prog_map = anime.episode_progress([a.id for a in animes])   # 一条 SQL，与 source_map 同形
+            gap_map = anime.episode_gaps(animes)    # 按开播日推算应播、库里却没见过的集（缺集提示）
             yrs = max(1, config.ANIME_PAGE_YEARS)  # 防 0（每页 0 季会除零）
             groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], yrs * 4)
             manage_page["n"] = page
@@ -738,7 +740,7 @@ def anime_page(t: str = ""):
                     fl["built"] = True
                     with box, ui.element("div").classes("anime-grid"):
                         for a in qi:
-                            _anime_card(a, src_map.get(a.id), prog_map.get(a.id))
+                            _anime_card(a, src_map.get(a.id), prog_map.get(a.id), gap_map.get(a.id))
 
                 def _toggle(e, q=q, f=_fill):
                     manage_page["open"][q] = e.value     # 记住手动开合，面板重建后照此恢复
@@ -1100,12 +1102,12 @@ def anime_page(t: str = ""):
                 ui.notify(f"完成：{cnt} 部刷到了 bgm 资料", type="positive")
             return h
 
-        def _card_cover(a, *, dim: bool = False, status=None, sources=None, prog=None):
+        def _card_cover(a, *, dim: bool = False, status=None, sources=None, prog=None, missing=None):
             """卡片的封面区，番剧表/待确认/已忽略三处共用。四个角的徽标只在这里摆，三处位置一致：
               · 左上：状态 status=(文案, 颜色, 悬停说明或 None)，下面叠『已下齐』——上下叠放而不是并排，
                 两个同时出现（判下齐后又被忽略/打回待确认）时也不会和右上角的季号挤在一起；
               · 右上：季号，下面叠 bgm 判定的非 TV 类型（WEB/剧场版/OVA…）；
-              · 左下：多源/单源（悬停看来源）；右下：已下/可下（只有番剧表给 prog）。
+              · 左下：多源/单源（悬停看来源）；右下：已下/可下（只有番剧表给 prog；missing＝缺集，见下）。
             dim：封面置灰（番剧表里的已忽略番）。返回容器，调用方可再挂点击。
 
             【封面】c 尺寸小图（见 layout.cover_thumb），浏览器直连 bgm 图床、不经过本服务也不调 bgm 接口；
@@ -1149,20 +1151,30 @@ def anime_page(t: str = ""):
                 # 按【集号】数而不是按种子条数：同一集常有好几个源各一份，按条数数出来的比值没有意义。
                 #   · 分子 < 分母 → 有集号还没到手（锁定源锁太死 / 关键词没匹配上 / 卡在缓冲窗口）
                 #   · 分母 > bgm 记的总集数 → 集号本身就不对（别的季的正片挂到了这条记录下面）
+                # 【缺集】missing＝按开播日推算应已播出、库里却一条种子都没见过的集（core.anime.missing_episodes）。
+                # 有缺集时分母改成"应有集数"＝库里见过的 + 缺的，这样 7/7 会显示成 7/12——
+                # 否则采集停过、锁定源断更漏下的集永远看不出来（比值是满的、还是蓝色）。
                 if prog:
                     _have, _seen = prog
                     _tot = a.total_episodes or 0
                     _over = bool(_tot and _seen > _tot)
-                    # 红＝集号超出 bgm 记载、橙＝还有集没到手、蓝＝正常（都到手了）
-                    _c = "red" if _over else ("orange" if _have < _seen else "blue")
-                    ui.badge(f"{_have}/{_seen}").props(f"color={_c}").classes(
-                        "absolute bottom-1 right-1").tooltip(
-                        f"已下 {_have} 集 / 库里有 {_seen} 集的种子"
-                        + (f"；bgm 记 {_tot} 集" if _tot else "；bgm 未给总集数")
-                        + ("。集号超出 bgm 记载——多半有别的季的正片挂到了这条记录下面，"
-                           "进详情页看『各源的集号范围』" if _over else
-                           ("。还有集号没到手：可能是锁定源锁太死、版本关键词没匹配上，"
-                            "或还在缓冲窗口里" if _have < _seen else "。都到手了")))
+                    _den = _seen + len(missing or ())
+                    # 红＝集号超出 bgm 记载、橙＝缺集或还有集没到手、蓝＝正常（都到手了）
+                    _c = "red" if _over else ("orange" if _have < _den else "blue")
+                    if missing:
+                        _tip = (f"已下 {_have} 集 / 应有 {_den} 集：缺第 {ep_ranges_text(missing)} 集"
+                                "——按 bgm 开播日推算早该播了，库里却一条种子都没有。"
+                                "采集停过一阵（RSS 只留最近几天）或锁定的源中途断更都会这样；"
+                                "进详情页把『下载源』换成还在更新的组，再点『补齐该源』")
+                    else:
+                        _tip = (f"已下 {_have} 集 / 库里有 {_seen} 集的种子"
+                                + (f"；bgm 记 {_tot} 集" if _tot else "；bgm 未给总集数")
+                                + ("。集号超出 bgm 记载——多半有别的季的正片挂到了这条记录下面，"
+                                   "进详情页看『各源的集号范围』" if _over else
+                                   ("。还有集号没到手：可能是锁定源锁太死、版本关键词没匹配上，"
+                                    "或还在缓冲窗口里" if _have < _seen else "。都到手了")))
+                    ui.badge(f"{_have}/{_den}").props(f"color={_c}").classes(
+                        "absolute bottom-1 right-1").tooltip(_tip)
             return box
 
         def _card_title(a, struck: bool = False):
@@ -1173,13 +1185,13 @@ def anime_page(t: str = ""):
             lbl.props["title"] = _nm          # 两行截断后，悬停看全名
             return lbl
 
-        def _anime_card(a, sources=None, prog=None):
+        def _anime_card(a, sources=None, prog=None, missing=None):
             # 一部番一张卡：封面（四角徽标）+ 番名。整张卡可点进详情（徽标的 tooltip 照常悬停可看）。
             status = (("已忽略", "grey", None) if a.rejected else
                       ("待确认", "orange", None) if not a.confirmed else None)
             with ui.card().tight().classes("anime-card cursor-pointer w-full").on(
                     "click", lambda aid=a.id: open_detail(aid)):
-                _card_cover(a, dim=a.rejected, status=status, sources=sources, prog=prog)
+                _card_cover(a, dim=a.rejected, status=status, sources=sources, prog=prog, missing=missing)
                 with ui.column().classes("px-3 py-2 gap-1.5 w-full"):
                     _card_title(a, struck=a.rejected)
 

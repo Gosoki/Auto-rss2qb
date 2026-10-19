@@ -138,6 +138,7 @@ _SPEC = {
     # 永远下不下来。开之前请先让它跑一阵、看『已完结』的标记打得对不对。
     "ANIME_FINISH_UNSUB": (bool, False),
     "ANIME_IDLE_DAYS": (int, 14),           # 一部追番中的番多少天没有新种子就提醒（0=关）
+    "ANIME_GAP_SLACK_WEEKS": (int, 2),      # 缺集提示：按开播日推算"应已播到第几集"时少算几周（休播一周/字幕组晚发不误报）
     "SWEEP_INTERVAL_MIN": (int, 180),       # 完结/断更巡检的间隔（分钟）
     "NOTIFY_TIMEOUT": (int, 10),
     "ENRICH_TIMEOUT": (int, 15),

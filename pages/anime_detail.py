@@ -4,7 +4,7 @@ from nicegui import ui
 from core import anime, engine
 import config
 from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, require_bind_confirm,
-                     ep_label, ep_str, finished_tip, meta_card,
+                     ep_label, ep_ranges_text, ep_str, finished_tip, meta_card,
                      name_of, parse_bgm_id,
                      qb_live_text, season_label, source_options, torrent_status_cn,
                      warn_banner)
@@ -298,6 +298,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 "『全系列绝对集号』与『季内集号』两种写法的取值范围重叠、分辨不出。"
                 "系统对这段【既不自动合并、也不跨源去重】：同一集最多每个源各下一份，宁可多下也不冒险把两集不同内容当成一集而漏下。"
                 "如确认某两条其实是同一集，点左边集号手动改成一致即可。")
+        # 【缺集】按开播日推算应已播出、库里却一条种子都没有的集（判据见 core.anime.missing_episodes）
+        _miss = anime.episode_gaps([cur]).get(cur.id)
+        if _miss:
+            warn_banner(
+                f"缺第 {ep_ranges_text(_miss)} 集：按 bgm 开播日推算早该播了，库里却一条种子都没有。"
+                "采集停过一阵（RSS 只留最近几天，停久了那几集就滚出去了）或锁定的源中途断更都会这样。"
+                "把上面的『下载源』换成还在更新的组，再点『补齐该源』去搜。")
         if not eps:
             ui.label("（还没有种子）").classes("text-gray-500")
             return

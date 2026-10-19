@@ -19,7 +19,8 @@ from sources.parse import format_quarter
 from .layout import busy_action, confirm, frame, reload_other_tabs, require_config_loaded, warn_banner
 
 _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
-            "NOTIFY_MAX_PER_HOUR", "NOTIFY_BACKLOG_MIN", "ANIME_IDLE_DAYS", "SWEEP_INTERVAL_MIN",
+            "NOTIFY_MAX_PER_HOUR", "NOTIFY_BACKLOG_MIN", "ANIME_IDLE_DAYS", "ANIME_GAP_SLACK_WEEKS",
+            "SWEEP_INTERVAL_MIN",
             "ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
             "QB_IDLE_RECHECK_MIN", "QB_STALL_TIMEOUT_MIN", "QB_ARCHIVE_AFTER_DAYS",
@@ -906,13 +907,16 @@ def settings():
                      "『下齐后停止自动下新集』默认关——判据虽保守，但 bgm 的总集数少记一集是真实存在的，"
                      "那会让最后一集永远下不下来。建议先让它跑一阵、看『已下齐』标得对不对再开。\n"
                      "断更提醒：一部追番中的番多少天没有新种子就说一声——那是发现『源失效/字幕组停更』的"
-                     "唯一自动手段（那类故障不报错，表现只是『好几天没更新了』）。")
+                     "唯一自动手段（那类故障不报错，表现只是『好几天没更新了』）。\n"
+                     "缺集提示：按开播日、每周一集推算到今天应已播到第几集，库里没见过的集在番剧卡片上标橙色。"
+                     "余量＝推算时少算几周，休播一周或字幕组晚发几天都不误报；调大更不容易误报，但发现得更晚。")
             with ui.element("div").classes("field-grid w-full"):
                 f["ANIME_FINISH_ENABLED"] = ui.switch(
                     "判定已下齐（只标记+通知）", value=config.ANIME_FINISH_ENABLED)
                 f["ANIME_FINISH_UNSUB"] = ui.switch(
                     "下齐后停止自动下新集", value=config.ANIME_FINISH_UNSUB)
                 _num("ANIME_IDLE_DAYS", "断更提醒阈值（天，0=关）", config.ANIME_IDLE_DAYS)
+                _num("ANIME_GAP_SLACK_WEEKS", "缺集提示余量（周）", config.ANIME_GAP_SLACK_WEEKS, 0, 8)
                 # 【给下限】这一项没有"0=关"的语义（关完结/断更各有自己的开关），
                 # 而 run_sweep 里是 max(60, ...) 秒——填 0 会变成每 60 秒来一次全表扫描。
                 _num("SWEEP_INTERVAL_MIN", "巡检间隔（分钟，最少 5）", config.SWEEP_INTERVAL_MIN, 5, 1440)

@@ -519,6 +519,21 @@ def ep_str(e) -> str:
     return str(int(e)) if float(e).is_integer() else str(e)
 
 
+def ep_ranges_text(eps) -> str:
+    """升序整数集号压成区间文字：[1, 8, 9, 10, 11, 12] → "1、8～12"。"""
+    parts, run = [], []
+    for k in eps:
+        if run and k == run[-1] + 1:
+            run.append(k)
+        else:
+            if run:
+                parts.append(str(run[0]) if len(run) == 1 else f"{run[0]}～{run[-1]}")
+            run = [k]
+    if run:
+        parts.append(str(run[0]) if len(run) == 1 else f"{run[0]}～{run[-1]}")
+    return "、".join(parts)
+
+
 def ep_label(e, single_work: bool = False) -> str:
     """列表里的集号文案：正集『第3集』、未知集『第?集』、特别篇『SP』（不套『第…集』，以前拼出来是『第特别集』）。
     single_work：番是单部作品，其 -2 也按特别篇标 SP（判据见 engine.is_special_ep）。"""
