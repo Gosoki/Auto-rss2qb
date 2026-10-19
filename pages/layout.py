@@ -878,6 +878,8 @@ _HEAD_BASE_CSS = (
     ".q-table tbody td,.q-table thead th{font-size:14px}"
     # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
     ".kpi-group{display:grid;gap:.75rem;grid-template-columns:repeat(2,minmax(0,1fr))}"
+    # 窄屏两列时，一组是奇数张（番剧仪表盘 5:5）最后落单的那张横跨整行，别只占半行留个空洞
+    "@media(max-width:859px){.kpi-group>:last-child:nth-child(odd){grid-column:span 2}}"
     "@media(min-width:860px){.kpi-group{grid-template-columns:repeat(var(--kpi-n,4),minmax(0,1fr))}}"
     # 数字输入：隐去浏览器原生上下箭头，统一成纯输入框
     "input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button"

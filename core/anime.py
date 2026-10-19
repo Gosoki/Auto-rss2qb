@@ -3910,6 +3910,17 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
     for items in await asyncio.gather(*tasks):
         for it in items:
             found.setdefault(it.info_hash, it)
+    # 【已知缺的集再按"名字 + 集号"补搜一轮】nyaa 的 RSS 搜索只回最近 75 条：一季 12 集 × 十来个组 ×
+    # 每组好几个版本，早几周的集早被挤出第一页（无自觉圣女第 8 集带中文字幕的那个版本就这样一直搜不到）。
+    # 【不看第一轮有没有搜到这一集】第一轮里可能只搜到了这一集的生肉/英文字幕版，真正要的版本还在后面几页。
+    # 最多补 4 集、只用前两个搜索名，免得请求数翻几倍。
+    seen_eps = {int(t.episode) for t in rows if t.episode and t.episode >= 1 and float(t.episode).is_integer()}
+    extra = missing_episodes(a, seen_eps)[:4]
+    if extra:
+        more = [_fetch_one(site_, f"{q} {e:02d}") for site_ in search_sites for q in queries[:2] for e in extra]
+        for items in await asyncio.gather(*more):
+            for it in items:
+                found.setdefault(it.info_hash, it)
 
     def _is_target(it) -> bool:
         return any(kw_match(g, it.source or "") for g in site_groups.get(it.site, ()))
@@ -3917,6 +3928,10 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
     # 过滤：季号一致（挡 S1/S2 混淆）+ name_filter 番名近似（挡同名衍生作/恶搞）
     ref_names = ({_norm_name(x) for x in (jp, dn, title) if x}
                  | {_norm_name(t.anime_title) for t in rows if t.anime_title})
+    # 判"别的组的结果像不像同一部"时，再并上本番现有种子标题里提取的搜索名（含罗马音）：
+    # 只写罗马音的组（Erai-raws『Mujikaku Seijo wa Kyou mo …』）与 bgm 的日文/中文名、库里解析出的中文名
+    # 一个都对不上，以前整组被当成别的作品丢掉 —— 无自觉圣女第 8 集只有它带中文字幕（Nix-Raws 跳过了这一集）。
+    ref_close = ref_names | {_norm_name(n) for n in names}
     have_eps = {t.episode for t in rows if t.status in HAVE_STATUSES}
     kept, other_hits = [], {}
     for it in found.values():
@@ -3924,7 +3939,7 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
             continue
         res = {_norm_name(it.anime_title)} | {_norm_name(x) for x in (it.search_names or [])}
         if _is_target(it):
-            if group and not _names_close(res, ref_names):
+            if group and not _names_close(res, ref_close):
                 continue          # 挑定的组本来就没在本番出现过，名字也得像，别把同组别的番挂进来
             if name_filter and not (ref_names & res):
                 continue
@@ -3932,7 +3947,7 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
                 continue          # 挑定的组只要本番还没下过的正集
             kept.append(it)
         elif (auto_downloadable_ep(it.episode) and it.episode not in have_eps
-              and _names_close(res, ref_names)):
+              and _names_close(res, ref_close)):
             g = other_hits.setdefault((it.source or "?", it.site), {"eps": set(), "sample": it.raw_title})
             g["eps"].add(int(it.episode) if float(it.episode).is_integer() else it.episode)
     others = sorted(({"group": g, "site": st, "eps": sorted(v["eps"]), "sample": v["sample"]}
@@ -4021,7 +4036,10 @@ async def _download_new_rows(anime_id: int, row_ids: list, kw: str | None = None
         by_ep.setdefault(t.episode, []).append(t)
     n = 0
     for ep in sorted(by_ep):
-        cands = sorted(by_ep[ep], key=lambda t: (not (kw and _kw_match(kw, t.raw_title)), t.id))
+        # 先试命中『版本』关键词的，再先试 1080p 的（Erai-raws 这类组同一集发 1080p/720p/480p 好几个版本，
+        # 按入库顺序挑会挑到 480p）
+        cands = sorted(by_ep[ep], key=lambda t: (not (kw and _kw_match(kw, t.raw_title)),
+                                                 "1080" not in (t.raw_title or ""), t.id))
         for t in cands:
             ok = await download_anime_torrent(t.id)
             if ok:

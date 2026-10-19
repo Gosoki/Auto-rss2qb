@@ -538,3 +538,60 @@ def test_second_nicegui_slot_variant_is_filtered():
     r = logging.LogRecord("nicegui", logging.ERROR, "x", 1,
                           "The parent element this slot belongs to has been deleted.", (), None)
     assert not _SuppressDeletedSlot().filter(r)
+
+
+def test_backfill_finds_a_romaji_only_group_by_episode_query(clean_tables, cfg, monkeypatch):
+    """无自觉圣女：Nix-Raws 跳过了第 8 集，只有 Erai-raws（标题只写罗马音、带 CR 简繁字幕）有。
+    两道坎：① nyaa 搜索只回最近 75 条，第 8 集被挤出第一页 —— 要按"名字 + 08"补搜；
+    ② 罗马音标题与 bgm 的日文/中文名对不上 —— 要拿本番种子标题里的搜索名（含罗马音）来比。
+    挑定 Erai-raws 补时，同一集好几个版本里先试 1080p。"""
+    import sources
+    from sources.base import ParsedItem
+    romaji = "Mujikaku Seijo wa Kyou mo Muishiki ni Chikara wo Tare Nagasu"
+
+    def erai(res, n):
+        return ParsedItem(info_hash=f"{n:040x}", raw_title=f"[Erai-raws] {romaji} - 08 [{res} CR WEB-DL AVC AAC][MultiSub]",
+                          anime_title=romaji, season=1, episode=8.0, quarter="26C", release_time=None,
+                          download_url=f"https://x/{n}.torrent", source="Erai-raws", site="nyaa",
+                          search_names=[romaji])
+    queries = []
+
+    class _Stub:
+        def __init__(self, name, url, **kw):
+            self.url = url
+
+        async def fetch(self, content_cache=None):
+            queries.append(self.url)
+            return [erai("480p", 500), erai("1080p", 501)] if self.url.endswith("%2008") else []
+    for site in ("nyaa", "mikan"):
+        monkeypatch.setitem(sources.SOURCES, site, _Stub)
+        monkeypatch.setitem(sources.SEARCH_URL, site, lambda q: "https://x/?q=" + q.replace(" ", "%20"))
+    tried = []
+
+    async def _fake_dl(tid, force=False):
+        with clean_tables.get_session() as s:
+            tried.append(s.get(AnimeTorrent, tid).raw_title)
+        return True
+
+    async def _alive():
+        return True
+    monkeypatch.setattr(A, "download_anime_torrent", _fake_dl)
+    monkeypatch.setattr(A, "qb_precheck", _alive)
+    cfg(ANIME_GAP_SLACK_WEEKS=2, ANIME_GAP_MAX_EPISODES=100)
+    with clean_tables.get_session() as s:
+        a = _a(title="无自觉圣女今天也无意识地释放力量", display_name="无自觉圣女今天也无意识地释放力量",
+               jp_name="無自覚聖女は今日も無意識に力を垂れ流す", air_date="2026-06-30")
+        s.add(a); s.commit(); s.refresh(a)
+        for e in (1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12):
+            s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{e:040x}", source="Nix-Raws", site="mikan", season=1,
+                               anime_title="无自觉圣女今天也无意识地释放力量", episode=e, status="sent",
+                               raw_title=f"[Nix-Raws] 无自觉圣女今天也无意识地释放力量 / Mujikaku Seijo wa Kyou mo "
+                                         f"Muishiki ni Chikara wo Tare S01E{e:02d} [CR WEB-DL 1080p AVC AAC][简繁内封]",
+                               created_at=datetime.now()))
+        s.commit()
+        aid = a.id
+    res = asyncio.run(A.backfill_source(aid))
+    assert any(q.endswith("%2008") for q in queries), "已知缺第 8 集，要按集号补搜"
+    assert [(o["group"], o["eps"]) for o in res["others"]] == [("Erai-raws", [8])], res["others"]
+    res = asyncio.run(A.backfill_source(aid, group="Erai-raws", site="nyaa"))
+    assert res["downloaded"] == 1 and "1080p" in tried[0], tried

@@ -142,6 +142,8 @@ def anime_page(t: str = ""):
                        "|",
                        ("已交付", k["done"], "green", None),
                        ("未知集", ps["unknown"], "purple", _open_unknown),
+                       # 特别篇只作提示、不是待办（后台本来就不自动下），所以数字不着色；与左边番维度凑成 5:5
+                       ("特别篇", ps["special"], "", _open_special),
                        # 名字与下方 chip『失败数』(仅 error) 区分开：这张卡是"需要处理的总数"，
                        # 含长期停滞，和点开后的 failed_rows()/弹窗标题『失败 / 异常』一致
                        ("失败/异常", ov["status"]["error"] + ov["status"]["stalled"], "red",
