@@ -5,6 +5,7 @@ main.py 导入时调用 setup_logging() 一次。控制台/文件挂根 logger�
 都用这个名，故缓冲里只有采集/下载/重识别/qB 同步这些真正想看的日志，不掺 HTTP 访问等框架噪声。
 """
 import logging
+import re
 from collections import deque
 from logging.handlers import RotatingFileHandler
 
@@ -12,6 +13,9 @@ from config import DATA_DIR
 
 LOG_PATH = DATA_DIR / "autorss.log"
 _RING_CAPACITY = 200            # /logs 页最多回看的最近条数（更早的翻日志文件）
+# /logs 页『警告以上』『仅错误』【单独】保留的最近条数。以前这两档是从上面那 200 条全量日志里筛的 ——
+# 真库每天 400+ 行 INFO，几个小时前的警告早被挤出去了，筛出来常常是空的。（用户 2026-10-19 提的）
+_ALERT_CAPACITY = 100
 _FILE_MAXBYTES = 2_000_000      # 单个日志文件上限≈2MB，滚动保留 5 份 → 最多约 10MB
 _FILE_BACKUPS = 5
 
@@ -27,11 +31,14 @@ class _SuppressDeletedSlot(logging.Filter):
         "The client this element belongs to has been deleted",
         "The client this outbox belongs to has been deleted",
     )
+    # 【NiceGUI 3 把第一条的文案改了】现在是 "The parent slot of Timer(id=307) has been deleted."
+    # （带上了元素类名和 id），上面那条精确字符串一个都匹配不上 —— 生产日志里于是又出现了这种 ERROR。
+    _SLOT_RE = re.compile(r"parent slot of \S+ has been deleted")
 
     def filter(self, record: logging.LogRecord) -> bool:
         exc = record.exc_info[1] if record.exc_info else None
         text = record.getMessage() + " " + str(exc or "")
-        return not any(n in text for n in self._NEEDLES)
+        return not (any(n in text for n in self._NEEDLES) or self._SLOT_RE.search(text))
 
 
 class _RedactUrls(logging.Filter):
@@ -105,7 +112,42 @@ class RingHandler(logging.Handler):
 
 
 ring = RingHandler(_RING_CAPACITY)
+# 警告/错误各自单独一份（挂在 root 上：NiceGUI 等框架自己的报错也在里面，全量 ring 只收本应用的）
+warnings_ring = RingHandler(_ALERT_CAPACITY)
+errors_ring = RingHandler(_ALERT_CAPACITY)
 _configured = False
+
+_LINE_HEAD = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} (DEBUG|INFO|WARNING|ERROR|CRITICAL) ")
+
+
+def _seed_alert_rings() -> None:
+    """启动时把日志文件里最近的警告/错误读回两份缓冲：重启前的那些（往往正是重启的原因）不该一重启就看不见。
+    读当前文件和上一份滚动文件（各约 2MB），多行的异常栈跟着它的那一行走。读不了就算了，不影响启动。"""
+    paths = [LOG_PATH.with_name(LOG_PATH.name + ".1"), LOG_PATH]
+    records: list[tuple[str, list[str]]] = []
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = _LINE_HEAD.match(line)
+                    if m:
+                        records.append((m.group(1), [line.rstrip("\n")]))
+                    elif records:
+                        records[-1][1].append(line.rstrip("\n"))
+        except OSError:
+            continue
+    supp = _SuppressDeletedSlot()
+    for level, lines in records:
+        no = logging.getLevelName(level)
+        if not isinstance(no, int) or no < logging.WARNING:
+            continue
+        text = "\n".join(lines)
+        if any(n in text for n in supp._NEEDLES) or supp._SLOT_RE.search(text):
+            continue
+        item = {"levelno": no, "level": level, "line": text}
+        warnings_ring.buf.append(item)
+        if no >= logging.ERROR:
+            errors_ring.buf.append(item)
 
 
 def setup_logging() -> None:
@@ -143,4 +185,11 @@ def setup_logging() -> None:
     # 只给 root 挂过滤器的话，/logs 页的实时视图仍然明文显示 passkey。
     ring.addFilter(redact_filt)
     logging.getLogger("autorss").addHandler(ring)  # 只收本应用日志（各模块都用这个 logger 名）
+    _seed_alert_rings()
+    for h, lv in ((warnings_ring, logging.WARNING), (errors_ring, logging.ERROR)):
+        h.setLevel(lv)
+        h.setFormatter(_FMT)
+        h.addFilter(filt)
+        h.addFilter(redact_filt)
+        root.addHandler(h)
     _configured = True

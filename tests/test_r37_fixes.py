@@ -373,3 +373,46 @@ def test_saving_settings_never_turns_qb_off():
     src = (Path(__file__).resolve().parents[1] / "pages" / "settings.py").read_text(encoding="utf-8")
     assert 'set_many({"QB_ENABLED": "false"})' not in src
     assert "_QB_CONN_KEYS" in src
+
+
+# ── 日志页：警告/错误单独保留最近 100 条（用户 2026-10-19）──────────────────
+
+def test_new_nicegui_slot_message_is_filtered():
+    """NiceGUI 3 把断连噪声的文案改成 "The parent slot of Timer(id=307) has been deleted."，
+    旧的精确字符串匹配不上 —— 生产日志里又冒出了这种 ERROR。"""
+    import logging
+
+    from core.logsetup import _SuppressDeletedSlot
+    f = _SuppressDeletedSlot()
+
+    def rec(msg, exc=None):
+        r = logging.LogRecord("nicegui", logging.ERROR, "x", 1, msg, (), None)
+        if exc:
+            r.exc_info = (type(exc), exc, None)
+        return r
+    assert not f.filter(rec("The parent slot of Timer(id=307) has been deleted."))
+    assert not f.filter(rec("按钮操作失败：%s", RuntimeError("The parent slot of Button(id=12) has been deleted.")))
+    assert f.filter(rec("抓取失败 ANi: ConnectError: boom")), "真错误不能被吞"
+
+
+def test_alert_rings_are_seeded_from_the_log_file(tmp_path, monkeypatch):
+    from core import logsetup as L
+    log = tmp_path / "autorss.log"
+    (tmp_path / "autorss.log.1").write_text(
+        "2026-10-18 01:00:00,000 WARNING 旧文件里的警告\n", encoding="utf-8")
+    log.write_text(
+        "2026-10-19 09:00:00,000 INFO 源 ANi：75 条，新增 0\n"
+        "2026-10-19 09:01:00,000 ERROR 本轮异常: boom\n"
+        "Traceback (most recent call last):\n"
+        '  File "x.py", line 1, in <module>\n'
+        "RuntimeError: boom\n"
+        "2026-10-19 09:02:00,000 ERROR The parent slot of Timer(id=307) has been deleted.\n"
+        "2026-10-19 09:03:00,000 WARNING 抓取失败 Mikan(兜底): 403\n", encoding="utf-8")
+    monkeypatch.setattr(L, "LOG_PATH", log)
+    monkeypatch.setattr(L, "warnings_ring", L.RingHandler(100))
+    monkeypatch.setattr(L, "errors_ring", L.RingHandler(100))
+    L._seed_alert_rings()
+    w = [x["line"].split(" ", 3)[3].splitlines()[0] for x in L.warnings_ring.snapshot()]
+    assert w == ["旧文件里的警告", "本轮异常: boom", "抓取失败 Mikan(兜底): 403"], w
+    e = L.errors_ring.snapshot()
+    assert len(e) == 1 and "RuntimeError: boom" in e[0]["line"], "异常栈跟着它那一行走"

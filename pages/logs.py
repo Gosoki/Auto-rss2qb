@@ -6,7 +6,7 @@ import logging
 
 from nicegui import ui
 
-from core.logsetup import LOG_PATH, ring
+from core.logsetup import LOG_PATH, errors_ring, ring, warnings_ring
 from pages.layout import frame, page_visibility
 
 # 级别过滤档位：文案 → 最低 levelno（该值及以上才显示）
@@ -45,10 +45,20 @@ def logs_page():
             ui.space()
             count = ui.label().classes("text-xs text-gray-500")
 
+        def _buf():
+            # 『警告以上』『仅错误』各读自己那份单独的缓冲（最近 100 条、含重启前从日志文件读回的），
+            # 而不是从全量的最近 200 条里筛 —— INFO 一多，几个小时前的警告就被挤没了。
+            # 那两份挂在 root 上，NiceGUI 等框架自己的报错也在里面；『全部』只看本应用的日志。
+            f = state["floor"]
+            return errors_ring if f >= logging.ERROR else warnings_ring if f >= logging.WARNING else ring
+
         @ui.refreshable
         def view():
-            items = [x for x in reversed(ring.snapshot()) if x["levelno"] >= state["floor"]]
-            count.text = f"最近 {len(items)} 条（新→旧）"
+            buf = _buf()
+            items = list(reversed(buf.snapshot()))
+            what = {errors_ring: "条错误", warnings_ring: "条警告/错误"}.get(buf, "条")
+            count.text = (f"最近 {len(items)} {what}（新→旧"
+                          + ("，单独保留最近 %d 条、含重启前的）" % buf.buf.maxlen if buf is not ring else "）"))
             if not items:
                 ui.label("暂无日志——后台还没产出，或当前级别下没有记录。").classes(
                     "text-sm text-gray-500 p-2")
@@ -61,14 +71,15 @@ def logs_page():
                         "white-space:pre-wrap;word-break:break-all")
 
         view()
-        seen = {"seq": ring.seq}
+        seen = {"seq": None}
 
         def _tick():
-            # 自动刷新时每 5s 看一次：标签页在后台、或这 5 秒没有新日志，就不重建（r37 #23：
+            # 自动刷新时每 5s 看一次：标签页在后台、或这 5 秒当前那份缓冲没有新日志，就不重建（r37 #23：
             # 以前每 5 秒把 200 行整块重建一遍，不管有没有变化、有没有人在看）
-            if not (state["auto"] and vis["on"]) or ring.seq == seen["seq"]:
+            cur = (id(_buf()), _buf().seq)
+            if not (state["auto"] and vis["on"]) or cur == seen["seq"]:
                 return
-            seen["seq"] = ring.seq
+            seen["seq"] = cur
             view.refresh()
         vis = page_visibility(_tick)
         ui.timer(5.0, _tick)
