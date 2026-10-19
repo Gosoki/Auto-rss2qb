@@ -1,5 +1,5 @@
 """番剧详情组件：render_anime_detail 渲染进列表页的悬浮框(dialog)，不再有独立页路由。"""
-from nicegui import ui
+from nicegui import context, ui
 
 from core import anime, engine
 import config
@@ -750,9 +750,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                   type="positive")
 
     async def _offer_other_groups(others):
-        """补齐后：别的组还有本番没下过的集 → 列出来让用户挑一个补（r37 #10）。"""
-        dlg = ui.dialog()
-        with dlg, ui.card().classes("gap-2 w-full max-w-xl"):
+        """补齐后：别的组还有本番没下过的集 → 列出来让用户挑一个补（r37 #10）。
+
+        【必须建在 client.layout 里、用完销毁】理由同 layout.confirm：调用方刚 _after()（body.refresh）过，
+        刷新排在下一个挂起点才真正执行 —— 对话框若建在点击按钮所在的槽位里，`await dlg` 那一刻
+        槽位被整块清掉，对话框还没显示就被销毁（第一版就是这样：补齐跑完、列表根本没弹出来）。"""
+        with context.client.layout, ui.dialog() as dlg, ui.card().classes("gap-2 w-full max-w-xl"):
             ui.label("别的组还有本番没下过的集").classes("font-bold")
             ui.label("这些是搜索时顺带看到的别的组，没有入库。挑一个组：只把它这几集入库、各下一份，"
                      "不改下载源，也不把番打回待确认。看一眼原名再挑——同名的别的作品偶尔也会混进来。").classes(
@@ -768,7 +771,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     _b.set_enabled(config.QB_ENABLED)
             with ui.row().classes("justify-end w-full"):
                 ui.button("关闭", on_click=lambda: dlg.submit(None)).props("flat")
-        pick = await dlg
+        try:
+            pick = await dlg
+        finally:
+            dlg.delete()
         if not pick:
             return
         ui.notify(f"正在补 {pick['group']}…", type="info")
