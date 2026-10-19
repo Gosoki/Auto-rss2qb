@@ -221,6 +221,7 @@ def init_business_state(sweep_leftovers: bool = True) -> None:
         _stale_sweep_pending = True     # 记账，等协程里补做（清扫要 await 问 qB）
     engine.backfill_legacy_progress_once()   # 一次性：历史 sent 标记为已完成
     anime.rekey_aliases()                    # 幂等：解析规则变了就给存量别名补新键（E-39）
+    anime.backfill_confirm_reasons()         # 幂等：给早先就在待确认里的番补推断的原因
 
 
 async def sweep_leftovers_if_pending() -> None:

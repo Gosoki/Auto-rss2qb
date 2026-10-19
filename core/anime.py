@@ -1644,6 +1644,48 @@ def confirm_reason_text(reason: str | None) -> tuple[str, str]:
     return CONFIRM_REASONS.get(reason or "", ("未记录", "这部番在开始记录原因之前就进了待确认，当时的原因没留下。"))
 
 
+def backfill_confirm_reasons() -> int:
+    """给『原因这一列上线前就进了待确认』的番（confirm_reason 为空）按现有数据推断原因。返回补上的部数。
+
+    只认两种有把握的，推断不出的保持为空（页面照旧显示『未记录』）：
+      · 绑定看着不对 → wrong_season。判据就是建番/合并时打这个原因用的那一个（_binding_looks_wrong_rows）；
+      · 一集都没下过、且每条种子都【只可能】来自『人工审核』策略的源组 → review。
+        "只可能"＝同站点的人工审核源组白名单收它，而没有任何自动下载的源组收它（白名单匹配与采集同一个
+        kw_match；空白名单＝全收）。下过集的不判：那是确认过又被打回来的（补齐/绑定），不是审核源新发现的。
+    不需要"做过了"的标记：只碰原因为空的待确认番，推断不出的下次再看一眼结果也一样，重复跑无害。
+    启动时由 core.worker.init_business_state 调用。"""
+    with get_session() as s:
+        cands = list(s.exec(select(Anime).where(
+            Anime.confirmed == False, Anime.rejected.is_not(True),   # noqa: E712
+            Anime.bangumi_id.is_not(None), Anime.confirm_reason.is_(None))))
+        if not cands:
+            return 0
+        groups = [(g.site, g.policy, [x.strip() for x in (g.subgroups or "").split(",") if x.strip()])
+                  for g in s.exec(select(SourceGroup))]
+
+        def _taken_by(t, policy) -> bool:
+            return any(site == t.site and pol == policy
+                       and (not subs or any(kw_match(x, t.source or "") for x in subs))
+                       for site, pol, subs in groups)
+
+        n = 0
+        for a in cands:
+            rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == a.id)))
+            if _binding_looks_wrong_rows(a, rows):
+                a.confirm_reason = "wrong_season"
+            elif (rows and not any(t.status in HANDLED_STATUSES for t in rows)
+                  and all(_taken_by(t, "review") and not _taken_by(t, "auto") for t in rows)):
+                a.confirm_reason = "review"
+            else:
+                continue
+            s.add(a)
+            n += 1
+        if n:
+            s.commit()
+            log.info("待确认原因：给 %d 部早先就在待确认里的番补上了推断的原因", n)
+    return n
+
+
 def pending_confirm() -> list[Anime]:
     """待确认：已匹配 bgm 但未确认、未拒绝的番。未匹配的在『待识别』，绑定后才来这里。"""
     with get_session() as s:

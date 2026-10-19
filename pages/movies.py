@@ -12,7 +12,8 @@ import db
 from db.models import MovieTorrent
 from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN
-from .layout import (SEVERITY_COLOR, WEEKDAY_CN, barline, busy_action, confirm, cover_thumb, require_bind_confirm,
+from .layout import (SEVERITY_COLOR, WEEKDAY_CN, barline, busy_action, confirm, cover_box, cover_title,
+                     require_bind_confirm, sources_spec,
                      require_config_loaded,
                      expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
@@ -605,35 +606,35 @@ def movies_page(t: str = ""):
             ui.notify(f"已保存：自动扫描{on}，每 {secs // 3600} 小时一次", type="positive")
 
         def _movie_card(m, ts):
-            # "已下 N" = 这部片有几个版本已经落到盘上（含停滞的半成品）——与同页搬迁框的
-            # "{n} 个版本已下"(87 行)、详情页"删除文件"按钮的门槛(178 行) 同集合，三者可互相校验。
+            # 一部片一张封面卡，四角位置与番剧卡片同一份（layout.cover_box）：
+            #   左上 待识别 · 右上 类型（Mikan 判定的剧场版/OVA）· 左下 多源/单源 · 右下 已下/版本数。
+            # 封面/片名点开详情；整张卡不可点——卡里有按钮，点它们会冒泡成"打开详情"。
+            # "已下" = 这部片有几个版本已经落到盘上（含停滞的半成品）——与同页搬迁框的
+            # "{n} 个版本已下"、详情页"删除文件"按钮的门槛同集合，三者可互相校验。
             # 不用 TRACKED：sent→stalled 只是引擎停止轮询的内部决定，盘上文件一点没变，
             # 若跟着 TRACKED 走，这个数字会无缘无故从 1 掉到 0，还把占空间的半成品藏起来。
             ndone = sum(1 for t in ts if t.status in engine.HAVE_STATUSES)
             srcs = sorted({t.source for t in ts if t.source})
-            with ui.card().classes("w-full"):
-                with ui.row().classes("gap-3 items-start no-wrap w-full"):
-                    if m.cover_url:
-                        ui.image(cover_thumb(m.cover_url)).classes("rounded").style("min-width:4rem;width:4rem")
-                    with ui.column().classes("gap-1 grow min-w-0"):
-                        with ui.row().classes("items-center gap-2 flex-wrap"):
-                            ui.badge(m.mikan_type or "剧场版").props("color=deep-purple")  # Mikan 桶判定
-                            ui.label(name_of(m)).classes(
-                                "text-lg cursor-pointer text-blue-400 hover:underline").on(
-                                "click", lambda mid=m.id: open_detail(mid))
-                            if not m.bangumi_id:
-                                ui.badge("待识别").props("color=red").tooltip("bgm 没匹配上，去『待识别』手动绑定")
-                        with ui.row().classes("gap-4 text-xs text-gray-400 flex-wrap"):
-                            ui.label(f"放送 {m.air_date or '—'}")
-                            ui.label(f"版本 {len(ts)}")
-                            ui.label(f"已下 {ndone}")
-                            ui.label("来源 " + (" · ".join(srcs) or "—"))
-                    with ui.column().classes("gap-1 items-end shrink-0"):
-                        ui.button("下载", icon="download",
+            done = (("已下", "green", f"已下 {ndone} 个版本 / 共 {len(ts)} 个版本") if ndone else
+                    (f"{len(ts)} 版本", "blue-grey", f"共 {len(ts)} 个版本，还没下") if ts else None)
+            with ui.card().tight().classes("cover-card w-full"):
+                cover_box(m.cover_url,
+                          top_left=[None if m.bangumi_id else
+                                    ("待识别", "red", "bgm 没匹配上，去『待识别』手动绑定")],
+                          top_right=[(m.mikan_type or "剧场版", "deep-purple", "Mikan 判定的类型")],
+                          bottom_left=[sources_spec(srcs)],
+                          bottom_right=[done]).classes("cursor-pointer").on(
+                    "click", lambda mid=m.id: open_detail(mid))
+                with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
+                    cover_title(name_of(m)).classes("cursor-pointer").on(
+                        "click", lambda mid=m.id: open_detail(mid))
+                    ui.label(f"放送 {m.air_date or '—'}").classes("text-xs text-gray-400")
+                    # no-wrap + 不带图标：卡片窄，带图标的『下载』会把『忽略』挤到下一行
+                    with ui.row().classes("w-full gap-2 items-center no-wrap mt-auto pt-1"):
+                        ui.button("下载",
                                   on_click=lambda mid=m.id: open_detail(mid)).props(
-                            "unelevated color=primary").tooltip("打开详情，自己挑版本下载")
-                        ui.button("忽略", icon="block", on_click=_reject(m.id)).props(
-                            "flat color=grey")
+                            "unelevated color=primary").classes("grow").tooltip("打开详情，自己挑版本下载")
+                        ui.button("忽略", on_click=_reject(m.id)).props("flat color=grey")
 
         # ---- 面板 ----
         @ui.refreshable
@@ -839,7 +840,7 @@ def movies_page(t: str = ""):
                     if fl["built"]:
                         return
                     fl["built"] = True
-                    with box:
+                    with box, ui.element("div").classes("cover-grid"):
                         # 【不再分二级季度小标题】(R31) 剧场版按年归档（E-30），季母对它没有意义：
                         # 存量那 53 条带着旧规则算出的 B/C/D，而新片一律 `<yy>A` ——
                         # 同一年被劈成最多 4 段小标题，且新旧片分在不同段里。

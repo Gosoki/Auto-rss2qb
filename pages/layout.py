@@ -4,7 +4,6 @@
 """
 import asyncio
 import logging
-import re
 from contextlib import contextmanager
 from html import escape
 
@@ -475,13 +474,62 @@ def season_label(a):
     return f"第{a.season}季" if (a.season or 1) > 1 else None
 
 
-def platform_badge(obj) -> None:
-    """bgm 判定为非 TV（剧场版/OVA/WEB…）时，给番剧行加个紫色徽标提示 bgm 眼里的实际类型。
+def platform_spec(obj):
+    """bgm 判定为非 TV（剧场版/OVA/WEB…）时的紫色类型徽标 (文案, 颜色, 悬停说明)；TV 或未知返回 None。
 
     冷门/怪格式常被当周更番收进番剧表，但 bgm 可能识别成剧场版/OVA——打个紫标好一眼看出、自行判断。"""
     p = getattr(obj, "platform", None)
-    if p and p != "TV":
-        ui.badge(p).props("color=deep-purple").tooltip("bgm 判定的类型（非 TV）")
+    return (p, "deep-purple", "bgm 判定的类型（非 TV）") if p and p != "TV" else None
+
+
+def sources_spec(sources):
+    """多源/单源徽标 (文案, 颜色, 悬停说明)：多源(>1)蓝、单源灰，悬停列出来源；没有来源返回 None。"""
+    if not sources:
+        return None
+    n = len(sources)
+    return ((f"多源 {n}", "blue") if n > 1 else (f"单源 {n}", "blue-grey")) + ("来源: " + " · ".join(sources),)
+
+
+def cover_box(cover_url, *, dim: bool = False, top_left=(), top_right=(), bottom_left=(), bottom_right=()):
+    """封面卡片的封面区：番剧表/待确认/已忽略/剧场版共用，四个角的位置全站一致。返回容器，调用方可再挂点击。
+
+    每个角是一串徽标 (文案, 颜色, 悬停说明或 None)，None 项跳过；同一个角有多个时上下叠放
+    （而不是并排），这样左右两个角各有两三个徽标时也不会挤在一起。dim：封面置灰。
+
+    【封面】c 尺寸小图（见 cover_thumb），浏览器直连 bgm 图床、不经过本服务也不调 bgm 接口；
+    q-img 默认 loading=lazy，只拉滚到附近的图；ratio 先占住高度，图慢慢来时网格不跳。"""
+    box = ui.element("div").classes("relative w-full")
+    with box:
+        thumb = cover_thumb(cover_url)
+        if thumb:
+            img = ui.image(thumb).props("ratio=0.707 no-spinner").classes("w-full")
+            if dim:
+                img.style("filter:grayscale(1);opacity:.45")
+        else:
+            with ui.element("div").classes(
+                    "w-full flex items-center justify-center text-gray-500").style(
+                    "aspect-ratio:150/212;background:rgba(255,255,255,.04)"):
+                ui.icon("image_not_supported", size="28px")
+        for specs, pos in ((top_left, "top-1 left-1 items-start"), (top_right, "top-1 right-1 items-end"),
+                           (bottom_left, "bottom-1 left-1 items-start"),
+                           (bottom_right, "bottom-1 right-1 items-end")):
+            specs = [x for x in specs if x]
+            if not specs:
+                continue
+            with ui.column().classes(f"absolute {pos} gap-1"):
+                for text, color, tip in specs:
+                    b = ui.badge(text).props(f"color={color}")
+                    if tip:
+                        b.tooltip(tip)
+    return box
+
+
+def cover_title(name: str, struck: bool = False):
+    """封面卡片上的标题：最多两行（.cover-card-title），悬停看全名。struck：灰色删除线（已忽略）。"""
+    lbl = ui.label(name).classes(
+        "cover-card-title " + ("text-gray-500 line-through" if struck else "text-blue-400"))
+    lbl.props["title"] = name          # 两行截断后，悬停看全名
+    return lbl
 
 
 def poll_time_text(iso: str) -> str:
@@ -839,6 +887,20 @@ _HEAD_BASE_CSS = (
     "oklch(70.7% 0.165 254.624);outline-offset:2px}"
     "</style>")
 # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。放 @layer overrides 才能压过 Quasar 的 .bg-* !important。
+# 封面卡片网格（番剧表/待确认/已忽略/剧场版共用）：按容器宽度自动排列数（桌面多列、手机至少 2 列）。
+_HEAD_COVER_CSS = (
+    "<style>"
+    # width:100% 必须写：季度/年份折叠块的内容区是 align-items:flex-start 的 flex 列，不写的话网格只按
+    # 内容收缩成 3 列、右边大片空着（auto-fill 要靠一个确定的宽度才排得出列数）。
+    # 列宽下限写成 min(固定宽, 50%-8px)：屏再窄也至少两列，不会掉成一列、封面撑满整屏。
+    ".cover-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(160px,calc(50% - 8px)),1fr));"
+    "gap:16px;padding:8px 4px;width:100%}"
+    ".cover-card:hover{border-color:rgba(255,255,255,.28)!important}"
+    ".cover-card-title{font-size:17px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;"
+    "overflow:hidden;line-height:1.35;min-height:2.7em;word-break:break-all}"
+    "</style>"
+)
+
 _HEAD_BADGE_CSS = (
     "<style>@layer overrides{"
     ".q-badge.bg-green{background:oklch(72.3% 0.219 149.579)!important}"               # green-500（绿单独调暗）
@@ -1086,6 +1148,7 @@ def frame(active: str = ""):
     ui.add_head_html(_HEAD_PRELOAD)
     ui.add_head_html(_HEAD_BASE_CSS)
     ui.add_head_html(_HEAD_BADGE_CSS)
+    ui.add_head_html(_HEAD_COVER_CSS)
     with ui.header().classes("p-0").style(
             "background:#15171c;border-bottom:1px solid rgba(255,255,255,.08);box-shadow:none"):
         # 内容包进固定 56px 高的行——用内容锁死高度，右侧有没有按钮都不改变（q-header 的 height 会被 quasar 忽略）

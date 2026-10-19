@@ -12,12 +12,13 @@ from db.models import AnimeTorrent
 from core import alerts, anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail, restore_anime_gated, subscribe_gated
-from .layout import (busy_action, confirm, cover_thumb, ep_ranges_text, finished_tip, require_bind_confirm,
+from .layout import (busy_action, confirm, cover_box, cover_title, ep_ranges_text, finished_tip,
+                     require_bind_confirm,
                      ep_label,
                      expand_collapse_bar,
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
-                     platform_badge, recent_table, season_label, source_options,
+                     platform_spec, recent_table, season_label, source_options, sources_spec,
                      warn_banner, poll_time_text, poll_stale)
 from .sources import render_sources
 
@@ -50,27 +51,11 @@ _TABS_DEF = (("overview", "仪表盘", "dashboard"), ("manage", "番剧表", "mo
 ANIME_TAB_LABELS = {k: name for k, name, _ in _TABS_DEF}   # 设置页『默认标签页』下拉直接用它
 _TAB_KEYS = tuple(ANIME_TAB_LABELS)
 
-# 番剧表的卡片网格：按容器宽度自动排列数（桌面多列、手机 2 列）；番名最多两行，悬停看全名（title 属性）。
-_HEAD_ANIME_CSS = (
-    "<style>"
-    # width:100% 必须写：季度折叠块的内容区是 align-items:flex-start 的 flex 列，不写的话网格只按
-    # 内容收缩成 3 列、右边大片空着（auto-fill 要靠一个确定的宽度才排得出列数）。
-    # 列宽下限写成 min(固定宽, 50%-8px)：屏再窄也至少两列，不会掉成一列、封面撑满整屏。
-    ".anime-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(160px,calc(50% - 8px)),1fr));"
-    "gap:16px;padding:8px 4px;width:100%}"
-    ".anime-card:hover{border-color:rgba(255,255,255,.28)!important}"
-    ".anime-card-title{font-size:17px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;"
-    "overflow:hidden;line-height:1.35;min-height:2.7em;word-break:break-all}"
-    "</style>"
-)
-
-
 @ui.page("/")
 def anime_page(t: str = ""):
     """t 为当前 tab（写在 URL ?t= 里），这样刷新（整页重载）能回到同一 tab、不跳回番剧表。
     默认空串：顶栏导航进来（无 ?t=）时留给下面按 ANIME_DEFAULT_TAB 决定默认停哪个 tab。"""
     with frame("manage"):  # 本页用 tab + 30s 定时刷新，不往顶栏右侧放自定义动作
-        ui.add_head_html(_HEAD_ANIME_CSS)
         # 番剧表：分页页码 + 一键展开/收起意图（None=按默认）+ 搜索词。
         # 【搜索词必须存在这里、不能只留在输入框控件上】面板是 @ui.refreshable，
         # 翻页/展开/详情弹窗关闭都会整体重建它，控件上的值会跟着没。
@@ -439,14 +424,14 @@ def anime_page(t: str = ""):
                                   value=confirm_page["open"].get(q, i == 0 if exp is None else exp)).classes(
                         "w-full").props(remove="dense").on_value_change(
                         lambda e, q=q: confirm_page["open"].__setitem__(q, e.value)):
-                    with ui.element("div").classes("anime-grid"):
+                    with ui.element("div").classes("cover-grid"):
                         for a in items:
                             _confirm_card(a, smap.get(a.id, []))
 
         def _confirm_card(a, srcs):
             # 待确认一张卡：封面/番名点开详情，下面是操作区。整张卡【不】可点——里面有下拉框和按钮，
             # 点它们会冒泡成"打开详情"。操作区用 mt-auto 压到卡底，同一行的卡按钮对齐。
-            with ui.card().tight().classes("anime-card w-full"):
+            with ui.card().tight().classes("cover-card w-full"):
                 _card_cover(a, status=("待确认", "orange", None), sources=srcs).classes(
                     "cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
                 with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
@@ -484,7 +469,7 @@ def anime_page(t: str = ""):
                                   value=reject_page["open"].get(q, i == 0 if exp is None else exp)).classes(
                         "w-full").props(remove="dense").on_value_change(
                         lambda e, q=q: reject_page["open"].__setitem__(q, e.value)):
-                    with ui.element("div").classes("anime-grid"):
+                    with ui.element("div").classes("cover-grid"):
                         for a in items:
                             _reject_card(a, smap.get(a.id, []), dlmap.get(a.id, 0))
 
@@ -533,7 +518,7 @@ def anime_page(t: str = ""):
 
         def _reject_card(a, srcs, nf):
             # 已忽略一张卡：同待确认，封面/番名点开详情、操作区压到卡底。封面不置灰——这一页全是已忽略，灰了反而看不清。
-            with ui.card().tight().classes("anime-card w-full"):
+            with ui.card().tight().classes("cover-card w-full"):
                 # 与详情页同一套词：超期忽略(rejected 且 confirmed=False，按开始使用日自动判) / 已忽略(人工)
                 status = (("超期忽略", "grey", "开播早于『开始使用日』，自动判的忽略。"
                                              "改开始使用日或点『恢复订阅』都能放回来")
@@ -542,13 +527,13 @@ def anime_page(t: str = ""):
                     "cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
                 with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
                     _card_title(a).classes("cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
-                    with ui.row().classes("w-full gap-2 items-center mt-auto pt-1"):
+                    with ui.row().classes("w-full gap-2 items-center no-wrap mt-auto pt-1"):
                         ui.button("恢复订阅", icon="undo", on_click=_restore(a.id)).props(
                             "unelevated color=primary").classes("grow")
                         if nf:  # 只有确实下过文件才给『删除文件』；卡片窄，只留图标，说明放 tooltip
                             ui.button(icon="delete_forever",
                                       on_click=_del_files(a.id, name_of(a), nf)).props(
-                                "flat round color=negative").tooltip(
+                                "flat color=negative").tooltip(
                                 f"删除已下的 {nf} 个文件：连同 qB 里的硬盘文件一起删（不可撤销）")
 
         @ui.refreshable
@@ -738,7 +723,7 @@ def anime_page(t: str = ""):
                     if fl["built"]:
                         return
                     fl["built"] = True
-                    with box, ui.element("div").classes("anime-grid"):
+                    with box, ui.element("div").classes("cover-grid"):
                         for a in qi:
                             _anime_card(a, src_map.get(a.id), prog_map.get(a.id), gap_map.get(a.id))
 
@@ -1103,93 +1088,61 @@ def anime_page(t: str = ""):
             return h
 
         def _card_cover(a, *, dim: bool = False, status=None, sources=None, prog=None, missing=None):
-            """卡片的封面区，番剧表/待确认/已忽略三处共用。四个角的徽标只在这里摆，三处位置一致：
-              · 左上：状态 status=(文案, 颜色, 悬停说明或 None)，下面叠『已下齐』——上下叠放而不是并排，
-                两个同时出现（判下齐后又被忽略/打回待确认）时也不会和右上角的季号挤在一起；
+            """番剧卡片的封面区（番剧表/待确认/已忽略共用），四角徽标的摆法与剧场版同一份（layout.cover_box）：
+              · 左上：状态 status=(文案, 颜色, 悬停说明或 None)，下面叠『已下齐』；
               · 右上：季号，下面叠 bgm 判定的非 TV 类型（WEB/剧场版/OVA…）；
               · 左下：多源/单源（悬停看来源）；右下：已下/可下（只有番剧表给 prog；missing＝缺集，见下）。
-            dim：封面置灰（番剧表里的已忽略番）。返回容器，调用方可再挂点击。
-
-            【封面】c 尺寸小图（见 layout.cover_thumb），浏览器直连 bgm 图床、不经过本服务也不调 bgm 接口；
-            q-img 默认 loading=lazy，只拉滚到附近的图；ratio 先占住高度，图慢慢来时网格不跳。"""
-            box = ui.element("div").classes("relative w-full")
-            with box:
-                _thumb = cover_thumb(a.cover_url)
-                if _thumb:
-                    _img = ui.image(_thumb).props("ratio=0.707 no-spinner").classes("w-full")
-                    if dim:
-                        _img.style("filter:grayscale(1);opacity:.45")
+            dim：封面置灰（番剧表里的已忽略番）。返回容器，调用方可再挂点击。"""
+            fin = None
+            if a.finished_at:
+                # 开了『下齐后停止自动下新集』时写明停订：那是行为变化，不写的话它和正常追番的番
+                # 长得一样，用户只会觉得"它好久没更新了"。说明与详情页同一份（layout.finished_tip）。
+                fin = ("已下齐·停订" if config.ANIME_FINISH_UNSUB else "已下齐", "teal",
+                       finished_tip(a, "进详情页点『继续订阅』"))
+            sl = season_label(a)
+            # 【已下/可下】分子＝已发给 qB 的不同正集号数，分母＝库里见过的不同正集号数。
+            # 按【集号】数而不是按种子条数：同一集常有好几个源各一份，按条数数出来的比值没有意义。
+            #   · 分子 < 分母 → 有集号还没到手（锁定源锁太死 / 关键词没匹配上 / 卡在缓冲窗口）
+            #   · 分母 > bgm 记的总集数 → 集号本身就不对（别的季的正片挂到了这条记录下面）
+            # 【缺集】missing＝按开播日推算应已播出、库里却一条种子都没见过的集（core.anime.missing_episodes）。
+            # 有缺集时分母改成"应有集数"＝库里见过的 + 缺的，这样 7/7 会显示成 7/12——
+            # 否则采集停过、锁定源断更漏下的集永远看不出来（比值是满的、还是蓝色）。
+            progress = None
+            if prog:
+                _have, _seen = prog
+                _tot = a.total_episodes or 0
+                _over = bool(_tot and _seen > _tot)
+                _den = _seen + len(missing or ())
+                # 红＝集号超出 bgm 记载、橙＝缺集或还有集没到手、蓝＝正常（都到手了）
+                _c = "red" if _over else ("orange" if _have < _den else "blue")
+                if missing:
+                    _tip = (f"已下 {_have} 集 / 应有 {_den} 集：缺第 {ep_ranges_text(missing)} 集"
+                            "——按 bgm 开播日推算早该播了，库里却一条种子都没有。"
+                            "采集停过一阵（RSS 只留最近几天）或锁定的源中途断更都会这样；"
+                            "进详情页把『下载源』换成还在更新的组，再点『补齐该源』")
                 else:
-                    with ui.element("div").classes(
-                            "w-full flex items-center justify-center text-gray-500").style(
-                            "aspect-ratio:150/212;background:rgba(255,255,255,.04)"):
-                        ui.icon("image_not_supported", size="28px")
-                if status or a.finished_at:
-                    with ui.column().classes("absolute top-1 left-1 gap-1 items-start"):
-                        if status:
-                            _b = ui.badge(status[0]).props(f"color={status[1]}")
-                            if status[2]:
-                                _b.tooltip(status[2])
-                        if a.finished_at:
-                            # 开了『判完结后停止自动下新集』时写明停订：那是行为变化，不写的话它和正常追番的番
-                            # 长得一样，用户只会觉得"它好久没更新了"。说明与详情页同一份（layout.finished_tip）。
-                            ui.badge("已下齐·停订" if config.ANIME_FINISH_UNSUB else "已下齐").props(
-                                "color=teal").tooltip(finished_tip(a, "进详情页点『继续订阅』"))
-                sl = season_label(a)
-                _p = getattr(a, "platform", None)
-                if sl or (_p and _p != "TV"):
-                    with ui.column().classes("absolute top-1 right-1 gap-1 items-end"):
-                        if sl:
-                            ui.badge(sl).props("color=purple")
-                        platform_badge(a)   # bgm 判定非 TV（剧场版/OVA…）时紫标
-                if sources:   # 多源(>1)蓝 / 单源(==1)灰
-                    n = len(sources)
-                    _lab, _c = (f"多源 {n}", "blue") if n > 1 else (f"单源 {n}", "blue-grey")
-                    ui.badge(_lab).props(f"color={_c}").classes("absolute bottom-1 left-1").tooltip(
-                        "来源: " + " · ".join(sources))
-                # 【已下/可下】分子＝已发给 qB 的不同正集号数，分母＝库里见过的不同正集号数。
-                # 按【集号】数而不是按种子条数：同一集常有好几个源各一份，按条数数出来的比值没有意义。
-                #   · 分子 < 分母 → 有集号还没到手（锁定源锁太死 / 关键词没匹配上 / 卡在缓冲窗口）
-                #   · 分母 > bgm 记的总集数 → 集号本身就不对（别的季的正片挂到了这条记录下面）
-                # 【缺集】missing＝按开播日推算应已播出、库里却一条种子都没见过的集（core.anime.missing_episodes）。
-                # 有缺集时分母改成"应有集数"＝库里见过的 + 缺的，这样 7/7 会显示成 7/12——
-                # 否则采集停过、锁定源断更漏下的集永远看不出来（比值是满的、还是蓝色）。
-                if prog:
-                    _have, _seen = prog
-                    _tot = a.total_episodes or 0
-                    _over = bool(_tot and _seen > _tot)
-                    _den = _seen + len(missing or ())
-                    # 红＝集号超出 bgm 记载、橙＝缺集或还有集没到手、蓝＝正常（都到手了）
-                    _c = "red" if _over else ("orange" if _have < _den else "blue")
-                    if missing:
-                        _tip = (f"已下 {_have} 集 / 应有 {_den} 集：缺第 {ep_ranges_text(missing)} 集"
-                                "——按 bgm 开播日推算早该播了，库里却一条种子都没有。"
-                                "采集停过一阵（RSS 只留最近几天）或锁定的源中途断更都会这样；"
-                                "进详情页把『下载源』换成还在更新的组，再点『补齐该源』")
-                    else:
-                        _tip = (f"已下 {_have} 集 / 库里有 {_seen} 集的种子"
-                                + (f"；bgm 记 {_tot} 集" if _tot else "；bgm 未给总集数")
-                                + ("。集号超出 bgm 记载——多半有别的季的正片挂到了这条记录下面，"
-                                   "进详情页看『各源的集号范围』" if _over else
-                                   ("。还有集号没到手：可能是锁定源锁太死、版本关键词没匹配上，"
-                                    "或还在缓冲窗口里" if _have < _seen else "。都到手了")))
-                    ui.badge(f"{_have}/{_den}").props(f"color={_c}").classes(
-                        "absolute bottom-1 right-1").tooltip(_tip)
-            return box
+                    _tip = (f"已下 {_have} 集 / 库里有 {_seen} 集的种子"
+                            + (f"；bgm 记 {_tot} 集" if _tot else "；bgm 未给总集数")
+                            + ("。集号超出 bgm 记载——多半有别的季的正片挂到了这条记录下面，"
+                               "进详情页看『各源的集号范围』" if _over else
+                               ("。还有集号没到手：可能是锁定源锁太死、版本关键词没匹配上，"
+                                "或还在缓冲窗口里" if _have < _seen else "。都到手了")))
+                progress = (f"{_have}/{_den}", _c, _tip)
+            return cover_box(a.cover_url, dim=dim,
+                             top_left=[status, fin],
+                             top_right=[(sl, "purple", None) if sl else None, platform_spec(a)],
+                             bottom_left=[sources_spec(sources)],
+                             bottom_right=[progress])
 
         def _card_title(a, struck: bool = False):
-            """卡片上的番名：最多两行（.anime-card-title），悬停看全名。struck：灰色删除线（已忽略）。"""
-            _nm = name_of(a)
-            lbl = ui.label(_nm).classes(
-                "anime-card-title " + ("text-gray-500 line-through" if struck else "text-blue-400"))
-            lbl.props["title"] = _nm          # 两行截断后，悬停看全名
-            return lbl
+            """番剧卡片上的番名（layout.cover_title）。struck：灰色删除线（已忽略）。"""
+            return cover_title(name_of(a), struck)
 
         def _anime_card(a, sources=None, prog=None, missing=None):
             # 一部番一张卡：封面（四角徽标）+ 番名。整张卡可点进详情（徽标的 tooltip 照常悬停可看）。
             status = (("已忽略", "grey", None) if a.rejected else
                       ("待确认", "orange", None) if not a.confirmed else None)
-            with ui.card().tight().classes("anime-card cursor-pointer w-full").on(
+            with ui.card().tight().classes("cover-card cursor-pointer w-full").on(
                     "click", lambda aid=a.id: open_detail(aid)):
                 _card_cover(a, dim=a.rejected, status=status, sources=sources, prog=prog, missing=missing)
                 with ui.column().classes("px-3 py-2 gap-1.5 w-full"):

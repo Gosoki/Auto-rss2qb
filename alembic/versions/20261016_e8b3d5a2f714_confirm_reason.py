@@ -19,20 +19,26 @@ def _role() -> str:
     return context.get_x_argument(as_dictionary=True).get("role", "data")
 
 
+def _add_column_if_missing(table: str, col: sa.Column) -> None:
+    """加列，已存在就跳过。必须幂等：MySQL 上 DDL 隐式提交、版本号最后才写，中途断掉重跑会撞
+    1060 Duplicate column 并被标成 fatal（理由详见 c7e1a93b4d02 的同名函数）。
+    --sql 离线模式没有真连接（get_bind 给的是 MockConnection），原样发出 ADD COLUMN。"""
+    from alembic import context
+    if context.is_offline_mode():
+        op.add_column(table, col)
+        return
+    have = {c["name"] for c in sa.inspect(context.get_bind()).get_columns(table)}
+    if col.name in have:
+        return
+    op.add_column(table, col)
+
+
 def upgrade() -> None:
     if _role() != "data":
         return
-    from alembic import context
-    col = sa.Column("confirm_reason",
-                    sa.Text().with_variant(mysql.TEXT(collation="utf8mb4_bin"), "mysql"),
-                    nullable=True)
-    if not context.is_offline_mode():
-        # 幂等：MySQL 上 DDL 隐式提交、版本号最后才写，中途断掉重跑会撞 1060 Duplicate column
-        # （理由详见 c7e1a93b4d02 的 _add_column_if_missing）。--sql 离线模式没有真连接，原样发出。
-        have = {c["name"] for c in sa.inspect(context.get_bind()).get_columns("anime")}
-        if col.name in have:
-            return
-    op.add_column("anime", col)
+    _add_column_if_missing("anime", sa.Column(
+        "confirm_reason", sa.Text().with_variant(mysql.TEXT(collation="utf8mb4_bin"), "mysql"),
+        nullable=True))
 
 
 def downgrade() -> None:

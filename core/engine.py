@@ -11,7 +11,7 @@ import ntpath
 import os
 import posixpath
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import httpx
 import sqlalchemy as sa
@@ -1006,7 +1006,6 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
                     s.add(t)
             s.commit()
 
-    all_ids = [tid for tid, _ in pairs]
     if not config.QB_ENABLED:
         # 【qB 关着时一行都不动】原写法是 _clear 成 pending「待重下」，但那个前提不成立：
         # qB 关着时 download_anime_torrent / download_movie_torrent / manual 三条下载入口

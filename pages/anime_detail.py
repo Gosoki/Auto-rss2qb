@@ -330,13 +330,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         _neg = t.episode == -2 and not _sp                # 解析也可能写错正整数(把分辨率/季号当集号)
                         ui.label(ep_txt).classes(
                             "shrink-0 cursor-pointer hover:underline"
-                            + (" text-blue-400" if _neg else " text-purple-400" if _sp else "")).on(
+                            + (" text-blue-400" if _neg else "")).on(
                             "click", _set_ep(t.id)).tooltip(
                             "集号没解析出来；点这里补集号或设为特别篇" if _neg
                             else "特别篇（SP）；其实是正片？点这里改集号" if _sp else "集号不对？点这里改")
                     else:
-                        ui.label(ep_txt).classes(                         # 主要信息：集号（已下等不可改）
-                            "shrink-0" + (" text-purple-400" if _sp else ""))
+                        ui.label(ep_txt).classes("shrink-0")              # 主要信息：集号（已下等不可改）
                     ui.label(t.source or "—").classes("shrink-0")         # 主要信息：字幕组（同色）
                     ui.label(engine.torrent_time(t)).classes(
                         "shrink-0 text-gray-500 text-xs")                 # 次要：时间(12px)
@@ -760,7 +759,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 num = ui.number("集号", value=1, min=0, step=1, format="%g").props("autofocus")
                 num.on("keydown.enter", lambda: dlg.submit(num.value))
                 with ui.row().classes("gap-2 justify-end w-full"):
-                    ui.button("设为特别篇", on_click=lambda: dlg.submit(-1)).props("flat color=purple")
+                    ui.button("设为特别篇", on_click=lambda: dlg.submit(-1)).props("flat color=primary")
                     ui.space()
                     ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                     ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("unelevated color=primary")

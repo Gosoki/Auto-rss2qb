@@ -79,18 +79,22 @@ def test_old_db_with_duplicate_mikan_ids_upgrades_cleanly(upgrade_from):
 
 def test_old_db_with_overlong_aliases_gets_trimmed(upgrade_from):
     """停在 trim_alias 之前的库，里面有超长别名 → 升级要截断并合并截断后重复的。"""
-    from db.models import Anime, AnimeAlias
+    from db.models import AnimeAlias
     eng = upgrade_from("c7e1a93b4d02")           # trim_alias 的前一版
     long_a = "番" * 250
     long_b = "番" * 254                           # 截断到 191 后与上面相同
-    with Session(eng) as s:
-        a = Anime(title="长名番", quarter="26A", confirmed=True)
-        s.add(a)
-        s.commit()
-        s.refresh(a)
-        s.add(AnimeAlias(title=long_a, anime_id=a.id))
-        s.add(AnimeAlias(title=long_b, anime_id=a.id))
-        s.commit()
+    # 【按老表结构用 SQL 插，别用 ORM】模型里有这一版之后才加的列（如 confirm_reason），
+    # ORM 的 INSERT 会带上它们、在老表上直接报 no such column。照表的实际非空列插（同 trim_alias 那条用例）。
+    with eng.begin() as c:
+        info = c.exec_driver_sql("PRAGMA table_info(anime)").fetchall()
+        vals = {"id": 1, "title": "长名番", "quarter": "26A", "confirmed": 1}
+        for col in (r[1] for r in info if r[3] and r[5] == 0):   # NOT NULL 且非主键
+            vals.setdefault(col, 0 if col in ("season", "rejected", "enrich_tries", "finish_optout") else "")
+        c.execute(sa.text(f"INSERT INTO anime ({', '.join(vals)}) VALUES ({', '.join(':' + k for k in vals)})"),
+                  vals)
+        for i, t in enumerate((long_a, long_b), 1):
+            c.execute(sa.text("INSERT INTO anime_alias (id, title, season, anime_id, created_at) "
+                              "VALUES (:i, :t, 1, 1, '2026-01-01 00:00:00')"), {"i": i, "t": t})
 
     upgrade_from.to_head(eng)
 
