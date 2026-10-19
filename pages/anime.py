@@ -420,13 +420,35 @@ def anime_page(t: str = ""):
             expand_collapse_bar(confirm_page, confirm_panel.refresh)
             exp = confirm_page["expand"]   # None=只开第一组；True/False=一键全展开/收起
             for i, (q, items) in enumerate(group_by_quarter(pend)):
-                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                  value=confirm_page["open"].get(q, i == 0 if exp is None else exp)).classes(
-                        "w-full").props(remove="dense").on_value_change(
-                        lambda e, q=q: confirm_page["open"].__setitem__(q, e.value)):
-                    with ui.element("div").classes("cover-grid"):
-                        for a in items:
-                            _confirm_card(a, smap.get(a.id, []))
+                _quarter_group(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
+                               confirm_page["open"].get(q, i == 0 if exp is None else exp),
+                               lambda qi=items: [_confirm_card(a, smap.get(a.id, [])) for a in qi],
+                               lambda v, q=q: confirm_page["open"].__setitem__(q, v))
+
+        def _quarter_group(label, opened, build, remember):
+            """一个季度折叠块，里面是封面卡片网格。番剧表/待确认/已忽略三处共用。
+            · 懒建：收着的季度先不建卡片，第一次展开时才建（build() 在网格里建卡片）；
+            · remember(开/合)：用户手动开合时调用，面板重建后照此恢复（不想记就传个空函数）。"""
+            # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
+            box = ui.expansion(label, value=opened).classes("w-full").props(remove="dense")
+            built = {"v": False}
+
+            def fill():
+                if built["v"]:
+                    return
+                built["v"] = True
+                with box, ui.element("div").classes("cover-grid"):
+                    build()
+
+            def toggle(e):
+                remember(e.value)
+                if e.value:
+                    fill()
+
+            if opened:
+                fill()
+            box.on_value_change(toggle)
+            return box
 
         def _confirm_card(a, srcs):
             # 待确认一张卡：封面/番名点开详情，下面是操作区。整张卡【不】可点——里面有下拉框和按钮，
@@ -465,13 +487,11 @@ def anime_page(t: str = ""):
             expand_collapse_bar(reject_page, reject_panel.refresh)
             exp = reject_page["expand"]
             for i, (q, items) in enumerate(group_by_quarter(rej)):
-                with ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                  value=reject_page["open"].get(q, i == 0 if exp is None else exp)).classes(
-                        "w-full").props(remove="dense").on_value_change(
-                        lambda e, q=q: reject_page["open"].__setitem__(q, e.value)):
-                    with ui.element("div").classes("cover-grid"):
-                        for a in items:
-                            _reject_card(a, smap.get(a.id, []), dlmap.get(a.id, 0))
+                _quarter_group(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
+                               reject_page["open"].get(q, i == 0 if exp is None else exp),
+                               lambda qi=items: [_reject_card(a, smap.get(a.id, []), dlmap.get(a.id, 0))
+                                                 for a in qi],
+                               lambda v, q=q: reject_page["open"].__setitem__(q, v))
 
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（deleted 是终态、不会自动重下）
             if dels:
@@ -707,34 +727,20 @@ def anime_page(t: str = ""):
             if not animes:
                 ui.label(f"（没有匹配「{manage_page['kw']}」的番剧）").classes("text-gray-500 p-4")
                 return
-            # 搜索态下强制展开：命中的番散在各季，全收着等于搜完还要一季季点开。
             exp = manage_page["expand"]  # None=各季按默认(仅最新季开)；True/False=一键全展开/收起(跨页一致)
-            if kw and exp is None:
-                exp = True
             for i, (q, items) in enumerate(groups):
-                _open = manage_page["open"].get(q, exp if exp is not None else i == 0)
-                # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
-                _exp = ui.expansion(f"{engine.quarter_label(q)}   ·   {len(items)} 部",
-                                    value=_open).classes("w-full").props(remove="dense")
-                # 懒加载：折叠的季度先不建行（省首建成本）；首次展开时才建，之后不再重建
-                _fl = {"built": False}
-
-                def _fill(qi=items, box=_exp, fl=_fl):
-                    if fl["built"]:
-                        return
-                    fl["built"] = True
-                    with box, ui.element("div").classes("cover-grid"):
-                        for a in qi:
-                            _anime_card(a, src_map.get(a.id), prog_map.get(a.id), gap_map.get(a.id))
-
-                def _toggle(e, q=q, f=_fill):
-                    manage_page["open"][q] = e.value     # 记住手动开合，面板重建后照此恢复
-                    if e.value:
-                        f()
-
-                if _open:
-                    _fill()
-                _exp.on_value_change(_toggle)
+                if kw:
+                    # 【搜索期间一律展开、也不记开合】命中的番散在各季，收着的季度里搜到了也看不见
+                    # （顶上写着"匹配 1 部"，卡片却藏在折叠里）。只有刚点过『全部收起』才照它收着。
+                    # 不记：搜索时的开合是临时的，清空搜索后要回到平时的开合状态。
+                    opened, remember = (exp if exp is not None else True), (lambda v: None)
+                else:
+                    opened = manage_page["open"].get(q, exp if exp is not None else i == 0)
+                    remember = lambda v, q=q: manage_page["open"].__setitem__(q, v)   # noqa: E731
+                _quarter_group(f"{engine.quarter_label(q)}   ·   {len(items)} 部", opened,
+                               lambda qi=items: [_anime_card(a, src_map.get(a.id), prog_map.get(a.id),
+                                                             gap_map.get(a.id)) for a in qi],
+                               remember)
 
         def _refresh_overview(charts):
             # 刷新仪表盘：head(计数)+tail(种子状态/qB实时)恒刷；charts(图表)仅 charts=True 时刷。
@@ -748,14 +754,16 @@ def anime_page(t: str = ""):
             finally:
                 _ov_snap.clear()      # 出了本轮就作废，避免下次读到陈旧快照
 
-        def refresh_dynamic():
-            # 用户操作后的全动态刷新：含『待确认/待识别』，好让确认/绑定/忽略后的番立即从对应列表流转。
-            _refresh_overview(charts=True)   # 用户操作不在悬停图表，可连图表一起刷
-            inflight_panel.refresh()
-            confirm_panel.refresh()
-            reject_panel.refresh()
-            fail_panel.refresh()
-            recent_panel.refresh()
+        # 用户操作（确认/忽略/绑定/补齐…）之后每个 tab 要刷新的面板。
+        _TAB_REFRESH = {
+            "overview": lambda: (_refresh_overview(charts=True),   # 用户操作不在悬停图表，可连图表一起刷
+                                 inflight_panel.refresh(), recent_panel.refresh()),
+            "manage": lambda: manage_panel.refresh(),
+            "confirm": lambda: confirm_panel.refresh(),
+            "fail": lambda: fail_panel.refresh(),
+            "reject": lambda: reject_panel.refresh(),
+        }
+        _dirty: set = set()   # 建过、但自上次操作后还没刷新的 tab；切过去时补刷（见 _on_tab）
 
         def _refresh_live(tab):
             """刷新某 tab 的只读实时区。只有仪表盘有实时区，其余 tab 一律不动。
@@ -767,7 +775,7 @@ def anime_page(t: str = ""):
             （对比 `manage_page["expand"]`）。于是用户刚展开的折叠块每 30 秒自动收起一次、
             滚动位置一起丢 —— 最难受的正是底部那个『已删除的种子』，它恰恰是用户展开去找条目
             点『重新下载』的地方：展开 → 找 → 还没点到就合上了。
-            摘掉它不丢任何东西：本页的操作走 `refresh_dynamic()`（那里点名刷了 reject_panel），
+            摘掉它不丢任何东西：本页的操作走 `refresh_all()`（切到『已忽略』时会补刷 reject_panel），
             而后台改动 rejected 的只有『开始使用日超期忽略』那条批量重算 ——
             那不是 30 秒尺度的实时量。顺带省掉每 30 秒一次事件循环上的同步查询
             （list_rejected_anime + deleted/excluded_torrent_rows + downloaded_counts，
@@ -790,8 +798,16 @@ def anime_page(t: str = ""):
             _refresh_live(tabs.value)
 
         def refresh_all():
-            refresh_dynamic()
-            manage_panel.refresh()
+            """用户操作之后的刷新：【只立刻刷当前看着的 tab】，其余建过的 tab 记成待刷新、切过去时再刷。
+            以前是把仪表盘（十几条查询 + 图表）、番剧表、待确认、已忽略……全部重建一遍，
+            不管你在哪个 tab——在番剧表点一次确认下载，要白白重算一遍看不见的仪表盘。
+            从用户看到的结果说两者等价：切到哪个 tab，那个 tab 都是最新的。"""
+            cur = tabs.value
+            for key, fn in _TAB_REFRESH.items():
+                if key == cur:
+                    fn()
+                elif key in _built:
+                    _dirty.add(key)
 
         # 详情悬浮框（复用一个 dialog，点开时清空重建，避免累积 + 不跳页丢滚动位置）
         detail_dlg = ui.dialog()
@@ -1177,11 +1193,14 @@ def anime_page(t: str = ""):
             for _k in _TAB_KEYS:
                 _slots[_k] = ui.tab_panel(_k)   # 空面板本身作容器，懒建时直接填入（不套内层 div，保持 tab-panel 原生行距）
 
-        def _on_tab(e):   # 切 tab：写 URL(不重载，刷新后仍停在此 tab) + 首次构建；已建过的切回来刷新实时区显示最新
+        def _on_tab(e):   # 切 tab：写 URL(不重载，刷新后仍停在此 tab) + 首次构建；已建过的切回来刷新显示最新
             ui.run_javascript(f"history.replaceState(null,'','?t='+encodeURIComponent('{e.value}'))")
             already = e.value in _built
             _build_tab(e.value)
-            if already:
+            if e.value in _dirty:          # 离开期间有过操作：整页补刷（见 refresh_all）
+                _dirty.discard(e.value)
+                _TAB_REFRESH[e.value]()
+            elif already:
                 _refresh_live(e.value)
         tabs.on_value_change(_on_tab)
         _build_tab(start)   # 构建首屏 tab

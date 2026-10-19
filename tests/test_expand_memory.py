@@ -78,3 +78,64 @@ async def test_expand_all_overrides_manual_memory(user: User, clean_tables):
             break
     assert old not in now, "前提：面板确实重建过"
     assert not any(e.value for e in now), "『全部收起』之后还有季度开着"
+
+
+async def _until(pred, tries=100):
+    """面板重建是异步的：轮询到条件成立（最多约 5 秒）。返回最后一次的判断结果。"""
+    for _ in range(tries):
+        if pred():
+            return True
+        await asyncio.sleep(0.05)
+    return pred()
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_search_opens_a_manually_closed_quarter(user: User, clean_tables):
+    """手动收起过的季度，搜索时也要展开——否则顶上写着"匹配 1 部"，卡片却藏在折叠里。
+    清空搜索后回到手动收起的状态（搜索期间的开合不记）。"""
+    from db.models import Anime
+    with clean_tables.get_session() as s:
+        s.add(Anime(title="新季甲", display_name="新季甲", season=1, quarter="26D", confirmed=True))
+        s.add(Anime(title="上季乙", display_name="上季乙", season=1, quarter="26C", confirmed=True))
+        s.commit()
+
+    await user.open("/?t=manage")
+    d = _expansions(user, "26D")[0]
+    assert d.value, "前提：最新一季默认展开"
+    d.value = False                                   # 用户手动收起（记进开合记忆）
+
+    user.find(marker="anime-search").type("新季")
+    assert await _until(lambda: _expansions(user, "26D") and _expansions(user, "26D")[0] is not d), \
+        "前提：搜索后面板重建过"
+    assert _expansions(user, "26D")[0].value, "搜索时手动收起过的季度没展开，搜到的番看不见"
+
+    searched = _expansions(user, "26D")[0]
+    user.find(marker="anime-search").clear()
+    assert await _until(lambda: _expansions(user, "26D") and _expansions(user, "26D")[0] is not searched)
+    assert not _expansions(user, "26D")[0].value, "清空搜索后没回到手动收起的状态"
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_hidden_tab_is_refreshed_only_when_switched_back(user: User, clean_tables):
+    """操作后只立刻刷新当前 tab；隐藏着的 tab 切回来时才补刷，切回来看到的一定是最新的。"""
+    from db.models import Anime
+    with clean_tables.get_session() as s:
+        s.add(Anime(title="待确认番", display_name="待确认番", season=1, quarter="26D",
+                    confirmed=False, bangumi_id=920001))
+        s.commit()
+
+    def pending_badges():
+        return [b for b in user.find(ui.badge).elements if b.text == "待确认"]
+
+    await user.open("/?t=manage")
+    assert pending_badges(), "前提：番剧表卡片上有『待确认』"
+    tabs = next(iter(user.find(ui.tabs).elements))
+    tabs.value = "confirm"
+    await user.should_see("确认下载")
+    btn = next(b for b in user.find(ui.button).elements if b.text == "确认下载")
+    UserInteraction(user, {btn}, None).click()
+    await user.should_see("没有待确认的番")         # 当前 tab（待确认）立刻刷新了
+
+    assert pending_badges(), "隐藏着的番剧表被立刻重建了（应当等切回来再刷）"
+    tabs.value = "manage"
+    assert await _until(lambda: not pending_badges()), "切回番剧表后没有补刷，还显示『待确认』"

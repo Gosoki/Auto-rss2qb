@@ -502,7 +502,8 @@ def cover_box(cover_url, *, dim: bool = False, top_left=(), top_right=(), bottom
     with box:
         thumb = cover_thumb(cover_url)
         if thumb:
-            img = ui.image(thumb).props("ratio=0.707 no-spinner").classes("w-full")
+            # no-transition：q-img 默认每次挂载都淡入一次，面板一重建，满屏封面就一起闪一下
+            img = ui.image(thumb).props("ratio=0.707 no-spinner no-transition").classes("w-full")
             if dim:
                 img.style("filter:grayscale(1);opacity:.45")
         else:

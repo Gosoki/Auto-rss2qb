@@ -851,8 +851,9 @@ def test_expansion_has_exactly_two_documented_tiers():
 
     assert not bad_dense, ("这些折叠面板在调用点写了 dense —— 那已经是全局默认："
                            + "; ".join(bad_dense))
-    assert len(opted_out) == 4, (
-        f"显式退出紧凑档的有 {len(opted_out)} 处（预期 4 处：番剧列表 3 + 剧场版 1）："
+    # 番剧页的季度分组头只在 _quarter_group 里建一次（番剧表/待确认/已忽略三个面板共用）
+    assert len(opted_out) == 2, (
+        f"显式退出紧凑档的有 {len(opted_out)} 处（预期 2 处：番剧页 _quarter_group 1 + 剧场版 1）："
         + "; ".join(opted_out) + "。多了说明第二档在扩散，少了说明分组头被压扁了")
 
 

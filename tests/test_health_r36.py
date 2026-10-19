@@ -192,13 +192,21 @@ def test_confirm_and_reject_panels_have_an_expand_all_bar():
         calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
                  and getattr(c.func, "id", "") == "expand_collapse_bar"]
         assert calls, f"{name} 没有『全部展开 / 全部收起』条"
-        exps = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
-                and getattr(c.func, "attr", "") == "expansion"
-                and c.args and "quarter_label" in ast.unparse(c.args[0])]   # 只看按季度分的那几组
-        assert exps, f"{name} 里找不到按季度分组的 ui.expansion（守卫前提坏了）"
-        for e in exps:
-            kw = {k.arg: ast.unparse(k.value) for k in e.keywords}
-            assert "exp" in kw.get("value", ""), f"{name}:{e.lineno} 的 ui.expansion 没看展开意图（条是死的）"
+        # 季度折叠块由 _quarter_group 建（番剧表/待确认/已忽略三处共用），第 2 个参数是"开不开"
+        groups = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                  and getattr(c.func, "id", "") == "_quarter_group"
+                  and c.args and "quarter_label" in ast.unparse(c.args[0])]   # 只看按季度分的那几组
+        assert groups, f"{name} 里找不到按季度分组的 _quarter_group（守卫前提坏了）"
+        for g in groups:
+            assert len(g.args) > 1 and "exp" in ast.unparse(g.args[1]), \
+                f"{name}:{g.lineno} 的季度折叠块没看展开意图（条是死的）"
+    # _quarter_group 自己必须把"开不开"真的交给 ui.expansion，否则上面查到的参数是摆设
+    helper = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_quarter_group"),
+                  None)
+    assert helper is not None, "找不到 _quarter_group（守卫前提坏了）"
+    exps = [c for c in ast.walk(helper) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "expansion"]
+    assert exps and any(k.arg == "value" and ast.unparse(k.value) == "opened" for k in exps[0].keywords), \
+        "_quarter_group 没把 opened 交给 ui.expansion 的 value"
 
 
 # ---------------- ux-7 / ux-9 / logic-10：真渲染 ----------------
