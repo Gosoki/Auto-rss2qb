@@ -33,7 +33,8 @@ class _SuppressDeletedSlot(logging.Filter):
     )
     # 【NiceGUI 3 把第一条的文案改了】现在是 "The parent slot of Timer(id=307) has been deleted."
     # （带上了元素类名和 id），上面那条精确字符串一个都匹配不上 —— 生产日志里于是又出现了这种 ERROR。
-    _SLOT_RE = re.compile(r"parent slot of \S+ has been deleted")
+    # 同族还有一条 "The parent element this slot belongs to has been deleted."（生产上也出现过）。
+    _SLOT_RE = re.compile(r"parent slot of \S+ has been deleted|parent element this slot belongs to has been deleted")
 
     def filter(self, record: logging.LogRecord) -> bool:
         exc = record.exc_info[1] if record.exc_info else None

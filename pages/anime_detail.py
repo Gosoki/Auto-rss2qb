@@ -245,7 +245,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                          "入库后转『待确认』，点『确认下载』才下。")
             _btn_bf_auto = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_auto).props(
                 "flat")
-            _btn_bf_auto.tooltip("同『补齐该源』，但额外用番名近似过滤挡掉同名衍生作/别的季，更少需人工把关。")
+            _btn_bf_auto.tooltip("同『补齐该源』，但额外用番名过滤挡掉同名衍生作/别的季。"
+                                 "在追的番补到就直接下（不打回待确认）；没在追的番照旧转『待确认』。")
 
         # 分集 / 种子（每条可单独强制下载）；标题右侧灰字标注会发送给 qB 的保存目录（按规则算出，全番同一目录）
         with ui.row().classes("items-center gap-2 w-full mt-2 flex-wrap"):
@@ -304,7 +305,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             warn_banner(
                 f"缺第 {ep_ranges_text(_miss)} 集：按 bgm 开播日推算早该播了，库里却一条种子都没有。"
                 "采集停过一阵（RSS 只留最近几天，停久了那几集就滚出去了）或锁定的源中途断更都会这样。"
-                "点『补齐该源』去搜：当前下载源搜不到时，会列出别的组有哪些集，挑一个就能补。")
+                "点『自动补齐』去搜（在追的番补到就直接下）：当前下载源搜不到时，会列出别的组有哪些集，挑一个就能补。")
         # 【锁定源落后】别的组已有后续集、锁定源迟迟不跟（判据见 core.anime.locked_out_episodes）
         _lo = anime.locked_out_episodes([cur]).get(cur.id)
         if _lo:
@@ -684,7 +685,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
 
     async def _run_backfill_inner(name_filter):
         cur = anime.get_anime(anime_id)
-        if cur is not None and cur.confirmed and not cur.rejected:
+        # 『自动补齐』对在追的番补到就直接下、不打回待确认（core.anime._backfill_source_inner），不必问
+        if cur is not None and not name_filter and cur.confirmed and not cur.rejected:
             # 已确认番：补齐入库新种子会把整部番退回『待确认』，后台从此暂停自动下新集，直到重新确认——先告知
             if not await confirm(
                     "补齐会暂停这部番的自动下载",
@@ -702,7 +704,14 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         if res.get("error"):
             ui.notify(res["error"], type="warning")
         elif res["ingested"]:
-            if res.get("to_confirm"):
+            if res.get("direct"):
+                n = res.get("downloaded", 0)
+                ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}），已下发 {n} 集"
+                          if n else
+                          f"补入库 {res['ingested']} 条（搜到 {res['found']}），但没有新下发："
+                          "补到的集已经有了、是特别篇，或不合『版本』关键词；qB 连不上时也会这样",
+                          type="positive" if n else "info")
+            elif res.get("to_confirm"):
                 ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}）→ 已转『待确认』，去点『确认下载』",
                           type="positive")
             else:   # rejected 番：入库了但订阅态没变，不会自动下

@@ -1353,12 +1353,25 @@ async def qb_precheck() -> bool:
     """
     if not config.QB_ENABLED:
         return True
+    global _qb_down_rounds
     alive = await engine.qb.reachable()
     await notify_state("qb_down", not alive,
                        "qB 连不上，暂停放行下载（种子留在待下）", "qB 恢复，继续交付")
+    # 【只在翻转时记 WARNING】(r37) 以前每轮一行，断网 30 小时记了 213 次。之后每 12 轮记一行 INFO。
     if not alive:
-        log.warning("qB 连不上，本轮不放行下载（种子留在待下，qB 恢复后自动继续）")
+        _qb_down_rounds += 1
+        if _qb_down_rounds == 1:
+            log.warning("qB 连不上，本轮不放行下载（种子留在待下，qB 恢复后自动继续）")
+        elif _qb_down_rounds % 12 == 0:
+            log.info("qB 仍然连不上，已连续 %d 轮不放行下载", _qb_down_rounds)
+    else:
+        if _qb_down_rounds >= 2:
+            log.info("qB 恢复，继续放行下载（之前连续 %d 轮连不上）", _qb_down_rounds)
+        _qb_down_rounds = 0
     return alive
+
+
+_qb_down_rounds = 0     # qb_precheck 连续判"连不上"的轮数（只用来给日志降噪）
 
 
 async def flush_ready_downloads(qb_alive: bool | None = None) -> int:
@@ -1502,6 +1515,7 @@ def overview() -> dict:
     split = pending_breakdown()   # 待下拆 将下载/备用/待确认/未知，算一次给 KPI 与状态区共用
     return {
         "kpi": {
+            "gaps": len(episode_gaps(animes)),   # 缺集的番（判据见 missing_episodes；只判在追的）
             "tracking": len(confirmed), "fail": sum(1 for a in animes if not a.bangumi_id),
             "confirm": len(pending_c), "rejected": rejected,
             "done": status.get("sent", 0),
@@ -3584,6 +3598,37 @@ def pending_breakdown() -> dict:
             "unknown": unknown, "special": special, "finished": finished, "locked": locked}
 
 
+def ep_ranges(eps) -> str:
+    """集号列表 → 『1、8～12』（连续的并成区间）。与 pages.layout.ep_ranges_text 同一写法，core 里要用。"""
+    out, run = [], []
+    for e in sorted(int(x) for x in eps):
+        if run and e == run[-1] + 1:
+            run.append(e)
+            continue
+        if run:
+            out.append(str(run[0]) if len(run) == 1 else f"{run[0]}～{run[-1]}")
+        run = [e]
+    if run:
+        out.append(str(run[0]) if len(run) == 1 else f"{run[0]}～{run[-1]}")
+    return "、".join(out)
+
+
+def gap_rows() -> list[dict]:
+    """仪表盘『缺集』卡点开的列表：每部缺集的番一行（形状与 _torrent_rows 一致，raw 放说明），新季度在前。
+    以前缺集只标在番剧卡片和详情页上，一部部点开才看得到 —— r37 那次的缺集清单是靠脚本算出来的。"""
+    with get_session() as s:
+        animes = list(s.exec(select(Anime).options(_NO_SUMMARY).where(
+            Anime.confirmed == True, Anime.rejected.is_not(True))))   # noqa: E712
+    gaps = episode_gaps(animes)
+    rows = [{"id": a.id, "anime_id": a.id, "name": display_of(a), "episode": None,
+             "raw": f"缺第 {ep_ranges(gaps[a.id])} 集"
+                    + (f"；锁定『{a.pref_source}』" if a.pref_source else "")
+                    + f"；{engine.quarter_label(a.quarter)}"}
+            for a in animes if a.id in gaps]
+    order = {a.id: quarter_sort_key(a.quarter or "") for a in animes}
+    return sorted(rows, key=lambda r: order[r["anime_id"]], reverse=True)
+
+
 def locked_out_rows() -> list[dict]:
     """仪表盘『锁源缺集』点开的列表：每部锁定源落后的番一行（形状与 _torrent_rows 一致，raw 放说明）。
     列的是 locked_out_candidates 有货的番（不看提醒的时间判据：这里回答的是"被锁挡住的有哪些"）。"""
@@ -3780,7 +3825,12 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
     group + site：用户从 others 里挑定了一个组 → 只搜那个站，把该组【本番还没下过的正集】入库并直接各下一份
     （每集一份，优先命中本番『版本』关键词的那条）；不把番打回待确认 —— 这是用户点名要的，不必再审一遍。
 
-    返回 {found, kept, ingested, sites, others[, downloaded][, to_confirm]}。"""
+    【『自动补齐』对在追的番直接下】(r37 后续) name_filter=True 且番正在追（已确认、未忽略、没下齐停订）时，
+    补到的正集【不打回待确认】，直接各下一份（锁定源/版本关键词照常生效）。打回待确认的初衷是"宽松补齐会把
+    同名的别的作品搜进来（攻壳机动队搜进 SAC_2045），要人过目"—— 而『自动补齐』本来就多一道番名过滤；
+    真库上补 8 部番，每部都要"补齐 → 待确认 → 确认下载"点两遍。宽松的『补齐该源』保持原样。
+
+    返回 {found, kept, ingested, sites, others[, downloaded][, to_confirm][, direct]}。"""
     from sources import SEARCH_URL, SOURCES
 
     with get_session() as s:
@@ -3928,7 +3978,8 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
                 _warn_unknown_episode(it)   # 补齐是第二个入库口，不走 process_item
             except IntegrityError:
                 s.rollback()
-        if ingested and not group and not a_now.rejected:   # 有新货且未忽略(实时态) → 转待确认，复用审核流、别自动下
+        direct = bool(name_filter and not group and is_subscribed(a_now))
+        if ingested and not group and not direct and not a_now.rejected:   # 有新货且未忽略(实时态) → 转待确认，复用审核流、别自动下
             if a_now.confirmed:   # 本来就在待确认的不覆写：原先那个原因（如疑似绑错季）仍然成立、更要紧
                 a_now.confirm_reason = "backfill"
             a_now.confirmed = False
@@ -3936,26 +3987,37 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
             s.commit()
             to_confirm = True
     out = {"found": len(found), "kept": len(kept), "ingested": ingested, "stolen": stolen,
-           "sites": list(site_groups), "to_confirm": to_confirm, "others": others}
+           "sites": list(site_groups), "to_confirm": to_confirm, "others": others, "direct": direct}
     if group:
         out["downloaded"] = await _download_new_rows(anime_id, new_ids, kw)
+    elif direct and new_ids:
+        out["downloaded"] = await _download_new_rows(anime_id, new_ids, kw, strict_kw=True)
     log.info("补齐 anime=%s 番名过滤=%s%s：搜到 %d（站 %s）→ 留 %d → 入库 %d%s%s",
              anime_id, name_filter, f" 指定组={group}@{site}" if group else "",
              len(found), list(site_groups), len(kept), ingested,
              f"（另跳过 {stolen} 条：对照表显示属于别的番）" if stolen else "",
-             f"；下发 {out['downloaded']} 集" if group else "")
+             f"；下发 {out['downloaded']} 集" if "downloaded" in out else "")
     return out
 
 
-async def _download_new_rows(anime_id: int, row_ids: list, kw: str | None = None) -> int:
+async def _download_new_rows(anime_id: int, row_ids: list, kw: str | None = None,
+                             strict_kw: bool = False) -> int:
     """把刚入库的这几条按集各下一份（同集多个版本时先试命中『版本』关键词的）。返回交付成功的集数。
-    走非 force 的交付：集去重闸照常生效，这一集若此刻已有一份就不会再下第二份。"""
+    只下【正集】、且只下本番此刻还没有一份的集（别把同集的别的版本挨个试一遍、落一串"跳过重复集"）；
+    走非 force 的交付，集去重闸照常生效。strict_kw：版本关键词当硬过滤（与后台自动下同口径，『自动补齐』用）；
+    否则只当偏好（用户挑定了一个组时，那个组可能没有这个版本）。"""
     if not row_ids or not await qb_precheck():
         return 0
     with get_session() as s:
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.id.in_(row_ids))))
+        have = set(s.exec(select(AnimeTorrent.episode).where(
+            AnimeTorrent.anime_id == anime_id, AnimeTorrent.status.in_(HAVE_STATUSES))))
     by_ep: dict = {}
     for t in rows:
+        if not auto_downloadable_ep(t.episode) or t.episode in have:
+            continue
+        if strict_kw and kw and not _kw_match(kw, t.raw_title):
+            continue
         by_ep.setdefault(t.episode, []).append(t)
     n = 0
     for ep in sorted(by_ep):

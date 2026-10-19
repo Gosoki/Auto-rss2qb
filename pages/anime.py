@@ -134,6 +134,8 @@ def anime_page(t: str = ""):
             # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
             # 番维度四卡（单位：部）与种子维度四卡（单位：条）各自打包，"|" 分组，窄了整组换行成上下布局；数字保持各自语义色
             kpi_cards([("订阅中", k["tracking"], "", lambda: tabs.set_value("manage")),
+                       # 缺集：按开播日推算应播、库里一条都没见过的集（r37 后续）——点开列出是哪几部
+                       ("缺集", k["gaps"], "orange", _open_gaps),
                        ("待识别", k["fail"], "red", lambda: tabs.set_value("fail")),
                        ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm")),
                        ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
@@ -831,11 +833,23 @@ def anime_page(t: str = ""):
 
         # 详情悬浮框（复用一个 dialog，点开时清空重建，避免累积 + 不跳页丢滚动位置）
         detail_dlg = ui.dialog()
+        # 【详情里的操作不立刻重建背后的 tab】(r37 #23) 详情弹窗挡着整个页面，在里面每点一次（确认、补齐、改集号、
+        # 排除……）就把背后的番剧表（一百多张卡片）整个重建一遍，用户一眼都看不到。记下"脏了"，关弹窗时补刷一次。
+        _outer_stale = {"v": False}
+
+        def _mark_outer_stale():
+            _outer_stale["v"] = True
+
+        def _on_detail_toggle(e):
+            if not e.value and _outer_stale["v"]:
+                _outer_stale["v"] = False
+                refresh_all()
+        detail_dlg.on_value_change(_on_detail_toggle)
 
         def open_detail(anime_id):
             detail_dlg.clear()
             with detail_dlg, ui.card().classes("w-full").style("max-width:860px"):
-                render_anime_detail(anime_id, refresh_outer=refresh_all, on_close=detail_dlg.close)
+                render_anime_detail(anime_id, refresh_outer=_mark_outer_stale, on_close=detail_dlg.close)
             detail_dlg.open()
 
         # KPI 卡点开：列出对应种子（未知集/失败），点番名进详情页处理。详情弹窗叠在本弹窗之上、
@@ -878,6 +892,12 @@ def anime_page(t: str = ""):
                 "未知集", "批量打包/集号没解析出来的种子，后台不自动下。点番名进详情页：点『第?集』补集号或设为特别篇，"
                 "要它就对准那一条点『下载』，不要就排除。（特别篇与剧场版/WEB 单部作品不在这里，它们不用处理）",
                 anime.unknown_episode_rows)
+
+        def _open_gaps():
+            _open_torrent_list(
+                "缺集", "按 bgm 开播日、每周一集推算早该播了、库里却一条种子都没有的集（采集停过或锁定的源断更都会这样）。"
+                "点番名进详情页点『自动补齐』：在追的番补到就直接下；当前下载源搜不到时会列出别的组有哪些集。",
+                anime.gap_rows)
 
         def _open_locked():
             _open_torrent_list(

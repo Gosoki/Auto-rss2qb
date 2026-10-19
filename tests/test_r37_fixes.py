@@ -416,3 +416,125 @@ def test_alert_rings_are_seeded_from_the_log_file(tmp_path, monkeypatch):
     assert w == ["旧文件里的警告", "本轮异常: boom", "抓取失败 Mikan(兜底): 403"], w
     e = L.errors_ring.snapshot()
     assert len(e) == 1 and "RuntimeError: boom" in e[0]["line"], "异常栈跟着它那一行走"
+
+
+# ── r37 后续：自动补齐直接下 / 整机断网 / 缺集清单 / 日志降噪 ──────────────────
+
+def test_auto_backfill_downloads_directly_for_a_tracked_show(clean_tables, cfg, monkeypatch):
+    """『自动补齐』在追的番：补到就直接下、不打回待确认；没在追的番照旧转待确认。宽松的『补齐该源』照旧打回。"""
+    import sources
+    found = [_item("ANi", 8, 300, site="nyaa"), _item("ANi", -1, 301, site="nyaa")]   # 一集正片 + 一条特别篇
+
+    class _Stub:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def fetch(self, content_cache=None):
+            return list(found)
+    for site in ("nyaa", "mikan"):
+        monkeypatch.setitem(sources.SOURCES, site, _Stub)
+        monkeypatch.setitem(sources.SEARCH_URL, site, lambda q: f"https://x/?q={q}")
+    sent = []
+
+    async def _fake_dl(tid, force=False):
+        sent.append(tid)
+        return True
+
+    async def _alive():
+        return True
+    monkeypatch.setattr(A, "download_anime_torrent", _fake_dl)
+    monkeypatch.setattr(A, "qb_precheck", _alive)
+    now = datetime.now()
+
+    def _show(title, confirmed):
+        with clean_tables.get_session() as s:
+            a = _a(title=title, display_name="尼古喵喵", confirmed=confirmed, pref_source="ANi")
+            s.add(a); s.commit(); s.refresh(a)
+            for e in range(1, 8):
+                s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{a.id:08x}{e:032x}", source="ANi", site="nyaa",
+                                   anime_title="尼古喵喵", season=1, episode=e, status="sent",
+                                   raw_title=f"[ANi] 尼古喵喵 - {e:02d}", created_at=now))
+            s.commit()
+            return a.id
+
+    tracked = _show("在追的", True)
+    res = asyncio.run(A.backfill_source(tracked, name_filter=True))
+    assert (res["ingested"], res.get("downloaded"), res["direct"]) == (2, 1, True), res
+    assert len(sent) == 1, "特别篇不自动下"
+    with clean_tables.get_session() as s:
+        assert s.get(Anime, tracked).confirmed, "在追的番不打回待确认"
+    with clean_tables.get_session() as s:
+        for t in s.exec(A.select(AnimeTorrent).where(AnimeTorrent.anime_id == tracked,
+                                                      AnimeTorrent.episode >= 8)):
+            s.delete(t)
+        s.commit()
+    res = asyncio.run(A.backfill_source(tracked, name_filter=False))
+    assert res["to_confirm"] and not res["direct"], "宽松的『补齐该源』照旧打回待确认"
+
+    pending = _show("待确认的", False)
+    res = asyncio.run(A.backfill_source(pending, name_filter=True))
+    assert not res["direct"] and "downloaded" not in res
+
+
+def test_network_down_is_one_message(fresh_health, cfg):
+    """所有源都连续失败、原因全是 DNS/连接类 → 一句"多半断网"，而不是逐个源报失败。"""
+    cfg(ALERT_SOURCE_FAIL_ROUNDS=3)
+    names = {"ANi", "喵萌(简中)", "Mikan(兜底)"}
+    health.forget_sources(names)
+    for _ in range(3):
+        for n in names:
+            health.record_source(n, False, "ConnectError: [Errno -3] Temporary failure in name resolution")
+    assert health.network_down()
+    assert "断网" in health.sources_problem()
+    health.record_source("ANi", False, "HTTPStatusError: 403 Forbidden")     # 有一个源的原因不是网络
+    assert not health.network_down()
+    assert health.sources_problem().startswith("源抓取连续失败")
+    health.record_source("ANi", True)
+    assert not health.network_down(), "有源还抓得到，就不是断网"
+
+
+def test_gap_rows_list_every_show_with_gaps(clean_tables, cfg):
+    cfg(ANIME_GAP_SLACK_WEEKS=2, ANIME_GAP_MAX_EPISODES=100)
+    now = datetime.now()
+    with clean_tables.get_session() as s:
+        a = _a(title="缺集番", air_date="2025-01-05", pref_source="ANi")
+        s.add(a); s.commit(); s.refresh(a)
+        for ep in (1, 2, 3, 5, 6, 7):
+            s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{ep:040x}", raw_title=f"t{ep}", episode=ep,
+                               status="sent", created_at=now))
+        s.commit()
+    rows = A.gap_rows()
+    assert [r["name"] for r in rows] == ["缺集番"]
+    assert rows[0]["raw"].startswith("缺第 4、8～12 集；锁定『ANi』"), rows[0]["raw"]
+    assert A.ep_ranges([12, 1, 2, 3, 7]) == "1～3、7、12"
+
+
+def test_qb_down_is_logged_once_not_every_round(monkeypatch, cfg, caplog):
+    """断网 30 小时里『qB 连不上』每轮记一行 WARNING（213 次），把日志缓冲冲掉了。现在只在翻转时记。"""
+    import logging
+
+    from core import engine
+    cfg(QB_ENABLED=True, NOTIFY_URL="")
+    state = {"alive": False}
+
+    async def _reach():
+        return state["alive"]
+    monkeypatch.setattr(engine.qb, "reachable", _reach)
+    monkeypatch.setattr(A, "_qb_down_rounds", 0)
+    with caplog.at_level(logging.INFO, logger="autorss"):
+        for _ in range(5):
+            asyncio.run(A.qb_precheck())
+        state["alive"] = True
+        asyncio.run(A.qb_precheck())
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING and "qB 连不上" in r.getMessage()]
+    assert len(warns) == 1
+    assert any("qB 恢复" in r.getMessage() for r in caplog.records)
+
+
+def test_second_nicegui_slot_variant_is_filtered():
+    import logging
+
+    from core.logsetup import _SuppressDeletedSlot
+    r = logging.LogRecord("nicegui", logging.ERROR, "x", 1,
+                          "The parent element this slot belongs to has been deleted.", (), None)
+    assert not _SuppressDeletedSlot().filter(r)

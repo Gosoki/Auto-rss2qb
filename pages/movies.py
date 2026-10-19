@@ -468,10 +468,22 @@ def movies_page(t: str = ""):
             list_page["n"] = int(e.value)
             list_panel.refresh()
 
+        # 详情里的操作不立刻重建背后的页面，关弹窗时补刷一次（与番剧页同一个理由，见 pages/anime.py）
+        _outer_stale = {"v": False}
+
+        def _mark_outer_stale():
+            _outer_stale["v"] = True
+
+        def _on_detail_toggle(e):
+            if not e.value and _outer_stale["v"]:
+                _outer_stale["v"] = False
+                refresh_all()
+        detail_dlg.on_value_change(_on_detail_toggle)
+
         def open_detail(movie_id):
             detail_dlg.clear()
             with detail_dlg, ui.card().classes("w-full").style("max-width:860px"):
-                render_movie_detail(movie_id, refresh_outer=refresh_all, on_close=detail_dlg.close)
+                render_movie_detail(movie_id, refresh_outer=_mark_outer_stale, on_close=detail_dlg.close)
             detail_dlg.open()
 
         list_dlg = ui.dialog()   # KPI『失败』点开的种子清单（对齐番剧页）

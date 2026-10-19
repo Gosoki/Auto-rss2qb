@@ -30,6 +30,10 @@ log = logging.getLogger("autorss")
 _last_activity: datetime = datetime.now()
 # 源组名 → (连续失败轮数, 最近一次失败原因)。进程内；重启后从 0 数起（重启本身就是一次重来）。
 _fail: dict[str, tuple[int, str]] = {}
+_alive: set = set()                   # 上一轮启用着的源组名（forget_sources 时记下，判"全挂了"要用分母）
+# 一看就是"这台机器连不上网"的失败原因（DNS 解析不了、连接被拒/超时、路由不可达）
+_NET_HINTS = ("name resolution", "Name or service not known", "nodename nor servname",
+              "ConnectError", "ConnectTimeout", "Network is unreachable", "No route to host")
 # feed 键 → 上次成功抓取的时刻（UTC ISO）。持久化在运行时配置 SOURCE_FEED_SEEN 里（重启之后正要用它）。
 _seen: dict | None = None
 _GAP_MIN = timedelta(minutes=10)      # 小于这个的"断档"只是两边时钟差，不报
@@ -51,6 +55,8 @@ def record_source(name: str, ok: bool, reason: str = "") -> None:
 
 def forget_sources(alive: set) -> None:
     """删掉已经不在启用列表里的源组的计数（被删 / 被停用的组不该一直挂着"连续失败"）。"""
+    global _alive
+    _alive = set(alive)
     for n in list(_fail):
         if n not in alive:
             _fail.pop(n, None)
@@ -60,6 +66,27 @@ def failing_sources() -> list[tuple[str, int, str]]:
     """连续失败达到阈值的源组：[(组名, 连续轮数, 最近原因)]。"""
     th = max(1, config.ALERT_SOURCE_FAIL_ROUNDS)
     return sorted(((n, c, r) for n, (c, r) in _fail.items() if c >= th), key=lambda x: -x[1])
+
+
+def network_down() -> bool:
+    """所有启用的源都连续失败到了阈值、而且失败原因全是连接/DNS 类 —— 多半是这台机器断网了。(r37)
+    2026-10-14 06:00 ~ 10-15 12:00 容器断网约 30 小时：6 个源每轮各报一条"抓取失败"，qB 也连不上，
+    页面上看起来像是六个源同时坏了，其实是一件事。"""
+    bad = failing_sources()
+    return (len(_alive) >= 2 and len(bad) == len(_alive)
+            and all(any(h in r for h in _NET_HINTS) for _, _, r in bad))
+
+
+def sources_problem() -> str | None:
+    """源抓取连续失败的人话描述（横幅与推送共用）；没问题返回 None。全挂且都是网络错时合成一句"多半断网"。"""
+    bad = failing_sources()
+    if not bad:
+        return None
+    if network_down():
+        return (f"所有 {len(bad)} 个源都连续 {min(c for _, c, _ in bad)} 轮以上连不上（DNS 解析失败 / 连接失败）"
+                "——多半是这台机器断网了，qB 很可能也连不上。看一下容器 / 宿主机的网络。")
+    return ("源抓取连续失败：" + "；".join(f"{n} 连续 {c} 轮（{r}）" for n, c, r in bad)
+            + "。去『订阅源』看看地址还对不对、站点是不是挂了。")
 
 
 def fail_streak(name: str) -> int:

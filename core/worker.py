@@ -147,13 +147,25 @@ async def poll_once() -> None:
             # 而 Mikan『我的番组』订阅地址把 token 放在 query 里 ——
             # 随便一次 403/500 就把 ?token=… 整条写进 data/autorss.log（滚动 5 份）
             # 与 /logs 页的「下载完整日志」。这里以前既不截断也不脱敏。
-            log.error("抓取失败 %s: %s: %s", source.name, type(e).__name__,
-                      fetch.redact(e)[:200])
+            # 【连续失败不逐轮记 ERROR】(r37) 10-14 断网 30 小时，6 个源每轮各一行 ERROR、共 480 行，
+            # 把日志缓冲冲得一条有用的都不剩。第一次记 ERROR，到告警阈值记一行 WARNING，之后每 12 轮一行 INFO。
+            n = health.fail_streak(source.name)
+            th = max(1, config.ALERT_SOURCE_FAIL_ROUNDS)
+            if n == 1:
+                log.error("抓取失败 %s: %s: %s", source.name, type(e).__name__,
+                          fetch.redact(e)[:200])
+            elif n == th:
+                log.warning("源 %s 已连续 %d 轮抓取失败：%s: %s", source.name, n, type(e).__name__,
+                            fetch.redact(e)[:200])
+            elif n % 12 == 0:
+                log.info("源 %s 仍然抓取失败（连续 %d 轮）：%s", source.name, n, type(e).__name__)
             continue
         finally:
             health.touch()
             if uses_left[_url] <= 0:
                 feed_cache.pop(_url, None)   # 后面没有源再用它了，字节不必整轮挂着
+        if health.fail_streak(source.name) >= 2:
+            log.info("源 %s 恢复了（之前连续 %d 轮抓取失败）", source.name, health.fail_streak(source.name))
         health.record_source(source.name, True)
         # 【窗口溢出】这一轮 feed 里最老的一条都比上次成功抓取还晚 → 中间那段已经滚出 RSS（r37 #1）
         _gap = health.check_window(_url or source.name, getattr(source, "oldest_entry_time", None))
@@ -366,10 +378,8 @@ async def _check_poll_health() -> None:
     try:
         problem = health.poll_problem()
         await notify_state("poll_stall", problem is not None, problem or "", "采集恢复正常")
-        bad = health.failing_sources()
-        await notify_state("source_down", bool(bad),
-                           "源抓取连续失败：" + "；".join(f"{n} 连续 {c} 轮（{r}）" for n, c, r in bad),
-                           "源抓取恢复正常")
+        sp = health.sources_problem()
+        await notify_state("source_down", sp is not None, sp or "", "源抓取恢复正常")
     except Exception as e:
         loop_error("采集健康检查", e)
 

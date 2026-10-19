@@ -72,6 +72,7 @@ class QBittorrent:
         self._logged_at = 0.0
         self._lock = asyncio.Lock()       # 串行化登录，防并发重复登录
         self._fail_until = 0.0            # 负缓存：在这个时刻之前不再尝试登录（见 _LOGIN_COOLDOWN_*）
+        self._net_fails = 0               # 连续几次"连不上"：只有第一次记 ERROR，之后每 12 次记一行（见 _login）
 
     async def _login(self) -> httpx.AsyncClient | None:
         """新建并登录一个 AsyncClient；成功返回它（不 aclose，交缓存复用），失败返回 None 并清理。"""
@@ -113,6 +114,9 @@ class QBittorrent:
             if resp.status_code == 204 or (resp.status_code == 200
                                            and resp.text.strip().lower().startswith("ok")):
                 ok = True
+                if self._net_fails >= 2:
+                    log.info("qBittorrent 连上了（之前连续 %d 次连不上）", self._net_fails)
+                self._net_fails = 0
                 return client
             # 凭据错 / 已被封 → 长冷却。再撞下去只会把封禁时间续上，且用户改对密码后仍连不上。
             self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_AUTH
@@ -121,7 +125,13 @@ class QBittorrent:
             return None
         except httpx.HTTPError as e:
             self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_NET   # 网络类：短冷却，qB 重启很快回来
-            log.error("qBittorrent 登录请求失败: %s", e)
+            # 【连续失败只在第一次记 ERROR】(r37) 10-14 断网那 30 小时里这一行记了 250 次，
+            # 把 200 条的日志缓冲整个冲掉了。之后每 12 次（约 4 小时）记一行 INFO，恢复时再记一行。
+            self._net_fails += 1
+            if self._net_fails == 1:
+                log.error("qBittorrent 登录请求失败: %s", e)
+            elif self._net_fails % 12 == 0:
+                log.info("qBittorrent 仍然连不上（连续 %d 次）: %s", self._net_fails, e)
             return None
         except Exception as e:                 # 非 HTTP 类异常(socket/URL 等)也别逃逸；CancelledError 是
             self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_NET

@@ -1027,9 +1027,8 @@ def _health_notices() -> None:
     lines = []
     if (p := health.poll_problem()):
         lines.append(p)
-    if (bad := health.failing_sources()):
-        lines.append("源抓取连续失败：" + "；".join(f"{n} 连续 {c} 轮（{r}）" for n, c, r in bad)
-                     + "。去『订阅源』看看地址还对不对、站点是不是挂了。")
+    if (sp := health.sources_problem()):
+        lines.append(sp)
     gaps = health.gaps()
     if not (lines or gaps):
         return
