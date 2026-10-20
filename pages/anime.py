@@ -1267,9 +1267,9 @@ def anime_page(t: str = ""):
         def _card_cover(a, *, dim: bool = False, status=None, sources=None, prog=None, missing=None):
             """番剧卡片的封面区（番剧表/待确认/已忽略共用），四角徽标的摆法与剧场版同一份（layout.cover_box）：
               · 左上：状态 status=(文案, 颜色, 悬停说明或 None)，下面叠『已下齐』；
-              · 右上：bgm 评分；
+              · 右上：bgm 评分，下面叠季号；
               · 左下：多源/单源（悬停看来源）；
-              · 右下：季号、bgm 判定的非 TV 类型（WEB/剧场版/OVA…），最下面是已下/可下
+              · 右下：bgm 判定的非 TV 类型（WEB/剧场版/OVA…），下面是已下/可下
                 （只有番剧表给 prog；missing＝缺集，见下）。
             dim：封面置灰（番剧表里的已忽略番）。返回容器，调用方可再挂点击。"""
             fin = None
@@ -1316,9 +1316,9 @@ def anime_page(t: str = ""):
                 progress = (f"{_have}/{_den}", _c, _tip)
             return cover_box(a.cover_url, dim=dim,
                              top_left=[status, fin],
-                             top_right=[rating_spec(a.rating)],
+                             top_right=[rating_spec(a.rating), (sl, "purple", None) if sl else None],
                              bottom_left=[sources_spec(sources)],
-                             bottom_right=[(sl, "purple", None) if sl else None, platform_spec(a), progress])
+                             bottom_right=[platform_spec(a), progress])
 
         def _card_title(a, struck: bool = False):
             """番剧卡片上的番名（layout.cover_title）。struck：灰色删除线（已忽略）。"""
