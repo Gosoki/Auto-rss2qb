@@ -82,6 +82,12 @@ def quarter_brief() -> list[dict]:
             .join(Anime, Anime.id == AnimeTorrent.anime_id)
             .where(Anime.quarter.in_([cur, prev]))
             .group_by(Anime.quarter, AnimeTorrent.status)))
+        # 缺集只判在追的（判据见 missing_episodes），与仪表盘『缺集』卡、gap_rows 同一批番
+        tracked = list(s.exec(select(Anime).options(_NO_SUMMARY).where(
+            Anime.quarter.in_([cur, prev]), Anime.confirmed == True,   # noqa: E712
+            Anime.rejected.is_not(True))))
+    gaps = episode_gaps(tracked)
+    gap_q = Counter((a.quarter or "") for a in tracked if a.id in gaps)
     out = []
     for tag, q in (("当季", cur), ("上季", prev)):
         aq = [(conf, rej, bid) for aqk, conf, rej, bid in animes if (aqk or "") == q]
@@ -93,6 +99,7 @@ def quarter_brief() -> list[dict]:
             "confirm": sum(1 for conf, rej, bid in aq if not conf and not rej and bid),  # 待确认
             "fail": sum(1 for conf, rej, bid in aq if not rej and not bid),    # 待识别(未匹配)
             "ignored": sum(1 for conf, rej, bid in aq if rej),                 # 已忽略
+            "gaps": gap_q.get(q, 0),                                           # 缺集的番
             "torrents": sum(qc.values()),
             "done": qc.get("sent", 0),
             "pending": sum(qc.get(k, 0) for k in DOWNLOADABLE_STATUSES),
@@ -3678,7 +3685,8 @@ def gap_rows() -> list[dict]:
     rows = [{"id": a.id, "anime_id": a.id, "name": display_of(a), "episode": None,
              "raw": f"缺第 {ep_ranges(gaps[a.id])} 集"
                     + (f"；锁定『{a.pref_source}』" if a.pref_source else "")
-                    + f"；{engine.quarter_label(a.quarter)}"}
+                    + f"；{engine.quarter_label(a.quarter)}",
+             "quarter": a.quarter or ""}   # 番剧表顶部季度小结点开时按季度筛
             for a in animes if a.id in gaps]
     order = {a.id: quarter_sort_key(a.quarter or "") for a in animes}
     return sorted(rows, key=lambda r: order[r["anime_id"]], reverse=True)

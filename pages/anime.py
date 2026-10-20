@@ -131,14 +131,14 @@ def anime_page(t: str = ""):
             k = ov["kpi"]
             ps = ov["pending_split"]
 
-            # ── KPI 卡片 ──（『未知集』『失败』可点开看是哪几个、进详情处理）
-            # 番维度四卡（单位：部）与种子维度四卡（单位：条）各自打包，"|" 分组，窄了整组换行成上下布局；数字保持各自语义色
-            kpi_cards([("订阅中", k["tracking"], "", lambda: tabs.set_value("manage")),
+            # ── KPI 卡片 ──（每张可点的都是就地弹窗，不跳 tab：看完关掉还在仪表盘）
+            # 番维度五卡（单位：部）与种子维度五卡（单位：条）各自打包，"|" 分组，窄了整组换行成上下布局；数字保持各自语义色
+            kpi_cards([("订阅中", k["tracking"], "", _open_pop("track")),
                        # 缺集：按开播日推算应播、库里一条都没见过的集（r37 后续）——点开列出是哪几部
-                       ("缺集", k["gaps"], "orange", _open_gaps),
-                       ("待识别", k["fail"], "red", lambda: tabs.set_value("fail")),
-                       ("待确认", k["confirm"], "orange", lambda: tabs.set_value("confirm")),
-                       ("已忽略", k["rejected"], "", lambda: tabs.set_value("reject")),
+                       ("缺集", k["gaps"], "orange", _open_gaps()),
+                       ("待识别", k["fail"], "red", _open_pop("fail")),
+                       ("待确认", k["confirm"], "orange", _open_pop("confirm")),
+                       ("已忽略", k["rejected"], "", _open_pop("reject")),
                        "|",
                        ("已交付", k["done"], "green", None),
                        ("未知集", ps["unknown"], "purple", _open_unknown),
@@ -603,30 +603,33 @@ def anime_page(t: str = ""):
                 "text-xs text-gray-400 p-2")
             smap = anime.source_map()   # 批量取来源，避免逐番 N+1
             for a in items:
-                srcs = smap.get(a.id, [])
-                with ui.card().classes("w-full"):
-                    with ui.row().classes("items-center gap-3 flex-wrap"):
-                        # 全站统一叫『待识别』：tab、KPI 卡、空状态文案、剧场版侧的 tooltip
-                        # 都用这个词，只有这里曾写「未匹配」。同一个状态三个叫法会让用户
-                        # 以为是三件事（GLOSSARY 里没有把它列为"有意的分歧"）。
-                        ui.badge("待识别").props("color=red")
-                        ui.label(name_of(a)).classes(
-                            "text-lg cursor-pointer text-blue-400 hover:underline").on(
-                            "click", lambda aid=a.id: open_detail(aid))
-                        sl = season_label(a)
-                        if sl:
-                            ui.badge(sl).props("color=purple")
-                        ui.badge("待确认" if not a.confirmed else "自动").props(
-                            f"color={'orange' if not a.confirmed else 'blue-grey'}")
-                        ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
-                        ui.link("去 bgm 搜", f"https://bgm.tv/subject_search/{quote(a.title)}?cat=2").props(
-                            "target=_blank").classes("text-xs")
-                    with ui.row().classes("items-stretch gap-3 flex-wrap"):
-                        inp = ui.input(
-                            placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").classes("w-96 min-w-0 max-sm:w-full")   # 桌面 384px；手机满卡宽(min-w-0 让 q-input 真能收缩，否则撑破卡片横向溢出)
-                        ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("unelevated color=primary")
-                        ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("flat color=grey")
-                        ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
+                _fail_card(a, smap.get(a.id, []))
+
+        def _fail_card(a, srcs):
+            """待识别一张卡（整行宽）：『待识别』tab 与 KPI 弹窗共用。"""
+            with ui.card().classes("w-full"):
+                with ui.row().classes("items-center gap-3 flex-wrap"):
+                    # 全站统一叫『待识别』：tab、KPI 卡、空状态文案、剧场版侧的 tooltip
+                    # 都用这个词，只有这里曾写「未匹配」。同一个状态三个叫法会让用户
+                    # 以为是三件事（GLOSSARY 里没有把它列为"有意的分歧"）。
+                    ui.badge("待识别").props("color=red")
+                    ui.label(name_of(a)).classes(
+                        "text-lg cursor-pointer text-blue-400 hover:underline").on(
+                        "click", lambda aid=a.id: open_detail(aid))
+                    sl = season_label(a)
+                    if sl:
+                        ui.badge(sl).props("color=purple")
+                    ui.badge("待确认" if not a.confirmed else "自动").props(
+                        f"color={'orange' if not a.confirmed else 'blue-grey'}")
+                    ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
+                    ui.link("去 bgm 搜", f"https://bgm.tv/subject_search/{quote(a.title)}?cat=2").props(
+                        "target=_blank").classes("text-xs")
+                with ui.row().classes("items-stretch gap-3 flex-wrap"):
+                    inp = ui.input(
+                        placeholder="bgm 链接或 ID，如 bgm.tv/subject/464376 或 464376").classes("w-96 min-w-0 max-sm:w-full")   # 桌面 384px；手机满卡宽(min-w-0 让 q-input 真能收缩，否则撑破卡片横向溢出)
+                    ui.button("绑定", icon="link", on_click=_bind(a.id, inp)).props("unelevated color=primary")
+                    ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("flat color=grey")
+                    ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
         @ui.refreshable
         def inflight_panel():
@@ -703,20 +706,27 @@ def anime_page(t: str = ""):
             # 当季 / 上季小结（数字大、标签小；零值待确认项变灰）
             with ui.row().classes("w-full gap-3 flex-wrap mb-3 items-stretch"):
                 for b in anime.quarter_brief():
+                    # 与仪表盘左组同五项、同顺序；点开是只列这一季的弹窗
+                    q = b["key"]
                     stats = [
-                        (b["shows"], "订阅中", "text-blue-400"),
-                        (b["confirm"], "待确认", "text-orange-400" if b["confirm"] else "text-gray-500"),
-                        (b["fail"], "待识别", "text-red-400" if b["fail"] else "text-gray-500"),
-                        (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-500"),
+                        (b["shows"], "订阅中", "text-blue-400", _open_pop("track", q)),
+                        (b["gaps"], "缺集", "text-orange-400" if b["gaps"] else "text-gray-500", _open_gaps(q)),
+                        (b["fail"], "待识别", "text-red-400" if b["fail"] else "text-gray-500", _open_pop("fail", q)),
+                        (b["confirm"], "待确认", "text-orange-400" if b["confirm"] else "text-gray-500",
+                         _open_pop("confirm", q)),
+                        (b["ignored"], "已忽略", "text-gray-400" if b["ignored"] else "text-gray-500",
+                         _open_pop("reject", q)),
                     ]
                     with ui.card().classes("gap-2 py-3").style("flex:1 1 300px"):
                         with ui.row().classes("items-center gap-2"):
                             ui.badge(b["tag"]).props(
                                 f"color={'primary' if b['tag'] == '当季' else 'blue-grey'}")
                             ui.label(engine.quarter_label(b["key"])).classes("font-bold text-base")
-                        with ui.row().classes("gap-6"):
-                            for num, lbl, color in stats:
-                                with ui.column().classes("items-center gap-0"):
+                        with ui.row().classes("gap-1"):   # 五项在 390px 手机上也要排成一行
+                            for num, lbl, color, click in stats:
+                                with ui.column().classes(
+                                        "items-center gap-0 px-2 py-1 rounded cursor-pointer hover:bg-white/5").props(
+                                        "tabindex=0").on("click", click).on("keydown.enter", click):
                                     ui.label(str(num)).classes(f"text-2xl font-bold leading-none {color}")
                                     ui.label(lbl).classes("text-xs text-gray-400 mt-1")
                         ui.separator()
@@ -848,6 +858,8 @@ def anime_page(t: str = ""):
                     fn()
                 elif key in _built:
                     _dirty.add(key)
+            if pop_dlg.value:              # KPI 弹窗开着：在里面点的操作要立刻反映到弹窗上
+                _render_pop()
 
         # 详情悬浮框（复用一个 dialog，点开时清空重建，避免累积 + 不跳页丢滚动位置）
         detail_dlg = ui.dialog()
@@ -911,11 +923,15 @@ def anime_page(t: str = ""):
                 "要它就对准那一条点『下载』，不要就排除。（特别篇与剧场版/WEB 单部作品不在这里，它们不用处理）",
                 anime.unknown_episode_rows)
 
-        def _open_gaps():
-            _open_torrent_list(
-                "缺集", "按 bgm 开播日、每周一集推算早该播了、库里却一条种子都没有的集（采集停过或锁定的源断更都会这样）。"
-                "点番名进详情页点『自动补齐』：在追的番补到就直接下；当前下载源搜不到时会列出别的组有哪些集。",
-                anime.gap_rows)
+        def _open_gaps(q=None):
+            """缺集列表；q=季度键时只列那一季（番剧表顶部季度小结点的）。返回点击处理器。"""
+            def h():
+                _open_torrent_list(
+                    "缺集" + (f" · {engine.quarter_label(q)}" if q else ""),
+                    "按 bgm 开播日、每周一集推算早该播了、库里却一条种子都没有的集（采集停过或锁定的源断更都会这样）。"
+                    "点番名进详情页点『自动补齐』：在追的番补到就直接下；当前下载源搜不到时会列出别的组有哪些集。",
+                    anime.gap_rows if q is None else (lambda: [r for r in anime.gap_rows() if r["quarter"] == q]))
+            return h
 
         def _open_locked():
             _open_torrent_list(
@@ -1005,6 +1021,78 @@ def anime_page(t: str = ""):
                 "失败 / 异常",
                 "下载失败过（取种/发送失败）或长期停滞无进展的种子。正集可在详情页『下载该源』重试；特别篇/未知集只能对准那一条点『下载』。",
                 anime.failed_rows)
+
+        # 订阅中 / 待识别 / 待确认 / 已忽略 的弹窗：仪表盘 KPI 与番剧表季度小结点开的都是它（以前是跳到对应 tab）。
+        # 卡片与 tab 里同一套（_anime_card / _fail_card / _confirm_card / _reject_card），按钮照旧能用；
+        # 卡片里的操作走 refresh_all()，弹窗开着时它会就地重建弹窗（见 refresh_all）。
+        # 已忽略弹窗只列番，不带 tab 底部那两个『已删除/已排除的种子』折叠（KPI 数的是番）。
+        pop_dlg = ui.dialog()
+        _pop: dict = {"kind": None, "q": None, "expand": None, "open": {}}
+        _POP_TITLE = {"track": "订阅中", "fail": "待识别", "confirm": "待确认", "reject": "已忽略"}
+
+        def _pop_items(kind, q):
+            if kind == "fail":
+                items = anime.list_unmatched_anime()
+            elif kind == "confirm":
+                items = anime.pending_confirm()
+            elif kind == "reject":
+                items = anime.list_rejected_anime()
+            else:
+                # 订阅中：仪表盘那张数的是已确认未忽略的全部；季度小结那张还要求绑了 bgm
+                # （没绑的算进同一张卡的『待识别』，四项互斥）——各自对上点它的那个数
+                items = [a for a in anime.list_all_anime() if a.confirmed and not a.rejected
+                         and (q is None or a.bangumi_id)]
+            return items if q is None else [a for a in items if (a.quarter or "") == q]
+
+        def _open_pop(kind, q=None):
+            """返回点击处理器：打开 kind 的弹窗，q=季度键时只列那一季。"""
+            def h():
+                _pop.update(kind=kind, q=q, expand=None, open={})
+                _render_pop()
+                pop_dlg.open()
+            return h
+
+        def _render_pop():
+            kind, q = _pop["kind"], _pop["q"]
+            items = _pop_items(kind, q)
+            pop_dlg.clear()
+            with pop_dlg, ui.card().classes("w-full").style("max-width:1180px"):
+                with ui.row().classes("items-center gap-3 w-full no-wrap"):
+                    ui.label(_POP_TITLE[kind] + (f" · {engine.quarter_label(q)}" if q else "")
+                             + f" · {len(items)} 部").classes("text-base font-bold")
+                    ui.space()
+                    ui.button(icon="close", on_click=pop_dlg.close).props("flat round dense")
+                if not items:
+                    ui.label("（空）").classes("text-gray-500 p-2")
+                    return
+                smap = anime.source_map()
+                if kind == "fail":
+                    ui.label("没自动匹配到 bgm：可『重试识别』，或粘贴 bgm 链接/ID『绑定』，实在没有就『忽略』。").classes(
+                        "text-xs text-gray-400")
+                    for a in items:
+                        _fail_card(a, smap.get(a.id, []))
+                    return
+                if kind == "track":
+                    prog, gaps = anime.progress_and_gaps(items)
+                    card = lambda a: _anime_card(a, smap.get(a.id), prog.get(a.id), gaps.get(a.id))   # noqa: E731
+                elif kind == "confirm":
+                    card = lambda a: _confirm_card(a, smap.get(a.id, []))   # noqa: E731
+                else:
+                    dl = anime.downloaded_counts([a.id for a in items])
+                    card = lambda a: _reject_card(a, smap.get(a.id, []), dl.get(a.id, 0))   # noqa: E731
+                groups = group_by_quarter(items)
+                if len(groups) == 1:          # 只有一季（季度小结点的都是）：不套折叠，直接铺卡片
+                    with ui.element("div").classes("cover-grid w-full"):
+                        for a in groups[0][1]:
+                            card(a)
+                    return
+                expand_collapse_bar(_pop, _render_pop)
+                exp = _pop["expand"]
+                for i, (gq, qi) in enumerate(groups):
+                    _quarter_group(f"{engine.quarter_label(gq)}   ·   {len(qi)} 部",
+                                   _pop["open"].get(gq, i == 0 if exp is None else exp),
+                                   lambda qi=qi: [card(a) for a in qi],
+                                   lambda v, gq=gq: _pop["open"].__setitem__(gq, v))
 
         # ---- 事件处理（闭包，直接引用上面的刷新函数）----
         def _approve(anime_id, sel=None):
