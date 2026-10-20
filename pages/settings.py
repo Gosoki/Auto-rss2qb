@@ -27,6 +27,7 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "QB_IDLE_RECHECK_MIN", "QB_STALL_TIMEOUT_MIN", "QB_ARCHIVE_AFTER_DAYS",
             "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
             "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES",
+            "ANIME_META_REFRESH_EPS",
             "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT", "DB_MYSQL_PORT"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
@@ -1058,14 +1059,18 @@ def settings():
                     "unelevated color=primary").classes("btn-sm")   # 不加 dense → 随行拉伸到与输入框等高
 
             ui.separator()
-            _section("Bangumi 重试（识别不到时）",
+            _section("Bangumi 重试与刷新",
                      "认不到 bgm 的番进『待识别』：先即时重试挡抖动，再指数退避后台重试（每失败翻倍、封顶 24h），"
-                     "满次数就停、留手动（详情页『重新识别』清零重来）。查到 bgm 自动升『待确认』。")
+                     "满次数就停、留手动（详情页『重新识别』清零重来）。查到 bgm 自动升『待确认』。\n"
+                     "已绑好的番每收录 N 集（按不同集号数）自动刷一次 bgm 资料：评分、总集数、封面跟着播出更新。"
+                     "只刷资料、不改绑定，也不改已下番的归档目录。")
             with ui.element("div").classes("field-grid w-full"):
                 _num("ENRICH_RETRY_TIMES", "即时重试次数（bgm 请求超时/连接错时）", config.ENRICH_RETRY_TIMES)
                 _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
                 _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
                 _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
+                _num("ANIME_META_REFRESH_EPS", "每几集刷新 bgm 资料（0=关）",
+                     config.ANIME_META_REFRESH_EPS, 0, 100)
 
             ui.separator()
             _section("归档")

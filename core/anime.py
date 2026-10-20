@@ -42,6 +42,10 @@ _download_lock = asyncio.Lock()
 # 协程回到**新库**按那个 id 写回，把另一部番的身份整个改写。
 # 页面上的批量『刷新资料』走 `reenrich_scope`，同一条路，所以锁加在这一层、两个入口共用。
 _enrich_lock = asyncio.Lock()
+# 收录集数刚到 ANIME_META_REFRESH_EPS 倍数的番 id，等延迟重识别协程顺手刷一次 bgm 资料（见 refresh_meta_due）。
+# 只在内存里：重启丢了也不要紧，下一个倍数会再记上。切库后残留的 id 指向新库的另一部番也无害——
+# 刷的是那部番按它自己的 bangumi_id 取来的资料。
+_meta_due: set[int] = set()
 
 # 状态词表统一在 engine（两条线共用，见那里的定义与口径说明）。此处把本模块用到的都转出：
 # 一是供 pages 沿用 anime.HAVE_STATUSES，二是让本文件内引用风格一致（全用不带前缀的名字）。
@@ -1012,6 +1016,7 @@ async def process_item(item, known_hashes: set | None = None,
                 a.confirmed = True
                 s.add(a)
                 s.commit()
+        _note_meta_refresh(s, a, episode, torrent_id)
         should_download = is_subscribed(a)
         lock = a.pref_source if a else None   # 锁定源：入库即下也只放行锁定组
         kw = a.pref_keyword if a else None     # 版本关键词：即时下载也只放行命中该版本的
@@ -1028,6 +1033,56 @@ async def process_item(item, known_hashes: set | None = None,
             and (not kw or _kw_match(kw, item.raw_title))):
         await download_anime_torrent(torrent_id)
     return True
+
+
+def _note_meta_refresh(s, a, episode, torrent_id: int) -> None:
+    """这条种子带来的是一个新集号、而且收录的不同集号数正好到 ANIME_META_REFRESH_EPS 的倍数 →
+    记进 _meta_due，等后台刷一次 bgm 资料（评分、总集数会随播出变）。
+    只记绑了 bgm、没被忽略的番；别的源早发过的同一集不算新集；只数正整数集号（特别篇、x.5 不算）。"""
+    n = config.ANIME_META_REFRESH_EPS
+    if (n <= 0 or a is None or not a.bangumi_id or a.rejected or episode is None
+            or episode < 1 or not float(episode).is_integer()):
+        return
+    if s.exec(select(AnimeTorrent.id).where(
+            AnimeTorrent.anime_id == a.id, AnimeTorrent.episode == episode,
+            AnimeTorrent.id != torrent_id)).first() is not None:
+        return
+    eps = {e for e in s.exec(select(AnimeTorrent.episode).where(
+        AnimeTorrent.anime_id == a.id, AnimeTorrent.episode >= 1).distinct()) if float(e).is_integer()}
+    if len(eps) % n == 0:
+        _meta_due.add(a.id)
+
+
+async def refresh_meta_due() -> int:
+    """给 _meta_due 里的番刷 bgm 资料。**整轮持 `_enrich_lock`**：与延迟重识别、批量刷新资料同一条线
+    （跨 await 按主键写回，`engine.maintenance_blockers()` 靠这把锁看见它）。"""
+    async with _enrich_lock:
+        return await _refresh_meta_due_inner()
+
+
+async def _refresh_meta_due_inner() -> int:
+    """与『刷新资料』按钮同一条路：已绑 bgm 的按 subject id 直取、只刷资料不改绑定，不动已下番的归档目录。
+    刷完对这批番判一次下齐（bgm 的总集数可能变了）。返回刷到的部数。"""
+    ids = sorted(_meta_due)
+    _meta_due.clear()
+    hit = set()
+    for aid in ids:
+        with get_session() as s:
+            a = s.get(Anime, aid)
+            if a is None or not a.bangumi_id or a.rejected:   # 记下之后被解绑 / 忽略了：不刷（不走按名识别）
+                continue
+        try:
+            if await enrich_anime(aid, freeze_empty_path=True, keep_binding=True):
+                hit.add(aid)
+        except Exception as e:
+            log.warning("定期刷新 bgm 资料失败 anime=%s: %s", aid, e)
+    if hit:
+        log.info("每收录 %d 集刷新 bgm 资料：%d 部", config.ANIME_META_REFRESH_EPS, len(hit))
+        try:
+            await sweep_finished(hit)
+        except Exception:
+            log.exception("刷新 bgm 资料后判已下齐失败（不影响刷新结果，等下一轮巡检）")
+    return len(hit)
 
 
 async def download_anime_torrent(torrent_id: int, force: bool = False) -> bool | None:

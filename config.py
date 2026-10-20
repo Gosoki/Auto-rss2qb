@@ -155,6 +155,7 @@ _SPEC = {
     "REENRICH_RETRY_BASE": (int, 30),        # 『待识别』番延迟重试基准等待（分钟），每失败一次翻倍（默认 30 分钟）
     "REENRICH_RETRY_MAX": (int, 1440),       # 延迟重试等待上限（分钟），翻倍到此封顶（默认 1440=24 小时）
     "REENRICH_MAX_TRIES": (int, 5),          # 每部『待识别』番最多自动重试几次（满则停自动、留手动）
+    "ANIME_META_REFRESH_EPS": (int, 4),      # 已绑 bgm 的番每收录这么多集（不同集号）自动刷一次 bgm 资料（评分/总集数等，0=关）
     "ANI_RSS_URL": (str, "https://nyaa.si/?page=rss&u=ANiTorrent"),
     "MIKAN_ENABLED": (bool, False),
     "MIKAN_RSS_URL": (str, "https://mikanani.me/RSS/Classic"),

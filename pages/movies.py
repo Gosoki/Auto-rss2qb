@@ -14,7 +14,7 @@ from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN
 from .layout import (SEVERITY_COLOR, WEEKDAY_CN, barline, busy_action, confirm, cover_box, cover_title,
                      page_visibility,
-                     require_bind_confirm, sources_spec,
+                     rating_spec, require_bind_confirm, sources_spec,
                      require_config_loaded,
                      expand_collapse_bar, frame,
                      human_size, kpi_cards, live_status, meta_card,
@@ -634,9 +634,9 @@ def movies_page(t: str = ""):
                 cover_box(m.cover_url,
                           top_left=[None if m.bangumi_id else
                                     ("待识别", "red", "bgm 没匹配上，去『待识别』手动绑定")],
-                          top_right=[(m.mikan_type or "剧场版", "deep-purple", "Mikan 判定的类型")],
+                          top_right=[rating_spec(m.rating)],
                           bottom_left=[sources_spec(srcs)],
-                          bottom_right=[done]).classes("cursor-pointer").on(
+                          bottom_right=[(m.mikan_type or "剧场版", "deep-purple", "Mikan 判定的类型"), done]).classes("cursor-pointer").on(
                     "click", lambda mid=m.id: open_detail(mid))
                 with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
                     cover_title(name_of(m)).classes("cursor-pointer").on(
@@ -918,8 +918,9 @@ def movies_page(t: str = ""):
                         with ui.card().tight().classes("cover-card w-full"):
                             cover_box(m.cover_url,
                                       top_left=[("已忽略", "grey", None)],
-                                      top_right=[(m.mikan_type or "剧场版", "deep-purple", "Mikan 判定的类型")],
-                                      bottom_left=[sources_spec(_smap.get(m.id, []))]).classes(
+                                      top_right=[rating_spec(m.rating)],
+                                      bottom_left=[sources_spec(_smap.get(m.id, []))],
+                                      bottom_right=[(m.mikan_type or "剧场版", "deep-purple", "Mikan 判定的类型")]).classes(
                                 "cursor-pointer").on("click", lambda mid=m.id: open_detail(mid))
                             with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
                                 cover_title(name_of(m)).classes("cursor-pointer").on(

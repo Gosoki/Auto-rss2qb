@@ -1010,7 +1010,7 @@ _STRADDLERS = {
         "flush_ready_downloads":          "lock:_poll_lock",
         "sweep_finished":                 "lock:_sweep_lock",
         "sweep_idle":                     "lock:_sweep_lock",
-        "enrich_anime":                   "caller:_manual_enrich_inner|_retry_unmatched_inner",  # _resolve_anime 调的是 enrich.resolve，不是它（R33 对抗审计纠）
+        "enrich_anime":                   "caller:_manual_enrich_inner|_retry_unmatched_inner|_refresh_meta_due_inner",  # _resolve_anime 调的是 enrich.resolve，不是它（R33 对抗审计纠）
         "_bind_anime_bgm_inner":          "in_flight",
         "_manual_enrich_inner":           "in_flight",
         "_retry_unmatched_inner":         "lock:_enrich_lock",
@@ -1025,6 +1025,7 @@ _STRADDLERS = {
         "_download_locked_out_inner":     "in_flight",
         "_download_new_rows":             "caller:_backfill_source_inner",
         "_reenrich_scope_inner":          "lock:_enrich_lock",
+        "_refresh_meta_due_inner":        "lock:_enrich_lock",   # 每收录 N 集刷一次 bgm 资料
     },
     "core/engine.py": {
         "archive_old_completed":          "lock:_archive_lock",

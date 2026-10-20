@@ -644,3 +644,59 @@ def test_ignored_but_still_airing(clean_tables, cfg):
     texts = [f["text"] for f in alerts.scan() if f["kind"] == "ign"]
     assert any("Re：从零开始的异世界生活 第四季』的详情页点『自动补齐』" in t for t in texts)
     assert any("欺诈游戏" in t and "恢复订阅" in t for t in texts)
+
+
+def test_meta_refresh_every_n_episodes(clean_tables, cfg, monkeypatch):
+    """已绑 bgm 的番每收录 N 个新集号刷一次 bgm 资料：别的源重复发的同一集、特别篇不算；没绑的、被忽略的不记。"""
+    cfg(ANIME_META_REFRESH_EPS=4)
+    A._meta_due.clear()
+    with clean_tables.get_session() as s:
+        bound = _a(title="绑了的", bangumi_id=1001)
+        unbound = _a(title="没绑的")
+        ignored = _a(title="忽略的", bangumi_id=1002, rejected=True)
+        for a in (bound, unbound, ignored):
+            s.add(a)
+        s.commit()
+        n = 0
+
+        def add(a, ep):
+            nonlocal n
+            n += 1
+            t = AnimeTorrent(anime_id=a.id, info_hash=f"{n:040x}", raw_title=f"t{n}", episode=ep, status="pending")
+            s.add(t)
+            s.commit()
+            A._note_meta_refresh(s, a, ep, t.id)
+
+        for ep in (1, 2, 3, 3, -1, 2.5):      # 第二份第 3 集、特别篇、x.5 都不算新集
+            add(bound, ep)
+        assert not A._meta_due
+        add(bound, 4)
+        assert A._meta_due == {bound.id}, "收录到第 4 个不同集号时记上"
+        A._meta_due.clear()
+        for ep in (5, 6, 7):
+            add(bound, ep)
+        assert not A._meta_due
+        add(bound, 8)
+        assert A._meta_due == {bound.id}, "第 8 个再记一次"
+        A._meta_due.clear()
+        for a in (unbound, ignored):
+            for ep in (1, 2, 3, 4):
+                add(a, ep)
+        assert not A._meta_due, "没绑 bgm、被忽略的番不记"
+        bid = bound.id
+
+    called = []
+
+    async def fake_enrich(aid, freeze_empty_path=False, keep_binding=False):
+        called.append((aid, freeze_empty_path, keep_binding))
+        return True
+
+    async def fake_sweep(ids):
+        return 0
+
+    monkeypatch.setattr(A, "enrich_anime", fake_enrich)
+    monkeypatch.setattr(A, "sweep_finished", fake_sweep)
+    A._meta_due.add(bid)
+    assert asyncio.run(A.refresh_meta_due()) == 1
+    assert called == [(bid, True, True)], "只刷资料不改绑定、不改已下番的归档目录"
+    assert not A._meta_due

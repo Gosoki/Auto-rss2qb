@@ -485,6 +485,14 @@ def platform_spec(obj):
     return (p, "deep-purple", "bgm 判定的类型（非 TV）") if p and p != "TV" else None
 
 
+def rating_spec(score):
+    """封面右上角的 bgm 评分徽标 (文案, 颜色, 悬停说明)；没有评分返回 None。琥珀色与详情页的大号分数同色。"""
+    if not score:
+        return None
+    lab = rating_label(score)
+    return (f"{score:.1f}", "amber", f"bgm 评分 {score:.1f}" + (f"（{lab}）" if lab else ""))
+
+
 def sources_spec(sources):
     """多源/单源徽标 (文案, 颜色, 悬停说明)：多源(>1)蓝、单源灰，悬停列出来源；没有来源返回 None。"""
     if not sources:

@@ -415,6 +415,10 @@ async def run_reenrich_retry() -> None:
             await anime.retry_unmatched()
         except Exception as e:
             loop_error("延迟重识别", e)
+        try:
+            await anime.refresh_meta_due()   # 收录集数到倍数的番刷一次 bgm 资料（同一条 bgm 串行线）
+        except Exception as e:
+            loop_error("定期刷新 bgm 资料", e)
 
 
 async def run_backup() -> None:
