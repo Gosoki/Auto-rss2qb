@@ -164,7 +164,23 @@ def anime_page(t: str = ""):
             # 【单独一个面板、不跟 30 秒定时器】(r37 #21) 它占仪表盘每轮一半的数据量（约 0.9 MB），
             # 而这些发现只在入库/绑定之后才会变：只在建页、用户操作（refresh_all）、点『知道了』时刷。
             _al = alerts.view()
+            # 『超期忽略但还在更新』一部番一条发现，但横幅合成一条（真库一下子有 10 部，各占一条会把仪表盘淹掉）；
+            # 『知道了』一次把这几条都标成已读，以后只有新冒出来的番才会再提示。
+            _ign = [f for f in _al["live"] if f["kind"] == "ign"]
+            if _ign:
+                _odd = [f for f in _ign if f.get("impossible")]
+                _plain = [f for f in _ign if not f.get("impossible")]
+                _txt = ""
+                if _plain:
+                    _txt += (f"{len(_plain)} 部番开播早于『开始使用日』被自动判了超期忽略，但最近 30 天还在收新集："
+                             + "、".join(f["text"].split("』")[0] + "』" for f in _plain)
+                             + "。要追就去『已忽略』页点『恢复订阅』。")
+                for f in _odd:
+                    _txt += f["text"]
+                warn_banner(_txt, action=("知道了", "inbox", _ack_alerts(_ign)))
             for _a in _al["live"]:
+                if _a["kind"] == "ign":
+                    continue
                 _pre = ""
                 if _a["revived"]:
                     _chg = "；".join(f"{k} {o} → {n}" for k, o, n in _a["revived"]["changed"])
@@ -918,6 +934,15 @@ def anime_page(t: str = ""):
             def h():
                 alerts.ack(f["ident"], f["kind"], f["fact"], f["text"])
                 ui.notify("已收进『已读的提示』")     # 只说已经发生的事，不预告"以后不会再看到"
+                alerts_panel.refresh()
+            return h
+
+        def _ack_alerts(fs):
+            """一次把好几条发现收进『已读的提示』（合成一条横幅的那一类用）。"""
+            def h():
+                for f in fs:
+                    alerts.ack(f["ident"], f["kind"], f["fact"], f["text"])
+                ui.notify(f"已收进『已读的提示』（{len(fs)} 条）")
                 alerts_panel.refresh()
             return h
 

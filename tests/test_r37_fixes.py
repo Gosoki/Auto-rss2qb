@@ -595,3 +595,52 @@ def test_backfill_finds_a_romaji_only_group_by_episode_query(clean_tables, cfg, 
     assert [(o["group"], o["eps"]) for o in res["others"]] == [("Erai-raws", [8])], res["others"]
     res = asyncio.run(A.backfill_source(aid, group="Erai-raws", site="nyaa"))
     assert res["downloaded"] == 1 and "1080p" in tried[0], tried
+
+
+# ── 逻辑漏洞排查（10-20）：绝对编号的终集、被分到超期忽略记录上的当季集 ──────────────────
+
+def test_absolute_numbering_tail_gap(cfg):
+    """Re:Zero 第四季后半：bgm 记 8 集，库里是 ANi 的绝对编号 12~18，终集 19 被停机吞了。
+    以前"集号超出总集数就不判"让它一声不吭；现在集号连续、见过的比应播的少 → 缺的算在末尾。"""
+    cfg(ANIME_GAP_SLACK_WEEKS=2, ANIME_GAP_MAX_EPISODES=100)
+    a = _a(total_episodes=8, air_date="2026-08-12")
+    assert A.missing_episodes(a, set(range(12, 19)), TODAY) == [19]
+    assert A.missing_episodes(a, set(range(12, 20)), TODAY) == [], "齐了就不报"
+    assert A.missing_episodes(a, set(range(12, 19)), TODAY, end_ep=18) == [], "字幕组标了 [END] 以它为准"
+    assert A.missing_episodes(a, {3, 4, 13, 14, 15}, TODAY) == [], "两套编号混着来（不连续）不判"
+    b = _a(total_episodes=12, air_date="2026-07-05")
+    assert A.missing_episodes(b, set(range(1, 37)), TODAY) == [], "从 1 连着数过总集数的（bgm 少记了）不判"
+
+
+def test_ignored_but_still_airing(clean_tables, cfg):
+    """超期忽略（自动的）却还在收新集的番要提示；分到了在追番的同系列旧记录上的，点名是哪一部。人工忽略的不算。"""
+    from core import alerts
+    from db.models import AnimeAlias
+    now = datetime.now()
+    with clean_tables.get_session() as s:
+        s4 = _a(title="Re：从零开始的异世界生活", display_name="Re：从零开始的异世界生活 第四季", season=4, total_episodes=8)
+        s1 = _a(title="Re:从零开始的异世界生活", season=1, total_episodes=26, confirmed=False, rejected=True)
+        cour = _a(title="欺诈游戏", total_episodes=24, confirmed=False, rejected=True)
+        manual = _a(title="人工忽略的番", confirmed=True, rejected=True)
+        old = _a(title="早就不更新的", confirmed=False, rejected=True)
+        for a in (s4, s1, cour, manual, old):
+            s.add(a)
+        s.commit()
+        s.add(AnimeAlias(title="Re：从零开始的异世界生活", season=4, anime_id=s4.id))
+        s.add(AnimeAlias(title="Re:从零开始的异世界生活", season=1, anime_id=s1.id))
+        n = 0
+        for a, eps, at in ((s1, (84, 85), now), (cour, (25, 26), now), (manual, (5,), now),
+                           (old, (12,), now - timedelta(days=60))):
+            for ep in eps:
+                n += 1
+                s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{n:040x}", raw_title=f"t{n}", episode=ep,
+                                   status="pending", created_at=at))
+        s.commit()
+        ids = {"s1": s1.id, "cour": cour.id}
+    got = {g["id"]: g for g in A.suspect_ignored_airing()}
+    assert set(got) == {ids["s1"], ids["cour"]}, "人工忽略的、30 天没动静的都不算"
+    assert got[ids["s1"]]["impossible"] and got[ids["s1"]]["sibling"] == "Re：从零开始的异世界生活 第四季"
+    assert not got[ids["cour"]]["impossible"], "只是集号超出 bgm 记的总集数（还在播），不算分错记录"
+    texts = [f["text"] for f in alerts.scan() if f["kind"] == "ign"]
+    assert any("Re：从零开始的异世界生活 第四季』的详情页点『自动补齐』" in t for t in texts)
+    assert any("欺诈游戏" in t and "恢复订阅" in t for t in texts)

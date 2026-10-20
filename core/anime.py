@@ -1667,6 +1667,15 @@ def missing_episodes(a, seen, today=None, end_ep: int | None = None) -> list:
     if not e or e > max(1, config.ANIME_GAP_MAX_EPISODES):
         return []
     slack = max(0, config.ANIME_GAP_SLACK_WEEKS)
+    lo, hi = min(seen), max(seen)
+    if hi > (a.total_episodes or 0) and lo > 1 and hi - lo + 1 == len(seen):
+        # 【绝对编号】(r37 后续) ANi 等组的续作沿用全系列连续编号：Re:Zero 第四季后半 bgm 记 8 集，库里是 12~18。
+        # 判不出"第几集"对应哪个号，只能数个数：集号连续、见过的集数比应播集数少 → 缺的算在末尾。
+        # 真库上它正好漏了终集第 19 集（9 月底停机那半个月滚出了 RSS），而下面那道"集号超出总集数不判"的闸
+        # 让它一声不吭。集号不连续（两套编号混着来）的照旧不判；字幕组打了 [END] 的以它为准。
+        if len(seen) >= e or (end_ep and end_ep <= hi):
+            return []
+        return list(range(hi + 1, hi + 1 + e - len(seen)))
     if (max(seen) > (a.total_episodes or 0)
             or min(seen) > e + slack
             or max(seen) > e + slack + 1):
@@ -1674,6 +1683,52 @@ def missing_episodes(a, seen, today=None, end_ep: int | None = None) -> list:
     if end_ep:
         e = min(e, end_ep)
     return [k for k in range(1, e + 1) if k not in seen]
+
+
+def suspect_ignored_airing(days: int = 30) -> list[dict]:
+    """『超期忽略』的番最近还在收新集（只读，不改任何东西）。(r37 后续)
+
+    超期忽略是自动的（开播早于『开始使用日』），用户没亲手点过 —— 而它会静默吞掉两类该下的集：
+      · 跨季连播的番：4 月开播、播到 9 月的两季番，整部被判超期，后半季一集都不下；
+      · 别的季的集被分错了记录：标题里不写第几季、又用全系列绝对编号的组（百冬练习组&LoliHouse 的
+        『Re:从零开始的异世界生活 - 85』）按别名落到了第一季那条超期忽略的记录上 —— 在追的第四季终集就这样没了。
+    人工点的『已忽略』不算（那是用户的意思）。只看最近 days 天入库的正片。
+    返回 [{id, born, name, bgm, confirmed, rejected, eps, total, impossible, sibling}]：
+    impossible＝集号超出总集数、而且有一部【在追的】番与它共用番名（别名经全角半角归一后相同）—— 那才是"分错了记录"，
+    sibling 是那部番的名字。只是集号超出总集数（bgm 少记了集数、番还在播：轻松熊、欺诈游戏）不算。"""
+    import unicodedata
+
+    def _k(t):
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", t or "")).lower()
+    since = datetime.now() - timedelta(days=days)
+    with get_session() as s:
+        animes = {a.id: a for a in s.exec(select(Anime).options(_NO_SUMMARY).where(
+            Anime.rejected == True, Anime.confirmed == False))}   # noqa: E712
+        if not animes:
+            return []
+        rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode).where(
+            AnimeTorrent.anime_id.in_(set(animes)), AnimeTorrent.created_at >= since,
+            AnimeTorrent.episode >= 1)))
+        subs = {a.id: a for a in s.exec(select(Anime).options(_NO_SUMMARY).where(*subscribed_where()))}
+        names: dict = {}
+        for aid, t in s.exec(select(AnimeAlias.anime_id, AnimeAlias.title)):
+            names.setdefault(aid, set()).add(_k(strip_season(t)))
+    for aid, a in list(animes.items()) + list(subs.items()):
+        names.setdefault(aid, set()).add(_k(strip_season(a.title)))
+    eps: dict = {}
+    for aid, ep in rows:
+        if float(ep).is_integer():
+            eps.setdefault(aid, set()).add(int(ep))
+    out = []
+    for aid in sorted(eps, key=lambda i: quarter_sort_key(animes[i].quarter or ""), reverse=True):
+        a = animes[aid]
+        over = bool(a.total_episodes and max(eps[aid]) > a.total_episodes)
+        sib = next((display_of(b) for bid, b in subs.items()
+                    if over and (names.get(bid, set()) & names.get(aid, set())) - {""}), None)
+        out.append({"id": aid, "born": a.created_at, "name": display_of(a), "bgm": a.bangumi_id,
+                    "confirmed": a.confirmed, "rejected": a.rejected, "eps": sorted(eps[aid]),
+                    "total": a.total_episodes or 0, "impossible": sib is not None, "sibling": sib})
+    return out
 
 
 # 字幕组在终集标题里打的完结标记：[END] / [Fin] / 【完】 / (END) …

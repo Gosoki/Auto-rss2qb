@@ -48,7 +48,8 @@ log = logging.getLogger("autorss")
 
 # 三类的键与人话名。加一类要同时给出 _IDENT/_FACT/_TEXT 三个构造式，
 # 下面 `scan()` 的断言会逼着你补齐。
-KINDS = {"dup": "同一部番被拆成两条", "mva": "番剧与剧场版重号", "wrb": "绑定看着不对"}
+KINDS = {"dup": "同一部番被拆成两条", "mva": "番剧与剧场版重号", "wrb": "绑定看着不对",
+         "ign": "超期忽略但还在更新"}
 
 
 def _tag(row_id, created_at) -> str:
@@ -132,9 +133,31 @@ def _wrb(w: dict) -> dict:
     }
 
 
+def ign_eps_text(eps) -> str:
+    return _anime.ep_ranges(eps)
+
+
+def _ign(g: dict) -> dict:
+    tot = f"共 {g['total']} 集" if g["total"] else "集数未知"
+    tail = (f"——集号超出了它的总集数（{tot}），而在追的『{g.get('sibling')}』是同一个系列：多半是那一季的集"
+            "被分到了这条记录（标题没写第几季、又用全系列编号），这些集不会被下载。去『"
+            f"{g.get('sibling')}』的详情页点『自动补齐』补上。" if g["impossible"] else
+            "——开播早于『开始使用日』被自动忽略了；要追就去『已忽略』页点『恢复订阅』。")
+    return {
+        "kind": "ign",
+        # 一部番一条：点过『知道了』就一直收着，番停了更新自然消失；别的番新冒出来才重新提示。
+        "ident": f"ign:{_tag(g['id'], g['born'])}",
+        # 【ast 必须进】那部番被恢复订阅（不再是超期忽略）又被打回来时该重新说一次；集号不进 —— 每周来一集就重报是噪音
+        "fact": f"bgm={g['bgm']};st={_bits(g['confirmed'], g['rejected'])}",
+        "text": f"『{g['name']}』(#{g['id']}) 最近 30 天还在收新集（第 {ign_eps_text(g['eps'])} 集）{tail}",
+        "impossible": g["impossible"],
+    }
+
+
 _BUILD = {"dup": (_anime.suspect_duplicate_anime, _dup),
           "mva": (_anime.suspect_movie_as_anime, _mva),
-          "wrb": (_anime.suspect_wrong_binding, _wrb)}
+          "wrb": (_anime.suspect_wrong_binding, _wrb),
+          "ign": (_anime.suspect_ignored_airing, _ign)}
 
 
 def scan() -> list[dict]:
@@ -144,7 +167,7 @@ def scan() -> list[dict]:
     """
     assert set(_BUILD) == set(KINDS), "加了一类却没给全 判据/构造式/人话名"
     out = []
-    for kind in ("dup", "mva", "wrb"):
+    for kind in ("dup", "mva", "wrb", "ign"):
         find, build = _BUILD[kind]
         for raw in find():
             out.append(build(raw))
@@ -205,7 +228,7 @@ def view() -> dict:
 
 FACT_LABEL = {"abgm": "左边那条绑的 bgm", "bbgm": "右边那条绑的 bgm",
               "ast": "左边那条的订阅状态", "bst": "右边那条的订阅状态",
-              "bgm": "绑的 bgm", "season": "季号", "eps": "出问题的集号"}
+              "bgm": "绑的 bgm", "season": "季号", "eps": "出问题的集号", "st": "订阅状态"}
 _BITS_CN = {"00": "待确认", "01": "超期忽略", "10": "追番中", "11": "人工拒绝"}
 
 
@@ -222,7 +245,7 @@ def fact_diff(old: str, new: str) -> list:
     for k, v in n.items():
         if o.get(k) == v:
             continue
-        cn = _BITS_CN.get if k in ("ast", "bst") else (lambda x, d=None: d)
+        cn = _BITS_CN.get if k in ("ast", "bst", "st") else (lambda x, d=None: d)
         out.append((FACT_LABEL.get(k, k),
                     cn(o.get(k), o.get(k, "（当时没有这一项）")) or o.get(k, "（当时没有这一项）"),
                     cn(v, v) or v))
