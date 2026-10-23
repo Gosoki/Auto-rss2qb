@@ -1029,6 +1029,7 @@ _STRADDLERS = {
     },
     "core/engine.py": {
         "archive_old_completed":          "lock:_archive_lock",
+        "fill_content_paths":             "lock:_archive_lock",   # 补记文件路径，先于归档、同一轮
         # (E-57) 清扫要先问 qB 才分得清"崩在交给 qB 之前/之后"，于是它自己也跨 await 持主键了。
         # 两个调用方都在 _sweep_lock 里：周期巡检轮 sweep_round、启动补做 sweep_leftovers_if_pending。
         "sweep_stale_delivering":         "lock:_sweep_lock",

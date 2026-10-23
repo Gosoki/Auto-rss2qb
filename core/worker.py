@@ -457,6 +457,10 @@ async def archive_round() -> None:
     "这条线真的拿着它跑"的，把 `async with` 删掉那种断言照样绿。
     """
     async with _archive_lock:
+        try:
+            await engine.fill_content_paths()     # 先补文件路径（播放用），再归档：归档后 qB 里就问不到了
+        except Exception as e:
+            loop_error("补记文件路径（忽略，下轮再来）", e)
         await engine.archive_old_completed()
 
 

@@ -167,6 +167,10 @@ class AnimeTorrent(SQLModel, table=True):
     status: str = Field(default="pending")
     download_url: str = Field(default="")
     save_path: str = Field(default="")          # 交 qB 时的实际保存路径；改季度/重绑后据此移动或提醒旧位置
+    # qB 回报的内容路径（qB 那台机器上的绝对路径）：单文件种子是文件本身，多文件种子是根目录。
+    # 给『播放』用：qB 同步时记下、归档前补齐（归档后 qB 里查不到了还得知道文件在哪）；搬迁后清空等重取。
+    # None＝还不知道。
+    content_path: str | None = Field(default=None)
     release_time: datetime | None = Field(default=None)
     priority: int = Field(default=0)            # 来源组优先级（缓冲窗口到点时按此选下哪一份）
     # 【index=True 是给"最近入库"那几条排序查询用的】(R21) 仪表盘打开后每 30 秒刷一次
@@ -248,6 +252,7 @@ class MovieTorrent(SQLModel, table=True):
     status: str = Field(default="pending")
     download_url: str = Field(default="")
     save_path: str = Field(default="")          # 交 qB 时的实际保存路径；改季度/重绑后据此移动或提醒旧位置
+    content_path: str | None = Field(default=None)   # 同 AnimeTorrent，理由见那里
     release_time: datetime | None = Field(default=None)
     priority: int = Field(default=0)
     created_at: datetime = Field(default_factory=datetime.now, index=True)   # 同 AnimeTorrent，理由见那里

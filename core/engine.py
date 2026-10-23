@@ -805,6 +805,52 @@ async def archive_old_completed() -> int:
     return n
 
 
+# fill_content_paths 问过、qB 里却没有的行（用户在 qB 里手动移除了种子）：本进程内不再问。
+_path_miss: set[tuple[str, int]] = set()
+_PATH_BATCH = 500
+
+
+async def fill_content_paths() -> int:
+    """给还不知道内容路径的已下种子向 qB 补上 content_path（播放用，见 models）。返回补上的条数。
+
+    同步只在种子【在下】时顺手记路径，已经落定的行（本列上线前下完的、搬迁后被清空的）由这里补。
+    挂在归档轮上、【先于归档】跑，同一把 `_archive_lock`（读 (id, hash) → await qb → 按主键写回，
+    与归档同形）：快到归档期的先补（按完成时间从早到晚），免得种子从 qB 移除后再也问不到。
+    已归档的不问（qB 里已经没有了）；qB 里查不到的记进 _path_miss，本进程内不再问。"""
+    if not config.QB_ENABLED:
+        return 0
+    n = 0
+    for model_cls in (AnimeTorrent, MovieTorrent):
+        name = model_cls.__name__
+        with get_session() as s:
+            rows = [(t.id, t.info_hash) for t in s.exec(select(model_cls).where(
+                model_cls.status.in_(("sent", "stalled")),
+                model_cls.archived_at.is_(None),
+                model_cls.content_path.is_(None),
+            ).order_by(model_cls.qb_synced_at, model_cls.id))
+                if t.info_hash and (name, t.id) not in _path_miss][:_PATH_BATCH]
+        if not rows:
+            continue
+        info = await qb.torrents_info([h for _, h in rows])
+        if info is None:              # qB 连不上：本轮不动，下轮再来
+            return n
+        with get_session() as s:
+            for tid, h in rows:
+                cp = (info.get(h) or {}).get("content_path")
+                if not cp:
+                    _path_miss.add((name, tid))
+                    continue
+                t = s.get(model_cls, tid)
+                if t is not None and t.content_path is None and t.archived_at is None:
+                    t.content_path = cp
+                    s.add(t)
+                    n += 1
+            s.commit()
+    if n:
+        log.info("补记 %d 个已下种子的文件路径（播放用）", n)
+    return n
+
+
 def pick_order(torrents, pref=None, prefer_fresh: bool = False):
     """把候选种子排成『该先试哪一个』的顺序：钉了首选源就先只看它（没有才退回全部），
     再按（优先级降序, 入库时间升序）排。返回排好序的列表（可能为空，调用方自理）。
@@ -1003,6 +1049,7 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
                 t = s.get(model_cls, tid)
                 if t is not None:
                     t.save_path = new_path
+                    t.content_path = None      # 文件挪了：等归档轮按 hash 向 qB 重取（fill_content_paths）
                     s.add(t)
             s.commit()
 
@@ -1784,6 +1831,8 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int | None:
             t.qb_progress = float(d.get("progress", 0) or 0)
             t.qb_dlspeed = int(d.get("dlspeed", 0) or 0)
             t.qb_size = int(d.get("size", 0) or 0)
+            if d.get("content_path"):          # 播放用（见 models）；qB 4.3.2 之前的版本不回这个字段
+                t.content_path = d["content_path"]
             t.qb_synced_at = now
             # 【比较要带 epsilon】这是第二道保险：即便列类型退回窄浮点（MySQL 的 4 字节 FLOAT
             # 会把 0.4212345 存成 0.42123448848724365），也不会因 round-trip 噪声把"没动"

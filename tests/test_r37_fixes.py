@@ -700,3 +700,62 @@ def test_meta_refresh_every_n_episodes(clean_tables, cfg, monkeypatch):
     assert asyncio.run(A.refresh_meta_due()) == 1
     assert called == [(bid, True, True)], "只刷资料不改绑定、不改已下番的归档目录"
     assert not A._meta_due
+
+
+def test_fill_content_paths(clean_tables, cfg, monkeypatch):
+    """已下种子向 qB 补记文件路径：已归档的不问、qB 里没有的记下来不再问、已有路径的不覆盖。"""
+    from core import engine as ce
+    cfg(QB_ENABLED=True)
+    ce._path_miss.clear()
+    with clean_tables.get_session() as s:
+        a = _a(title="番")
+        s.add(a)
+        s.commit()
+        rows = {}
+        for k, kw in (("ok", {}), ("gone", {}), ("archived", {"archived_at": datetime.now()}),
+                      ("known", {"content_path": "E:\\old.mkv"}), ("pending", {"status": "pending"})):
+            t = AnimeTorrent(anime_id=a.id, info_hash=(k * 40)[:40], raw_title=k, episode=1,
+                             **{"status": "sent", **kw})
+            s.add(t)
+            s.commit()
+            rows[k] = t.id
+    asked = []
+
+    async def fake_info(hashes):
+        asked.append(set(hashes))
+        return {("ok" * 40)[:40]: {"content_path": "E:\\Anime\\AutoRSS\\26D\\番\\[ANi] 番 - 01.mp4"}}
+
+    monkeypatch.setattr(ce.qb, "torrents_info", fake_info)
+    assert asyncio.run(ce.fill_content_paths()) == 1
+    assert asked == [{("ok" * 40)[:40], ("gone" * 40)[:40]}], "已归档、已有路径、没交给 qB 的都不问"
+    with clean_tables.get_session() as s:
+        got = {k: s.get(AnimeTorrent, i).content_path for k, i in rows.items()}
+    assert got["ok"].endswith("[ANi] 番 - 01.mp4") and got["known"] == "E:\\old.mkv"
+    assert got["gone"] is None and got["archived"] is None
+    asked.clear()
+    asyncio.run(ce.fill_content_paths())
+    assert asked == [], "qB 里没有的那条本进程内不再问"
+
+
+def test_sync_records_content_path(clean_tables, cfg, monkeypatch):
+    """在下的种子每轮同步顺手记下 qB 回报的文件路径。"""
+    from core import engine as ce
+    cfg(QB_ENABLED=True, QB_SYNC_STATUS=True)
+    with clean_tables.get_session() as s:
+        a = _a(title="番")
+        s.add(a)
+        s.commit()
+        t = AnimeTorrent(anime_id=a.id, info_hash="e" * 40, raw_title="x", episode=1, status="sent",
+                         qb_progress=0.3, qb_state="downloading", qb_synced_at=datetime.now())
+        s.add(t)
+        s.commit()
+        tid = t.id
+
+    async def fake_info(hashes):
+        return {h: {"state": "downloading", "progress": 0.6, "dlspeed": 1, "size": 1,
+                    "content_path": "E:\\Anime\\AutoRSS\\26D\\番\\01.mp4"} for h in hashes}
+
+    monkeypatch.setattr(ce.qb, "torrents_info", fake_info)
+    asyncio.run(ce.sync_qb_status(AnimeTorrent))
+    with clean_tables.get_session() as s:
+        assert s.get(AnimeTorrent, tid).content_path == "E:\\Anime\\AutoRSS\\26D\\番\\01.mp4"
