@@ -81,6 +81,14 @@ _SPEC = {
     "QB_CATEGORY_ANIME": (str, "AutoRSS-Anime"),
     "QB_CATEGORY_MOVIE": (str, "AutoRSS-Movie"),
     "QB_CATEGORY_MANUAL": (str, "AutoRSS-Manual"),
+    # ---- qB 的 IP 过滤：定期重新生成「屏蔽某国 IP」的 .p2p（见 core/ipfilter.py，包成 web seed 种子让 qB 自己下）----
+    "IPFILTER_DAYS": (int, 30),             # 每隔几天重新生成一次（0=关）
+    "IPFILTER_COUNTRIES": (list, "JP"),     # 屏蔽哪些国家/地区（两位代码，可多选）
+    "IPFILTER_GAP_FILL": (int, 4096),       # 同一国相邻区间之间小于这么多个地址的缝直接填平（宁可误杀；0=不填）
+    "IPFILTER_ANTIP2P": (bool, True),       # 另外并上通用反 P2P 名单（不分国家，挡境外的监控方；约 41 万条，误杀更多）
+    "IPFILTER_DIR": (str, ""),              # qB 那台机器上放规则文件的目录；空=工作目录下的 IPBlocker
+    "IPFILTER_SEED_URL": (str, ""),         # qB 来下文件时访问本程序的地址；空=自动（本机连 qB 用的 IP + Web 端口）
+    "IPFILTER_STATE": (str, ""),            # 运行时状态 JSON（上次更新/待下完的种子/状态文案；非用户填）
     # 【默认空，不是 /home】空 = build_save_path 返回 None = 拒绝下载并报"未配置下载目录"。
     # 曾默认 /home：那是系统目录，而首配链路上【没有任何一处会拦】——设置页的防呆判的是
     # "两个根不能都为空"，预填的 /home 恒满足它，于是新用户装完直接点保存，番就下进了
@@ -477,7 +485,7 @@ def _merge_new_notify_events(have: dict) -> None:
 
 # 后台每轮自己写的运行时键：改动不进『设置已修改』日志（每 20 分钟一行只会把真改动冲掉）
 _RUNTIME_KEYS = {"MOVIE_SCAN_LAST", "ANIME_POLL_LAST", "ANIME_POLL_FAILED", "ANIME_POLL_OK_LAST",
-                 "BACKUP_LAST", "SOURCE_FEED_SEEN", "FEED_GAPS"}
+                 "BACKUP_LAST", "SOURCE_FEED_SEEN", "FEED_GAPS", "IPFILTER_STATE"}
 # 值里带密钥的键：日志只说"改了"，不写值（NOTIFY_URL 的 Bark/Server酱 密钥在路径里，PROXY_URL 可内嵌口令）
 _SECRET_KEYS = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD", "QB_CALLBACK_TOKEN",
                 "NOTIFY_URL", "PROXY_URL", "HEARTBEAT_URL"}

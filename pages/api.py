@@ -14,11 +14,12 @@ POST 无法这样触发。qB 的 run-external-program 支持 curl -X POST，故�
 """
 import hmac
 
-from fastapi import Request
+from fastapi import HTTPException, Request
+from fastapi.responses import FileResponse
 from nicegui import app
 
 import config
-from core import engine
+from core import engine, ipfilter
 
 
 @app.post("/api/qb/done")
@@ -71,3 +72,13 @@ async def qb_done(request: Request, hash: str = "", t: str = "") -> dict:
     elif not hmac.compare_digest(t.encode("utf-8"), tok.encode("utf-8")):
         return {"ok": False, "error": "bad token"}
     return {"ok": True, "marked": engine.mark_done_by_hash(hash)}
+
+
+@app.get("/api/ipfilter/{digest}/{name}")
+async def ipfilter_file(digest: str, name: str) -> FileResponse:
+    """qB 来下屏蔽列表：core/ipfilter 交给 qB 的种子里，唯一的 HTTP 下载源就是这里（支持分段请求）。
+    只给【当前这一份】（摘要和文件名都对上），别的一律 404；内容是公开的屏蔽列表，不用鉴权。"""
+    p = ipfilter.serving_file(digest, name)
+    if p is None:
+        raise HTTPException(status_code=404)
+    return FileResponse(p, media_type="application/octet-stream")

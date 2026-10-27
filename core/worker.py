@@ -11,7 +11,7 @@ import time
 
 from core import anime
 import config
-from core import engine, health, movies
+from core import engine, health, ipfilter, movies
 import db
 from db.models import AnimeTorrent
 from core.anime import flush_ready_downloads, list_source_groups, process_item
@@ -419,6 +419,20 @@ async def run_reenrich_retry() -> None:
             await anime.refresh_meta_due()   # 收录集数到倍数的番刷一次 bgm 资料（同一条 bgm 串行线）
         except Exception as e:
             loop_error("定期刷新 bgm 资料", e)
+
+
+async def run_ipfilter() -> None:
+    """独立协程：定期更新 qB 的 IP 过滤屏蔽列表（实现见 core/ipfilter）。
+    每 10 分钟看一眼：交给 qB 的那份下完了就收尾，到期了就更新。不碰业务库，停摆期间照常跑。"""
+    log.info("屏蔽列表更新协程启动（%s）", f"每 {config.IPFILTER_DAYS} 天"
+             if config.IPFILTER_DAYS > 0 else "关·在设置页开启")
+    while True:
+        await asyncio.sleep(600)
+        try:
+            if await ipfilter.finish_pending() is None and ipfilter.due():
+                await ipfilter.run_once()
+        except Exception as e:
+            loop_error("屏蔽列表更新", e)
 
 
 async def run_backup() -> None:

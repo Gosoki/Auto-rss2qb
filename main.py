@@ -23,7 +23,7 @@ from config import WEB_HOST, WEB_PORT
 from core.logsetup import setup_logging
 from core.netguard import install as install_netguard
 from core import worker as worker_mod
-from core.worker import (init_business_state, run_backup, run_db_watch, run_movie_scan,
+from core.worker import (init_business_state, run_backup, run_db_watch, run_ipfilter, run_movie_scan,
                          run_qb_sync, run_reenrich_retry, run_sweep, run_worker, log_task_exit)
 import db
 from db import apply_configured_backend, init_db
@@ -34,7 +34,7 @@ install_netguard(app)   # 网段白名单中间件（WEB_ALLOW_CIDRS 为空则�
 log = logging.getLogger("autorss")
 
 
-# 七条后台协程的句柄。理由见 on_startup 里的说明。
+# 后台协程的句柄。理由见 on_startup 里的说明。
 background_tasks: list = []
 
 
@@ -71,7 +71,7 @@ async def _startup():
     # 协程照常建：它们各自都按 db.is_data_down() 把门，停摆期间空转短睡，库一恢复就自动接上。
     # 【句柄必须存住】(R33) 两个理由：① asyncio 只对 task 持弱引用，官方文档明写
     #   "Save a reference to the result of this function, to avoid a task disappearing mid-execution"
-    #   —— 这七条是长驻循环、实际一直被调度着，大概率没事，但那是靠运气不是靠设计；
+    #   —— 这几条是长驻循环、实际一直被调度着，大概率没事，但那是靠运气不是靠设计；
     # ② E-46 讨论过"切库前先停掉全部后台线"这条路，它的前提就是有句柄可停。
     #   这一轮没走"停"（所有跨 await 的线都已在闸里，"有界地等"就够，见 engine.wait_until_quiet），
     #   但把抓手留下：将来要停，一行 `for t in background_tasks: t.cancel()`。
@@ -83,6 +83,7 @@ async def _startup():
         asyncio.create_task(run_reenrich_retry(), name="reenrich"),  # 『待识别』番后台重试 bgm（独立频率，不阻塞采集）
         asyncio.create_task(run_backup(), name="backup"),        # 整库自动备份（独立频率；采集暂停/qB 掉线都不影响它）
         asyncio.create_task(run_sweep(), name="sweep"),          # 完结判定 + 断更提醒（回答"有没有【没发生】的事"）
+        asyncio.create_task(run_ipfilter(), name="ipfilter"),    # qB 的 IP 过滤屏蔽列表定期更新（不碰业务库）
     ])
     for _t in background_tasks:
         _t.add_done_callback(log_task_exit)   # 任何一条意外退出都留一行 ERROR（见 core.worker.log_task_exit）

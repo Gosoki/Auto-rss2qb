@@ -326,6 +326,25 @@ class QBittorrent:
         log.error("删除下载任务失败 %s: %s", resp.status_code, resp.text[:80])
         return False
 
+    async def preferences(self) -> dict | None:
+        """qB 的全局设置（app/preferences）；连不上或回的不是对象返回 None。"""
+        resp = await self._request("GET", "/api/v2/app/preferences")
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def set_preferences(self, prefs: dict) -> bool:
+        """改 qB 的全局设置（只传要改的键）。"""
+        resp = await self._request("POST", "/api/v2/app/setPreferences", data={"json": json.dumps(prefs)})
+        if resp is not None and resp.status_code == 200:
+            return True
+        log.error("修改 qB 设置失败 %s", getattr(resp, "status_code", "（连不上）"))
+        return False
+
     async def set_location(self, hashes: list[str], location: str) -> int | None:
         """把这些种子的保存路径整批移到 location（qB 后台搬文件，autoTMM=false 的不会被分类路径覆盖）。
 

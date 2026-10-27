@@ -8,7 +8,7 @@ import json
 
 from nicegui import context, run, ui
 
-from core import anime, engine, netguard, worker
+from core import anime, engine, ipfilter, netguard, worker
 from urllib.parse import quote
 
 import config
@@ -27,7 +27,7 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "QB_IDLE_RECHECK_MIN", "QB_STALL_TIMEOUT_MIN", "QB_ARCHIVE_AFTER_DAYS",
             "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
             "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES",
-            "ANIME_META_REFRESH_EPS",
+            "ANIME_META_REFRESH_EPS", "IPFILTER_DAYS", "IPFILTER_GAP_FILL",
             "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT", "DB_MYSQL_PORT"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
@@ -800,6 +800,56 @@ def settings():
                     f["QB_CALLBACK_TOKEN"].on_value_change(lambda: _cb_cmd.refresh())   # token 改则命令跟着变
                     ui.label("↑ 复制这行填进 qB → Options → Downloads →『Run external program on torrent "
                              "finished』（%I=种子 hash）").classes("text-xs text-gray-500")
+
+            ui.separator()
+            _section("qB 的 IP 过滤：屏蔽指定国家的 IP（自动更新）",
+                     "定期重新生成屏蔽这些国家/地区 IP 的规则（.p2p，默认日本），包成一个种子交给 qB，"
+                     "让 qB 自己下到下面的目录——qB 在别的机器上也能用，不用共享文件夹。"
+                     "宁可误杀、不许漏：规则取几十个来源的并集——五大 RIR 注册数据、ipdeny/ipverse、"
+                     "GeoLite2/DB-IP 等 6 个地理与 ASN 库、Linode/Vultr/DigitalOcean 的地理表、"
+                     "AWS/GCP/Azure/Oracle 在该国的机房区段，相邻小缝也一并填平；"
+                     "任何一个源取不到就不更新、旧规则照用（少一个源就少一片覆盖）。"
+                     "『通用反 P2P 名单』不分国家，挡在境外开机器的监控方，条数多、误杀也多。\n"
+                     "下好后去 qB → 设置 → 连接 → IP 过滤，勾上并填下面显示的文件路径，只需设一次；"
+                     "之后每次更新都是同一个文件（换国家也不变），qB 已经指向它时会自动重新加载。\n"
+                     "qB 要能访问本程序：自动推算的地址不对（比如本程序在反代后面）就手动填；"
+                     "设了『允许访问的网段』的话，要把 qB 那台放进去。")
+            f["IPFILTER_COUNTRIES"] = ui.select(
+                {k: f"{v}（{k}）" for k, v in ipfilter.COUNTRY_CHOICES.items()} | {
+                    c: c for c in config.IPFILTER_COUNTRIES if c not in ipfilter.COUNTRY_CHOICES},
+                value=list(config.IPFILTER_COUNTRIES or []), multiple=True,
+                new_value_mode="add-unique",
+                label="屏蔽哪些国家/地区（可多选；列表里没有的直接输入两位代码回车）").classes("w-full")
+            _switch_field("IPFILTER_ANTIP2P", "另外并上通用反 P2P 名单（约 41 万条）", config.IPFILTER_ANTIP2P)
+            with ui.element("div").classes("field-grid w-full"):
+                _num("IPFILTER_DAYS", "每隔几天更新（0=关）", config.IPFILTER_DAYS, 0, 365)
+                _num("IPFILTER_GAP_FILL", "填平小于几个地址的缝", config.IPFILTER_GAP_FILL, 0, 1048576)
+            _text("IPFILTER_DIR", "qB 那台上的存放目录", config.IPFILTER_DIR,
+                  f"空=工作目录下的 IPBlocker（{ipfilter.default_dir() or '工作目录还没填'}）")
+            _text("IPFILTER_SEED_URL", "qB 访问本程序的地址", config.IPFILTER_SEED_URL,
+                  f"空=自动（{ipfilter.auto_seed_base()}）")
+
+            @ui.refreshable
+            def _ipf_status():
+                st = ipfilter.run_state()
+                ui.label(st.get("status") or "还没更新过").classes("text-sm")
+                path = ipfilter.qb_file_path()
+                if path:
+                    ui.label(f"qB 里 IP 过滤要填的路径：{path}").classes("text-xs text-gray-400 break-all")
+
+            async def _ipf_now(e):
+                async def _go():
+                    ui.notify("正在取数据源、生成规则并交给 qB…（十几个源，可能要一两分钟）", type="info")
+                    res = await ipfilter.run_once()
+                    _ipf_status.refresh()
+                    ui.notify(res, type="positive" if res.startswith(("已更新", "已交给")) else "warning")
+                await busy_action(e.sender, "ipfilter-now", _go, fail="更新 IP 屏蔽规则失败")
+
+            with ui.row().classes("items-center gap-3 w-full"):
+                with ui.column().classes("gap-0 grow min-w-0"):
+                    _ipf_status()
+                ui.button("立即更新", icon="shield", on_click=_ipf_now).props(
+                    "flat dense color=primary").classes("btn-sm").tooltip("用已保存的设置马上更新一次")
 
             ui.separator()
             _section("保存 & 命名",
