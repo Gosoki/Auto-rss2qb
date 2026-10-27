@@ -704,13 +704,30 @@ def settings():
         _sub_ph = ("留空=直接落工作目录；或填相对目录名（如 番剧）" if config.DOWN_PATH
                    else "工作目录未设，此处须填绝对路径")
 
-        # ========== 折叠 ① 通用（默认展开）==========
+        # ========== 折叠 ① 下载 / qB（默认展开）==========
         with ui.card().classes("w-full"), ui.expansion(
-                "通用（站点 / qB / 保存 / 网络 / Web / 高级）", icon="tune", value=True).classes(
-                "w-full"):
-            _section("站点", "显示在顶栏左上角与浏览器标签页标题。保存后刷新页面即变。")
-            with ui.element("div").classes("field-grid w-full"):
-                _text("SITE_NAME", "站点名", config.SITE_NAME, "空=autorss")
+                "下载 / qB（工作目录 / qB 连接 / IP 过滤）", icon="download", value=True).classes("w-full"):
+            _section("保存 & 命名",
+                     "有工作目录时，番剧/剧场版目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
+                     "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，番剧/剧场版须各填【绝对】路径（可不同盘）。"
+                     "两侧都空又无工作目录=无处下载、保存拦下。")
+            _text("DOWN_PATH", "工作目录（下载根）", config.DOWN_PATH,
+                  "必填，如 /mnt/media —— 留空则下载会被拒绝（不会乱下到系统目录）")
+            _text("ANIME_DOWN_PATH", "番剧下载目录", config.ANIME_DOWN_PATH, _sub_ph)
+            _text("MOVIE_DOWN_PATH", "剧场版下载目录", config.MOVIE_DOWN_PATH, _sub_ph)
+            if config.QB_ENABLED and not engine.qb_is_local():
+                warn_banner("qB 在远程主机（非 127.0.0.1）：以上路径是【qB 主机上】的绝对路径，不是本机路径。"
+                            "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。")
+            _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
+                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的下载文件夹命名。",
+                             # 【渲染原始值，不是派生值】config.QUARTER_FMT_UI 走 __getattr__，
+                             # 返回的是 `_v["QUARTER_FMT_UI"] or _v["QUARTER_FMT"]` —— 也就是说
+                             # "跟随"这个状态（原始值为空串）在框里被渲染成 QUARTER_FMT 当下的字面量，
+                             # 而保存链路又原样把框里的值写回原始键：读派生、写原始，两端不对称，
+                             # 一次保存就把"跟随"塌缩成"钉死在当时那个字面量"。
+                             # 之后用户改『下载文件夹命名』，目录跟着变、页面上的季度标题却不动。
+                             config.raw("QUARTER_FMT_UI"),
+                             empty_hint="留空＝跟随番剧下载文件夹命名", tpl_label="季度模板")
 
             ui.separator()
             _section("下载 / qBittorrent",
@@ -851,30 +868,9 @@ def settings():
                 ui.button("立即更新", icon="shield", on_click=_ipf_now).props(
                     "flat dense color=primary").classes("btn-sm").tooltip("用已保存的设置马上更新一次")
 
-            ui.separator()
-            _section("保存 & 命名",
-                     "有工作目录时，番剧/剧场版目录按【相对】拼在它下面：留空=直接落工作目录（不额外分类），"
-                     "填相对名（如 番剧 / 剧场版）则各建子目录。没设工作目录时，番剧/剧场版须各填【绝对】路径（可不同盘）。"
-                     "两侧都空又无工作目录=无处下载、保存拦下。")
-            _text("DOWN_PATH", "工作目录（下载根）", config.DOWN_PATH,
-                  "必填，如 /mnt/media —— 留空则下载会被拒绝（不会乱下到系统目录）")
-            _text("ANIME_DOWN_PATH", "番剧下载目录", config.ANIME_DOWN_PATH, _sub_ph)
-            _text("MOVIE_DOWN_PATH", "剧场版下载目录", config.MOVIE_DOWN_PATH, _sub_ph)
-            if config.QB_ENABLED and not engine.qb_is_local():
-                warn_banner("qB 在远程主机（非 127.0.0.1）：以上路径是【qB 主机上】的绝对路径，不是本机路径。"
-                            "本机不会真的建这些目录，由 qB 在它那侧建/写；请确保该路径在 qB 主机上存在且可写。")
-            _quarter_setting(f, "QUARTER_FMT_UI", "季度显示",
-                             "页面上季度怎么显示：番剧表季度标题 / 仪表盘 / 详情。留空＝跟随番剧的下载文件夹命名。",
-                             # 【渲染原始值，不是派生值】config.QUARTER_FMT_UI 走 __getattr__，
-                             # 返回的是 `_v["QUARTER_FMT_UI"] or _v["QUARTER_FMT"]` —— 也就是说
-                             # "跟随"这个状态（原始值为空串）在框里被渲染成 QUARTER_FMT 当下的字面量，
-                             # 而保存链路又原样把框里的值写回原始键：读派生、写原始，两端不对称，
-                             # 一次保存就把"跟随"塌缩成"钉死在当时那个字面量"。
-                             # 之后用户改『下载文件夹命名』，目录跟着变、页面上的季度标题却不动。
-                             config.raw("QUARTER_FMT_UI"),
-                             empty_hint="留空＝跟随番剧下载文件夹命名", tpl_label="季度模板")
-
-            ui.separator()
+        # ========== 折叠 ② 网络 / 通知 ==========
+        with ui.card().classes("w-full"), ui.expansion(
+                "网络 / 通知（代理 / 推送）", icon="notifications", value=False).classes("w-full"):
             _section("网络 / 通知",
                      "代理支持 http:// / https://；socks5:// 需另装 socksio 包（未装时填 socks5:// 会在请求时出错）。"
                      "代理账号/密码仅『需认证的代理』才填，留空=不认证。通知 URL：留空=关闭推送。")
@@ -954,7 +950,9 @@ def settings():
                 _num("NOTIFY_MAX_PER_HOUR", "每小时最多几条（0=不限）", config.NOTIFY_MAX_PER_HOUR)
                 _num("NOTIFY_BACKLOG_MIN", "待识别积压到几部才提醒", config.NOTIFY_BACKLOG_MIN)
 
-            ui.separator()
+        # ========== 折叠 ③ 巡检 / 健康 ==========
+        with ui.card().classes("w-full"), ui.expansion(
+                "巡检 / 健康（下齐 / 断更 / 缺集 / 采集停摆）", icon="monitor_heart", value=False).classes("w-full"):
             _section("下齐 / 断更巡检",
                      "下齐判定：bgm 给出总集数、且 1~总集数【每一集都在手】才算已下齐（有集号歧义段的番一律不判）。"
                      "系统确认不了一部番是不是真的播完了，所以只叫『已下齐』不叫『完结』。\n"
@@ -995,6 +993,13 @@ def settings():
                 _num("ALERT_POLL_STALL_MIN", "停摆提醒（分钟没动静）", config.ALERT_POLL_STALL_MIN, 10, 10080)
                 _num("ALERT_POLL_PAUSED_HOURS", "暂停提醒（小时，0=不提醒）", config.ALERT_POLL_PAUSED_HOURS, 0, 720)
                 _num("ALERT_SOURCE_FAIL_ROUNDS", "源连续失败几轮提醒", config.ALERT_SOURCE_FAIL_ROUNDS, 1, 100)
+
+        # ========== 折叠 ④ 站点 / Web 访问 / 高级 ==========
+        with ui.card().classes("w-full"), ui.expansion(
+                "站点 / Web 访问 / 高级", icon="tune", value=False).classes("w-full"):
+            _section("站点", "显示在顶栏左上角与浏览器标签页标题。保存后刷新页面即变。")
+            with ui.element("div").classes("field-grid w-full"):
+                _text("SITE_NAME", "站点名", config.SITE_NAME, "空=autorss")
 
             ui.separator()
             _section("Web 访问",
@@ -1052,7 +1057,7 @@ def settings():
             _text("MIKAN_BASE", "Mikan 站点根地址", config.MIKAN_BASE)
             _text("BGM_API", "Bangumi API 根地址", config.BGM_API)
 
-        # ========== 折叠 ② 番剧 ==========
+        # ========== 折叠 ⑤ 番剧 ==========
         with ui.card().classes("w-full"), ui.expansion(
                 "番剧", icon="movie", value=True).classes("w-full"):
             _section("采集",
@@ -1143,7 +1148,7 @@ def settings():
                 _select("ANIME_DEFAULT_TAB", "默认标签页", ANIME_TAB_LABELS, config.ANIME_DEFAULT_TAB)
                 _num("ANIME_PAGE_YEARS", "分页 · 每页年数", config.ANIME_PAGE_YEARS, 1, 5)
 
-        # ========== 折叠 ③ 剧场版 ==========
+        # ========== 折叠 ⑥ 剧场版 ==========
         with ui.card().classes("w-full"), ui.expansion(
                 "剧场版", icon="theaters", value=True).classes("w-full"):
             _section("列表显示",
@@ -1156,12 +1161,12 @@ def settings():
                              "剧场版按此建下载文件夹（默认年份，如 2026；同年归一个文件夹）；留空＝不分类、直接放片名。",
                              config.MOVIE_QUARTER_FMT, empty_hint="留空＝不建年份目录，直接 …/片名/")
 
-        # ========== 折叠 ④ 数据库 ==========
+        # ========== 折叠 ⑦ 数据库 ==========
         with ui.card().classes("w-full"), ui.expansion(
                 "数据库", icon="storage", value=False).classes("w-full"):
             _db_panel(f)
 
-        # ========== 折叠 ⑤ 备份 ==========
+        # ========== 折叠 ⑧ 备份 ==========
         with ui.card().classes("w-full"), ui.expansion(
                 "备份", icon="backup", value=False).classes("w-full"):
             _backup_panel(f)
