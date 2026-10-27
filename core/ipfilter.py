@@ -24,8 +24,8 @@
 qB 的 IP 过滤只认【qB 那台机器上的】本地文件路径，WebAPI 也传不了文件；而本程序与 qB 常常不在同一台
 （生产：本程序在 LXC，qB 在 Windows），本程序写不到 qB 的盘。所以把规则文件包成一个【只有 HTTP 下载源】
 （web seed，BEP 19）的私有种子交给 qB：qB 像下普通种子一样，从本程序的 /api/ipfilter/<摘要>/<文件名>
-把文件下到 IPFILTER_DIR。下完把种子从 qB 里移除（留文件），并在 qB 已经指向这个文件时让它重新读一次
-（关掉再打开 IP 过滤）。qB 里的路径要用户自己设一次，之后每次更新都是同一个文件（换国家也不变）。
+把文件下到 IPFILTER_DIR。下完把种子从 qB 里移除（留文件），再把 qB 的 IP 过滤打开并指向这个文件；
+已经指向它时就让 qB 重新读一次（关掉再打开 IP 过滤）。每次更新都是同一个文件（换国家也不变）。
 
 只碰运行时配置与 data/ipfilter/，不碰业务库。
 """
@@ -516,14 +516,22 @@ async def finish_pending() -> str | None:
         return None
     await qb.delete([h], delete_files=False)
     path = qb_file_path()
+    manual = f"去 qB 设置 → 连接 → IP 过滤，勾上并填 {path}"
     prefs = await qb.preferences()
-    if prefs and prefs.get("ip_filter_enabled") and _same_path(prefs.get("ip_filter_path", ""), path):
+    if prefs is None:
+        tail = f"，但没读到 qB 的设置：{manual}"
+    elif prefs.get("ip_filter_enabled") and _same_path(prefs.get("ip_filter_path", ""), path):
         # qB 只在路径变了或开关切换时重读文件；路径没变，就关掉再打开一次
         await qb.set_preferences({"ip_filter_enabled": False})
         await qb.set_preferences({"ip_filter_enabled": True})
         tail = "，qB 已重新加载"
     else:
-        tail = f"。去 qB 设置 → 连接 → IP 过滤，勾上并填 {path}（只需设一次）"
+        # 打开 IP 过滤并指向这个文件（路径变了或开关打开，qB 都会当场读一次）。qB 文档要求路径用正斜杠
+        old = prefs.get("ip_filter_path", "") if prefs.get("ip_filter_enabled") else ""
+        if await qb.set_preferences({"ip_filter_enabled": True, "ip_filter_path": path.replace("\\", "/")}):
+            tail = "，已在 qB 里打开 IP 过滤并指向它" + (f"（原来指向 {old}）" if old else "")
+        else:
+            tail = f"，但改 qB 设置失败：{manual}"
     log.info("IP 屏蔽规则更新完成：%s%s", path, tail)
     return _status(f"已更新（{st.get('summary', '')}）{tail}", pending="")
 

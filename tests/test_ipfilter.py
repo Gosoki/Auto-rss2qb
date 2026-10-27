@@ -197,10 +197,26 @@ def test_update_then_finish_reloads_qb_filter(testdb, cfg, monkeypatch, tmp_path
     assert not F.run_state()["pending"]
 
 
-def test_finish_does_not_touch_qb_settings_it_does_not_point_to(testdb, cfg, monkeypatch, tmp_path):
-    """qB 还没设这个路径（或关着 IP 过滤）：只提示该填什么，不替用户改 qB 设置。"""
-    qb = _FakeQB(qb_path="C:/other.p2p")
+@pytest.mark.parametrize("qb_path,enabled,old", [("C:/other.p2p", True, "C:/other.p2p"), ("", False, "")])
+def test_finish_points_qb_filter_at_the_file(testdb, cfg, monkeypatch, tmp_path, qb_path, enabled, old):
+    """qB 还没指向这个文件（指着别的、或 IP 过滤关着）：替用户打开并指过来，原来指着别的就写明。"""
+    qb = _FakeQB(qb_path=qb_path, enabled=enabled)
     _setup(cfg, monkeypatch, tmp_path, qb)
+    asyncio.run(F.update())
+    qb.progress = 1.0
+    res = asyncio.run(F.finish_pending())
+    assert qb.calls[-1] == ("prefs", {"ip_filter_enabled": True,
+                                      "ip_filter_path": "E:/Anime/AutoRSS/IPBlocker/ipfilter.p2p"})
+    assert "已在 qB 里打开 IP 过滤" in res and (f"原来指向 {old}" in res) == bool(old)
+
+
+def test_finish_when_qb_settings_unreadable(testdb, cfg, monkeypatch, tmp_path):
+    qb = _FakeQB()
+    _setup(cfg, monkeypatch, tmp_path, qb)
+
+    async def no_prefs():
+        return None
+    qb.preferences = no_prefs
     asyncio.run(F.update())
     qb.progress = 1.0
     assert "E:\\Anime\\AutoRSS\\IPBlocker\\ipfilter.p2p" in asyncio.run(F.finish_pending())
