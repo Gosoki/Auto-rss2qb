@@ -19,6 +19,7 @@ from nicegui import app, ui  # noqa: E402
 
 import config
 import pages  # noqa: F401  导入即注册页面
+from pages.layout import FAVICON
 from config import WEB_HOST, WEB_PORT
 from core.logsetup import setup_logging
 from core.netguard import install as install_netguard
@@ -103,4 +104,4 @@ if __name__ in {"__main__", "__mp_main__"}:
     # 正确做法是显式写 forwarded_allow_ips="<代理IP>"，而不是把 proxy_headers 打开。
     # language：Quasar 自带文案（断线重连提示、表格分页等）用中文，不再冒出英文（r37）
     ui.run(title="autorss", host=WEB_HOST, port=WEB_PORT, show=False, reload=False,
-           proxy_headers=False, language="zh-CN")
+           proxy_headers=False, language="zh-CN", favicon=FAVICON)   # 标签页图标＝顶栏 logo

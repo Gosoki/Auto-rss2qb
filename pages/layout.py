@@ -272,6 +272,13 @@ _TOKENS = {
 }
 
 
+# 浏览器标签页图标：与顶栏品牌【同一个图标】（Material live_tv）、【同一个颜色】（blue-400），由 main.py 交给 ui.run
+FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+           f'<path fill="oklch({_TOKENS["blue"]})" d="M21 6h-7.59l3.29-3.29L16 2l-4 4-4-4-.71.71L10.59 6H3'
+           'c-1.1 0-2 .89-2 2v12c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V8c0-1.11-.9-2-2-2zm0 14H3V8h18v12zM9 10v8l7-4z"/>'
+           '</svg>')
+
+
 def tint(token: str, alpha: float = 0.12) -> str:
     """染色提示块的底色，全站唯一配方。
 
