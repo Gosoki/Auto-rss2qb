@@ -1026,6 +1026,7 @@ _STRADDLERS = {
         "_download_new_rows":             "caller:_backfill_source_inner",
         "_reenrich_scope_inner":          "lock:_enrich_lock",
         "_refresh_meta_due_inner":        "lock:_enrich_lock",   # 每收录 N 集刷一次 bgm 资料
+        "_retire_old_versions":           "lock:_poll_lock",     # 修正版：新版下完删旧版
     },
     "core/engine.py": {
         "archive_old_completed":          "lock:_archive_lock",

@@ -588,6 +588,16 @@ def format_quarter(quarter: str, fmt: str) -> str:
     return out[:60] if len(out) > 60 else out
 
 
+# 修正版标记（同一个组重发的同一集）：'04v2' '[01v2]' '- 81 v2' '[V2]' '[v2]'。只认 2~9，没标的就是 1。
+# 前面必须紧挨数字或括号/空白，后面必须是括号/空白/结尾——AVC、HEVC、AV1 这类编码名里的 V 不会被当成版本。
+_VERSION_RE = re.compile(r"(?i)(?:(?<=\d)|(?<=[\s\[(【_]))v([2-9])(?=$|[\s\])】_.\-])")
+
+
+def parse_version(raw: str) -> int:
+    m = _VERSION_RE.search(raw or "")
+    return int(m.group(1)) if m else 1
+
+
 def kw_match(kw: str, raw: str) -> bool:
     """版本/标题关键词是否命中种子原名？**大小写不敏感**子串（繁日/简日/1080p 等）。
 

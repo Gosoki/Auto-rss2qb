@@ -25,7 +25,7 @@ from services import enrich, fetch
 from services.notify import (cooldown_active as notify_cooldown_active,
                              enabled as notify_enabled, event as notify_event,
                              state as notify_state)
-from sources.parse import (extract_episode_abs, kw_match, parse_title, quarter_of,
+from sources.parse import (extract_episode_abs, kw_match, parse_title, parse_version, quarter_of,
                            quarter_sort_key,
                            search_query_names, season_from_name, strip_season)
 
@@ -3860,6 +3860,135 @@ def exclude_torrent(torrent_id: int) -> bool:
 def unexclude_torrent(torrent_id: int) -> bool:
     """取消排除：放回 pending，重新参与下载/去重。返回是否放回了。"""
     return engine.unexclude_torrent(AnimeTorrent, torrent_id)
+
+
+# ---------------- 修正版替换（同一个组重发的 v2、v3…）----------------
+# 【为什么要有它】集去重是"一集只下一份"：v1 下过之后，同组的 v2 进来只会被当成备用项、永远不下
+# （真库：学生会也有洞 第 4 集，ANi 发了 V2，被判成 skipped）。字幕组重发修正版是因为 v1 有错（时间轴、错字、
+# 压制花屏），用户要的是 v2。做法是【先下好新版，再删旧版】：新版在 qB 里下完之前旧版一直留着，任何一步失败都不会
+# 让这一集变成"一份都没有"——漏集不可逆，多一份可以再删。
+# 只认【同一个组】的更高版本：别的组发的 v2 是它自己 v1 的修正，跟我们下的那份无关，照旧只是备用项。
+_TAG_RE = re.compile(r"\[([^\[\]]+)\]|【([^【】]+)】")
+_EPV_TAG_RE = re.compile(r"(?i)^\s*(\d+(\.\d+)?)?\s*(v\d)?\s*(end|完)?\s*$")
+
+
+def _variant_tags(raw: str) -> set:
+    """同组同集有好几个版本（简体内嵌 / 繁体内嵌 / 简繁内封…）时，用标题里的方括号标签挑和旧版最像的那份。
+    去掉第一个（组名）和集号/版本号这类标签，小写。"""
+    tags = [a or b for a, b in _TAG_RE.findall(raw or "")]
+    return {t.strip().lower() for t in tags[1:] if not _EPV_TAG_RE.match(t)}
+
+
+async def replace_versions(qb_alive: bool | None = None) -> tuple[int, int]:
+    """修正版替换的一轮：先把该下的新版交给 qB，再把新版已下完的那些集的旧版删掉。返回 (交付数, 删旧数)。
+    挂在采集轮里（_poll_lock 内），排在放行下载之后。开关：ANIME_REPLACE_VERSIONS。"""
+    if not config.ANIME_REPLACE_VERSIONS or not config.QB_ENABLED or qb_alive is False:
+        return 0, 0
+    return await _deliver_new_versions(), await _retire_old_versions()
+
+
+async def _deliver_new_versions() -> int:
+    """同组发了更高版本、这一集下过该组的旧版 → 把新版交给 qB（force：越过"一集只下一份"）。
+    跟放行下载同一个缓冲窗口：同组往往同时发简繁好几个版本，等齐了再挑。"""
+    grace = timedelta(minutes=max(0, config.ANIME_DOWNLOAD_GRACE_MIN))
+    now = datetime.now()
+    picks: list[tuple[int, str]] = []
+    with get_session() as s:
+        auto = {a.id: a for a in s.exec(select(Anime).where(*subscribed_where()))}
+        if not auto:
+            return 0
+        cands = [t for t in s.exec(select(AnimeTorrent).where(
+            AnimeTorrent.anime_id.in_(list(auto)), AnimeTorrent.status.in_(("pending", "skipped")),
+            AnimeTorrent.created_at <= now - grace))
+            if auto_downloadable_ep(t.episode) and parse_version(t.raw_title) >= 2]
+        if not cands:
+            return 0
+        keys = {(t.anime_id, t.episode) for t in cands}
+        have: dict = {}
+        for t in s.exec(select(AnimeTorrent).where(
+                AnimeTorrent.anime_id.in_({k[0] for k in keys}), AnimeTorrent.status.in_(HAVE_STATUSES))):
+            if (t.anime_id, t.episode) in keys:
+                have.setdefault((t.anime_id, t.episode, t.source), []).append(t)
+        groups: dict = {}
+        for t in cands:
+            a = auto[t.anime_id]
+            if a.pref_source and t.source != a.pref_source:
+                continue                      # 锁了源：只认锁定的组
+            if a.pref_keyword and not _kw_match(a.pref_keyword, t.raw_title):
+                continue
+            mine = have.get((t.anime_id, t.episode, t.source), [])
+            v = parse_version(t.raw_title)
+            if any(parse_version(h.raw_title) >= v for h in mine):
+                continue                      # 已经有同版或更新的了（比如简体版的 v2 已下，繁体版的 v2 不再要）
+            olds = [h for h in mine if h.archived_at is None]
+            if not olds:
+                continue                      # 没下过该组的旧版（或旧版已归档、qB 里删不掉）：不是修正，照旧当备用项
+            groups.setdefault((t.anime_id, t.episode, t.source), []).append((t, olds))
+        for key, items in groups.items():
+            ref = _variant_tags(max(items[0][1], key=lambda h: parse_version(h.raw_title)).raw_title)
+            best = max(items, key=lambda it: (parse_version(it[0].raw_title),
+                                              len(_variant_tags(it[0].raw_title) & ref), -it[0].id))[0]
+            picks.append((best.id, best.raw_title))
+    n = 0
+    for tid, raw in picks:
+        if await download_anime_torrent(tid, force=True):
+            n += 1
+            log.info("修正版：交付新版（下完后删旧版）- %s", raw)
+    return n
+
+
+async def _retire_old_versions() -> int:
+    """新版已下完的集：删掉同组的旧版（种子＋文件），旧行记成 deleted 并写明被哪一版替换。
+    新旧两版是同一个文件（qB 原地覆盖）时只删种子、不删文件——否则删掉的就是新版。"""
+    jobs: list[tuple[int, str, int, list[tuple[int, str, str | None]]]] = []
+    with get_session() as s:
+        news = [t for t in s.exec(select(AnimeTorrent).where(
+            AnimeTorrent.status == "sent", AnimeTorrent.qb_progress >= 1.0 - 1e-9))
+            if parse_version(t.raw_title) >= 2 and auto_downloadable_ep(t.episode)]
+        if not news:
+            return 0
+        for t in news:
+            v = parse_version(t.raw_title)
+            olds = [(o.id, o.info_hash, o.content_path) for o in s.exec(select(AnimeTorrent).where(
+                AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode,
+                AnimeTorrent.source == t.source, AnimeTorrent.id != t.id,
+                AnimeTorrent.status.in_(("sent", "stalled")),       # 交付中的（downloading）不碰
+                AnimeTorrent.archived_at.is_(None)))
+                if parse_version(o.raw_title) < v]
+            if olds:
+                jobs.append((t.id, t.info_hash, v, olds))
+    if not jobs:
+        return 0
+    info = await engine.qb.torrents_info([h for _, nh, _, olds in jobs for h in [nh] + [o[1] for o in olds]])
+    if info is None:
+        return 0                              # 连不上 qB：下轮再来
+    n = 0
+    for new_id, new_hash, v, olds in jobs:
+        new_cp = (info.get(new_hash) or {}).get("content_path")
+        for old_id, old_hash, old_cp in olds:
+            d = info.get(old_hash)
+            cp = (d or {}).get("content_path") or old_cp
+            same_file = not new_cp or not cp or _norm_path(new_cp) == _norm_path(cp)
+            if d is not None and not await engine.qb.delete([old_hash], delete_files=not same_file):
+                continue                      # 删失败：旧行不动，下轮再试
+            with get_session() as s:
+                o = s.get(AnimeTorrent, old_id)
+                if o is None or o.status not in HAVE_STATUSES:
+                    continue
+                o.status, o.qb_state = "deleted", ""
+                o.fail_reason = (f"已被 v{v} 替换（#{new_id}）"
+                                 + ("" if d is not None else "；qB 里已经没有这条，旧文件如果还在要手动删")
+                                 + ("；与新版同一个文件，只删了种子" if d is not None and same_file else ""))
+                s.add(o)
+                s.commit()
+            n += 1
+            log.info("修正版：已删除旧版 #%s（被 v%d #%s 替换%s）", old_id, v, new_id,
+                     "，只删种子" if same_file else "，连文件")
+    return n
+
+
+def _norm_path(p: str) -> str:
+    return (p or "").replace("\\", "/").rstrip("/").lower()
 
 
 async def download_all_pending() -> int:

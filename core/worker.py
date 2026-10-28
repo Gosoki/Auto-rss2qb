@@ -209,6 +209,10 @@ async def poll_once() -> None:
             log.info("缓冲窗口放行下载 %d 集", n)
     except Exception as e:
         loop_error("放行下载", e)
+    try:
+        await anime.replace_versions(qb_alive=qb_alive)   # 同组修正版：先下新版、下完删旧版
+    except Exception as e:
+        loop_error("修正版替换", e)
     # 【落一行"这一轮发生了什么"】(R36 体检 ux-5) 抓取失败以前只进日志 —— /logs 是 200 条环形缓冲，
     # 真库每天 400+ 行、约 10 小时就冲掉；一天看一次的用户在页面上看不到夜里的失败，6 条 feed 全 403 时
     # 仪表盘与正常时逐字相同。与剧场版的 MOVIE_SCAN_LAST 同一条路：运行时键、只记最近一轮、不做历史。

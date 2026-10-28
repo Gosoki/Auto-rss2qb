@@ -116,6 +116,7 @@ _SPEC = {
     "ANIME_POLL_INTERVAL": (int, 1200),
     "ANIME_DOWNLOAD_GRACE_MIN": (int, 120),
     "ANIME_TOP_PRIORITY_INSTANT": (bool, True),
+    "ANIME_REPLACE_VERSIONS": (bool, True),     # 同一个组发了修正版（v2…）：先下好新版，再删掉旧版（种子和文件）
     "ANIME_START_DATE": (str, ""),          # 开始使用日 YYYY-MM-DD：早于这天开播的番自动判『超期忽略』、不自动下载
                                             # （种子照常入库）；空=不限。改日期可逆，只动待确认/超期番，不碰人工确认/拒绝。
                                             # 【只作用于 TV 番剧】：剧场版逐版本人工点下、本就不会自动下载，

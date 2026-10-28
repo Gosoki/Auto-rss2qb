@@ -759,3 +759,113 @@ def test_sync_records_content_path(clean_tables, cfg, monkeypatch):
     asyncio.run(ce.sync_qb_status(AnimeTorrent))
     with clean_tables.get_session() as s:
         assert s.get(AnimeTorrent, tid).content_path == "E:\\Anime\\AutoRSS\\26D\\番\\01.mp4"
+
+
+# ── 修正版替换（同组 v2：先下新版，下完删旧版）────────────────────────
+
+@pytest.mark.parametrize("raw,v", [
+    ("[ANi] x - 04 [1080P][Baha][WEB-DL][AAC AVC][CHT][V2][MP4]", 2),
+    ("[桜都字幕组] x [01v2][1080P][简体内嵌]", 2),
+    ("[百冬练习组&LoliHouse] x - 81 v2 [WebRip 1080p HEVC-10bit AAC]", 2),
+    ("【喵萌奶茶屋】★04月新番★[x][09][1080p][繁日雙語][v2]", 2),
+    ("[ANi] x - 04 [1080P][Baha][WEB-DL][AAC AVC][CHT][MP4]", 1),
+    ("[LoliHouse] x - 05 [WebRip 1080p HEVC-10bit AAC][AV1]", 1),
+])
+def test_parse_version(raw, v):
+    from sources.parse import parse_version
+    assert parse_version(raw) == v
+
+
+def _versions_setup(clean_tables, cfg, monkeypatch, rows, qb_paths):
+    """rows=[(key, source, raw, status, content_path)]；qb_paths={key: qB 回报的 content_path 或 None=qB 里没有}"""
+    from core import engine
+    cfg(ANIME_REPLACE_VERSIONS=True, QB_ENABLED=True, ANIME_DOWNLOAD_GRACE_MIN=0, ANIME_FINISH_UNSUB=False)
+    old = datetime.now() - timedelta(hours=3)
+    ids = {}
+    with clean_tables.get_session() as s:
+        a = _a(title="学生会也有洞", bangumi_id=1)
+        s.add(a)
+        s.commit()
+        for i, (k, src, raw, st, cp) in enumerate(rows):
+            t = AnimeTorrent(anime_id=a.id, info_hash=f"{i + 1:040x}", raw_title=raw, episode=4, source=src,
+                             status=st, content_path=cp, created_at=old,
+                             qb_progress=1.0 if st == "sent" else 0.0)
+            s.add(t)
+            s.commit()
+            ids[k] = t.id
+    hashes = {k: f"{i + 1:040x}" for i, (k, *_r) in enumerate(rows)}
+    calls = []
+
+    async def fake_download(tid, force=False):
+        calls.append(("download", tid, force))
+        with clean_tables.get_session() as s:
+            t = s.get(AnimeTorrent, tid)
+            t.status, t.qb_progress = "sent", 1.0
+            s.add(t)
+            s.commit()
+        return True
+
+    async def fake_info(hs):
+        return {hashes[k]: {"content_path": p} for k, p in qb_paths.items() if p is not None}
+
+    async def fake_delete(hs, delete_files=True):
+        calls.append(("delete", tuple(hs), delete_files))
+        return True
+    monkeypatch.setattr(A, "download_anime_torrent", fake_download)
+    monkeypatch.setattr(engine.qb, "torrents_info", fake_info)
+    monkeypatch.setattr(engine.qb, "delete", fake_delete)
+    return ids, hashes, calls
+
+
+def test_same_group_v2_replaces_v1(clean_tables, cfg, monkeypatch):
+    """学生会也有洞 第 4 集：ANi 的 V2 被去重判成 skipped。同组 v2 → 先下新版，下完删旧版（连文件）；
+    别的组发的 v2 是它自己的修正，跟我们下的那份无关，不动。"""
+    ids, hashes, calls = _versions_setup(clean_tables, cfg, monkeypatch, [
+        ("v1", "ANi", "[ANi] 学生会也有洞！ - 04 [1080P][Baha][WEB-DL][AAC AVC][CHT][MP4]", "sent", None),
+        ("v2", "ANi", "[ANi] 學生會也有洞！ - 04 [1080P][Baha][WEB-DL][AAC AVC][CHT][V2][MP4]", "skipped", None),
+        ("other", "绿茶字幕组", "[绿茶字幕组] 学生会 [04v2][WebRip][1080p][简繁日内封]", "pending", None),
+    ], {"v1": "E:/A/04.mp4", "v2": "E:/A/04 [V2].mp4"})
+    assert asyncio.run(A.replace_versions()) == (1, 1)
+    assert calls == [("download", ids["v2"], True), ("delete", (hashes["v1"],), True)]
+    with clean_tables.get_session() as s:
+        v1 = s.get(AnimeTorrent, ids["v1"])
+        assert v1.status == "deleted" and f"#{ids['v2']}" in v1.fail_reason
+        assert s.get(AnimeTorrent, ids["other"]).status == "pending"
+    calls.clear()
+    assert asyncio.run(A.replace_versions()) == (0, 0) and calls == [], "替换完就不再动"
+
+
+def test_v2_picks_same_variant_and_keeps_shared_file(clean_tables, cfg, monkeypatch):
+    """同组同时发了简体/繁体/简繁三个 v2：挑和旧版一样的简体内嵌。新旧同一个文件（qB 原地覆盖）时只删种子。"""
+    ids, hashes, calls = _versions_setup(clean_tables, cfg, monkeypatch, [
+        ("v1", "桜都字幕组", "[桜都字幕组] 鼠标 / Mouse [04][1080P][简体内嵌]", "sent", "E:/A/04.mp4"),
+        ("tc", "桜都字幕组", "[桜都字幕组] 鼠标 / Mouse [04v2][1080P][繁体内嵌]", "pending", None),
+        ("sc", "桜都字幕组", "[桜都字幕组] 鼠标 / Mouse [04v2][1080P][简体内嵌]", "pending", None),
+        ("mix", "桜都字幕组", "[桜都字幕组] 鼠标 / Mouse [04v2][1080P][简繁内封]", "pending", None),
+    ], {"v1": "E:/A/04.mp4", "sc": "E:\\A\\04.mp4"})
+    asyncio.run(A.replace_versions())
+    assert calls == [("download", ids["sc"], True), ("delete", (hashes["v1"],), False)]
+    with clean_tables.get_session() as s:
+        assert "只删了种子" in s.get(AnimeTorrent, ids["v1"]).fail_reason
+        assert {s.get(AnimeTorrent, ids[k]).status for k in ("tc", "mix")} == {"pending"}
+
+
+def test_old_version_kept_until_new_one_finishes(clean_tables, cfg, monkeypatch):
+    """新版还没下完：旧版一根头发都不动（漏集不可逆）。开关关掉：什么都不做。"""
+    ids, hashes, calls = _versions_setup(clean_tables, cfg, monkeypatch, [
+        ("v1", "ANi", "[ANi] x - 04 [1080P][CHT][MP4]", "sent", None),
+        ("v2", "ANi", "[ANi] x - 04 [1080P][CHT][V2][MP4]", "sent", None),
+    ], {"v1": "E:/A/a.mp4", "v2": "E:/A/b.mp4"})
+    with clean_tables.get_session() as s:
+        t = s.get(AnimeTorrent, ids["v2"])
+        t.qb_progress = 0.4
+        s.add(t)
+        s.commit()
+    assert asyncio.run(A.replace_versions()) == (0, 0) and calls == []
+    cfg(ANIME_REPLACE_VERSIONS=False)
+    with clean_tables.get_session() as s:
+        t = s.get(AnimeTorrent, ids["v2"])
+        t.qb_progress = 1.0
+        s.add(t)
+        s.commit()
+    assert asyncio.run(A.replace_versions()) == (0, 0) and calls == []

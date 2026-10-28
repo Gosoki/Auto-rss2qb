@@ -1070,6 +1070,9 @@ def settings():
                      config.ANIME_DOWNLOAD_GRACE_MIN)
             _switch_field("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
                     config.ANIME_TOP_PRIORITY_INSTANT)
+            _switch_field("ANIME_REPLACE_VERSIONS",
+                    "同一个组发了修正版（v2…）就替换：先下好新版，再删掉旧版的种子和文件",
+                    config.ANIME_REPLACE_VERSIONS)
             _switch_field("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（识别 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
