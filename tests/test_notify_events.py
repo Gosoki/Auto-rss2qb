@@ -186,7 +186,8 @@ def test_event_keys_are_stable():
     assert set(N.EVENTS) == {"delivered", "movie", "failed", "stalled", "finished",
                              "idle", "qb_down", "db_down", "backlog",
                              "poll_stall", "source_down", "feed_gap", "lock_lag",   # r37 新增
-                             "gap"}                                                 # r38 新增
+                             "gap",                                                 # r38 新增
+                             "lock_fallback"}                                       # r39 新增（E-74）
 
 
 def test_default_subscription_preserves_old_behaviour():

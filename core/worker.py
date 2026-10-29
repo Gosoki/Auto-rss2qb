@@ -5,9 +5,11 @@
 """
 import asyncio
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import time
+
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from core import anime
 import config
@@ -129,6 +131,10 @@ async def poll_once() -> None:
         health.record_source(_n, False, "源组配置有问题（未知站点 / feed 为空）")
     feed_cache: dict = {}
     new_gaps: list[dict] = []        # 本轮发现的 RSS 断档（见 core/health.check_window）
+    # (r39 A13) 每个 feed 本轮第一次碰到时记着的 seen，与本轮撞上过业务库连接错误的 feed —— 决定组末
+    # seen 推进到哪（规则见每组末尾的 mark_seen）。键同 feed_cache，【不许进日志】。
+    round_prev: dict = {}
+    broke_urls: set = set()
     uses_left = Counter(getattr(s, "rss_url", None) for s in sources)
     # 本轮"没抓到"的源名，轮末写进 ANIME_POLL_FAILED 给仪表盘看。分母要含构造阶段就被跳过的组
     # （feed 为空 / 未知站点），不然配置坏了的源组在徽标上是隐形的（核实意见）。
@@ -167,11 +173,17 @@ async def poll_once() -> None:
         if health.fail_streak(source.name) >= 2:
             log.info("源 %s 恢复了（之前连续 %d 轮抓取失败）", source.name, health.fail_streak(source.name))
         health.record_source(source.name, True)
-        # 【窗口溢出】这一轮 feed 里最老的一条都比上次成功抓取还晚 → 中间那段已经滚出 RSS（r37 #1）
-        _gap = health.check_window(_url or source.name, getattr(source, "oldest_entry_time", None))
+        # 【窗口溢出】这一轮 feed 里最老的一条都比 seen（这之前的发布都已处理过）还晚 → 中间那段已经滚出 RSS（r37 #1）
+        # 【只算不写】(r39 A13) 抓到了不等于入库了：seen 等本组条目处理完再写，见本组末尾。
+        _key = _url or source.name
+        _t = datetime.now(timezone.utc)
+        _oldest = getattr(source, "oldest_entry_time", None)
+        if _key not in round_prev:
+            round_prev[_key] = health.seen_at(_key)
+        _gap = health.check_window(_key, _oldest, now=_t, commit=False)
         if _gap:
             new_gaps.append(health.gap_record(source.name, *_gap))
-            log.warning("RSS 断档：源 %s 在 %s ~ %s 之间的发布已滚出 feed（这段时间没抓到），可能漏集",
+            log.warning("RSS 断档：源 %s 在 %s ~ %s 之间的发布已滚出 feed（这段时间没抓到或没入库），可能漏集",
                         source.name, _gap[0].astimezone().strftime("%m-%d %H:%M"),
                         _gap[1].astimezone().strftime("%m-%d %H:%M"))
         # 【本源这一批的 hash 一次查完】RSS 一轮的条目绝大多数是上一轮就见过的，
@@ -184,9 +196,15 @@ async def poll_once() -> None:
         # 所以处理完就补进集合：无论它是被入库还是被过滤掉，同一轮里再见到都该是同样的结局。
         known = engine.existing_hashes(
             AnimeTorrent, [getattr(i, "info_hash", "") for i in items])
+        # (r39 I8) 别的源先收过、行上优先级比本源低的待下种子：提到本源的优先级（见 anime.promote_known）。
+        # 本源没设优先级（0）时不查库。items 已按本组字幕组/标题过滤过，提的只是本组真会收的那些。
+        promote = anime.promotable_hashes([getattr(i, "info_hash", "") for i in items],
+                                          getattr(source, "priority", 0) or 0)
         new = 0
         for item in items:
             try:
+                if getattr(item, "info_hash", "") in promote:
+                    anime.promote_known(item)
                 if await process_item(item, known_hashes=known, qb_alive=qb_alive):
                     new += 1
             except db.DatabaseBusy:
@@ -197,10 +215,28 @@ async def poll_once() -> None:
                 raise
             except Exception as e:
                 loop_error(f"处理 {getattr(item, 'anime_title', '?')}", e)
+                # 业务库连不上：这一条没入库，本组的 seen 不能推进到抓取时刻（见下）。
+                # 判据与 pages/layout.py 的页面兜底同口径：锁竞争、表结构这类不算"库停了"。
+                if isinstance(e, (OperationalError, InterfaceError)) and db.looks_like_connection_error(e):
+                    broke_urls.add(_key)
             finally:
                 health.touch()
                 if getattr(item, "info_hash", ""):
                     known.add(item.info_hash)   # 同一 feed 内的重复条目不再重复识别（理由见上）
+        # 【seen 推进到哪】(r39 A13) seen 的意思是"这之前的发布都处理过了"，下一轮拿它判断有没有断档。
+        # 早先抓到就写成抓取时刻：条目撞上业务库连接错误被 loop_error 吞掉，seen 照样推进 ——
+        # 库停得久一点、那几条滚出 feed，下一轮判不出断档，就是静默漏集。
+        # · 没撞上连接错误 → 推进到抓取时刻 _t（与以前相同）；
+        # · 撞上了 → 只推进到 max(本轮开头的 seen, 本轮 feed 最老一条)：本轮已报过的断档下一轮不重报；
+        #   失败的条目要是在下一轮之前滚出了 feed，[本轮最老, 下一轮最老] 会作为新断档报出来；
+        #   最老一条早于原 seen 时等于原地不动，下一轮整组重来。
+        # · 同一个 URL 被两组共用时，本轮只要有一组撞上，后面的组也按这条写（否则后一组的 _t 会把它盖掉）。
+        # DatabaseBusy / existing_hashes 抛出、整轮早退时走不到这里，什么都不写，下一轮会重新算出断档。
+        if _key in broke_urls:
+            health.mark_seen(_key, max((t for t in (round_prev[_key], _oldest) if t is not None),
+                                       default=None))
+        else:
+            health.mark_seen(_key, _t)
         log.info("源 %s：%d 条，新增 %d", source.name, len(items), new)
 
     try:
@@ -217,6 +253,16 @@ async def poll_once() -> None:
         await anime.deliver_single_works(qb_alive=qb_alive)   # 在追的单部作品一份都没下：挑一份下
     except Exception as e:
         loop_error("单部作品放行", e)
+    try:
+        # 锁定源停更兜底（E-74）。本轮新发现的断档要到下面才写进 FEED_GAPS，这里一并传进去：
+        # 不然采集停摆后恢复的那一轮，断档闸还看不见这段空白，兜底正好在这一轮触发（#10 的形状）
+        # 有源在失败时跳过 B 步、A 步照跑（r39 F29）：断档只在源抓到时才算得出来，承载锁定组的源连续失败期间
+        # 既没有断档记录也没有锁定组新行，静默满 N 天会被当成停更。本轮没抓到的、连续失败到阈值的都算；
+        # 整机断网（health.network_down）必然也在 failing_sources 里，不另判。
+        _failing = bool(failed_sources) or bool(health.failing_sources())
+        await anime.deliver_lock_fallback(qb_alive=qb_alive, new_gaps=new_gaps, sources_failing=_failing)
+    except Exception as e:
+        loop_error("锁定源兜底", e)
     # 【落一行"这一轮发生了什么"】(R36 体检 ux-5) 抓取失败以前只进日志 —— /logs 是 200 条环形缓冲，
     # 真库每天 400+ 行、约 10 小时就冲掉；一天看一次的用户在页面上看不到夜里的失败，6 条 feed 全 403 时
     # 仪表盘与正常时逐字相同。与剧场版的 MOVIE_SCAN_LAST 同一条路：运行时键、只记最近一轮、不做历史。
@@ -382,13 +428,19 @@ async def run_db_watch() -> None:
 
 
 async def _check_poll_health() -> None:
-    """采集停摆 / 暂停太久 / 源连续失败 → 状态型通知（只在翻转时各发一条）。挂在看守协程的 30 秒节拍上：
+    """采集停摆 / 暂停太久 / 源连续失败 → 状态型通知（翻转时各发一条；source_down 已在坏着时
+    又冒出新的失败源也再推一条，见下）。挂在看守协程的 30 秒节拍上：
     采集循环自己卡住时它发现不了自己，而看守协程是独立的一条。判据见 core/health.py。"""
     try:
         problem = health.poll_problem()
         await notify_state("poll_stall", problem is not None, problem or "", "采集恢复正常")
         sp = health.sources_problem()
-        await notify_state("source_down", sp is not None, sp or "", "源抓取恢复正常")
+        # 【带上成员】(r39 A11) A 挂着时 B 也挂了，纯边沿不会再说话；传失败源组名，出现新的失败源就再推一条
+        # （文案照旧是 sources_problem 的全量列表）。断网刚开始可能按源逐条推几条（每个 kind 每小时 12 条封顶），
+        # 最后一条是"多半断网"：poll_once 逐个抓源，黑洞式断网下每个源要等满连接超时才算失败，
+        # 看守读的是实时的失败名单，会依次看到 {A}、{A,B}…… 每次都是新成员。是吵不是误报，r39 审查后选择接受。
+        await notify_state("source_down", sp is not None, sp or "", "源抓取恢复正常",
+                           members=frozenset(n for n, _, _ in health.failing_sources()))
     except Exception as e:
         loop_error("采集健康检查", e)
 
@@ -718,7 +770,8 @@ async def run_all_once() -> tuple[bool, str]:
     else:
         try:
             async with _scan_lock:
-                if await movies.auto_scan_tick():
+                # (r39 F26) 用户明确点的：绕过失败退避闸（否则修好网络后点这里，扫描被静默跳过还报绿色成功）
+                if await movies.auto_scan_tick(respect_backoff=False):
                     log.info("重新激活：剧场版自动扫描完成")
         except Exception as e:
             loop_error("重新激活：剧场版扫描", e)

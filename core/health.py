@@ -14,8 +14,9 @@
           关久了就是在静默漏集，这件事用户未必知道。
   · 源连续失败：同一个源组连着 N 轮抓不到（网络、403、站点返回维护页）。只看"上一轮"的话，
           一个源坏了三天，页面上和偶尔抖一下没有区别。
-  · 窗口溢出：每个 feed 记下"上次成功抓到的时刻"；这一轮成功抓到时，若 feed 里最老一条都比它晚，
-          中间那段就已经滚出 RSS、永远看不到了。这是零误报的：说"可能漏了"的那段时间里我们确实一条都没看到。
+  · 窗口溢出：每个 feed 记下 seen ——"这之前的发布都已处理过"（正常等于上次抓取时刻）；这一轮成功抓到时，
+          若 feed 里最老一条都比它晚，中间那段就已经滚出 RSS、永远看不到了。这是零误报的：说"可能漏了"的
+          那段时间里我们确实一条都没处理到。入库撞上连接错误时，断档也可能落在抓到但没入库的那段（r39 A13）。
 """
 import hashlib
 import json
@@ -34,7 +35,8 @@ _alive: set = set()                   # 上一轮启用着的源组名（forget_
 # 一看就是"这台机器连不上网"的失败原因（DNS 解析不了、连接被拒/超时、路由不可达）
 _NET_HINTS = ("name resolution", "Name or service not known", "nodename nor servname",
               "ConnectError", "ConnectTimeout", "Network is unreachable", "No route to host")
-# feed 键 → 上次成功抓取的时刻（UTC ISO）。持久化在运行时配置 SOURCE_FEED_SEEN 里（重启之后正要用它）。
+# feed 键 → seen：这之前的发布都已处理过（正常等于上次抓取时刻；UTC ISO）。
+# 持久化在运行时配置 SOURCE_FEED_SEEN 里（重启之后正要用它）。
 _seen: dict | None = None
 _GAP_MIN = timedelta(minutes=10)      # 小于这个的"断档"只是两边时钟差，不报
 _GAPS_KEEP = 10
@@ -110,19 +112,36 @@ def _load_seen() -> dict:
     return _seen
 
 
-def check_window(url: str, oldest: datetime | None, now: datetime | None = None):
-    """这个 feed 这一轮成功抓到了：记下时刻，并判断上次到这次之间有没有一段滚出了 RSS。
-    返回 (上次成功时刻, 这次最老一条的时刻)（都是带时区的 UTC），没有断档返回 None。
-    同一个 URL 被两个源组共用时，第二个组读到的"上次"就是第一个组刚写的，不会重复报。"""
+def seen_at(url: str) -> datetime | None:
+    """这个 feed 记着的 seen：这之前的发布都已处理过（正常等于上次抓取时刻；带时区的 UTC）。
+    没记过 / 记坏了返回 None。"""
     seen = _load_seen()
     k = _feed_key(url)
-    now = now or datetime.now(timezone.utc)
-    prev = None
     try:
-        prev = datetime.fromisoformat(seen[k]) if k in seen else None
+        return datetime.fromisoformat(seen[k]) if k in seen else None
     except (ValueError, TypeError):
-        prev = None
-    seen[k] = now.isoformat(timespec="seconds")
+        return None
+
+
+def mark_seen(url: str, t: datetime | None) -> None:
+    """把这个 feed 的 seen 写成 t：这之前的发布都已处理过（正常等于上次抓取时刻；
+    撞上业务库连接错误时 worker 会写得更早，规则在 poll_once）。t 为 None 时不写。(r39 A13)"""
+    if t is not None:
+        _load_seen()[_feed_key(url)] = t.isoformat(timespec="seconds")
+
+
+def check_window(url: str, oldest: datetime | None, now: datetime | None = None, *,
+                 commit: bool = True):
+    """这个 feed 这一轮成功抓到了：记下时刻，并判断上次到这次之间有没有一段滚出了 RSS。
+    返回 (seen, 这次最老一条的时刻)（都是带时区的 UTC），没有断档返回 None。
+    同一个 URL 被两个源组共用时，第二个组读到的"上次"就是第一个组刚写的，不会重复报。
+
+    commit=False：只算断档、不写时刻 (r39 A13)。"抓到了"不等于"入库了"——worker 要等这一组条目
+    处理完、看有没有撞上业务库连接错误，再用 mark_seen 决定推进到哪（规则写在 poll_once 里）。"""
+    now = now or datetime.now(timezone.utc)
+    prev = seen_at(url)
+    if commit:
+        mark_seen(url, now)
     if prev is None or oldest is None:
         return None
     if oldest - prev > _GAP_MIN:

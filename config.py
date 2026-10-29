@@ -117,6 +117,7 @@ _SPEC = {
     "ANIME_DOWNLOAD_GRACE_MIN": (int, 120),
     # 取种失败（源站超时/502/DNS）或重启打断交付时，依次等这么多分钟再试；用完转 error（error 不自动重试）。
     # 合计就是"断网能扛多久"。解析/校验只此一份：core.engine.parse_retry_backoff
+    # 所有源都连不上（整机断网）期间用满不转失败，按最后一档继续排队（r39 D7b，见 core.anime._retry）。
     "ANIME_RETRY_BACKOFF_MIN": (list, "1,5,30,180,720,1440"),
     "ANIME_TOP_PRIORITY_INSTANT": (bool, True),
     "ANIME_BACKFILL_PREAIR_DAYS": (int, 30),    # 补齐时，发布早于本季开播日这么多天的种子当成前几季的、不收（0=不限）
@@ -124,6 +125,9 @@ _SPEC = {
     "ANIME_BACKFILL_PREFER": (str, "1080"),     # 补齐时同一集多个版本：版本关键词之后，先试含这个词的（空=不偏好）
     "ANIME_SINGLE_WORK_AUTO": (bool, True),     # 在追的单部作品（bgm 只有 1 集的 WEB/OVA/剧场版）没标集号的种子：一份都没下时自动挑一份下；像剧场版的先打回待确认，你点了确认才下
     "ANIME_REPLACE_VERSIONS": (bool, True),     # 同一个组发了修正版（v2…）：先下好新版，再删掉旧版（种子和文件）
+    # 修正版与旧版发布时间最多相差几天（1~60）：超过的 v2 多半是别季同集号挂错了番，不当修正版：
+    # 不自动下它、旧版不动（人工下的 v2 也不会顶掉旧版）（r39 I6）
+    "ANIME_REPLACE_MAX_GAP_DAYS": (int, 30),
     "ANIME_START_DATE": (str, ""),          # 开始使用日 YYYY-MM-DD：早于这天开播的番自动判『超期忽略』、不自动下载
                                             # （种子照常入库）；空=不限。改日期可逆，只动待确认/超期番，不碰人工确认/拒绝。
                                             # 【只作用于 TV 番剧】：剧场版逐版本人工点下、本就不会自动下载，
@@ -145,7 +149,7 @@ _SPEC = {
     # 这与本项目别处"留空=不限"（字幕组白名单、标题关键词）恰好相反，设置页上写明了。
     # 默认值含 delivered，所以老库升级后【行为一字不变】（load_from_db 只补缺键）。
     "NOTIFY_EVENTS": (list, "delivered,movie,failed,stalled,finished,idle,qb_down,db_down,backlog,"
-                            "poll_stall,source_down,feed_gap,lock_lag,gap"),
+                            "poll_stall,source_down,feed_gap,lock_lag,gap,lock_fallback"),
     "NOTIFY_MAX_PER_HOUR": (int, 20),       # 全事件合计的限流上限（0=不限）。被丢弃的条数会挂在下一条消息尾巴上
     "NOTIFY_BACKLOG_MIN": (int, 5),         # 『待识别』积压到几部才提醒
     "ALERT_REPEAT_HOURS": (int, 6),         # 下载失败/停滞/绑定看着不对：同一批多少小时内只说一次（有新成员立刻再说）
@@ -164,6 +168,9 @@ _SPEC = {
     "ANIME_RERELEASE_WEEKS": (int, 20),     # 同号新集：新来的种子比这一集已下的那份晚这么多周以上就提醒（多半是新一季用季内编号；0=关）
     "ANIME_LOCK_LAG_DAYS": (int, 7),        # 锁定源落后提醒：别的组已有后续集、锁定源过了这么多天还没跟上才提醒（0=关）
     "ANIME_LOCK_SYNC_DAYS": (int, 2),       # 锁定组在别组发某集前后这么多天内也在发（且集号差得远）→ 当两套编号同步在发，不算落后（只影响提醒）
+    # 锁定源停更兜底（E-74）：锁定组满这么多天没新东西、编号/发布时间核对无误的缺集，用别的组补一份（0=关）。
+    # 判据见 core.anime.lock_fallback_plan。应不小于 ANIME_LOCK_LAG_DAYS：提醒先到，人才来得及介入
+    "ANIME_LOCK_FALLBACK_DAYS": (int, 14),
     "SWEEP_INTERVAL_MIN": (int, 180),       # 完结/断更巡检的间隔（分钟）
     # ---- 采集健康（见 core/health.py；r37：容器停了 15 天全程零提醒）----
     "ALERT_POLL_STALL_MIN": (int, 90),      # 采集开着却这么多分钟没有任何动静 → 停摆提醒（实际取它与 3 个轮询间隔的较大者）
@@ -188,10 +195,13 @@ _SPEC = {
     "MOVIE_SCAN_INTERVAL": (int, 604800),   # 每隔多少秒自动扫一次剧场版（默认 7 天）——
                                             # 剧场版桶更新很慢，扫太勤没意义、只是白打 Mikan
     "MOVIE_SCAN_LAST": (str, ""),           # 上次扫描时间（ISO，运行时更新；非用户填）
+    # 下面两项在 /movies『自动扫描』卡上改，合法范围见 core/movies.SCAN_SETTING_RANGE（读取与保存都经它钳）
+    "MOVIE_REFRESH_BACK_YEARS": (int, 2),   # 自动扫描时顺带刷新年份在 [当年-N, 当年] 的已有片的版本（只拉种子 RSS，0=关）(r39)
+    "MOVIE_SCAN_RETRY_MIN": (int, 30),      # 当年扫描整轮失败后的首次重试等待（分钟），每失败一次翻倍、封顶为扫描间隔 (r39)
     "ANIME_POLL_LAST": (str, ""),           # 上一轮采集结束时间（ISO，运行时更新；非用户填）(R36 ux-5)
     "ANIME_POLL_FAILED": (str, ""),         # 上一轮抓取失败的源名（换行分隔，空=全部成功；运行时更新；非用户填）
     "ANIME_POLL_OK_LAST": (str, ""),        # 上次至少有一个源抓到的那一轮结束时间（ISO，运行时更新；非用户填）
-    "SOURCE_FEED_SEEN": (str, ""),          # 每个 feed 上次成功抓取的时刻（JSON，键是 URL 摘要；运行时更新；非用户填）
+    "SOURCE_FEED_SEEN": (str, ""),          # 每个 feed 的 seen：这之前的发布都已处理过（正常等于上次抓取时刻；JSON，键是 URL 摘要；运行时更新；非用户填）
     "FEED_GAPS": (str, ""),                 # 检测到的 RSS 断档、用户还没点『知道了』的（JSON；运行时更新；非用户填）
     # ---- 自动备份（整库快照，走 VACUUM INTO；见 db/backup.py）----
     # 这是全项目唯一"出事就没救"的空白的补丁：我们有迁移、有 Alembic、有停摆自愈，
@@ -215,11 +225,14 @@ _SPEC = {
 # 设置页保存时越界直接拒收。raw() 仍返回存储值。
 _RANGE: dict[str, tuple[int, int]] = {
     "ANIME_LOCK_SYNC_DAYS": (0, 14),
+    "ANIME_LOCK_FALLBACK_DAYS": (0, 90),
     "ANIME_IDLE_WINDOW_X": (2, 52),
     "ANIME_IGNORED_AIRING_DAYS": (1, 365),
     "ANIME_BACKFILL_EXTRA_EPS": (0, 8),
     "ALERT_REPEAT_HOURS": (1, 720),
     "ALERT_REPEAT_DAYS": (1, 90),
+    # 上限 60：12 集一季两季紧挨着播时同集号相隔约 84 天，放到 85 以上就分不开了；合法修正版实测最大间隔 20.5 天
+    "ANIME_REPLACE_MAX_GAP_DAYS": (1, 60),
 }
 
 # 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集

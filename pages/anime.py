@@ -327,7 +327,7 @@ def anime_page(t: str = ""):
                 ("已交付", ov["status"]["sent"], "green",
                  "已发送给 qB 的种子数（含仍在下载的）。真正下完的看下方『已完成』"),
                 ("将下载", ps["will"], "blue", "已确认番·本集首选，会自动下（特别篇/未知集不在其列，需手动下）"),
-                ("备用项", ps["backup"], "blue-grey", "同集已有『将下载/已下』的更优版本，不会自动下"),
+                ("备用项", ps["backup"], "blue-grey", "同集已有『将下载/已下』的更优版本，或该集已人工删除，不会自动下"),
                 # 被锁定源挡住、这一集一份都没有的（r37 #2）：以前混在『备用项』里，说法正好相反
                 *([("锁源缺集", ps["locked"], "orange",
                     "番锁了下载源，这些是别的组发的、锁定源还没跟上的集——这一集一份都没下。"
@@ -355,7 +355,9 @@ def anime_page(t: str = ""):
             for _lb, _key, _cl, _tip in (
                 ("下载中", "downloading", "blue", "已挑中正在交付给 qB 的瞬时态（通常一闪而过）"),
                 ("停滞", "stalled", "deep-orange", "已交付但长期零推进，脱离轮询、等人工处理"),
-                ("已删除", "deleted", "grey", "人工删过的种子（同集来新 hash 仍会照常下）"),
+                ("已删除", "deleted", "grey",
+                 "人工删过的种子。删的若是那一集仅剩的一份，后台不再自动下这一集的其它版本；"
+                 "只删了重复份的，同集照常补"),
                 ("已排除", "excluded", "grey", "人工排除的种子（不再参与自动下载）"),
             ):
                 if ov["status"].get(_key):
@@ -402,18 +404,15 @@ def anime_page(t: str = ""):
                 # 【档位跟同类走】上面『补下全部』『立刻刷新』与 /movies 的『立刻刷新』都是
                 # 页头行里的 outline 触发器、都是 btn-sm；R18 里我把这一个改成了 14px，
                 # 于是同一页同一角色出现两种尺寸——正是这轮统一要根除的形状。四个一律 12px。
-                _rb = ui.button("刷新资料", icon="sync").props(
+                # 【范围选择是 page 级的 reident_dlg，不是挂在按钮上的 ui.menu】(r39 U15) 本面板每 30 秒被定时器
+                # 重建：菜单开着时会被收掉；更糟的是菜单项就是长操作的处理器槽位，几分钟后跑完时槽位早被回收，
+                # 完成/失败提示都发不出来。
+                _rb = ui.button("刷新资料", icon="sync", on_click=reident_dlg.open).props(
                     "outline color=primary").classes("btn-sm")
                 _rb.tooltip("按 bgm 重新拉封面/评分/总集数/放送日等元数据。"
                             "【已经绑好的番只刷资料、不会改绑定】——批量重新匹配在真库上实测"
                             "错误率 4.3%，而已有绑定的正确率是 98%。"
                             "要改某一部的绑定去它的详情页，那里有绑定回显。")
-                with _rb:
-                    with ui.menu():
-                        ui.menu_item("刷新当季", on_click=_reident(1))
-                        ui.menu_item("刷新半年（近 2 季）", on_click=_reident(2))
-                        ui.menu_item("刷新 1 年（近 4 季）", on_click=_reident(4))
-                        ui.menu_item("刷新全部", on_click=_reident(None))
             with ui.row().classes("gap-2 flex-wrap pl-1"):
                 ui.badge("采集开启" if ov["config"]["poll_on"] else "采集暂停").props(
                     f"color={'green' if ov['config']['poll_on'] else 'red'}").tooltip(
@@ -448,6 +447,7 @@ def anime_page(t: str = ""):
         @ui.refreshable
         def confirm_panel():
             pend = anime.pending_confirm()
+            _seen["confirm"] = _sig("confirm", pend)   # 切回本 tab 时据此判断要不要重建（见 _TAB_SIG）
             if not pend:
                 ui.label("没有待确认的番。（『人工审核』策略的源组发现的番、补齐入库了新种子的番会出现在这里）").classes("text-gray-500 p-4")
                 return
@@ -594,6 +594,7 @@ def anime_page(t: str = ""):
         @ui.refreshable
         def fail_panel():
             items = anime.list_unmatched_anime()
+            _seen["fail"] = _sig("fail", items)        # 同 confirm_panel
             if not items:
                 ui.label("没有待识别的番。（bgm 没自动匹配上的番会出现在这里，可重试或手动绑定）").classes(
                     "text-gray-500 p-4")
@@ -687,7 +688,8 @@ def anime_page(t: str = ""):
                                           auto_off=off_why.get(r["anime_id"], ""),
                                           retry_at=r.get("retry_at"),
                                           single_work=r["anime_id"] in sw,
-                                          locked_out=r.get("locked_out", False))
+                                          locked_out=r.get("locked_out", False),
+                                          dropped=r.get("dropped", False))
                 rows.append({
                     "id": r["id"],
                     "detail_id": r["anime_id"],
@@ -813,6 +815,24 @@ def anime_page(t: str = ""):
         }
         _dirty: set = set()   # 建过、但自上次操作后还没刷新的 tab；切过去时补刷（见 _on_tab）
 
+        # 【待确认/待识别 切回来时按数据签名决定刷不刷】(r39 U13) 这两个 tab 不进 30 秒定时器
+        # （卡片上有半途输入，见 _refresh_live），于是后台新进来的番、别的标签页做的操作，切回来也看不到——
+        # 空的待确认 tab 永远停在"没有待确认的番"。切回来时比一下签名：变了才重建，没变不碰，半途输入保得住。
+        # · 用 frozenset 不用 tuple：pending_confirm() 没有 ORDER BY，MySQL 不保证行序，数据没变也会判成变了；
+        # · 待确认要带上 pref_source：别处给某部番锁了源而成员没变时，卡片下拉还是旧快照，
+        #   这时点卡片上的『确认下载』会把旧值写回、静默解掉刚设的锁（同 r37 #11）。
+        # 不接到 page_visibility：待识别的典型操作就是切去别的浏览器标签页复制 bgm 链接再回来，回前台重建会打断它。
+        _seen: dict = {}      # {tab: 上次建面板时的签名}，由 confirm_panel / fail_panel 自己写
+
+        def _sig(key, items):
+            """两处共用的签名口径（面板建时记、切回来时比），免得两边各写一份算法分叉。"""
+            if key == "confirm":
+                return frozenset((a.id, a.pref_source or "") for a in items)
+            return frozenset(a.id for a in items)
+
+        _TAB_SIG = {"confirm": lambda: _sig("confirm", anime.pending_confirm()),
+                    "fail": lambda: _sig("fail", anime.list_unmatched_anime())}
+
         def _refresh_live(tab):
             """刷新某 tab 的只读实时区。只有仪表盘有实时区，其余 tab 一律不动。
 
@@ -860,6 +880,10 @@ def anime_page(t: str = ""):
                     _dirty.add(key)
             if pop_dlg.value:              # KPI 弹窗开着：在里面点的操作要立刻反映到弹窗上
                 _render_pop()
+            # 明细列表弹窗（未知集/缺集/失败…/已读的提示）同理 (r39 U12)：从列表进详情处理完关掉，
+            # 列表里那一条还在、标题计数不变，看上去像没处理成功。按上次打开它的方式（含页码）就地重建
+            if list_dlg.value and _list_view["fn"]:
+                _list_view["fn"]()
 
         # 详情悬浮框（复用一个 dialog，点开时清空重建，避免累积 + 不跳页丢滚动位置）
         detail_dlg = ui.dialog()
@@ -868,7 +892,14 @@ def anime_page(t: str = ""):
         _outer_stale = {"v": False}
 
         def _mark_outer_stale():
-            _outer_stale["v"] = True
+            # 【详情已经关了就直接刷】(r39 U12) 补齐/重新识别这类长操作，用户常常点完就关详情；
+            # 等它跑完才来置标记，关弹窗那一刻早过去了 —— 外层要等下一次开关详情才刷，一直显示旧的。
+            if detail_dlg.is_deleted:          # 整页已关（长操作在后台续跑完）：没有可刷的了
+                return
+            if detail_dlg.value:
+                _outer_stale["v"] = True
+            else:
+                refresh_all()
 
         def _on_detail_toggle(e):
             if not e.value and _outer_stale["v"]:
@@ -887,9 +918,12 @@ def anime_page(t: str = ""):
         list_dlg = ui.dialog()
 
         _LIST_PAGE_SIZE = 50   # 弹窗每页条数：挂机久了这两类可能上百条，一次建几百个元素会明显卡
+        _list_view: dict = {"fn": None}   # list_dlg 当前显示的是哪个列表：refresh_all 据此就地重建 (r39 U12)
 
         def _open_torrent_list(title, desc, fetch, page: int = 1):
             """未知集 / 特别篇 / 失败异常 的明细弹窗。分页而不是一次全渲染——总数照实显示在标题里。"""
+            # 迟绑定：page 在下面被 paginate 夹回合法页码，重建时用的是夹过之后的那一页
+            _list_view["fn"] = lambda: _open_torrent_list(title, desc, fetch, page)
             list_dlg.clear()
             rows = fetch()
             shown, pages, page = paginate(rows, page, _LIST_PAGE_SIZE)
@@ -935,8 +969,10 @@ def anime_page(t: str = ""):
 
         def _open_locked():
             _open_torrent_list(
-                "锁源缺集", "这些番锁了下载源，锁定的组停更或远远落后，别的组已经发了后面的集，但因为锁了源一集都不会下。"
-                "点番名进详情页：『只补这几集』用别的组补上（不改锁），或把下载源改回按优先级。",
+                "锁源缺集", "这些番锁了下载源，锁定的组停更或远远落后，别的组已经发了后面的集，"
+                + (f"锁定组停更满 {config.ANIME_LOCK_FALLBACK_DAYS} 天、核对无误的会自动用别的组补一份，其余被锁挡着不下。"
+                   if config.ANIME_LOCK_FALLBACK_DAYS > 0 else "但因为锁了源一集都不会下。")
+                + "点番名进详情页：『只补这几集』用别的组补上（不改锁），或把下载源改回按优先级。",
                 anime.locked_out_rows)
 
         def _open_special():
@@ -971,6 +1007,7 @@ def anime_page(t: str = ""):
             bug 付过一次学费（见 manage_panel 那段 docstring）。对话框活在
             client.layout 上，不受面板重建影响。
             """
+            _list_view["fn"] = _open_acked
             list_dlg.clear()
             rows = alerts.view()["acked"]
             with list_dlg, ui.card().classes("w-full").style("max-width:720px"):
@@ -1123,9 +1160,12 @@ def anime_page(t: str = ""):
 
         def _del_files(anime_id, name, cnt):
             async def h():
+                # (E-73) 以前这里误抄了单集删除的文案（"这一集…删的是这一条种子"）。整部删完后这些集一份不剩，
+                # 都成了"该集已删"：恢复订阅、换源兜底、补下都不会再为它们下别的版本。
                 if not await confirm(f"删除《{name}》的 {cnt} 个已下文件？",
                                      "通过 qB 连同硬盘文件一起删除，不可撤销。\n"
-                                     "这一集若还有别的源的『备用项』待下，后台会在下一轮采集自动补下一份（删的是这一条种子，不是整集）。不想让它回来：先把备用项『排除』，或整部番用『忽略』。",
+                                     "删掉后这些集就算『不要了』：以后恢复订阅，后台也不会再自动下这些集的其它版本"
+                                     "（要哪一集就到详情页对准那一条点『下载』）。",
                                      ok_label="删除文件", ok_icon="delete_forever"):
                     return
                 r = await anime.delete_anime_files(anime_id)
@@ -1252,24 +1292,33 @@ def anime_page(t: str = ""):
             ui.notify("正在向 qB 拉最新进度…（qB 不通时最长约 45 秒）", type="info")
             await busy_action(e.sender, "qb-sync-anime", _go, fail="同步失败")
 
-        _reident_busy = {"v": False}   # 防抖：整轮 bgm 遍历可能跑几分钟，期间连点会叠出多轮并发请求
-
         def _reident(seasons):
             async def h():
-                if _reident_busy["v"]:
-                    ui.notify("正在刷新资料中，请稍候…", type="info")
-                    return
+                reident_dlg.close()
                 scope = {1: "当季", 2: "近半年", 4: "近1年", None: "全部"}.get(seasons, "")
-                ui.notify(f"正在刷新元数据（{scope}）…走 bgm，可能要一会儿。"
-                          "已绑好的番只刷资料、不会改绑定；没认出来的会再试一次", type="info")
-                _reident_busy["v"] = True
-                try:
+
+                async def _go():
+                    ui.notify(f"正在刷新元数据（{scope}）…走 bgm，可能要一会儿。"
+                              "已绑好的番只刷资料、不会改绑定；没认出来的会再试一次", type="info")
                     cnt = await anime.reenrich_scope(seasons)
-                finally:
-                    _reident_busy["v"] = False
-                _refresh_overview(charts=True)   # 重识别改了数据，连图表一起刷
-                ui.notify(f"完成：{cnt} 部刷到了 bgm 资料", type="positive")
+                    _refresh_overview(charts=True)   # 重识别改了数据，连图表一起刷
+                    ui.notify(f"完成：{cnt} 部刷到了 bgm 资料", type="positive")
+                # 走 busy_action：整轮 bgm 遍历可能跑几分钟，按 key 去重挡连点（也挡两个标签页同时点），
+                # 异常给『刷新资料失败』而不是静默。btn 传 None：触发按钮在 overview_tail 里、每 30 秒被重建，
+                # loading 留不住，进度靠 toast 表达（同 _qb_sync_now 的理由）。
+                await busy_action(None, "reident-anime", _go, fail="刷新资料失败")
             return h
+
+        # 『刷新资料』的范围选择 (r39 U15)：建在 page 级、只建一次、内容静态 —— 不随 overview_tail 的 30 秒重建消失，
+        # 里面按钮作处理器槽位，长操作跑完时完成/失败提示一定发得出来。
+        reident_dlg = ui.dialog()
+        with reident_dlg, ui.card().classes("gap-2"):
+            ui.label("刷新资料：选范围").classes("font-bold")
+            for _lb, _ss in (("刷新当季", 1), ("刷新半年（近 2 季）", 2),
+                             ("刷新 1 年（近 4 季）", 4), ("刷新全部", None)):
+                ui.button(_lb, on_click=_reident(_ss)).props("flat color=primary").classes("w-full")
+            with ui.row().classes("justify-end w-full"):
+                ui.button("取消", on_click=reident_dlg.close).props("flat")
 
         def _card_cover(a, *, dim: bool = False, status=None, sources=None, prog=None, missing=None):
             """番剧卡片的封面区（番剧表/待确认/已忽略共用），四角徽标的摆法与剧场版同一份（layout.cover_box）：
@@ -1309,10 +1358,17 @@ def anime_page(t: str = ""):
                             + "。这部番没在追（待确认 / 已忽略 / 已下齐停订），后台不会自动下它；"
                               "要追就进详情页确认或恢复订阅")
                 elif missing:
+                    # (r39 F8) 槽位被别季旧种子占着的缺集补齐也下不了，单独说、不引导去补齐（见 core.anime.slot_held_gaps）。
+                    # 只有带缺集的卡片才多一条 SQL（真库几部），不为它改 progress_and_gaps 的返回形状。
+                    _held = anime.slot_held_gaps({a.id: missing}).get(a.id, [])
+                    _free = [e for e in missing if e not in _held]
                     _tip = (f"已下 {_have} 集 / 应有 {_den} 集：缺第 {ep_ranges_text(missing)} 集"
-                            "——按 bgm 开播日推算早该播了，库里却一条种子都没有。"
-                            "采集停过一阵（RSS 只留最近几天）或锁定的源中途断更都会这样；"
-                            "进详情页把『下载源』换成还在更新的组，再点『补齐该源』")
+                            + ((f"——其中第 {ep_ranges_text(_free)} 集" if _held else "——")
+                               + "按 bgm 开播日推算早该播了，库里却一条种子都没有。"
+                               "采集停过一阵（RSS 只留最近几天）或锁定的源中途断更都会这样；"
+                               "进详情页把『下载源』换成还在更新的组，再点『补齐该源』" if _free else "")
+                            + ((f"{'；' if _free else '——'}第 {ep_ranges_text(_held)} 集的槽位被别的季的旧种子占着，"
+                                "补齐也下不了，先处理绑定（看『绑定看着不对』）") if _held else ""))
                 else:
                     _tip = (f"已下 {_have} 集 / 库里有 {_seen} 集的种子"
                             + (f"；bgm 记 {_tot} 集" if _tot else "；bgm 未给总集数")
@@ -1383,7 +1439,12 @@ def anime_page(t: str = ""):
                 _dirty.discard(e.value)
                 _TAB_REFRESH[e.value]()
             elif already:
-                _refresh_live(e.value)
+                # 待确认/待识别：数据真变了才重建（理由见 _TAB_SIG）；停摆/维护时不撞库
+                if (not db.is_data_down() and e.value in _TAB_SIG
+                        and _TAB_SIG[e.value]() != _seen.get(e.value)):
+                    _TAB_REFRESH[e.value]()
+                else:
+                    _refresh_live(e.value)
         tabs.on_value_change(_on_tab)
         _build_tab(start)   # 构建首屏 tab
 

@@ -288,6 +288,7 @@ async def test_relocate_with_qb_disabled_changes_nothing(clean_tables, cfg, monk
     from core import anime as A
 
     cfg(QB_ENABLED=False, DOWN_PATH="/data")
+    # 行落在旧目录 25D（新目录是 26A）：(r39 U7a) 已在当前目录的行 relocate 根本不碰、走不到 qB 关的那一支
     with clean_tables.get_session() as s:
         a = Anime(title="番", display_name="番", quarter="26A", confirmed=True)
         s.add(a)
@@ -296,11 +297,11 @@ async def test_relocate_with_qb_disabled_changes_nothing(clean_tables, cfg, monk
         for i, h in enumerate("abc"):
             s.add(AnimeTorrent(anime_id=a.id, info_hash=h * 40, raw_title=f"[组][{i}]",
                                episode=i + 1, status="sent", qb_progress=1.0,
-                               save_path="/data/26A/番", created_at=datetime.now()))
+                               save_path="/data/25D/番", created_at=datetime.now()))
         s.commit()
         aid = a.id
 
-    rep = await A.relocate_anime(aid, old_path="/data/26A/番")
+    rep = await A.relocate_anime(aid, old_path="/data/25D/番")
 
     assert rep.get("error") and "qB 未启用" in rep["error"]
     assert not rep.get("redownload"), "qB 关着时不该把已下集清成 pending"
@@ -308,7 +309,7 @@ async def test_relocate_with_qb_disabled_changes_nothing(clean_tables, cfg, monk
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == aid)))
     assert all(t.status == "sent" and t.qb_progress == 1.0 for t in rows), \
         "已下集的状态被改写了——那份记录抹掉就再也回不来"
-    assert all(t.save_path == "/data/26A/番" for t in rows), "路径不该被改成新目录"
+    assert all(t.save_path == "/data/25D/番" for t in rows), "路径不该被改成新目录"
 
 
 # ---------------- (R21) SQLite 引擎的连接期设置：两条建法必须一致 ----------------
@@ -975,7 +976,7 @@ async def test_a_crashing_delivery_still_unregisters(monkeypatch, clean_tables):
         s.add(t); s.commit(); s.refresh(t)
         tid = t.id
 
-    async def boom(torrent_id, force=False):
+    async def boom(torrent_id, force=False, prefs_gate=None):   # 包装层按位置透传 prefs_gate（r39 D4）
         ce._delivering.add((AnimeTorrent.__name__, int(torrent_id)))   # 包装层登记的那一下
         raise RuntimeError("回写撞上库抖动")
 
@@ -1027,6 +1028,8 @@ _STRADDLERS = {
         "_reenrich_scope_inner":          "lock:_enrich_lock",
         "_refresh_meta_due_inner":        "lock:_enrich_lock",   # 每收录 N 集刷一次 bgm 资料
         "_retire_old_versions":           "lock:_poll_lock",     # 修正版：新版下完删旧版
+        # (r39 E-74) 锁定源停更兜底：读计划 → await 交付 → 当场重读锁/状态、按 id 写 lock_fallback 标记
+        "deliver_lock_fallback":          "lock:_poll_lock",
     },
     "core/engine.py": {
         "archive_old_completed":          "lock:_archive_lock",
@@ -1039,13 +1042,16 @@ _STRADDLERS = {
         "relocate":                       "caller:relocate_anime|relocate_movie",  # 读 (id,hash) → await setLocation → _mark_moved(ids)
     },
     "core/movies.py": {
-        "_enrich_movie_inner":            "in_flight",
+        # (r39 M2) _enrich_movie_inner 已删：『重新识别』改走 suggest_movie_bgm（await 之后不开会话）+ 带回显的绑定
         "_bind_movie_bgm_inner":          "in_flight",
         "_download_movie_torrent_inner":  "delivering",
         "_refresh_movie_torrents_inner":  "in_flight",
         "_delete_movie_torrent_inner":    "in_flight",     # 审计探针在这条上真把 deleted 写进了另一个库
         "relocate_movie":                 "in_flight",
         "_discover_loop":                 "lock:_scan_lock",  # 只经 discover_movies ← scan_now / worker 整年扫描，都在 _scan_lock 里
+        # (r39 M3) 自动扫描顺带往前刷新版本：读 (id, mikan_id) → await Mikan RSS → _store_movie_torrents(id)
+        "_refresh_back_years":            "lock:_scan_lock",  # 只经 auto_scan_tick ← run_movie_scan / run_all_once，都持锁
+        "auto_scan_tick":                 "lock:_scan_lock",  # await scan_now 之后再 await _refresh_back_years（同上两个调用方）
     },
 }
 
@@ -1783,23 +1789,24 @@ async def test_relocate_keeps_special_and_unknown_episodes_instead_of_clearing_t
         return {}
     monkeypatch.setattr(ce.qb, "torrents_info", nobody_home)
 
+    # 行都落在旧目录 25D（新目录是 26A）：(r39 U7a) 已在当前目录的行 relocate 不碰，测不到 E-4
     with clean_tables.get_session() as s:
         a = Anime(title="番", display_name="番", quarter="26A", confirmed=True)
         s.add(a); s.commit(); s.refresh(a)
         for h, ep in (("a", 1), ("b", -1), ("c", -2), ("d", 2)):
             s.add(AnimeTorrent(anime_id=a.id, info_hash=h * 40, raw_title=f"[组][{ep}]",
                                episode=ep, status="sent", qb_progress=1.0,
-                               save_path="/data/26A/番", created_at=datetime.now()))
+                               save_path="/data/25D/番", created_at=datetime.now()))
         s.commit()
         aid = a.id
 
         # 停滞且 -1 的行：只算进 stalled_kept，不重复计入 special_kept（R34 对抗审计的变异 M9 要挡的）
         s.add(AnimeTorrent(anime_id=a.id, info_hash="e" * 40, raw_title="[组][SP]", episode=-1,
-                           status="stalled", qb_progress=0.3, save_path="/data/26A/番",
+                           status="stalled", qb_progress=0.3, save_path="/data/25D/番",
                            created_at=datetime.now()))
         s.commit()
 
-    rep = await A.relocate_anime(aid, old_path="/data/26A/番")
+    rep = await A.relocate_anime(aid, old_path="/data/25D/番")
     assert (rep["redownload"], rep["special_kept"], rep["stalled_kept"]) == (2, 2, 1), rep
     with clean_tables.get_session() as s:
         got = {t.info_hash[0]: t.status for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == aid))}
@@ -1810,10 +1817,10 @@ async def test_relocate_keeps_special_and_unknown_episodes_instead_of_clearing_t
         m = Movie(title="片", quarter="2026")
         s.add(m); s.commit(); s.refresh(m)
         s.add(MovieTorrent(movie_id=m.id, info_hash="e" * 40, raw_title="mv", status="sent",
-                           qb_progress=1.0, save_path="/data/2026/片"))
+                           qb_progress=1.0, save_path="/data/2025/片"))
         s.commit()
         mid = m.id
-    rep = await M.relocate_movie(mid, old_path="/data/2026/片")
+    rep = await M.relocate_movie(mid, old_path="/data/2025/片")
     assert rep["redownload"] == 1 and rep["special_kept"] == 0, rep
 
 

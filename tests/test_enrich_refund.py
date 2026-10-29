@@ -218,7 +218,7 @@ async def test_candidate_names_are_capped(monkeypatch):
     from services import enrich as E
     seen = {}
 
-    async def capture(names, est, date_ref, info_hash):
+    async def capture(names, est, date_ref, info_hash, episode=None):
         seen["n"] = list(names)
         return None
     monkeypatch.setattr(E, "_resolve_inner", capture)
@@ -232,7 +232,7 @@ def _stub_search(mapping):
     """把 name → (subject_id, 放送日) 的映射做成 _search_one 的桩。"""
     from datetime import datetime as _dt
 
-    async def _one(client, name, est, date_ref):
+    async def _one(client, name, est, date_ref, episode=None):
         hit = mapping.get(name)
         if hit is None:
             return None

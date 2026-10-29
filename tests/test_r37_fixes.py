@@ -268,7 +268,7 @@ def test_backfill_lists_other_groups_and_can_take_one(clean_tables, cfg, monkeyp
         monkeypatch.setitem(sources.SEARCH_URL, site, lambda q: f"https://x/?q={q}")
     sent = []
 
-    async def _fake_dl(tid, force=False):
+    async def _fake_dl(tid, force=False, **kw):   # **kw：调用方会传 prefs_gate（r39 D4）
         sent.append(tid)
         return True
 
@@ -308,7 +308,7 @@ def test_download_locked_out_keeps_the_lock(clean_tables, cfg, monkeypatch):
     """『只补这几集』：不改锁，锁定源之后那几集用别的组各下一份。"""
     sent = []
 
-    async def _fake_dl(tid, force=False):
+    async def _fake_dl(tid, force=False, **kw):   # **kw：调用方会传 prefs_gate（r39 D4）
         sent.append(tid)
         return True
 
@@ -424,6 +424,9 @@ def test_auto_backfill_downloads_directly_for_a_tracked_show(clean_tables, cfg, 
     """『自动补齐』在追的番：补到就直接下、不打回待确认；没在追的番照旧转待确认。宽松的『补齐该源』照旧打回。"""
     import sources
     found = [_item("ANi", 8, 300, site="nyaa"), _item("ANi", -1, 301, site="nyaa")]   # 一集正片 + 一条特别篇
+    for it in found:
+        # (r39 DEC1x) 自动补齐不收没有发布时间的目标组结果（判断不了是不是前几季的同号集），这里给真实搜索结果都有的时间
+        it.release_time = datetime(2026, 8, 30)
 
     class _Stub:
         def __init__(self, *a, **kw):
@@ -436,7 +439,7 @@ def test_auto_backfill_downloads_directly_for_a_tracked_show(clean_tables, cfg, 
         monkeypatch.setitem(sources.SEARCH_URL, site, lambda q: f"https://x/?q={q}")
     sent = []
 
-    async def _fake_dl(tid, force=False):
+    async def _fake_dl(tid, force=False, **kw):   # **kw：调用方会传 prefs_gate（r39 D4）
         sent.append(tid)
         return True
 
@@ -568,7 +571,7 @@ def test_backfill_finds_a_romaji_only_group_by_episode_query(clean_tables, cfg, 
         monkeypatch.setitem(sources.SEARCH_URL, site, lambda q: "https://x/?q=" + q.replace(" ", "%20"))
     tried = []
 
-    async def _fake_dl(tid, force=False):
+    async def _fake_dl(tid, force=False, **kw):   # **kw：调用方会传 prefs_gate（r39 D4）
         with clean_tables.get_session() as s:
             tried.append(s.get(AnimeTorrent, tid).raw_title)
         return True
@@ -787,8 +790,9 @@ def _versions_setup(clean_tables, cfg, monkeypatch, rows, qb_paths):
         s.add(a)
         s.commit()
         for i, (k, src, raw, st, cp) in enumerate(rows):
+            # release_time：(r39 I6) 修正版替换要求新旧两版发布时间都在、相差不超过 ANIME_REPLACE_MAX_GAP_DAYS
             t = AnimeTorrent(anime_id=a.id, info_hash=f"{i + 1:040x}", raw_title=raw, episode=4, source=src,
-                             status=st, content_path=cp, created_at=old,
+                             status=st, content_path=cp, created_at=old, release_time=old,
                              qb_progress=1.0 if st == "sent" else 0.0)
             s.add(t)
             s.commit()
@@ -796,7 +800,7 @@ def _versions_setup(clean_tables, cfg, monkeypatch, rows, qb_paths):
     hashes = {k: f"{i + 1:040x}" for i, (k, *_r) in enumerate(rows)}
     calls = []
 
-    async def fake_download(tid, force=False):
+    async def fake_download(tid, force=False, **kw):   # **kw：修正版交付传 prefs_gate=True（r39 D4）
         calls.append(("download", tid, force))
         with clean_tables.get_session() as s:
             t = s.get(AnimeTorrent, tid)

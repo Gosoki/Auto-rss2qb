@@ -87,6 +87,10 @@ def test_the_two_gates_are_the_only_thing_between_a_search_hit_and_a_binding():
 
     如果哪天 `_search_one` 里加了第三道闸、或者去掉了其中一道，
     上面那些用例的**意义**就变了 —— 这条让那种变化必须先来改它。
+
+    (R39) 第三道是 `_single_ep_cannot_host`：它不放行任何候选，只在第一个过闸的候选是
+    单集条目、而本条是第 2 集及以后时让这个名字弃权（用例见 tests/test_r39_ident.py）。
+    上面两道的意义不变，仍是"认不认"的全部判据。
     """
     import ast
     import inspect
@@ -97,5 +101,5 @@ def test_the_two_gates_are_the_only_thing_between_a_search_hit_and_a_binding():
     tree = ast.parse(textwrap.dedent(inspect.getsource(enrich._search_one)))
     called = {n.func.id for n in ast.walk(tree)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert {"_date_ok", "_name_not_contradicted"} <= called, \
-        "_search_one 不再走这两道闸了 —— 那么本文件钉的就不是自动识别的把关判据了"
+    assert {"_date_ok", "_name_not_contradicted", "_single_ep_cannot_host"} <= called, \
+        "_search_one 不再走这几道闸了 —— 那么本文件钉的就不是自动识别的把关判据了"

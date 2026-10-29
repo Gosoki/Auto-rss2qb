@@ -91,7 +91,12 @@ def _notify_relocate_movie(rep):
     if rep.get("moved"):
         parts.append(f"已移动 {rep['moved']} 个版本到新目录")
     if rep.get("redownload"):
-        parts.append(f"{rep['redownload']} 个版本 qB 未跟踪/连不上 → 已清状态待重下到新目录")
+        # (r39 Q2) 不写『连不上』（连不上走 error 分支、一行都不动）；也不许诺『待重下』——
+        # 剧场版没有自动下载的路径，清成待下之后只能在版本列表里逐个手动点（core/movies 只有手动下这一条）。
+        parts.append(f"{rep['redownload']} 个版本 qB 里已没有这条种子（多半是下完后被移除）→ 已清成待下"
+                     "（剧场版不会自动重下，需要在版本列表里手动点『下载』）")
+    if rep.get("in_place"):       # (r39 Q2) 文件本就在当前目录：relocate 不碰它们，说一声免得用户以为漏了
+        parts.append(f"{rep['in_place']} 个版本 qB 已不跟踪、文件本就在当前目录，未改动")
     if rep.get("failed"):
         parts.append(f"{rep['failed']} 个版本移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
     if rep.get("stalled_kept"):   # 停滞版本有意不动：保留停滞标记与删除入口，但文件没跟着走，要说清楚
@@ -105,8 +110,21 @@ def _notify_relocate_movie(rep):
     msg = "；".join(parts) or "无需移动"
     warn = bool(rep.get("redownload") or rep.get("failed")
                 or rep.get("stalled_kept") or rep.get("special_kept") or rep.get("delivering"))
-    if (rep.get("redownload") or rep.get("stalled_kept")) and rep.get("old_path"):
-        msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"   # special_kept 有意不进这句：那是唯一的一份
+    # 目录只取实际被清的版本所在处、下完再删、只删这几个，理由见 pages/anime_detail.notify_relocate_anime 同一处 (r39 Q2)。
+    # special_kept 有意不进任何清理提示：那是唯一的一份
+    if rep.get("redownload") and rep.get("redownload_dirs"):
+        if rep["redownload_dirs"] == ["原目录未记录"]:   # (r39 F4) 同番剧侧：别把这几个字拼得像一个路径
+            msg += (f"。⚠️ 这 {rep['redownload']} 个版本原来放在哪里没有记录，等新目录下完后自行核对"
+                    "（下完前旧文件如果还在，那是唯一一份）")
+        else:
+            msg += (f"。⚠️ 这 {rep['redownload']} 个版本的旧文件（如果还在）在 {'、'.join(rep['redownload_dirs'])}："
+                    "等新目录重新下完再删，下完前那是唯一一份；只删这几个版本，别整目录删")
+        # (r39 F1) 不断言『该目录里』，理由见番剧侧同一处
+        if any(rep.get(k) for k in ("stalled_kept", "special_kept", "failed", "delivering")):
+            msg += "；另有停滞、特别篇、移动被拒或交付中的文件没跟着搬、仍在用，删之前认准是哪几个版本"
+    # (r39 F1) 只用停滞行自己的目录，不用 old_path（被清行与停滞行的并集），理由见番剧侧同一处
+    if rep.get("stalled_kept") and rep.get("stalled_dirs"):
+        msg += f"。⚠️ 停滞的半成品留在 {'、'.join(rep['stalled_dirs'])}，需你手动处理"
     ui.notify(msg, type="warning" if warn else "positive")
 
 
@@ -132,11 +150,17 @@ async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
             ui.notify("归档目录已更新（无已下文件，新版本将下到新目录）", type="positive")
         return
     _extra = f"；另有 {len(arch)} 个版本已归档、无法代为移动（文件留在旧目录）" if arch else ""
-    if new_path != old_path:     # 两种来路两种话，理由见 pages/anime_detail.maybe_relocate_anime 同一处
-        _title, _body = "归档目录变了，移动已下文件？", f"{len(dl)} 个版本已下，移到新目录：{new_path}{_extra}"
+    # 数量＝relocate 实际会动的行、标题用 same_dir、括号不断言原因，理由见 pages/anime_detail.maybe_relocate_anime 同一处 (r39 F5/F35)
+    _n = len(stale) + sum(1 for t in dl if not t.save_path)
+    if not _n:
+        ui.notify(f"归档目录已更新（已下的文件本就在新目录，不用移动{_extra}）",
+                  type="warning" if arch else "positive")
+        return
+    if not engine.same_dir(new_path, old_path):     # 两种来路两种话，理由同上
+        _title, _body = "归档目录变了，移动已下文件？", f"{_n} 个版本已下，移到新目录：{new_path}{_extra}"
     else:
         _title, _body = ("有已下文件不在归档目录里，搬回去？",
-                         f"{len(stale)} 个版本的文件落在别处（上次没搬成），搬回当前归档目录：{new_path}{_extra}")
+                         f"{_n} 个版本的文件落在别处（上次没搬成，或改过下载目录设置），搬回当前归档目录：{new_path}{_extra}")
     if not await confirm(_title, _body,
                          ok_label="移动文件", ok_icon="drive_file_move", ok_color="primary"):
         ui.notify("已更新记录，未移动文件（新版本将下到新目录，旧文件留在原处）", type="warning")
@@ -144,6 +168,40 @@ async def _maybe_relocate_movie(movie_id, old_path, refresh_cb):
     rep = await mov.relocate_movie(movie_id, old_path)
     refresh_cb()
     _notify_relocate_movie(rep)
+
+
+def _confirm_and_bind(movie_id: int, refresh_cb):
+    """详情页『重新识别』与待识别『重试识别』共用：core 只出候选，写库一律走带回显的绑定。(r39 M2)
+
+    原来这两个按钮调 enrich_movie：按名字模糊搜、不校验日期，撞上别人已占的 bgm 时不写绑定却照样弹
+    『识别成功』，Mikan 番组页上的精确链接也没用上。现在 suggest_movie_bgm（Mikan 优先）给候选，
+    先把它的说明弹出来（尤其是『与当前绑定不同』），再过 require_bind_confirm（E-13 的两道回显闸），
+    之后与『绑定 bgm』完全同一条路：bind_movie_bgm → 同样的提示 → 搬迁确认。
+
+    返回交给 busy_action 的无参协程函数。调用方要把它以 `_go` 这个名字传给 busy_action：
+    tests/test_ui_busy 按名字核"回显闸在防抖里"，内层函数也就叫 `_go`。
+    """
+    async def _go():
+        r = await mov.suggest_movie_bgm(movie_id)
+        bid = r["bgm_id"]
+        if bid is None:
+            ui.notify(r["msg"], type="warning")
+            return
+        # 候选与现绑定不同 → 用警告色：确认下去会改掉现在的绑定（可能是用户亲手改过的）
+        ui.notify(r["msg"], type="warning" if r["current"] not in (None, bid) else "info")
+        if not await require_bind_confirm(movie_id, bid, kind="movie"):
+            return
+        old_path = mov.movie_save_path(movie_id)
+        _rep: dict = {}    # 收『这次绑定冻结了哪些字段』，见 core 里 report 出参的说明
+        ok = await mov.bind_movie_bgm(movie_id, bid, report=_rep)
+        refresh_cb()
+        _msg = ("绑定失败：ID 不存在或取不到 bgm 数据" if not ok
+                else ("已绑定，但这一部有【已归档】的文件搬不动 —— 片名/目录保持原样，只换了 bgm 与封面简介。要一并改名：先在 qB 里重新添加那些种子（或手动移动文件），再绑一次" if _rep.get("frozen") else "已绑定并识别 ✓"))
+        ui.notify(_msg, type=("negative" if not ok
+                              else "warning" if _rep.get("frozen") else "positive"))
+        if ok:
+            await _maybe_relocate_movie(movie_id, old_path, refresh_cb)
+    return _go
 
 
 def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> None:
@@ -275,17 +333,12 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             refresh_outer()
 
     async def _enrich(e):
-        # 走 busy_action：识别的时间预算是 120 秒，期间按钮毫无反应、用户会连点，
+        # 走 busy_action：取候选 + 两次 bgm 往返，期间按钮毫无反应、用户会连点，
         # 于是并发跑好几轮并重复弹搬迁确认框（与番剧详情页同款理由）。
-        async def _go():
-            old_path = mov.movie_save_path(movie_id)
-            ok = await mov.enrich_movie(movie_id)
-            _after()
-            ui.notify("识别成功" if ok else "未识别到（可粘贴 bgm 链接绑定）",
-                      type="positive" if ok else "warning")
-            if ok:
-                await _maybe_relocate_movie(movie_id, old_path, _after)
-        await busy_action(e.sender, f"mov-enrich:{movie_id}", _go, fail="识别失败")
+        # 【键与『绑定』同一个 mov-bind:】(r39 M2) 这条现在也落到 bind_movie_bgm（无 CAS、末尾可能合并删行），
+        # 键不同就能对同一部片并发绑两次、最后写的赢。
+        _go = _confirm_and_bind(movie_id, _after)
+        await busy_action(e.sender, f"mov-bind:{movie_id}", _go, fail="识别失败")
 
     async def _edit_year():
         """手动改归档年份 (E-33)。与番剧详情页的『编辑季度』对称，只是这里收的是【年份】。
@@ -333,7 +386,8 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             ui.notify("保存失败（这部片可能已被删除）", type="warning")
             return
         _after()
-        ui.notify(f"归档年份已改为 {v}", type="positive")
+        # (r39 M1y) set_quarter 同时置了年份锁，这里把锁的效果和解除条件说出来
+        ui.notify(f"归档年份已改为 {v}（后台扫描不会再改回；换绑到别的 bgm 会按新条目重算）", type="positive")
         await _maybe_relocate_movie(movie_id, old_path, _after)
 
     async def _refresh_versions(e):
@@ -543,6 +597,12 @@ def movies_page(t: str = ""):
             ui.notify(
                 f"扫描完成：命中 {res['seen']} 部，新增 {res['movies']}，种子 {res['torrents']}{tail}",
                 type="positive")
+            if res.get("bgm_down"):
+                # (r39 M8) 判据是『一部都没问成』（连接失败/限流/5xx），bgm 答『没有』(404) 不算，所以这句不会误报。
+                # 『稍后自动重试』只在真排了重试时说（当年四季 + 开了自动扫描），否则如实让用户自己再扫。
+                _later = ("稍后自动重试" if res.get("retry_at") and config.MOVIE_SCAN_ENABLED
+                          else "稍后再扫一次")
+                ui.notify(f"bgm 连接失败（一部都没问成），新片暂留待识别，{_later}", type="warning")
 
         def _reject(movie_id):
             def h():
@@ -600,17 +660,11 @@ def movies_page(t: str = ""):
 
         def _refail(movie_id):
             async def h(e):
-                # 与番剧侧的『重新识别』同一个形状：enrich_movie 走 bgm，同样是 120 秒预算，
-                # 同样会改名字/季度并可能触发搬迁确认。剧场版这边原来整条都没有防抖。
-                async def _go():
-                    old_path = mov.movie_save_path(movie_id)
-                    ok = await mov.enrich_movie(movie_id)
-                    refresh_all()
-                    ui.notify("识别成功 ✓" if ok else "还是没识别到（可粘贴 bgm 链接绑定）",
-                              type="positive" if ok else "warning")
-                    if ok:
-                        await _maybe_relocate_movie(movie_id, old_path, refresh_all)
-                await busy_action(e.sender, f"mov-refail:{movie_id}", _go,
+                # 与详情页『重新识别』同一条路（_confirm_and_bind）：取候选 + 两次 bgm 往返，
+                # 同样会改名字/年份并可能触发搬迁确认。剧场版这边原来整条都没有防抖。
+                # 键统一成 mov-bind:（理由见详情页 _enrich），与旁边的『绑定』互斥。
+                _go = _confirm_and_bind(movie_id, refresh_all)
+                await busy_action(e.sender, f"mov-bind:{movie_id}", _go,
                                   fail="重新识别失败")
             return h
 
@@ -624,13 +678,28 @@ def movies_page(t: str = ""):
             except (ValueError, TypeError):
                 ui.notify("间隔要填数字（小时）", type="warning")
                 return
+            # (r39 M3/M8) ui.number 回的是 float：int(float()) 存整数（存成 '2.0' 读回会变 0、设置静默失效）；
+            # 钳位走 core 里那一份界值（读取处同一个 clamp_scan_setting）。留空 = 保持当前值（0 是合法值，不能用 or）。
+            try:
+                vals = {}
+                for k, fk in (("MOVIE_REFRESH_BACK_YEARS", "back"), ("MOVIE_SCAN_RETRY_MIN", "retry")):
+                    raw = f[fk].value
+                    vals[k] = mov.clamp_scan_setting(
+                        k, int(float(raw)) if raw not in (None, "") else getattr(config, k))
+            except (ValueError, TypeError):
+                ui.notify("往前刷新年数 / 失败重试分钟要填数字", type="warning")
+                return
             config.set_many({
                 "MOVIE_SCAN_ENABLED": "true" if f["enabled"].value else "false",
                 "MOVIE_SCAN_INTERVAL": str(secs),
+                **{k: str(v) for k, v in vals.items()},
             })
             sources_panel.refresh()
             on = "开" if f["enabled"].value else "关"
-            ui.notify(f"已保存：自动扫描{on}，每 {secs // 3600} 小时一次", type="positive")
+            back = vals["MOVIE_REFRESH_BACK_YEARS"]
+            ui.notify(f"已保存：自动扫描{on}，每 {secs // 3600} 小时一次；"
+                      + (f"顺带刷新往前 {back} 年的版本" if back else "不往前刷新")
+                      + f"；整轮失败 {vals['MOVIE_SCAN_RETRY_MIN']} 分钟后起重试", type="positive")
 
         def _movie_card(m, ts):
             # 一部片一张封面卡，四角位置与番剧卡片同一份（layout.cover_box）：
@@ -1005,6 +1074,20 @@ def movies_page(t: str = ""):
                     f["hours"] = ui.number("扫描间隔（小时）",
                                            value=round(config.MOVIE_SCAN_INTERVAL / 3600, 1),
                                            min=1, format="%g").classes("w-40")
+                    # (r39 M3/M8) 范围取自 core 的 SCAN_SETTING_RANGE，与读取、保存时的钳位同一份
+                    _blo, _bhi = mov.SCAN_SETTING_RANGE["MOVIE_REFRESH_BACK_YEARS"]
+                    f["back"] = ui.number(
+                        "往前刷新（年）",
+                        value=mov.clamp_scan_setting("MOVIE_REFRESH_BACK_YEARS", config.MOVIE_REFRESH_BACK_YEARS),
+                        min=_blo, max=_bhi, step=1, format="%d").classes("w-36").tooltip(
+                        f"只按 Mikan 番组重拉种子，不碰 bgm、不改片的资料。0 = 关，最多 {_bhi} 年")
+                    _rlo, _rhi = mov.SCAN_SETTING_RANGE["MOVIE_SCAN_RETRY_MIN"]
+                    f["retry"] = ui.number(
+                        "失败重试（分钟）",
+                        value=mov.clamp_scan_setting("MOVIE_SCAN_RETRY_MIN", config.MOVIE_SCAN_RETRY_MIN),
+                        min=_rlo, max=_rhi, step=5, format="%d").classes("w-36").tooltip(
+                        "当年扫描整轮失败（Mikan 打不开，或 bgm 一部都没问成）时不推进『上次扫描』，"
+                        f"按这个间隔起自动重试，每再失败一次翻倍、最长等一个扫描间隔（{_rlo}~{_rhi}）")
                     ui.button("保存", icon="save", on_click=lambda: _save_scan(f)).props("unelevated color=primary")
                 last = config.MOVIE_SCAN_LAST
                 try:      # 存的是 ISO 原串（2026-10-19T09:18:33），显示成人话
@@ -1014,6 +1097,8 @@ def movies_page(t: str = ""):
                 ui.label(f"上次扫描：{last}").classes("text-xs text-gray-400")
                 ui.label("剧场版桶更新不频繁，间隔别设太小；改动即时生效，到点自动扫。").classes(
                     "text-xs text-gray-500")
+                ui.label("自动扫描时顺带刷新往前 N 年的片的版本（BD 常在首映后半年到一年半才出），"
+                         "只入库不下载。").classes("text-xs text-gray-500")
 
             # 手动立即扫描（可指定年份/季度回填历史）
             with ui.card().classes("w-full"):

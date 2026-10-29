@@ -5,10 +5,11 @@
 """
 import ipaddress
 import json
+import logging
 
 from nicegui import context, run, ui
 
-from core import anime, engine, ipfilter, netguard, worker
+from core import anime, engine, ipfilter, movies, netguard, worker
 from urllib.parse import quote
 
 import config
@@ -31,12 +32,52 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT", "DB_MYSQL_PORT",
             # r39：带合法范围的新阈值（config._RANGE），保存时越界拒收
             "ANIME_BACKFILL_EXTRA_EPS", "ANIME_LOCK_SYNC_DAYS", "ANIME_IDLE_WINDOW_X",
-            "ANIME_IGNORED_AIRING_DAYS", "ALERT_REPEAT_HOURS", "ALERT_REPEAT_DAYS"}
+            "ANIME_IGNORED_AIRING_DAYS", "ALERT_REPEAT_HOURS", "ALERT_REPEAT_DAYS",
+            "ANIME_LOCK_FALLBACK_DAYS", "ANIME_REPLACE_MAX_GAP_DAYS"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
 # 改了这几项才在保存时测一次 qB 连接（r37 #5）
 _QB_CONN_KEYS = {"QB_ENABLED", "QB_URL", "QB_USERNAME", "QB_PASSWORD"}
+# 决定归档目录的键（r39 U7）：改了它们，已下的文件留在原目录、之后的新集落到新目录。DOWN_PATH 两侧都管
+_ANIME_PATH_KEYS = {"DOWN_PATH", "ANIME_DOWN_PATH", "QUARTER_FMT", "ANIME_SEASON_SUBFOLDER"}
+_MOVIE_PATH_KEYS = {"DOWN_PATH", "MOVIE_DOWN_PATH", "MOVIE_QUARTER_FMT"}
+
+log = logging.getLogger("autorss")
+
+
+def _split_notice(snaps: dict) -> str:
+    """改完下载目录规则后的『目录分裂』提示；这次改动没让任何已下文件掉队就返回空串。(r39 U7)
+
+    snaps 是 _save 在 set_many 之前按旧规则拍的快照 {"anime"/"movie": 快照或 None}。只读、只提示、不改任何行。
+    哪一侧快照为 None 或计数出错就当那一侧没有——告警宁可漏报不误报。
+    """
+    parts, has_anime = [], False
+    if snaps.get("anime"):
+        try:
+            n, m, k = anime.anime_split_count(snaps["anime"])
+        except Exception:
+            log.warning("目录分裂计数失败（番剧），这次不提示", exc_info=True)
+            m = 0
+        if m:
+            parts.append(f"{n} 部番 {m} 集（其中在追 {k} 部）")
+            has_anime = True
+    if snaps.get("movie"):
+        try:
+            p, q = movies.movie_split_count(snaps["movie"])
+        except Exception:
+            log.warning("目录分裂计数失败（剧场版），这次不提示", exc_info=True)
+            q = 0
+        if q:
+            parts.append(f"剧场版 {p} 部 {q} 个版本")   # q 是 MovieTorrent 行数＝版本数，与 relocate_movie 同说法(r39 F36)
+    if not parts:
+        return ""
+    # 『要搬』只给番剧：编辑季度原样保存会触发搬迁（U7a 之后闸按盘上实际位置判）；季度为空的番 set_quarter 拒收。
+    # 剧场版的『编辑年份』原样保存也会搬，但会顺带置年份锁，方案没定，不往文案里写
+    # 『之后新下的』而不是『之后的新集』：只有剧场版分裂时也是这句，剧场版没有『新集』(r39 F36)
+    return (f"下载目录规则改了：{' / '.join(parts)} 的已下文件还在改之前的目录，之后新下的会落到新目录，"
+            "同一部会分在两个文件夹。误改的话把设置改回原值再保存即可。"
+            + ("要搬，进该番详情点『编辑季度』原样保存（季度为空的番不适用）。" if has_anime else ""))
 
 
 def qb_callback_curl(tok: str, port: int) -> str:
@@ -981,8 +1022,8 @@ def settings():
             _section("通知事件",
                      "勾了哪些就只收哪些。【留空＝一条都不发】——注意这与『订阅源』页上"
                      "『留空＝不限』（字幕组白名单、标题关键词）的含义相反。\n"
-                     "『qB 连不上』『数据库停摆』『待识别积压』是状态型：只在状态【翻转】的那一刻"
-                     "各发一条（进一条、出一条），不会每轮重复轰炸。\n"
+                     "『qB 连不上』『数据库停摆』『待识别积压』『采集停摆』『源抓取失败』是状态型：只在状态【翻转】的那一刻"
+                     "各发一条（进一条、出一条），不会每轮重复轰炸；『源抓取失败』在又有新的源挂掉时也会再推一条。\n"
                      f"『下载失败』『停滞异常』『绑定看着不对』由后台巡检合并上报，同一批 {config.ALERT_REPEAT_HOURS} 小时内"
                      "只说一次（有新成员立刻再说）；改这一项不会清掉正在计的冷却。\n"
                      f"『已下齐』『缺集』『锁定源落后』：同一部番的同一件事 {config.ALERT_REPEAT_DAYS} 天内只推一次"
@@ -1020,6 +1061,19 @@ def settings():
                      "就在详情页和仪表盘提醒（只提醒，不改下载行为；0=关）。"
                      "同步窗口：锁定组在别组发某集的前后这么多天内也在发、而集号差得远（季内号对绝对号）时，"
                      "当成两套编号同步在发，不算落后；只对锁定组最新一集之后的集生效，调大提醒更少。\n"
+                     "锁定源停更兜底：锁定组所有种子里最新一条入库已满这么多天、别的组的某一集也已入库满这么多天，"
+                     "且下面几道闸全过，才用别的组给这一集补一份（0=关）：bgm 总集数已知、这一集不超过它；"
+                     "没有集号歧义段、编号冲突、绑定可疑；锁定组至少发过一集正片，补的那个组也发过锁定组最新那一集；"
+                     "两组共有的每一集发布时间相差不超过这么多天，这一集的发布时间不早于该组发的锁定组最新那一集"
+                     "（锁定组中间跳过的集，比的是该组前一集）；"
+                     "这一集没被排除过、也没被你删成『该集已删』（只删了重复份的不算）。"
+                     "版本关键词是硬条件：别的组没有这个版本就不补、继续提醒。"
+                     "锁定组静默期间有没点『知道了』的 RSS 断档时不补（可能是采集漏收，不是它停更）；"
+                     "有订阅源抓取失败时不兜底（分不清是锁定组停更还是没抓到）。"
+                     "锁定组以后补发了这一集，会再自动下它的版本（多一份；兜底那份不会自动删，到详情页删）。"
+                     "锁定组补发之前别删兜底那份：删了等于这一集不要了，它的版本也不会再自动下。"
+                     "设成 0 只停新的兜底；已经兜底过的集，锁定组补发后仍会下它的版本。"
+                     "建议不小于『锁定源落后提醒』的天数，好让提醒先到、你来得及介入。\n"
                      "断更提醒窗口：一段静默里每满一个阈值提醒一次，静默超过『阈值×倍数』天就不再提醒，"
                      "即最多提醒『倍数−1』次（默认 4：阈值 14 天时在第 14、28、42 天各一次）；"
                      "从没成功提醒过的番不受这个限制，一定会先提醒一次。最小 2。\n"
@@ -1033,6 +1087,8 @@ def settings():
                 _num("ANIME_GAP_SLACK_WEEKS", "缺集提示余量（周）", config.ANIME_GAP_SLACK_WEEKS, 0, 8)
                 _num("ANIME_GAP_MAX_EPISODES", "缺集提示长番上限（集）", config.ANIME_GAP_MAX_EPISODES, 1, 10000)
                 _num("ANIME_LOCK_LAG_DAYS", "锁定源落后提醒（天，0=关）", config.ANIME_LOCK_LAG_DAYS, 0, 90)
+                _num("ANIME_LOCK_FALLBACK_DAYS", "锁定源停更兜底（天，0=关）", config.ANIME_LOCK_FALLBACK_DAYS,
+                     *config._RANGE["ANIME_LOCK_FALLBACK_DAYS"])
                 _num("ANIME_RERELEASE_WEEKS", "同号新集晚几周算可疑（0=关）", config.ANIME_RERELEASE_WEEKS, 0, 520)
                 _num("ANIME_LOCK_SYNC_DAYS", "锁定源同步窗口（天）", config.ANIME_LOCK_SYNC_DAYS,
                      *config._RANGE["ANIME_LOCK_SYNC_DAYS"])
@@ -1139,9 +1195,10 @@ def settings():
             _text("ANIME_RETRY_BACKOFF_MIN", "取种失败重试间隔（分钟，逗号分隔）",
                   ",".join(map(str, engine.retry_backoff_min())), "1,5,30,180,720,1440")
             if engine.parse_retry_backoff(config.raw("ANIME_RETRY_BACKOFF_MIN")) is None:
-                ui.label("库里的值无效，正按默认表执行，保存会写回上面这张表").classes("text-xs text-amber-500")
+                ui.label("库里的值无效，正按默认表执行，保存会写回上面这张表").classes("text-xs text-amber-400")
             ui.label("取种失败（源站超时/502/DNS）或重启打断交付时，按这张表依次等这么多分钟再试；用完转『失败』，"
                      "失败不会自动重试。默认合计约 40 小时，断网更久就往后加（如 …,1440,2880,2880）。"
+                     "所有源都连不上（整机断网）期间用满不转失败，按最后一档继续排队，网络恢复后自动接上。"
                      "实际间隔按轮询周期取整。").classes("text-xs text-gray-500")
             _switch_field("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
                     config.ANIME_TOP_PRIORITY_INSTANT)
@@ -1160,6 +1217,12 @@ def settings():
             _switch_field("ANIME_REPLACE_VERSIONS",
                     "同一个组发了修正版（v2…）就替换：先下好新版，再删掉旧版的种子和文件",
                     config.ANIME_REPLACE_VERSIONS)
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ANIME_REPLACE_MAX_GAP_DAYS", "修正版与旧版发布时间最多相差（天）",
+                     config.ANIME_REPLACE_MAX_GAP_DAYS, *config._RANGE["ANIME_REPLACE_MAX_GAP_DAYS"])
+            ui.label("超过这个天数的 v2 不当修正版（多半是别季同集号挂错了番）：不自动下它、旧版不动"
+                     "（人工下的 v2 也不会顶掉旧版）。"
+                     ).classes("text-xs text-gray-500")
             _switch_field("ANIME_MULTIBRACKET_PARSE",
                     "多括号命名回退捕获（识别 [组][番名][集] 格式）",
                     config.ANIME_MULTIBRACKET_PARSE)
@@ -1359,7 +1422,25 @@ def settings():
                            if k in _RESTART_ONLY and v != (_env_now.get(k) or "")}
             if db_updates:
                 sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
+                # 【目录分裂提示】(r39 U7) 改下载目录规则只影响之后的新集，已下的文件留在原目录——同一部会分在两个文件夹，
+                # 而保存时只有一句绿色『已保存』。要报的是【这次改动造成的】增量，旧目录只能在 set_many 之前算，
+                # 所以先预判哪些键会变（比较式与 set_many 内部一致），路径键真的会变才拍快照（生产库约 73ms）。
+                # 快照出错只记日志、那一侧不提示（宁可漏报），保存照常。
+                going = {k for k in db_updates if k in config._SPEC
+                         and config._coerce(config._SPEC[k][0], db_updates[k]) != config.raw(k)}
+                snaps = {}
+                for side, keys, take in (("anime", _ANIME_PATH_KEYS, anime.anime_path_snapshot),
+                                         ("movie", _MOVIE_PATH_KEYS, movies.movie_path_snapshot)):
+                    if going & keys:
+                        try:
+                            snaps[side] = take()
+                        except Exception:
+                            # warning 而非 error：坏的只是一条提示，保存本身没出错
+                            log.warning("目录分裂快照失败（%s），这次不提示", side, exc_info=True)
+                            snaps[side] = None
                 changed = config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效；返回真的变了的键
+                if snaps and (split_msg := _split_notice(snaps)):
+                    ui.notify(split_msg, type="warning", timeout=0, close_button="知道了")
                 # 通知的冷却/状态记忆是【进程内】的：不清的话，用户刚把某个事件勾上，
                 # 还要等冷却过期或状态再翻转一次才看得到效果——那看起来就像"设置没生效"。
                 # 【只在真的改了 NOTIFY_* 时才清】(R36 体检) 以前保存任何一项（改个轮询间隔）都会把

@@ -93,6 +93,9 @@ def test_a_hand_edited_episode_is_never_pushed_back(clean_tables):
     """用户在详情页手工改过的集号不许被折算推回去。
 
     判据是 `_orig_episode`：手工改过之后 `episode != 标题原值`，锚不成立 → 跳过。
+    （r39 F10）这只对"人工值落在锚外"成立 —— 本例的 20 就是，所以值判据挡得住；人工值落进判据的
+    （O<T 改成 8、O≥T 改回 13）值判据挡不住，靠的是 episode_manual 标记，见下面 r39 I10 那组用例。
+    别据本例去收窄值判据。
 
     ⚠️ 取值必须**仍落在绝对域内**（这里 T=13、O=13 → 绝对域 (13, 26]，人工改成 20）。
     第一版改成了 7 —— 那个值根本进不了折算的 if（`13 < 7` 为假），
@@ -215,3 +218,93 @@ def test_both_folding_sites_agree_on_every_input(total, offset, ep, clean_tables
     assert via_ingest == via_refold, (
         f"T={total} O={offset} ep={ep}：入库归一给 {via_ingest}，存量回折给 {via_refold} —— "
         "两处判据已经分家，同一集会落在两个去重键上")
+
+
+# ---- r39 I10：人工改过的集号用 episode_manual 标记守住，不靠值判据 ----
+# 值判据（_orig_episode 幂等锚）分不出"旧规则折的"和"人改的"：人改出的值恰好落进判据时，
+# 展开/回折会把它推回去。下面 ①②③ 都是这种值，④ 钉住非人工行的值判据不许被收窄，⑤ 钉住空确认不打标。
+
+def _only_tid(session):
+    return session.exec(select(AnimeTorrent)).one().id
+
+
+def _refold(clean_tables, aid):
+    with clean_tables.get_session() as s:
+        A._refold_absolute_episodes(s, s.get(Anime, aid))
+        s.commit()
+    with clean_tables.get_session() as s:
+        return s.exec(select(AnimeTorrent)).one()
+
+
+@pytest.mark.parametrize("raw_ep,manual_ep", [
+    (20, 8.0),    # ① 8 + 12 == 原值 20：旧代码的展开分支会推回 20
+    (30, 18.0),   # ② 18 + 12 == 原值 30（旧规则域 (T, O+T] 内），同上
+])
+def test_manual_episode_survives_unwinding(raw_ep, manual_ep, clean_tables):
+    """O=12 < T=24（不可折）：用户改出的值满足『原值 == 现值 + O』，展开分支必须跳过这一行。"""
+    with clean_tables.get_session() as s:
+        aid = _mk(s, total=24, offset=12, rows=[(f"[ANi] 某番 - {raw_ep} [1080P]", float(raw_ep))])
+        tid = _only_tid(s)
+    assert A.set_torrent_episode(tid, manual_ep) is True
+    t = _refold(clean_tables, aid)
+    assert t.episode == manual_ep, f"人工改的 {manual_ep} 被展开推回了 {t.episode}"
+    assert t.episode_manual is True
+
+
+def test_manual_episode_survives_folding(clean_tables):
+    """③ O=12 ≥ T=12（可折）：已被误折成 1 的 '- 13'，用户改回 13 —— 13 == 原值，回折分支必须跳过。"""
+    with clean_tables.get_session() as s:
+        aid = _mk(s, total=12, offset=12, rows=[("[ANi] 某番 - 13 [1080P]", 1.0)])
+        tid = _only_tid(s)
+    assert A.set_torrent_episode(tid, 13.0) is True
+    t = _refold(clean_tables, aid)
+    assert t.episode == 13.0, f"人工改回的 13 又被折成了 {t.episode}"
+    assert t.episode_manual is True
+
+
+def test_non_manual_row_still_unwinds_by_value(clean_tables):
+    """④ 钉住值判据：非人工行 O=12、T=13、'- 13' 存 1，必须展开回 13。
+
+    防止后人为了"保护人工值"去收窄判据 —— 那样旧规则误折的行展不回来，与真第 1 集同占键 (番,1)，第 13 集漏掉。
+    """
+    with clean_tables.get_session() as s:
+        aid = _mk(s, total=13, offset=12, rows=[("[ANi] 某番 - 13 [1080P]", 1.0)])
+    t = _refold(clean_tables, aid)
+    assert t.episode == 13.0 and t.episode_manual is False
+
+
+def test_noop_confirm_does_not_mark_manual(clean_tables):
+    """⑤ 空确认（对话框默认填当前值，不改直接确定）不打标：T 改正后照样能展开修复。
+
+    O=12、T=12 时 '- 13' 被误折成 1（bgm 少记一集）；用户打开改集号对话框直接确定 1；
+    bgm 把 T 改正为 13 → 展开分支必须还能把它推回 13，否则与真第 1 集撞键、第 13 集漏掉。
+    """
+    with clean_tables.get_session() as s:
+        aid = _mk(s, total=12, offset=12, rows=[("[ANi] 某番 - 13 [1080P]", 1.0)])
+        tid = _only_tid(s)
+    assert A.set_torrent_episode(tid, 1.0) is True
+    with clean_tables.get_session() as s:
+        t = s.get(AnimeTorrent, tid)
+        assert t.episode == 1.0 and t.episode_manual is False, "空确认被打成了人工标记"
+        a = s.get(Anime, aid)
+        a.total_episodes = 13
+        s.add(a)
+        s.commit()
+    t = _refold(clean_tables, aid)
+    assert t.episode == 13.0, f"空确认之后展开修复被堵死了：仍是 {t.episode}"
+
+
+def test_repair_truncated_skips_manual_rows(clean_tables):
+    """截断修复同样跳过人工行：模型注释里『截断修复跳过这一行』这条不变量要名副其实。"""
+    with clean_tables.get_session() as s:
+        _mk(s, total=None, offset=None, rows=[("[Sub] One Piece S01E1174 [1080p]", 117.0),
+                                              ("[Sub] One Piece S01E1175 [1080p]", 117.0)])
+        man, auto = sorted(s.exec(select(AnimeTorrent)), key=lambda t: t.raw_title)
+        man.episode_manual = True    # 不经 set_torrent_episode（值没变它不打标），直接造一行人工定过的 117
+        s.add(man)
+        s.commit()
+        man_id, auto_id = man.id, auto.id
+    assert A.repair_truncated_episodes() == 1, "对照行（非人工）应被修：用例要走得到修复分支"
+    with clean_tables.get_session() as s:
+        assert s.get(AnimeTorrent, man_id).episode == 117.0, "人工行被截断修复改了"
+        assert s.get(AnimeTorrent, auto_id).episode == 1175.0

@@ -4,6 +4,8 @@
   ① 用标题里的候选名（日文原名/罗马音/中文简繁）搜 bgm，被越多名字一致命中越可信；
      用『集数倒推的首播日』校验放送日，挡掉同名老番/别的作品。
   ② 都没命中才退回 Mikan-hash 桥（hash→Mikan剧集页→bgm）当兜底——Mikan 只是下载源+兜底。
+  例外(R39)：日期闸关着（集号越出 1..30 / 没有发布时间）时名字投票没有任何时间约束，
+     改成【先】问桥、问不到再投票，理由与生产数据见 resolve 里的注释。
 拿到 bgm id 后，name_cn=规范名、date=真实放送日→季度、id=跨源去重身份，全出自 bgm。
 全程尽力而为，拿不到返回 None，绝不阻断主下载链路。
 """
@@ -101,11 +103,15 @@ async def _retryable(make_request):
 # retry_unmatched 的退避阶梯一共只有 REENRICH_MAX_TRIES 次、总跨度约 15 小时，正好能被
 # bgm 的一次限流窗口或机房故障吃光——而"根本没问成"不该消耗那几次机会。
 #
-# 【只统计 bgm 这一个对端】计数器的唯一消费者是 retry_unmatched，它问的是"bgm 到底可不可达"。
+# 【只统计 bgm 这一个对端】计数器有两个消费者，问的都是"bgm 到底可不可达"：
+#   · retry_unmatched（core/anime.py）——候选都是 bangumi_id 为空的番，走 resolve；
+#   · 剧场版扫描的 _discover_loop（core/movies.py）——按 Mikan 给的 bgm id 走 fetch_by_id，
+#     "一部都没问成"才判 bgm_down、不推进扫描基准。(R39) 此前 fetch_by_id 这条路一次都不记账，
+#     计数恒为 0，那边无从区分"bgm 挂了"与"问到了、对方说没有(404)"。
 # 早先这里把 Mikan 桥的失败也记进同一个数：于是"bgm 一切正常、只是 Mikan 打不开"会被
 # 判成"bgm 整体不可达"，退避阶梯被无限退款、每个节拍重打一遍 bgm（实测 bgm 恒 200 也照样如此）。
 # 同理，纯本地的解析异常（JSON 坏了、字段类型不对）也不算"没问成"——问是问到了。
-# 【按 asyncio 任务分账，不是进程全局】(R21) 唯一的消费者 retry_unmatched 是这么用的：
+# 【按 asyncio 任务分账，不是进程全局】(R21) 消费者 retry_unmatched 是这么用的：
 #     before = net_failures(); await enrich_anime(aid); reached += (net_failures() == before)
 # 而 `_bgm_fail` 原来是**进程级模块变量**——采集轮那条线
 # （run_worker → poll_once → process_item → _resolve_anime → enrich.resolve → _search_one）
@@ -152,7 +158,9 @@ def _parse_date(s: str | None) -> datetime | None:
 def _date_ok(bgm_dt: datetime, est: datetime | None, release: datetime | None) -> bool:
     """放送日是否合理：贴近『集数倒推的首播日』(±35天)，或落在种子发布前后的兜底窗口。"""
     if est is None and release is None:
-        return True  # 完全没有时间基准时不卡日期，交给名字重叠+bgm 相关性排序
+        # 完全没有时间基准时不卡日期。(R39) 这时带 hash、带集号的条目先由 Mikan-hash 桥按 hash
+        # 精确定番（见 _resolve_inner），桥没给答案才落到这里，交给名字重叠+bgm 相关性排序。
+        return True
     if est is not None and abs((est - bgm_dt).days) <= 35:
         return True
     if release is not None and -21 <= (release - bgm_dt).days <= 45:
@@ -170,8 +178,26 @@ def _name_not_contradicted(query: str, subject: dict) -> bool:
     return any(query[i:i + 2] in cand for i in range(len(query) - 1) if query[i:i + 2].strip())
 
 
-async def _search_one(client, name, est, release):
-    """用一个名字搜 bgm，返回第一个通过日期+名字校验的 subject（bgm 按相关性排序）。"""
+def _single_ep_cannot_host(subject: dict, episode) -> bool:
+    """候选是【单集】条目（特典/OVA/PV），而本条是第 2 集及以后 —— 这一集不可能属于它。(R39)
+
+    与 core.anime 里 binding_looks_wrong 的判据②同口径：那边是绑上之后从库里种子事后发现，
+    这里是绑定之前就拦。集数的取法与 _subject_to_info 一致（total_episodes 优先、退 eps），
+    所以命中它就等于"绑上之后 total_episodes 会是 1"。
+    集数为 0 / 缺字段（bgm 还没填）不算单集；集号为空 / 特别篇(-1) / 未知(-2) / 0 / 1 不启用。
+    1 和 2 是"单集作品"的定义值，不是可调阈值，与判据②里写死的 ==1 同一性质，不进设置。
+    """
+    if not isinstance(episode, (int, float)) or episode < 2:
+        return False
+    return (subject.get("total_episodes") or subject.get("eps")) == 1
+
+
+async def _search_one(client, name, est, release, episode=None):
+    """用一个名字搜 bgm，返回第一个通过日期+名字校验的 subject（bgm 按相关性排序）。
+
+    episode：本条的集号。第一个过闸的候选若是单集条目而本条是第 2 集及以后，
+    这个名字【弃权】返回 None（见下面循环里的注释）。
+    """
     try:
         code, raw = await _retryable(lambda: _capped(
             client, "POST", f"{config.BGM_API}/v0/search/subjects", headers=_UA,
@@ -199,6 +225,18 @@ async def _search_one(client, name, est, release):
         if dt is None:
             continue
         if _date_ok(dt, est, release) and _name_not_contradicted(name, d):
+            # 【单集条目收到第 N 集 → 这个名字弃权，不往下找】(R39) 真库 anime#96：
+            # 'Akane-banashi' 第一个过闸的是 664060『AKANE On My Mind』(1 集·其他)，绑上之后
+            # 第 3~12 集全挂在一个特典下（binding_looks_wrong ② 事后才发现）。
+            # 【不能 continue 去取排名更低的候选】那是拿一个更弱的候选顶替、等于替用户新猜一次：
+            # 标题『… OVA - 02』被解析成 ep=2，而 OVA 每部在 bgm 上单独一条(1 集)；同系列 TV
+            # 恰好也在日期窗口里的话，continue 就改绑到 TV、复用已有的 TV 番，OVA 第 2 集与
+            # TV 第 2 集共用去重键 (aid,2)——OVA 那份先 sent，TV 第 2 集就被 have_eps 永久挡掉，
+            # 静默漏集且不可逆。弃权之后这条落到别的候选名、Mikan-hash 桥或『待识别』，不猜。
+            if _single_ep_cannot_host(d, episode):
+                log.info("bgm 候选 %s『%s』只有 1 集，而本条是第 %s 集：名字『%s』弃权",
+                         d.get("id"), d.get("name_cn") or d.get("name") or "", episode, name[:40])
+                return None
             return d, dt   # 连同已解析的放送日返回，供 resolve 复用、免二次解析
     return None
 
@@ -319,6 +357,11 @@ async def fetch_by_id(bgm_id: int) -> dict | None:
         async with asyncio.timeout(_RESOLVE_BUDGET):
             return await _fetch_by_id_inner(bgm_id)
     except TimeoutError:
+        # 【这里要记一笔 bgm 没问成，与 resolve 外层【不记】的理由不同】(R39)
+        # resolve 的预算罩着 Mikan 桥，超时说不清是谁慢；这个预算里只有 bgm 一个对端
+        # （subject + characters，而 characters 自己有 _CAST_TIMEOUT 兜着），超时就是 bgm 没答上来。
+        # 不记的话，剧场版扫描撞上 bgm 涓流时每部都"没拿到、也没记失败"，会被当成"问到了、没有"。
+        _note_bgm_fail()
         log.warning("按 id 取 bgm 超时（整体 %ds）：%s", _RESOLVE_BUDGET, bgm_id)
         return None
 
@@ -332,8 +375,18 @@ async def _fetch_by_id_inner(bgm_id: int) -> dict | None:
             code, raw = await _retryable(lambda: _capped(
                 client, "GET", f"{config.BGM_API}/v0/subjects/{bgm_id}", headers=_UA))
             if code != 200:
+                # (R39) 与 _search_one 同口径：429/5xx 是【没问成】，404（条目被合并/删除、
+                # NSFW 条目对未登录请求）是"问到了、对方说没有"，不计。
+                if code == 429 or code >= 500:
+                    _note_bgm_fail()
                 return None
-            j = json.loads(raw)
+            try:
+                j = json.loads(raw)
+            except ValueError as e:
+                # 【单独接住，不落进下面的 catch-all】JSON 坏了是"问到了、对方给的东西不对"，
+                # 与 _search_one / _resolve_inner 同口径不记 bgm 失败；落进 catch-all 就会被记成没问成。
+                log.warning("按 id 取 bgm：响应不是合法 JSON %s: %s", bgm_id, e)
+                return None
             # 【声优要自己的小超时，不能裸调】与 _resolve_inner 里那段【同一个理由】：
             # 一个涓流的 /characters 会把 3 次重试各拖满 _ATTEMPT_TIMEOUT(90s)≈270s，
             # 撑破外层 _RESOLVE_BUDGET(120s)，于是一次【已经拿到 subject 的成功取数】被整份丢掉。
@@ -355,6 +408,9 @@ async def _fetch_by_id_inner(bgm_id: int) -> dict | None:
         # 而 NiceGUI 默认只 log.exception，用户侧连一条 notify 都没有：按钮点了没反应。
         # 同一个弹窗里的『重新识别』走 resolve、那条是 except Exception，同样的故障它会正常弹提示：
         # 同一页同一故障，一个按钮报错、旁边那个装死。
+        # (R39) 走到这里的都是请求机制本身的失败（建 client、连接层、重试用尽），记一笔没问成——
+        # 与 _resolve_inner 末尾的 catch-all 同口径。纯本地的 JSON 解析已在上面单独接住。
+        _note_bgm_fail()
         log.warning("按 id 取 bgm 失败 %s: %s: %s", bgm_id, type(e).__name__, e)
         return None
     if not isinstance(j, dict) or not j.get("id"):
@@ -394,9 +450,18 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
     # 集号落在 1..30 之外时【连同 release 一起放弃日期校验】，不能像以前那样退回拿 release_time
     # 当首播日：那样 _date_ok 的两条判据会塌缩成同一个 [bgm_air-35, bgm_air+45] 窗口，而长番
     # 第 40 集的发布时间距首播已 280 天，窗口必然落空 → _search_one 把【包括正确答案在内的】
-    # 全部候选 continue 掉，名字投票整条路径失效，识别退化成只剩 Mikan-hash 桥一个单点。
+    # 全部候选 continue 掉，名字投票整条路径失效。
     # 也不能无脑把倒推外推到更大集号：跨季绝对编号（S2 第 4 集被写成 16）倒推会指到【上一季】的
-    # 首播日，反而把正确的续季 subject 判否。宁可不设基准，交给名字重叠 + bgm 相关性排序。
+    # 首播日，反而把正确的续季 subject 判否。所以宁可不设基准。
+    #
+    # 【不设基准时先问 Mikan-hash 桥，问不到再投票】(R39) 不设基准的代价是名字投票失去全部时间约束：
+    # 搜 'Re:Zero kara Hajimeru Isekai Seikatsu'，140001(第一季)排第 1、633836(第四季)排第 5，
+    # 绝对编号的第 78/79 集就稳稳绑到 2016 年的第一季。生产副本里首条种子落在这一支的番共 19 部，
+    # 名字投票绑错 4 部（#100/#165/#115/#150）；同样 19 个 hash 问桥：13 个有答案、全部等于最终的
+    # 正确绑定，另 6 个没答案（回落名字投票，与原来一样）。再拿 125 部已确认番的首条 hash 测：
+    # 119 个与现绑定一致、0 个不一致、6 个无答案。桥是按 hash 精确查番组，不是按名字猜。
+    # 只有"日期闸关着 + 带 hash + 带集号"才走这个顺序：剧场版传 episode=None、日期闸开着的季番都照旧
+    # 名字优先。桥自己有上限、超时回落投票，细节见 _resolve_inner。
     est = release_time
     date_ref = release_time      # 传给 _date_ok 的 release 基准；放弃校验时与 est 一起置 None
     if isinstance(episode, (int, float)):
@@ -415,7 +480,7 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
     try:
         async with asyncio.timeout(_RESOLVE_BUDGET):
             return await _resolve_inner(_dedup_names(names)[:_MAX_CANDIDATE_NAMES],
-                                        est, date_ref, info_hash)
+                                        est, date_ref, info_hash, episode)
     except TimeoutError:
         # 【这里不能再自己记一次 bgm 失败】预算罩住的不只是 bgm，还有 Mikan 桥
         # （_mikan_bridge）——而它自己的注释明写着"不记 bgm 的账：混在一起会让
@@ -428,7 +493,7 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
         return None
 
 
-async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
+async def _resolve_inner(names, est, date_ref, info_hash, episode=None) -> dict | None:
     """resolve 的主体。拆出来只为让上面那层 asyncio.timeout 包得干净。"""
     try:
         # 【两个地址都要报】这一个客户端既打 BGM_API（搜索/详情）又打 MIKAN_BASE
@@ -436,11 +501,37 @@ async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
         async with httpx.AsyncClient(**config.http_client_kwargs(
                 max(1, config.ENRICH_TIMEOUT),
                 url=(config.BGM_API, config.MIKAN_BASE))) as client:
-            # ① 多名搜 bgm，统计投票（被几个名字命中）+ 记录日期贴合度
+            bgm_id = None
+            bridged = False      # 这个 hash 已经问过桥（不论问没问到），第②步不再问第二次
+            # ⓪ 日期闸关着（resolve 把 est/date_ref 都置了 None）且带 hash、带集号 → 先问桥。
+            # 理由与生产数据见 resolve 里的注释。
+            if (est is None and date_ref is None and info_hash
+                    and isinstance(episode, (int, float))):
+                bridged = True
+                # 【桥要自己的上限，不能裸调】ENRICH_TIMEOUT 只是逐块读超时，涓流响应下每次尝试
+                # 能拖到 _ATTEMPT_TIMEOUT(90s)，桥两个 GET 各重试 ENRICH_RETRY_TIMES 次，
+                # 加起来远超 _RESOLVE_BUDGET——Mikan 一涓流，名字投票根本轮不到，整次识别超时作废，
+                # 而原来名字优先时这 19 部里投票能对 15 部。上限全由现有设置推出（不新增设置），
+                # 再夹到整体预算的一半，保证名字投票至少还剩一半时间。
+                cap = min(max(1, config.ENRICH_TIMEOUT) * max(1, config.ENRICH_RETRY_TIMES),
+                          _RESOLVE_BUDGET // 2)
+                try:
+                    async with asyncio.timeout(cap):
+                        bgm_id = await _mikan_bridge(client, info_hash)
+                except TimeoutError:
+                    # 【就地接住、不记 bgm 的账】TimeoutError 是 Exception 的子类，漏到本函数末尾的
+                    # catch-all 会被 _note_bgm_fail 记成"bgm 没问成"，而这是 Mikan 慢——
+                    # retry_unmatched 的退避阶梯会被错误退款（理由同 _mikan_bridge 的注释）。
+                    # 外层整体预算先到时，这里接不住（内层收到的是取消），照常往外传给 resolve。
+                    log.info("Mikan-hash 桥 %ds 内没答上来，回落名字投票：%s", cap, info_hash[:16])
+                if bgm_id is not None:
+                    log.info("日期闸关闭（第 %s 集），按 hash 经 Mikan 桥定到 bgm %s，跳过名字投票：%s",
+                             episode, bgm_id, "/".join(names)[:60] or info_hash[:16])
+            # ① 多名搜 bgm，统计投票（被几个名字命中）+ 记录日期贴合度。桥已经给了答案就整段跳过。
             votes: Counter = Counter()
             gap: dict = {}
-            for name in names:
-                hit = await _search_one(client, name, est, date_ref)
+            for name in (names if bgm_id is None else []):
+                hit = await _search_one(client, name, est, date_ref, episode)
                 if hit:
                     d, bdt = hit   # bdt 已由 _search_one 解析（且必非 None，命中前已校验）
                     bid = d.get("id")
@@ -449,7 +540,6 @@ async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
                     votes[bid] += 1
                     g = abs(((est or date_ref) - bdt).days) if (bdt and (est or date_ref)) else 999
                     gap[bid] = min(gap.get(bid, 10 ** 9), g)
-            bgm_id = None
             if votes:
                 # 优先被多个名字一致命中的；其次放送日最贴的
                 ranked = sorted(votes, key=lambda i: (-votes[i], gap.get(i, 10 ** 9)))
@@ -470,7 +560,8 @@ async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
                     # 整部番被判「超期忽略」，一集都不会下。而且详情页的『重新识别』同样平局、
                     # 会把人工绑好的 975 再覆盖成另一部（实测 90390「航海王：奈美之章」）。
                     #
-                    # 平局时【什么都不绑】更好：bgm_id 留 None 会落到下面的 Mikan-hash 桥——
+                    # 平局时【什么都不绑】更好：bgm_id 留 None 会落到下面的 Mikan-hash 桥
+                    # （日期闸关着且带集号时桥已在第⓪步问过、没答上来才轮到投票，这时直接留『待识别』）——
                     # 那是按 info_hash 精确查番组，比"按名字书写顺序猜"可靠得多；桥也不通就留在
                     # 『待识别』等人工绑定，由 run_reenrich_retry 按退避重试。宁可多一条待办，
                     # 不要一个静默绑错的番（绑错之后没有任何告警，而它会连带决定归档目录与超期判定）。
@@ -479,8 +570,9 @@ async def _resolve_inner(names, est, date_ref, info_hash) -> dict | None:
                 else:
                     bgm_id = best
 
-            # ② 兜底：Mikan-hash 桥
-            if bgm_id is None and info_hash:
+            # ② 兜底：Mikan-hash 桥。第⓪步问过就不再问（同一个 hash 答案不会变；超时过的也不再问，
+            # 否则 Mikan 涓流时同一次识别要被它拖两回）。
+            if bgm_id is None and info_hash and not bridged:
                 bgm_id = await _mikan_bridge(client, info_hash)
 
             # ③ 取 bgm 元数据（规范名/原名/放送日 + 简介/总集数/类型/封面/评分 + 原作/导演/音乐）

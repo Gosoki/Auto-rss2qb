@@ -98,7 +98,8 @@ def delivering(model_cls, torrent_id: int):
 # NiceGUI 的请求上下文里，既没有锁、也不是我们 create_task 出来的，闸怎么数都数不到它。
 # R33 用 AST 扫出来是 **8 个**（bind_anime_bgm / bind_movie_bgm / manual_enrich / enrich_movie /
 # download_all_pending / backfill_source / delete_anime_files / refresh_movie_torrents），
-# 不是审计凭记性说的"三四个"。
+# 不是审计凭记性说的"三四个"。（r39 M2 删了 enrich_movie：剧场版『重新识别』改成只出候选的
+# suggest_movie_bgm + 带回显的 bind_movie_bgm，前者 await 之后不开会话、不用登记。）
 #
 # 这里不给它们上锁：锁会让用户两个不相干的操作互相等（绑一部番要等另一部番刷新版本）。
 # 照 `_delivering` 的做法做一个**只登记、不串行**的集合：进函数登记、finally 注销、
@@ -181,6 +182,20 @@ def _settle_as_delivered(t, d: dict) -> None:
         t.qb_progress, t.qb_state, t.qb_synced_at, t.qb_progress_at = 1.0, "", None, None
 
 
+def clear_ep_dropped(s, anime_id, episode) -> None:
+    """这一集又有一份交给 qB 了：清掉同番同集（粗键，不分源）所有行的"该集已删"标记（E-73）。调用方负责 commit。
+
+    两处调：番剧交付成功段（force 时）、sweep_stale_delivering 把残骸按已交付落定时。后者漏了的话，
+    force 交付在 add_to_qb 成功后崩溃 → 清扫落成 sent，标记却还在；以后这一份被清回待下 / 0% 落 error，
+    就被它自己的旧标记挡死，用户明确要回来的集就漏了。清多了只会多下。"""
+    from db.models import AnimeTorrent
+    for o in s.exec(select(AnimeTorrent).where(
+            AnimeTorrent.anime_id == anime_id, AnimeTorrent.episode == episode,
+            AnimeTorrent.ep_dropped == True)):   # noqa: E712
+        o.ep_dropped = False
+        s.add(o)
+
+
 async def sweep_stale_delivering() -> int:
     """把"落库是 downloading、但本进程并没有协程在管"的残骸落定。返回处理的行数。
 
@@ -239,6 +254,8 @@ async def sweep_stale_delivering() -> int:
                 restored += 1
             else:
                 _settle_as_delivered(t, d)
+                if model_cls is AnimeTorrent:
+                    clear_ep_dropped(s, t.anime_id, t.episode)   # 与交付成功段同口径（E-73），见 clear_ep_dropped
                 settled += 1
             s.add(t)
         if restored or settled:
@@ -347,17 +364,19 @@ ALL_STATUSES = ("pending", "downloading", "sent", "error",
 #      （那是人工抢救停滞种子的唯一入口）。
 TRACKED_STATUSES = ("sent", "downloading")
 # ② HAVE：『这一集盘上已经有一份』——在 ① 基础上 +stalled（停滞种子的半成品文件确实在盘上）。
-#    用于：集去重(flush/plan/instant 去重闸/补下)、跨表持有判断、删除、搬迁、详情页 covered。
-#    【不含 deleted】——用户删的那条不会自己回来（它自身是终态，flush/plan 只挑 pending/error 永不选它），
-#    但同集来了新 hash 照常自动下（该集此时不含本集合任一状态 → 不被挡）。
+#    用于：跨表持有判断、删除、搬迁、详情页 covered；番剧侧集去重的判据建在它上面（见下）。
+#    【不含 deleted】——用户删的那条不会自己回来（它自身是终态，flush/plan 只挑 pending/error 永不选它）。
+#    【番剧侧集去重不直接用它】(E-73，推翻 cf00748 的"同集来新 hash 照常自动下") 用的是 core.anime._covered：
+#    HAVE，或 deleted 且 ep_dropped（用户删的是该集最后一份＝这一集不要了）。只删了重复份的 deleted 不挡。
 HAVE_STATUSES = TRACKED_STATUSES + ("stalled",)
-# ③ HANDLED：『这一集处理过』——在 ② 基础上 +deleted。用于 restore / 换源兜底：
-#    用户特意删过的集，其被去重压成 skipped 的兄弟不该被复活重下。
+# ③ HANDLED：『这一集/这部番处理过』——在 ② 基础上 +deleted。用于"下过没有"一类判断
+#    （季度已落盘不改、自动升确认只救没下过的番、剧场版侧持有）。
+#    restore / 换源兜底 / 单部作品下发 以前也用它挡"删过的集"，E-73 起改用 core.anime._covered（只挡该集已删）。
 HANDLED_STATUSES = HAVE_STATUSES + ("deleted",)
 
 # 『用户手工置的终态』：不是流程跑出来的，是人明确表达过"不要这条"。两处判据共用：
-#   · force 重下失败时恢复原态（core.anime 的 fail_status）——落成 error 会让该集不再含任何
-#     HANDLED 状态，进而被换源兜底复活 + flush 自动重下，等于把用户的删除决定悄悄撤销；
+#   · force 重下失败时恢复原态（core.anime 的 fail_status）——落成 error 会让该集丢掉"该集已删"
+#     （deleted+ep_dropped，E-73）这份着落，进而被换源兜底复活 + flush 自动重下，等于把用户的删除决定悄悄撤销；
 #   · UI 显示时优先于 qB 残留态（pages.layout.qb_live_text）——删除/排除只改 status 不清 qb_state，
 #     不先拦住就会把已删的显示成『已归档』或『已完成 100%』。
 # 加第 9 个人工终态时，这两处会同时跟着走，不必再各改一遍。
@@ -406,6 +425,7 @@ def is_special_ep(ep, single_work: bool = False) -> bool:
 
 # 【暂时性失败】的重试退避（分钟）：设置项 ANIME_RETRY_BACKOFF_MIN（默认 1,5,30,180,720,1440）。
 # 第 n 次失败后等第 n 项那么多分钟再发，用满就落 error 等人工。
+# 所有源都连不上（整机断网，health.network_down）期间用满不转失败，按最后一档继续排队（r39 D7b，见 anime._retry）。
 # 只给两类用：取种失败（nyaa/Mikan 超时、502、DNS…）和关停中断（重启时正在交付的那几条）——
 # 它们与种子本身无关，重发大概率就好了。其余一律不进队列，重试没有意义甚至有害：
 #   · 越界保存路径 → 配置问题，重试多少次都一样
@@ -528,6 +548,27 @@ def _path_module(base: str):
     """
     b = (base or "").strip()
     return ntpath if (_WIN_DRIVE_RE.match(b) or b.startswith("\\\\")) else posixpath
+
+
+def same_dir(a: str | None, b: str | None) -> bool:
+    """两个目录字符串是不是【同一个物理目录】。搬迁闸（rows_in_wrong_dir / needs_relocate）、
+    relocate 的选行与提示、设置页的『目录分裂』警告共用这一个谓词。(r39 U7/U7a)
+
+    【为什么不能用 ==】Windows 上同一个目录有多种写法：'E:/Anime' 与 'E:\\Anime'、大小写不同、
+    末尾多一个分隔符。生产库的 DOWN_PATH 是 'E:\\Anime\\AutoRSS'，用户把它改写成 'E:/Anime/AutoRSS'
+    物理目录没变，逐字比较却会把上百集判成『不在当前目录』——relocate 据此把这些行当旧目录处理，
+    提示还会让用户去删【当前目录】里唯一的一份。
+    【任一侧】像 Windows 路径（盘符、\\\\ 或 // 开头的 UNC）就用 ntpath，否则 posixpath：ntpath 的 normcase
+    统一分隔符并转小写，posixpath 的 normcase 什么都不做（POSIX 区分大小写，不能替它合并）。空/None 只与空/None 相同。
+    (r39 F2) 以前只看 a（为空才看 b）选规则，结果跟参数顺序有关：_path_module 不把正斜杠 UNC 认成 Windows，
+    same_dir('//NAS/share/x', '\\\\NAS\\share\\x') 按 posixpath 判成不同、反过来却相同。DOWN_PATH 从 //NAS/share
+    改写成 \\\\NAS\\share 后，同一个物理目录就被判成『不在位』，qB 不认识的行会被清成待下。
+    这里单独认 '//'，不改 _path_module：它决定拼路径用哪种分隔符，用户写的 //NAS/share 照原样拼正斜杠没问题。
+    """
+    win = any(_WIN_DRIVE_RE.match(p) or p.startswith(("\\\\", "//"))
+              for p in ((a or "").strip(), (b or "").strip()))
+    pm = ntpath if win else posixpath
+    return pm.normcase(pm.normpath(a or "")) == pm.normcase(pm.normpath(b or ""))
 
 
 def build_save_path(quarter: str, folder_name: str, season: int | None = None,
@@ -829,8 +870,11 @@ async def archive_old_completed() -> int:
     return n
 
 
-# fill_content_paths 问过、qB 里却没有的行（用户在 qB 里手动移除了种子）：本进程内不再问。
-_path_miss: set[tuple[str, int]] = set()
+# fill_content_paths 问过、qB 里却没有的种子（用户在 qB 里手动移除了）：本进程内不再问。
+# 【按小写 info_hash 做键，不按行 id】(r39 Q9) 行 id 会被复用（SQLite 的 rowid 取 max+1：删掉的若是
+# 最大 id，下一条新行就拿到它），按 id 记的话，复用了这个 id 的新种子在本进程内永远不会被问 → 永远没有播放路径。
+# 取舍：同一 hash 在新行里重新交付后这里也不再问它，但在下期间 sync 会顺手写上 content_path，可以接受。
+_path_miss: set[str] = set()
 _PATH_BATCH = 500
 
 
@@ -838,37 +882,41 @@ async def fill_content_paths() -> int:
     """给还不知道内容路径的已下种子向 qB 补上 content_path（播放用，见 models）。返回补上的条数。
 
     同步只在种子【在下】时顺手记路径，已经落定的行（本列上线前下完的、搬迁后被清空的）由这里补。
-    挂在归档轮上、【先于归档】跑，同一把 `_archive_lock`（读 (id, hash) → await qb → 按主键写回，
+    挂在归档轮上、【先于归档】跑，同一把 `_archive_lock`（读 (id, hash, save_path) → await qb → 按主键写回，
     与归档同形）：快到归档期的先补（按完成时间从早到晚），免得种子从 qB 移除后再也问不到。
-    已归档的不问（qB 里已经没有了）；qB 里查不到的记进 _path_miss，本进程内不再问。"""
+    已归档的不问（qB 里已经没有了）；qB 里查不到的记进 _path_miss，本进程内不再问。
+
+    【写回前核对 save_path 没变】(r39 Q9) 快照 → await qB 之间，页面上的 relocate 可能已经 setLocation
+    成功并把这行的 save_path 改成新目录、content_path 清空（它不拿 _archive_lock）。此时 qB 刚才回的
+    是搬迁前的旧路径，照写就把『播放』指向旧目录。save_path 与快照不一致就跳过、也不记 miss，下一轮重问。"""
     if not config.QB_ENABLED:
         return 0
     n = 0
     for model_cls in (AnimeTorrent, MovieTorrent):
-        name = model_cls.__name__
         with get_session() as s:
-            rows = [(t.id, t.info_hash) for t in s.exec(select(model_cls).where(
+            rows = [(t.id, t.info_hash, t.save_path) for t in s.exec(select(model_cls).where(
                 model_cls.status.in_(("sent", "stalled")),
                 model_cls.archived_at.is_(None),
                 model_cls.content_path.is_(None),
             ).order_by(model_cls.qb_synced_at, model_cls.id))
-                if t.info_hash and (name, t.id) not in _path_miss][:_PATH_BATCH]
+                if t.info_hash and t.info_hash.lower() not in _path_miss][:_PATH_BATCH]
         if not rows:
             continue
-        info = await qb.torrents_info([h for _, h in rows])
+        info = await qb.torrents_info([h for _, h, _ in rows])
         if info is None:              # qB 连不上：本轮不动，下轮再来
             return n
         with get_session() as s:
-            for tid, h in rows:
+            for tid, h, sp in rows:
                 d = info.get(h) or {}
                 cp = d.get("content_path")
                 if not cp:
-                    _path_miss.add((name, tid))
+                    _path_miss.add(h.lower())
                     continue
                 if (d.get("state") or "") in _QB_TRANSIENT:
                     continue          # 正在搬移/校验：回的可能还是旧路径，下轮再补
                 t = s.get(model_cls, tid)
-                if t is not None and t.content_path is None and t.archived_at is None:
+                if (t is not None and t.content_path is None and t.archived_at is None
+                        and t.save_path == sp):
                     t.content_path = cp
                     s.add(t)
                     n += 1
@@ -1049,14 +1097,22 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
     """把某番/某片『盘上有文件』的种子移到新的归档目录（改季度/重绑后调用，调用方须已落新季度/名）。
 
     两条线逻辑完全一致（此前是同一段 67 行抄两份），故实现放这里；差异只有名词与错误文案，走参数。
+    · 文件本就在当前目录（save_path 与新目录 same_dir）→ 一律不碰：不 setLocation、不清状态 (r39 Q2/U7a)
     · qB 跟踪该种子 → setLocation 原地搬 + 更新 save_path
-    · qB 关(用户显式关掉发送) / 不认识该 hash(remove-on-complete) → 清状态待重下到新目录
+    · qB 不认识该 hash(remove-on-complete)且文件不在当前目录 → 清状态（qB 关着时一行都不动，见下方）
     · 【qB 连不上】→ 一行都不动，只回 error 让用户稍后重试（与"qB 说没有"是两码事，见下方长注释）
     · setLocation 报 403/409(新目录不可写) → 只报告、不动状态
-    返回 {new_path, old_path, moved, redownload, untracked, failed, stalled_kept, special_kept, delivering, fail_code?, error?}。
+    返回 {new_path, old_path, moved, redownload, redownload_dirs, stalled_dirs, untracked, in_place, failed,
+    stalled_kept, special_kept, delivering, fail_code?, error?}。
+    走到问完 qB 那一步时，old_path 已改写成【被清/停滞行实际所在的目录】或 None（见下方 ③），不会是 new_path；
+    提前返回（error、没有要搬的行）时保持调用方传入的值。页面的两句指路提示不用它，各取
+    redownload_dirs（被清的那几集）/ stalled_dirs（停滞行自己），理由见 ③。
     """
     rep = {"new_path": new_path, "old_path": old_path, "moved": 0,
            "redownload": 0, "untracked": 0, "failed": 0,
+           "redownload_dirs": [],   # 被清行原先所在的目录（去重排序；save_path 为空记『原目录未记录』）
+           "stalled_dirs": [],      # 停滞行（不含特别篇/未知集）自己所在的目录，不含当前目录（r39 F1）
+           "in_place": 0,       # qB 已不跟踪、但文件本就在当前目录的行：未改动（r39 Q2）
            "stalled_kept": 0,   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
            "special_kept": 0,   # 特别篇(-1)/未知集(-2)：清成 pending 没有路径会再下它，同样不动（E-4）
            "delivering": 0}     # 交付中的占位行：本次不动它，交付完仍会落旧目录，需提示用户再点一次
@@ -1073,21 +1129,33 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         # untracked 清成 pending，而交付协程返回时又无条件写回 sent + 旧路径，净效果是：
         # 文件落旧目录、库里记 sent 不会重下、报告却谎称"已清状态待重下"并让用户去删
         # ——那正是 qB 此刻在写的文件。这里不碰它，只在报告里单独计数提示用户稍后再点一次。
-        pairs = [(t.id, t.info_hash) for t in rows if t.status != "downloading"]
-        rep["delivering"] = sum(1 for t in rows if t.status == "downloading")
+        live = [t for t in rows if t.status != "downloading"]
+        rep["delivering"] = len(rows) - len(live)
+        # 【已在当前目录的行一律不碰】(r39 Q2/U7a) 判据与 rows_in_wrong_dir 同一个：save_path 非空且
+        # same_dir(save_path, new_path)。『搬回来』那条入口（maybe_relocate_* 里 new_path==old_path）把整部番
+        # 的 HAVE 行都送进来：qB 认识的，setLocation 本就是空操作；qB 不认识的（remove-on-complete，
+        # 生产上 7~9 月有 713 条正是这样）原先会被 _clear 成 pending，提示还写『旧文件在 {当前目录}
+        # 需你手动清理』—— 用户照做，删掉的就是当前目录里唯一的一份（生产副本回放 anime#2 实测 10 集）。
+        # 现在既不 setLocation 也不 _clear；hash 照样随下面那次 torrents_info 一起问，
+        # 只为数出『qB 已不跟踪、文件本就在当前目录』的条数（rep['in_place']）。save_path 为空的老行判不了，照常参与。
+        where = {t.id: t.save_path for t in rows}
+        special = {t.id for t in rows if not auto_downloadable_ep(getattr(t, "episode", 0))}   # 见下方 ③
+        here = [(t.id, t.info_hash) for t in live if t.save_path and same_dir(t.save_path, new_path)]
+        pairs = [(t.id, t.info_hash) for t in live if not (t.save_path and same_dir(t.save_path, new_path))]
     if not pairs:
         return rep
 
-    def _clear(ids) -> int:
-        """搬不动时把行清成 pending，等重下到新目录。返回【实际改了几行】。
+    def _clear(ids) -> list:
+        """搬不动时把行清成 pending，等重下到新目录。返回【实际改了的行 id】。
 
         只降级仍被 qB 跟踪的行(TRACKED)。stalled 有意保持原样——它是『等人工处理』的标记，
         降成 pending 会：① 让停滞集重回自动队列，flush 还可能挑中同集别的源＝对停滞集自动换源
         （状态词表明令禁止）；② 抹掉『停滞』提示；③ 详情页删除按钮门槛是 HAVE，
         变 pending 后按钮消失，旧目录的半成品成了 UI 删不掉的孤儿。
-        返回真实改动数是为了让报告不说谎（说要重下 N 条，就得真有 N 条被清）。
+        返回真实改动的行是为了让报告不说谎（说要重下 N 条，就得真有 N 条被清），
+        也让提示里的『旧文件在哪』只取这些行的 save_path（r39 Q2/U7a）。
         """
-        changed = 0
+        changed = []
         with get_session() as s:
             for tid in ids:
                 t = s.get(model_cls, tid)
@@ -1098,7 +1166,7 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
                     t.qb_state, t.qb_progress = "", 0.0
                     t.qb_synced_at, t.qb_progress_at = None, None
                     s.add(t)
-                    changed += 1
+                    changed.append(tid)
             s.commit()
         return changed
 
@@ -1112,10 +1180,10 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         """
         return auto_downloadable_ep(getattr(t, "episode", 0))
 
-    def _stalled_of(ids) -> int:
+    def _stalled_of(ids) -> list:
         with get_session() as s:
-            return sum(1 for tid in ids
-                       if (t := s.get(model_cls, tid)) is not None and t.status == "stalled")
+            return [tid for tid in ids
+                    if (t := s.get(model_cls, tid)) is not None and t.status == "stalled"]
 
     def _special_of(ids) -> int:
         with get_session() as s:
@@ -1144,11 +1212,13 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         #      那份旧文件连 UI 入口都没有了。
         # 与本函数另外两条分支同口径：已归档行"不在 qB，setLocation 移不动、别误清成 pending"，
         # qB 连不上"一行都不动"。qB 关着与那两种是同一类：我们动不了文件，那就什么都别改。
+        # 『搬回来』入口传进来的 old_path 就是当前目录：不把它说成旧目录 (r39 Q2)
+        _old = old_path if old_path and not same_dir(old_path, new_path) else ""
         rep["error"] = ("qB 未启用，无法代为移动文件：一行都没有改动，"
-                        f"这些集的文件仍在旧目录 {rep.get('old_path') or '（原处）'}。"
+                        f"这些集的文件仍在旧目录 {_old or '（原处）'}。"
                         "到设置页打开『发送种子到 qB』后再点一次即可。")
         return rep
-    info = await qb.torrents_info([h for _, h in pairs])
+    info = await qb.torrents_info([h for _, h in pairs + here])   # here 只为数 in_place，见上
     if info is None:
         # 【qB 连不上：一行都不动】——绝不能与上面"qB 关"或下面"qB 说不认识这个 hash"混为一谈。
         # 连不上时那些种子好端端地在 qB 里做种，若照样 _clear 成 pending：下一轮 flush 会全部重发，
@@ -1159,12 +1229,35 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         # 与全项目对该信号的统一口径一致：sync_qb_status 连不上就本轮不动、flush 预检不过就整轮不放行。
         rep["error"] = "qB 连不上，未做任何改动。等 qB 恢复后重试即可（文件与状态都原样保留）"
         return rep
+    rep["in_place"] = sum(1 for _, h in here if h not in info)
     tracked = [(tid, h) for tid, h in pairs if h in info]
     untracked = [tid for tid, h in pairs if h not in info]
-    if untracked:               # remove-on-complete 等：qB 已不认识 → 清状态待重下
-        rep["stalled_kept"] += _stalled_of(untracked)
+    cleared, stalled = [], []
+    if untracked:               # remove-on-complete 等：qB 已不认识、文件也不在当前目录 → 清状态
+        stalled = _stalled_of(untracked)
+        rep["stalled_kept"] += len(stalled)
         rep["special_kept"] += _special_of(untracked)     # -1/-2：不清（E-4），报告单列
-        rep["untracked"] = rep["redownload"] = _clear(untracked)
+        cleared = _clear(untracked)
+        rep["untracked"] = rep["redownload"] = len(cleared)
+        # 提示里『这 N 集的旧文件在哪』只取【实际被清】的行（r39 Q2）。经过上面的『已在位不碰』，
+        # 这里不会出现 new_path；老行没记 save_path，如实写『原目录未记录』而不是猜一个。
+        rep["redownload_dirs"] = sorted({where.get(i) or "原目录未记录" for i in cleared})
+    # ③ 报告里的 old_path 改写成【被清行 + 停滞行实际所在的目录】(r39 U7a)：调用方传进来的 old_path
+    # 是『按改之前的记录算出来的目录』，『搬回来』那条入口里它就等于 new_path —— 拿它当『旧文件在 X』，
+    # 指向的正是当前目录。特别篇/未知集（停滞的也算）不进这个集合（E-4：那是唯一一份，不进任何清理提示）。
+    # 集合为空时只有传入的 old_path 确实不是当前目录才保留，否则置 None（宁可漏报）。
+    dirs = {where[i] for i in cleared + stalled
+            if i not in special and where.get(i) and not same_dir(where[i], new_path)}
+    if dirs:
+        rep["old_path"] = "、".join(sorted(dirs))
+    elif not old_path or same_dir(old_path, new_path):
+        rep["old_path"] = None
+    # 『停滞的半成品留在 X』那句只用停滞行【自己】的目录 (r39 F1)。拿上面的并集会把只放着被清那几集的目录
+    # 说成停滞半成品所在处——那里是重下完成前唯一的一份，同一条提示刚说过『下完再删』；停滞的又是特别篇时
+    # （目录被排除），并集只剩被清行的目录，点名的地方根本没有停滞文件。为空就不出那句：没记 save_path 的
+    # 停滞行不拿传入的 old_path 去猜（宁可漏报，『N 集处于停滞、未移动』那句照样有）。
+    rep["stalled_dirs"] = sorted({where[i] for i in stalled
+                                  if i not in special and where.get(i) and not same_dir(where[i], new_path)})
     if tracked:
         code = await qb.set_location([h for _, h in tracked], new_path)
         if code == 200:
@@ -1174,7 +1267,9 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
             # 中途连不上：同样【一行都不动】（理由见上面 info is None 处）。
             # 这一批的 save_path 还指着旧目录、文件也确实在旧目录，保持原样才是自洽的。
             # 前面若已有 untracked 被清，那部分是"qB 确实不认识"，与本分支无关，照旧计入报告。
-            _part = (f"（此前已有 {rep['untracked']} 集因 qB 确实不认识而清状态待重下）"
+            # 只说『已清成待下』、名词跟着线走 (r39 F3)：剧场版不会自动重下，番剧也只有在订阅中、
+            # 符合锁定源和版本关键词的才会；这条 error 是用户唯一看得到的一句，不能替它许诺『待重下』。
+            _part = (f"（此前已有 {rep['untracked']} {noun}因 qB 确实不认识，已清成待下）"
                      if rep.get("untracked") else "")
             rep["error"] = ("qB 中途连不上，这批文件未移动，状态原样保留。等 qB 恢复后重试" + _part)
         else:                   # 403/409：新目录不可写/建不了 → 只报告，不动状态
@@ -1212,7 +1307,8 @@ def needs_relocate(rows, new_path: str, old_path) -> bool:
     """
     if not new_path:
         return False
-    return new_path != old_path or bool(rows_in_wrong_dir(rows, new_path))
+    # same_dir 而不是 !=：只改分隔符/大小写的写法不算『目录变了』，与 rows_in_wrong_dir、relocate 选行同一谓词 (r39 U7a)
+    return not same_dir(new_path, old_path) or bool(rows_in_wrong_dir(rows, new_path))
 
 
 def rows_in_wrong_dir(rows, new_path: str) -> list:
@@ -1232,10 +1328,11 @@ def rows_in_wrong_dir(rows, new_path: str) -> list:
     记录早已改成 `26B\あかね噺`，界面上没有任何地方还会提出搬它。
 
     真相就记在行上的 save_path 里，直接问它。空 save_path 不算（老行/没交付过的行）。
+    比较用 same_dir（只差分隔符/大小写的 Windows 写法算同一目录），relocate 跳过『已在位』的行用的是同一个判据。(r39 U7a)
     """
     return [t for t in rows
             if t.status in HAVE_STATUSES and not t.archived_at
-            and (t.save_path or "") and t.save_path != new_path]
+            and (t.save_path or "") and not same_dir(t.save_path, new_path)]
 
 
 async def add_to_qb(data: bytes | None, save_path: str, category: str, tags: str,

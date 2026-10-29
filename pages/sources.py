@@ -53,51 +53,48 @@ def render_sources() -> None:
              "② 标题关键词：比对整条标题（如按语言 繁日/简日）。 两者可叠加(AND)。").classes(
         "text-xs text-gray-400 mb-2")
 
-    @ui.refreshable
-    def group_list():
-        groups = anime.list_source_groups()
-        if not groups:
-            ui.label("（还没有源组，下面添加）").classes("text-gray-500")
-        for g in groups:
-            with ui.card().classes("w-full"):
-                with ui.row().classes("items-center gap-2 w-full flex-wrap"):
-                    name = ui.input("名字", value=g.name).classes("w-32")
-                    # 【库里的值不在选项里也要能渲染】ui.select 拿到不在 options 里的 value 会抛，
-                    # 而这一页正是删除源组的【唯一入口】——一旦崩掉，用户连把那个坏组删掉都做不到。
-                    # 后台对同样的数据只是 log.warning 跳过（见 core/worker.py 的 build_sources），
-                    # 没有理由 UI 这边反而硬崩。
-                    site = ui.select(_opts_with(SITE_OPTS, g.site), value=g.site,
-                                     label="类型").classes("w-32")
-                    policy = ui.select(_opts_with(POLICY_OPTS, g.policy), value=g.policy,
-                                       label="策略").classes("w-32")
-                    priority = ui.number("优先级", value=g.priority, format="%d").classes("w-32")
-                    enabled = ui.switch("启用", value=g.enabled)
-                feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).classes("w-full")
-                subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）",
-                                     value=g.subgroups).classes("w-full")
-                tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日）",
-                                   value=g.title_filter).classes("w-full")
-                with ui.row().classes("gap-2"):
-                    ui.button("保存", icon="save",
-                              on_click=_save(g.id, name, site, policy, priority, enabled, feed, subgroups, tfilter)
-                              ).props("unelevated color=primary")
-                    ui.button("删除", icon="delete",
-                              on_click=_delete(g.id)).props("flat color=grey")
+    # 【不用 @ui.refreshable 整页重建】(r39 U11) 以前整张列表连同底下的添加表单是一个 refreshable，
+    # 保存/添加/删除任一组都 refresh 整块：别的组卡片上【没点保存】的改动、底下半填的新组表单，
+    # 全被服务端快照冲掉（用户改了 A 组的关键词还没保存，顺手保存了 B 组，A 的改动一声不响就没了）。
+    # 改成稳定容器 + 按 id 登记卡片：保存只回写本卡、添加只追加一张、删除只删一张，其余控件原样不动。
+    cards: dict = {}                                # {源组 id: 该组的卡片}
+    # 空状态放在卡片容器【外面】：_resort 按下标挪卡片，容器里混一个 label 下标就错位了
+    empty = ui.label("（还没有源组，下面添加）").classes("text-gray-500")
+    cards_box = ui.column().classes("w-full")       # ui.column 默认间距与外层一致，跟原来 refreshable 平铺时对齐
 
-        ui.separator().classes("my-2")
-        ui.label("添加新组").classes("font-bold")
-        with ui.card().classes("w-full"):
+    def _card(g):
+        """在 cards_box 里建一张源组卡片并登记进 cards。"""
+        with cards_box, ui.card().classes("w-full") as card:
             with ui.row().classes("items-center gap-2 w-full flex-wrap"):
-                n_name = ui.input("名字").classes("w-32")
-                n_site = ui.select(SITE_OPTS, value="nyaa", label="类型").classes("w-32")
-                n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").classes("w-32")
-                n_priority = ui.number("优先级", value=50, format="%d").classes("w-32")
-            n_feed = ui.input("feed（nyaa 用户名如 Lilith-Raws，或完整 RSS URL）").classes("w-full")
-            n_subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）").classes("w-full")
-            n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").classes("w-full")
-            ui.button("添加", icon="add",
-                      on_click=_add(n_name, n_site, n_policy, n_priority, n_feed, n_subgroups, n_tfilter)
-                      ).props("unelevated color=primary")
+                name = ui.input("名字", value=g.name).classes("w-32")
+                # 【库里的值不在选项里也要能渲染】ui.select 拿到不在 options 里的 value 会抛，
+                # 而这一页正是删除源组的【唯一入口】——一旦崩掉，用户连把那个坏组删掉都做不到。
+                # 后台对同样的数据只是 log.warning 跳过（见 core/worker.py 的 build_sources），
+                # 没有理由 UI 这边反而硬崩。
+                site = ui.select(_opts_with(SITE_OPTS, g.site), value=g.site,
+                                 label="类型").classes("w-32")
+                policy = ui.select(_opts_with(POLICY_OPTS, g.policy), value=g.policy,
+                                   label="策略").classes("w-32")
+                priority = ui.number("优先级", value=g.priority, format="%d").classes("w-32")
+                enabled = ui.switch("启用", value=g.enabled)
+            feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).classes("w-full")
+            subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）",
+                                 value=g.subgroups).classes("w-full")
+            tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日）",
+                               value=g.title_filter).classes("w-full")
+            with ui.row().classes("gap-2"):
+                ui.button("保存", icon="save",
+                          on_click=_save(g.id, name, site, policy, priority, enabled, feed, subgroups, tfilter)
+                          ).props("unelevated color=primary")
+                ui.button("删除", icon="delete",
+                          on_click=_delete(g.id)).props("flat color=grey")
+        cards[g.id] = card
+
+    def _resort():
+        """按库里的顺序（优先级降序）摆放已有卡片：只挪位置、不重建，卡片上没保存的输入不受影响。"""
+        order = [g.id for g in anime.list_source_groups() if g.id in cards]
+        for i, gid in enumerate(order):
+            cards[gid].move(target_index=i)
 
     def _save(gid, name, site, policy, priority, enabled, feed, subgroups, tfilter):
         def h():
@@ -118,7 +115,11 @@ def render_sources() -> None:
                 ui.notify(f"保存失败：多半是已有叫『{name.value.strip()}』的源组（换个名字），"
                           "也可能是某个字段太长写不进库——具体原因看 /logs", type="warning")
                 return
-            group_list.refresh()
+            # 不重建（理由见 cards 上方）：把输入框回写成实际存进库的值（去空格、优先级取整），屏上与库一致
+            for inp in (name, feed, subgroups, tfilter):
+                inp.value = (inp.value or "").strip()
+            priority.value = int(priority.value)
+            _resort()                               # 改了优先级的话，卡片顺序跟着库走
             ui.notify("已保存（下一轮生效）", type="positive")
         return h
 
@@ -131,7 +132,10 @@ def render_sources() -> None:
                     ok_label="删除", ok_icon="delete_forever"):
                 return
             anime.delete_source_group(gid)
-            group_list.refresh()
+            card = cards.pop(gid, None)             # 两个确认框都点了『删除』时第二次已经不在了
+            if card is not None:
+                card.delete()
+            empty.set_visibility(not cards)
             ui.notify("已删除", type="positive")
         return h
 
@@ -151,11 +155,37 @@ def render_sources() -> None:
                 ui.notify(f"添加失败：多半是已有叫『{name.value.strip()}』的源组（换个名字），"
                           "也可能是某个字段太长写不进库——具体原因看 /logs", type="warning")
                 return
-            group_list.refresh()
+            # 只追加新组这一张卡（名字有唯一约束，按名字找回刚建的那一行）
+            new = next((g for g in anime.list_source_groups() if g.name == name.value.strip()), None)
+            if new is not None:
+                _card(new)
+                _resort()
+            empty.set_visibility(not cards)
+            # 表单回到初始值，方便接着添加下一个
+            name.value = feed.value = subgroups.value = tfilter.value = ""
+            site.value, policy.value, priority.value = "nyaa", "auto", 50
             ui.notify("已添加（下一轮生效）", type="positive")
         return h
 
-    group_list()
+    for _g in anime.list_source_groups():
+        _card(_g)
+    empty.set_visibility(not cards)
+
+    # 添加表单建在卡片容器外面、只建一次：保存/添加/删除都不碰它，半填的内容不会丢
+    ui.separator().classes("my-2")
+    ui.label("添加新组").classes("font-bold")
+    with ui.card().classes("w-full"):
+        with ui.row().classes("items-center gap-2 w-full flex-wrap"):
+            n_name = ui.input("名字").classes("w-32")
+            n_site = ui.select(SITE_OPTS, value="nyaa", label="类型").classes("w-32")
+            n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").classes("w-32")
+            n_priority = ui.number("优先级", value=50, format="%d").classes("w-32")
+        n_feed = ui.input("feed（nyaa 用户名如 Lilith-Raws，或完整 RSS URL）").classes("w-full")
+        n_subgroups = ui.input("字幕组白名单（匹配 []/【】 里的组名；逗号分隔，空=全部）").classes("w-full")
+        n_tfilter = ui.input("标题关键词（匹配整条标题，不只括号；逗号分隔，空=不限；如 繁日/简日 分语言）").classes("w-full")
+        ui.button("添加", icon="add",
+                  on_click=_add(n_name, n_site, n_policy, n_priority, n_feed, n_subgroups, n_tfilter)
+                  ).props("unelevated color=primary")
 
 
 @ui.page("/sources")

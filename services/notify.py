@@ -36,6 +36,8 @@ EVENTS: dict[str, tuple[str, str]] = {
     "feed_gap": ("RSS 断档", "🕳️"),       # 一次性：两轮之间有一段发布滚出了 RSS，可能漏集
     "lock_lag": ("锁定源落后", "🔒"),     # 别的组已有后续集，锁定的源迟迟不跟（core.anime.locked_out_episodes）
     "gap": ("缺集", "🧩"),               # r38：在追的番按开播日早该播了、库里一条种子都没有的集（core.anime.episode_gaps）
+    # r39：锁定源停更满 N 天、用别的组补了几集 / 锁定组补发后又下了它的版本（core.anime.deliver_lock_fallback）
+    "lock_fallback": ("锁定源兜底", "🛟"),
 }
 
 # (事件, key) → 上次发送时刻（monotonic）。进程内，重启即忘。
@@ -46,6 +48,12 @@ EVENTS: dict[str, tuple[str, str]] = {
 _last_sent: dict[tuple[str, str], float] = {}
 # 状态型事件的当前认知：None=未知（首次观测到"坏"也算翻转，否则"启动时就坏着"永远不会被告知）
 _state_now: dict[str, bool | None] = {}
+# 状态型"坏"的那一侧【已经告知过的成员】（目前只有 source_down 传：连续失败到阈值的源组名）。(r39 A11)
+# 纯边沿只说得出"坏了 / 好了"：A 源挂着的时候 B 也挂了，状态一直是"坏"、没有翻转，用户什么都收不到，
+# 只能从下一条『恢复』里倒推——而 B 挂掉正是该立刻知道的事。记下"说过哪些"，冒出没说过的成员就再推一条。
+# 记账口径与 _state_now 一致：送达才算说过（先占位、失败还原）；集合变小只收窄不推（那个源之后
+# 再挂回来算新成员）；恢复那条边沿记账成功后整份丢掉。reset_state 不清它，理由同 _state_now。
+_state_members: dict[str, frozenset] = {}
 # 限流令牌：最近一小时内已【送达】的时刻列表 + 被丢弃的条数。
 # 【记账在送达之后，不在发送之前】桶的用户口径是设置页那句"每小时最多几条"和
 # 消息尾巴那句"另有 N 条被限流丢弃"——两句说的都是【收到几条】。早先是先 append 再 await，
@@ -314,21 +322,37 @@ async def event(kind: str, message: str, *, key: str = "", cooldown: int = 0,
     return True
 
 
-async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "") -> None:
+async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "", *,
+                members: frozenset | None = None) -> None:
     """状态型事件：只在【翻转】的那一刻发一条。
 
     这是"qB 掉线时每 30 秒一条通知"的根治法——边沿触发，不是电平触发。
     首次观测到 bad=True 也算翻转（`None → True`），否则"启动时就已经坏着"永远不会被告知；
     而首次观测到 bad=False 【不】发（一切正常时不该有通知）。
+
+    members：坏的那一侧由哪些成员构成（r39，目前只有 source_down 传）。已经在"坏"着、又冒出
+    【没告知过的成员】时也再推一条（文案照旧是调用方给的全量描述）；只是变小不推。
+    不传就是纯边沿，与以前逐字相同。记账见 _state_members。
     """
     prev = _state_now.get(kind)
-    if prev == bad:
+    told = _state_members.get(kind)            # None = 这一场还没记过成员
+    grew = bool(bad and prev is True and members and members - (told or frozenset()))
+    if prev == bad and not grew:
+        if bad and members is not None and told is not None:
+            # 集合变小（有源恢复了）：不推，但记忆跟着收窄 —— 那个源之后再挂回来，得算新成员
+            _state_members[kind] = told & members
         return
     # 【订阅判定要在扣费之前】enabled() 原本在 event() 内部才判，于是一个【没订阅】的 kind
     # 每一轮都判成翻转、每一轮扣一枚令牌，而它永远发不出去、_state_now 也永远不落记忆。
     # db_watch 每 30 秒一轮 = 120 次/小时，足够把 12 枚一小时的额度打光，
     # 把另外两个【已订阅】的状态型事件一起饿死。实测：未订阅的 qb_down 调 12 轮 → 桶 12/12。
     if not enabled(kind):
+        return
+    # 【熔断期间直接返回：不尝试、不计数、不占位、不扣令牌】(r39 A12) 熔断中 notify() 会把每一次调用
+    # 记进 _dropped（消息尾巴上的"另有 N 条没能送到"），而状态型的边沿【每一轮都重判】——看守协程
+    # 30 秒一轮，一次 5 分钟的熔断就把同一条边沿记成 10 条"没送到"，其实它一条都没丢：
+    # 边沿留在原地，熔断一过的第一轮照常发出（D-04）。也不能碰 _state_members，否则新成员会在熔断期被吃掉。
+    if time.monotonic() < _muted_until:
         return
     # 【状态记忆也要等发送成功】早先是先写记忆再发：一条被限流吞掉的 qb_down / db_down
     # 就此【永远不会重发】——因为状态已经记成"坏"，后续每一轮都判为"没翻转"而静默返回，
@@ -356,6 +380,8 @@ async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "") -> None:
     # 于是同一次翻转推【两条】、占两枚令牌。对称交错还能把一次真实掉线告警吞掉一轮。
     # 占位之后失败再还原，"没发出去就不落记忆"这条性质保持不变。
     _state_now[kind] = bad
+    if bad and members is not None:
+        _state_members[kind] = members  # 成员同样先占位（新成员那一推也会被两个协程同时看到）
     sent = False                        # 这次翻转有没有【真的推出去一条】（决定扣不扣令牌）
     try:
         if bad:
@@ -368,10 +394,20 @@ async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "") -> None:
             ok = sent = await event(kind, ok_msg, bypass_rate=True)
     except Exception:
         _state_now[kind] = prev         # 【异常也要还原】否则那次翻转被永久吃掉
+        if told is None:
+            _state_members.pop(kind, None)
+        else:
+            _state_members[kind] = told
         raise
     if not ok:
         _state_now[kind] = prev
+        if told is None:                # 成员也还原：没送到的新成员下一轮还得算"新"
+            _state_members.pop(kind, None)
+        else:
+            _state_members[kind] = told
         return
+    if not bad:
+        _state_members.pop(kind, None)  # 恢复了：这一场结束，下一场从头记
     if sent:
         # 【送达了才扣令牌】理由见 _sent_times 处。"只记不发"的那两支【也不能扣】：
         # 它们连请求都没发出去，扣了等于让"一切正常"这件事本身消耗抖动预算。
@@ -389,6 +425,8 @@ def reset_state() -> None:
       于是"qB 恢复了"那条提示会被一次不相干的保存吃掉。边沿下一轮会自愈（D-04），
       但那要求故障【还在持续】；保存发生在故障刚结束的那几秒时，恢复提示就真的没了。
       而它本来就没有需要被清的理由：未订阅的 kind 在 state() 里根本走不到写记忆那一步。
+    · _state_members（状态型已告知过的成员）——同上；清了的话，保存一次设置就把正挂着的那几个源
+      当成新成员再推一遍。
     · _sent_times / _state_times / _dropped（限流账本）——桶的容量是每次现读 config 的，
       改大改小【立刻】生效，不需要清账本；清了反而等于"保存一次设置＝额度清零重来"，
       连点几次保存就能绕过用户自己设的上限。

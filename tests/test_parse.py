@@ -769,6 +769,13 @@ def test_every_episode_form_the_extractor_knows_is_also_stripped_from_the_name()
         "[组] 某番 EP07 [1080p]",
         "[组] 某番 Episode 07 [1080p]",
         "[组] 某番 EP1174 [1080p]",
+        # (r39 I11) 无空格写法：抽取侧 `(?<!\d)[-–—]` 认得出集号，剥离侧 _EP_TAIL 要 `\s[-–—]` 剥不掉
+        "[组] 某番-07 [1080p]",
+        "[组] 某番- 07 [1080p]",
+        # (r39 I11) 显式标记前面还有一个分隔符：从标记处切开后剩光杆 ' -'，番名脏成 '某番-'
+        "[组] 某番 - EP07 END [1080p]",
+        "[组] 某番 - 第07话 [1080p]",
+        "[组] 某番 - S02E07 [1080p]",
     ]
     dirty = []
     for t in forms:
@@ -780,6 +787,58 @@ def test_every_episode_form_the_extractor_knows_is_also_stripped_from_the_name()
     assert not dirty, (
         "这些写法集号认得出来、番名却没洗干净（alias_key 会脏成一个新身份）：\n  "
         + "\n  ".join(dirty))
+
+
+# ---------------- (r39 I11) 无空格集号尾巴 '某番-07' / 切标记后的光杆分隔符 ----------------
+
+@pytest.mark.parametrize("raw,want", [
+    ("[ANi] 86-エイティシックス- - 05 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4", "86-エイティシックス-"),
+    ("[组] R-15 [05]", "R-15"),                            # ASCII 左邻
+    ("[组] ID-0 [05]", "ID-0"),                            # ASCII 左邻 + 单位数
+    ("[组] ブルーロック VS. U-20 [05]", "ブルーロックVS.U-20"),
+    ("[组] ゴジラ-1.0 [1080p]", "ゴジラ-1.0"),              # 单位数
+    ("[组] 藤本树 17-26 - 08", "藤本树17-26"),
+    ("[组] Tokyo 24-ku - 05", "Tokyo24-ku"),
+    ("[组] 22/7 - 05", "22/7"),
+    ("[组] Dr.STONE - 05", "Dr.STONE"),
+    ("[组] Ga-Rei -Zero- - 05 [1080p]", "Ga-Rei-Zero-"),   # 光杆分隔符那条要求破折号左边是空白
+    # 质疑方实测的两条回归样例：
+    ("[组] 某番 第05集 简日-12 [1080p]", "某番"),           # 显式标记优先，不能先在 '简日-12' 处切
+    ("[组] 某番-2024 [05]", "某番-2024"),                   # 年份不剥
+])
+def test_names_containing_a_dash_and_digits_stay_intact(raw, want):
+    """(r39 I11) 无空格那条剥离规则有意比抽取侧窄：名字自带"连字符+数字"的番一个都不许动。
+
+    剥错的代价是**静默错绑**：番名经 alias_key 就是身份键，'某番-2024' 被剥成 '某番'
+    会直接命中同名老作品、新作无声挂进旧番；而留着脏名只是进『待识别』，人看得见。
+    '第05集 简日-12' 那条守的是优先级：两个清洗函数"按模式顺序取第一个匹配就 break"，
+    无空格那条排在前面时番名会变成 '某番第05集简日'。
+    """
+    assert parse_title(raw)[1] == want
+
+
+def test_nospace_episode_tail_is_stripped_from_bgm_candidates_too():
+    """(r39 I11) 搜 bgm 的候选名与番名同进同退：'番名-05' 不洗掉，bgm 搜不到、永久停在待识别。
+    只动剥离侧，季/集/合集判定一个都不许变。"""
+    raw = "[组] 番名-05 [1080p]"
+    assert candidate_names(raw) == ["番名"]
+    assert (extract_season(raw), extract_episode(raw), is_batch(raw)) == (1, 5, False)
+
+
+@pytest.mark.parametrize("raw,season,ep", [
+    # '- 05 - 06' 与 '某番 - 2 - 05' 同形，分不出是双集还是季号：误剥会把第二季并进第一季、撞键漏集
+    ("[组] 番名 - 05 - 06", 1, 6),
+    # ASCII 左邻：'-05' 可能就是名字的一部分（R-15 / U-20 同形）
+    ("[组] Some Show-05", 1, 5),
+])
+def test_ambiguous_dash_forms_are_left_alone_on_purpose(raw, season, ep):
+    """(r39 I11) 有意不修，生产副本上均为 0 条。
+
+    【番名故意不断言】它们现在的番名是脏的（'番名-05' / 'SomeShow-05'），把脏名钉成期望值
+    等于把 bug 写进守卫。这里只钉"本次只动剥离侧"：季、集、合集判定保持现状
+    （集号 6 是现状值，不代表它一定是对的）。
+    """
+    assert (extract_season(raw), extract_episode(raw), is_batch(raw)) == (season, ep, False)
 
 
 def test_episode_zero_is_a_real_episode_not_an_error_code():

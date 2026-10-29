@@ -174,16 +174,36 @@ _EP_MARK = (r"第\s*(?:[一二三四五六七八九十]+|\d+(?:\.\d+)?)\s*[话�
             # 于是同一部番的 EP1174 进「OnePiece」、EP1080 另建一条垃圾番，候选名还脏到 bgm 搜不到。
             # 认不出集号 ≠ 名字要留着它。
             r"(?<![A-Za-z0-9])(?:EP|Episode)\s*\.?\s*\d{1,4}(?![\dpPiI])")
+# 【无空格的集号尾巴 '某番-07' / '某番- 07'】(r39 I11) 抽取侧第 1 条 `(?<!\d)[-–—]` 不要求左边有空格，
+# 集号认得出来；而 _EP_TAIL 要求 `\s[-–—]`，名字一个字符都不剥 → 番名脏成 '某番-07'，
+# 每一集各是一个新的 alias_key，各建一部垃圾番。
+# ① 【有意比抽取侧窄】左邻必须是汉字/假名/标点（不是空白、不是 ASCII 字母数字），集号至少两位，
+#    且排掉 19xx/20xx 年份。名字本身就带"连字符+数字"的番一个都不能动：
+#    R-15、ID-0、ブルーロック VS. U-20（ASCII 左邻）、ゴジラ-1.0（单位数）、某番-2024（年份，
+#    剥成 '某番' 会让别名直接命中同名老作品、新作被无声挂进旧番；留着脏名进待识别，人看得见）。
+#    抽取侧 '某番-2024 [05]' 会抽成第 2024 集（_EP_PATTERNS[0] 没有年份守卫），那是既有问题，
+#    但剥离侧不该再把身份也一起弄错。
+# ② 【必须排在两个元组的最末尾】_clean_name_once / _clean_for_search 是"按模式顺序取第一个
+#    匹配上的就 break"，取的不是最靠前的位置。放在前面会盖过显式的 EP / 第N话 / SxxE 标记：
+#    '某番 第05集 简日-12' 会先在 '简日-12' 处切，番名变成 '某番第05集简日'。
+# ③ R28 的"逐字同宽"只约束 _EP_MARK（显式标记两侧必须同宽），不约束这条：
+#    这条宁可留脏名（人能在待识别里看见），也不能把名字的一部分当集号剥掉、造成静默错绑。
+_EP_TAIL_NOSPACE = (r"(?<![\sA-Za-z0-9])[-–—]\s*" + _not_year(r"(?!\d)")
+                    + r"\d{2,4}(?:\.\d+)?(?:\s*[vV]\d+)?" + _FINALE + _EP_END)
 _STRIP_PATTERNS = [re.compile(p, re.I) for p in (     # 预编译（_clean_name 循环用）
     # 【剥离侧【不】带尾部守卫，与抽取侧有意不同】抽取要的是"宁可认不出，也别认错"，
     # 所以 SxxE 那条带 (?!\d)；但剥离要的是"番名必须干净"——番名经 alias_key 就是番的身份键，
     # 脏一个字符就等于给同一部番造了个新身份、裂成两部。
     # 带守卫的话，S01E11745（5 位）整条匹配不上、一个字符都不剥，番名变成 'ShowS01E11745'；
     # 而它的集号本来就该落 -2（5 位不是合法集号），两件事互不矛盾：认不出集号 ≠ 名字要留着它。
-    _EP_TAIL, r"[Ss]\d{1,2}[Ee]\d+", *_EP_MARK)]
+    _EP_TAIL, r"[Ss]\d{1,2}[Ee]\d+", *_EP_MARK, _EP_TAIL_NOSPACE)]
 # 搜 bgm 用的同款集号段，但【不含 S02E07】：那条带着季号，留在搜索词里有助于命中正确的季条目
 # （_clean_for_search 的既定策略就是"去集号、留季标记"）。
-_SEARCH_STRIP_PATTERNS = [re.compile(p, re.I) for p in (_EP_TAIL, *_EP_MARK)]
+_SEARCH_STRIP_PATTERNS = [re.compile(p, re.I) for p in (_EP_TAIL, *_EP_MARK, _EP_TAIL_NOSPACE)]
+# 切掉集号标记后留下的光杆分隔符：'某番 - EP12 END' / '某番 - 第12话' / '某番 - S01E05' 从标记处切开，
+# 剩 '某番 - '，番名脏成 '某番-'（别名键又是一个新身份）。
+# 【要求破折号左边是空白】名字自带的收尾连字符（'Ga-Rei -Zero-'、'86-エイティシックス-'）左边是字，不会被动。
+_SEP_TAIL_RE = re.compile(r"\s[-–—]\s*$")
 # 标签块 [..]/【..】（含空括号，整体替换）——_clean_name/_clean_for_search/parse_multibracket 共用。
 # 勿与 _INNER_BLK(带捕获组、+ 不匹配空括号) 混用：对空括号 [] 的 sub 结果不同。
 _TAG_BLK_RE = re.compile(r"[\[【][^\]】]*[\]】]")
@@ -473,7 +493,7 @@ def _clean_name_once(name_part: str) -> str:
     for pat in _STRIP_PATTERNS:
         m = pat.search(s)
         if m:
-            s = s[:m.start()]
+            s = _SEP_TAIL_RE.sub("", s[:m.start()])
             break
     # 去掉分段切剩的孤立括号（『★07月新番★[番名』剥掉标记后会留个左括号）
     return s.replace(" ", "").strip().strip("[]【】").strip()
@@ -669,7 +689,7 @@ def _clean_for_search(s: str) -> str:
     for pat in _SEARCH_STRIP_PATTERNS:
         m = pat.search(s)
         if m:
-            s = s[:m.start()]
+            s = _SEP_TAIL_RE.sub("", s[:m.start()])
             break
     # 再剥掉首尾【落单】的括号：形如 [猫与龙 / Nekokaburi] 的标题会先被斜杠切成两段，
     # 于是各自剩下半个括号（'[猫与龙' / 'Nekokaburi]'），_TAG_BLK_RE 要成对才认，管不到。

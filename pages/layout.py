@@ -663,7 +663,7 @@ SEVERITY_COLOR = {"error": "red", "stalled": "deep-orange"}
 def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
                 qb_dlspeed=0, in_plan=None, confirmed=True, episode=None,
                 auto_off: str = "", retry_at=None, single_work: bool = False,
-                locked_out: bool = False) -> tuple[str, str]:
+                locked_out: bool = False, dropped: bool = False) -> tuple[str, str]:
     """新入库/正在下载：把一条种子压成 (文案, 徽标色)，复刻详情页那套阶梯。
 
     有 qB 实时态 → 『下载中 X% ↓速度』/『做种 100%』(完成绿、在下蓝)；否则 in_plan 非空(番剧)时
@@ -671,7 +671,8 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
     in_plan=None 表示不区分首选/备用（剧场版没有集去重，用这个）。
     confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。
     single_work：番是单部作品，其 -2 按『特别篇』而不是『未知集』显示（判据见 engine.is_special_ep）。
-    locked_out：这条被锁定源挡住、这一集一份都没有 → 『锁源缺集』，不是『备用项』（判据见 core.anime.locked_out_torrent_ids）。"""
+    locked_out：这条被锁定源挡住、这一集一份都没有 → 『锁源缺集』，不是『备用项』（判据见 core.anime.locked_out_torrent_ids）。
+    dropped：这条落在"该集已删"那一集上 → 『该集已删·不自动下』（判据见 core.anime.dropped_torrent_ids，E-73）。"""
     # 同 qb_live_text：人工终态与停滞的 qB 残留态是陈旧的，别拿它盖住真实 status
     if status in engine.MANUAL_TERMINAL_STATUSES or status == "stalled":
         return (torrent_status_cn(status, qb_progress, qb_synced_at),
@@ -704,6 +705,10 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
                                   "grey" if auto_off == "已忽略" else "teal")
             if not confirmed:
                 return "待确认", "orange"
+            if dropped:
+                # 【要排在 retry_at 之前】(r39 F14，E-73) 用户删掉这一集最后一份时，同集兄弟可能正在退避队列里：
+                # 说『重试中』等于承诺会重发，而 flush 与同集闸都认这一集有着落、永不重发。判序与详情页一致。
+                return "该集已删·不自动下", "grey"
             if retry_at:
                 # 暂时性失败排队中（retry_at 非空）：它仍是待下、也不在本轮计划里，但说它是『备用项』
                 # （同集已有更优版本）是错的 —— 详情页对同一行说的是『重试中』。(R36 体检 logic-5)
@@ -1096,7 +1101,7 @@ def _health_notices() -> None:
             def _ack():
                 health.clear_gaps()
                 ui.navigate.reload()
-            warn_banner("RSS 断档：下面这段时间的发布在两轮采集之间滚出了 feed、没抓到，可能漏集——"
+            warn_banner("RSS 断档：下面这段时间的发布在两轮采集之间滚出了 feed、没抓到或没入库，可能漏集——"
                         + "；".join(health.gap_text(g) for g in gaps)
                         + "。去番剧表看缺集提示，用『补齐该源』补；补完点『知道了』。" + tail,
                         action=("知道了", "done", _ack))

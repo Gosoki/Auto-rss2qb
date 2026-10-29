@@ -60,7 +60,7 @@ def _bf_setup(clean_tables, cfg, monkeypatch, found, *, pref=None, air="2026-07-
         monkeypatch.setitem(sources.SEARCH_URL, site, lambda q: f"https://x/?q={q}")
     sent = []
 
-    async def _fake_dl(tid, force=False):
+    async def _fake_dl(tid, force=False, **kw):   # **kw：补齐下发传 prefs_gate（r39 D4）
         sent.append(tid)
         return True
 
@@ -314,8 +314,9 @@ def test_single_work_without_episode_number_gets_one_copy(clean_tables, cfg, mon
                 (tv.id, "X", 40, "[X] TV 番 [1080p]", -2, "pending")]
         ids = []
         for i, (aid, src, pri, raw, ep, st) in enumerate(rows):
+            # (r39 E-73) "删过的片"删的是它仅剩的一份 → 该集已删（ep_dropped）；只删重复份的另见 test_r39_deleted
             t = AnimeTorrent(anime_id=aid, info_hash=f"{i + 1:040x}", source=src, priority=pri, raw_title=raw,
-                             episode=ep, status=st, created_at=old)
+                             episode=ep, status=st, created_at=old, ep_dropped=(st == "deleted"))
             s.add(t)
             s.commit()
             ids.append(t.id)
@@ -489,8 +490,9 @@ def test_skipped_siblings_come_back_when_the_chosen_one_is_excluded_or_failing(c
                 (4, "pending", 0), (4, "skipped", 0)]           # 第 4 集：首选还没试过 → 不动
         ids = []
         for i, (ep, st, rc) in enumerate(rows):
+            # (r39 E-73) 第 3 集删的是最后一份 → 该集已删；只删重复份的不再挡复活，见 test_r39_deleted
             t = AnimeTorrent(anime_id=a.id, info_hash=f"{i + 1:040x}", raw_title=f"x {ep}", episode=ep,
-                             status=st, retry_count=rc, source=f"g{i}")
+                             status=st, retry_count=rc, source=f"g{i}", ep_dropped=(st == "deleted"))
             s.add(t); s.commit()
             ids.append(t.id)
     A._revive_orphaned_skipped()

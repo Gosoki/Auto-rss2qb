@@ -23,7 +23,12 @@ def notify_relocate_anime(rep):
     if rep.get("moved"):
         parts.append(f"已移动 {rep['moved']} 集到新目录")
     if rep.get("redownload"):
-        parts.append(f"{rep['redownload']} 集 qB 未跟踪/连不上 → 已清状态待重下到新目录")
+        # (r39 Q2) 不写『连不上』：连不上走上面的 error 分支、一行都不动，这里只可能是 qB 说没有。
+        # 也不许诺『待重下到新目录』：flush 只重下在订阅中、符合锁定源和版本关键词的，待确认/已忽略的番不会。
+        parts.append(f"{rep['redownload']} 集 qB 里已没有这条种子（多半是下完后被移除）→ 已清成待下"
+                     "（在订阅中、符合锁定源和版本关键词的才会自动重下；待确认或已忽略的要先确认或恢复订阅）")
+    if rep.get("in_place"):       # (r39 Q2) 文件本就在当前目录：relocate 不碰它们，说一声免得用户以为漏了
+        parts.append(f"{rep['in_place']} 集 qB 已不跟踪、文件本就在当前目录，未改动")
     if rep.get("failed"):
         parts.append(f"{rep['failed']} 集移动被拒（{rep.get('fail_code')}：新目录不可写，未改动）")
     if rep.get("stalled_kept"):   # 停滞集有意不动：不降级、不自动重下，但要告诉用户文件没跟着走
@@ -31,7 +36,7 @@ def notify_relocate_anime(rep):
     if rep.get("special_kept"):   # 特别篇/未知集：清成待下也没有路径会再下它（E-4），所以不动，要说清
         # 【出路不能是"点『下载』"】(R34 对抗审计) 这些行仍是 sent，force 也被 TRACKED 短路，点了只会
         # 弹"下载失败"。能走通的是：先『删除』（qB 不认识它 → 只标记、文件留在旧目录）再『下载』；
-        # 或者手动把文件搬到新目录、状态不动。它们**不进**下面那句"旧文件需你手动清理"——
+        # 或者手动把文件搬到新目录、状态不动。它们**不进**下面任何一句清理/处理提示——
         # 那是唯一的一份，行还指着它。
         parts.append(f"{rep['special_kept']} 条特别篇/未知集 qB 未跟踪、未移动（这类不会自动重下；"
                      "要搬到新目录：先对准那条点『删除』（只标记，文件留在原处）再点『下载』，"
@@ -42,8 +47,22 @@ def notify_relocate_anime(rep):
     msg = "；".join(parts) or "无需移动"
     warn = bool(rep.get("redownload") or rep.get("failed")
                 or rep.get("stalled_kept") or rep.get("special_kept") or rep.get("delivering"))
-    if (rep.get("redownload") or rep.get("stalled_kept")) and rep.get("old_path"):
-        msg += f"。⚠️ 旧文件在 {rep['old_path']} 需你手动清理"
+    # (r39 Q2) 旧的一句『旧文件在 {old_path} 需你手动清理』有两处会删掉唯一一份：『搬回来』入口里
+    # old_path 就是当前目录；而且一个目录里可能还混着停滞/特别篇/移动被拒/交付中的文件，整目录删就全没了。
+    # 现在目录只取【实际被清的那几集】所在处（engine 给的 redownload_dirs），并写明下完再删、只删这几集。
+    if rep.get("redownload") and rep.get("redownload_dirs"):
+        if rep["redownload_dirs"] == ["原目录未记录"]:   # (r39 F4) 全是没记 save_path 的老行：别把这几个字拼得像一个路径
+            msg += (f"。⚠️ 这 {rep['redownload']} 集原来放在哪里没有记录，等新目录下完后自行核对"
+                    "（下完前旧文件如果还在，那是唯一一份）")
+        else:
+            msg += (f"。⚠️ 这 {rep['redownload']} 集的旧文件（如果还在）在 {'、'.join(rep['redownload_dirs'])}："
+                    "等新目录重新下完再删，下完前那是唯一一份；只删这几集，别整目录删")
+        # (r39 F1) 不断言『该目录里』：这几类行在哪个目录没有逐一核对，只提醒它们也没跟着搬
+        if any(rep.get(k) for k in ("stalled_kept", "special_kept", "failed", "delivering")):
+            msg += "；另有停滞、特别篇、移动被拒或交付中的文件没跟着搬、仍在用，删之前认准是哪几集"
+    # (r39 F1) 只用停滞行自己的目录（engine 已排除特别篇与当前目录），不用 old_path：那是被清行与停滞行的并集
+    if rep.get("stalled_kept") and rep.get("stalled_dirs"):
+        msg += f"。⚠️ 停滞的半成品留在 {'、'.join(rep['stalled_dirs'])}，需你手动处理"
     ui.notify(msg, type="warning" if warn else "positive")
 
 
@@ -120,13 +139,23 @@ async def maybe_relocate_anime(anime_id: int, old_path, after=None):
             ui.notify("归档目录已更新（无已下文件，新集将下到新目录）", type="positive")
         return
     _extra = f"；另有 {len(arch)} 集已归档、无法代为移动（文件留在旧目录）" if arch else ""
+    # 【确认框说的集数＝relocate 实际会动的行】(r39 F5) 已在当前目录的它不碰（同 rows_in_wrong_dir 判据）；
+    # save_path 为空的老行判不了在哪，relocate 照常让它参与，这里也算上。以前用 len(dl) 把已在位的也算了进去。
+    _n = len(stale) + sum(1 for t in dl if not t.save_path)
+    if not _n:   # 已下的都已在新目录（例如改走又改回、当时没搬）：别弹『0 集…移到新目录』
+        ui.notify(f"归档目录已更新（已下的文件本就在新目录，不用移动{_extra}）",
+                  type="warning" if arch else "positive")
+        return
     # 两种来路两种话（R36 体检 logic-10）：目录真的变了 → "移到新目录"；目录没变、是盘上有 N 集落在别处
-    # （上次搬迁失败/被拒） → "搬回来"。后者正是 rows_in_wrong_dir 被抽出来的理由，以前算完就丢。
-    if new_path != old_path:
-        _title, _body = "归档目录变了，移动已下文件？", f"{len(dl)} 集已下，移到新目录：{new_path}{_extra}"
+    # （上次搬迁失败/被拒，或改过下载目录设置） → "搬回来"。后者正是 rows_in_wrong_dir 被抽出来的理由，以前算完就丢。
+    # 用 same_dir 而不是 !=：只差分隔符/大小写算同一目录，与 needs_relocate 同一谓词 (r39 F5)
+    if not engine.same_dir(new_path, old_path):
+        _title, _body = "归档目录变了，移动已下文件？", f"{_n} 集已下，移到新目录：{new_path}{_extra}"
     else:
+        # 括号里不断言原因 (r39 F35)：设置页目录分裂提示让用户『编辑季度原样保存』，走的正是这一支，
+        # 那时文件不在位是因为刚改了设置，不是上次没搬成
         _title, _body = ("有已下文件不在归档目录里，搬回去？",
-                         f"{len(stale)} 集的文件落在别处（上次没搬成），搬回当前归档目录：{new_path}{_extra}")
+                         f"{_n} 集的文件落在别处（上次没搬成，或改过下载目录设置），搬回当前归档目录：{new_path}{_extra}")
     if not await confirm(_title, _body,
                          ok_label="移动文件", ok_icon="drive_file_move", ok_color="primary"):
         ui.notify("已更新记录，未移动文件（新集将下到新目录，旧文件留在原处）", type="warning")
@@ -221,14 +250,17 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                           on_change=_set_source).classes(
                     "w-full sm:w-auto sm:min-w-52").tooltip(
                     "『按优先级』= 多源自动挑、缺集用别的源兜底；"
-                    "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）")
+                    + (f"选某个组 = 锁定，之后只下这个组；它停更满 {config.ANIME_LOCK_FALLBACK_DAYS} 天、"
+                       "核对无误的缺集才自动用别的组补一份，其余缺集自己来点下载"
+                       if config.ANIME_LOCK_FALLBACK_DAYS > 0 else
+                       "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）"))
                 _kwin = ui.input(value=(cur.pref_keyword or ""), label="版本",
                                  placeholder="繁日/简日/1080p…").classes(
                     "w-36").tooltip(
                     "版本关键词：在『下载源』基础上，再只下种子原名含此词的版本（繁日/简日/画质等，大小写不敏感）。"
                     "留空=不限；硬过滤、缺此版本的集不兜底。回车或点输入框外生效。")
-                _kwin.on("blur", lambda: _set_keyword(_kwin.value))
-                _kwin.on("keydown.enter", lambda: _set_keyword(_kwin.value))
+                _kwin.on("blur", lambda: _set_keyword(_kwin.value, _kwin))
+                _kwin.on("keydown.enter", lambda: _set_keyword(_kwin.value, _kwin))
             if not cur.rejected and not cur.confirmed:
                 ui.button("确认下载", on_click=_approve).props("unelevated color=primary")
             _dln = ui.button("下载该源", icon="download", on_click=_download).props("flat")
@@ -248,6 +280,27 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             _btn_bf_auto.tooltip("同『补齐该源』，但额外用番名过滤挡掉同名衍生作/别的季。"
                                  "在追的番补到就直接下（不打回待确认）；没在追的番照旧转『待确认』。")
 
+        ep_section()   # 分集区单独可刷新（改版本关键词只刷它），理由见 ep_section
+
+    @ui.refreshable
+    def ep_section():
+        """分集区（标题行 + 各类横幅 + 逐条种子），单独可刷新。
+
+        【为什么从 body 里拆出来】(R39 U10) 改『版本』关键词(_set_keyword)以前是 body.refresh()：
+        整块重建会把上面操作行的『确认下载』『下载该源』一起删掉换新 id。用户填完关键词直接去点
+        这两个按钮时，浏览器先发 blur、再发 click——click 带的是旧 id，Client.handle_event
+        按 id 查不到元素就静默丢弃：点了，什么都没发生，也没有任何提示。
+        关键词只影响这一段的标注（将下载/备用项/锁源缺集…），上面那几块除了输入框自己都不读
+        pref_keyword，所以改关键词只刷这一段（输入框不重建，回车后焦点也还在）。
+        其余改动照旧经 _after() 刷整个 body（会连带重建这一段）。
+        自己取 cur/eps：单独刷新时不能用 body 那次的旧快照。
+        【残留】逐条的『下载』『排除』等按钮就在这一段里、照样会被重建：填完关键词直接点它们，
+        仍会丢一次点击（要再点一下）。
+        """
+        cur = anime.get_anime(anime_id)
+        if cur is None:
+            return
+        eps = anime.list_episodes(anime_id)
         # 分集 / 种子（每条可单独强制下载）；标题右侧灰字标注会发送给 qB 的保存目录（按规则算出，全番同一目录）
         with ui.row().classes("items-center gap-2 w-full mt-2 flex-wrap"):
             ui.label(f"分集 / 种子（{len(eps)}）").classes("text-sm font-bold shrink-0")
@@ -300,19 +353,29 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 "系统对这段【既不自动合并、也不跨源去重】：同一集最多每个源各下一份，宁可多下也不冒险把两集不同内容当成一集而漏下。"
                 "如确认某两条其实是同一集，点左边集号手动改成一致即可。")
         # 【缺集】按开播日推算应已播出、库里却一条种子都没有的集（判据见 core.anime.missing_episodes）
-        _miss = anime.episode_gaps([cur]).get(cur.id)
-        if _miss:
+        _miss = anime.episode_gaps([cur]).get(cur.id) or []
+        # (r39 F8) 槽位被别季旧种子占着的那几集：补齐拿回来也会被『同集已有』挡住，不能再叫人去点补齐（见 slot_held_gaps）
+        _held = anime.slot_held_gaps({cur.id: _miss}).get(cur.id, []) if _miss else []
+        _free = [e for e in _miss if e not in _held]
+        if _free:
             warn_banner(
-                f"缺第 {ep_ranges_text(_miss)} 集：按 bgm 开播日推算早该播了，库里却一条种子都没有。"
+                f"缺第 {ep_ranges_text(_free)} 集：按 bgm 开播日推算早该播了，库里却一条种子都没有。"
                 "采集停过一阵（RSS 只留最近几天，停久了那几集就滚出去了）或锁定的源中途断更都会这样。"
                 "点『自动补齐』去搜（在追的番补到就直接下）：当前下载源搜不到时，会列出别的组有哪些集，挑一个就能补。")
+        if _held:
+            warn_banner(
+                f"缺第 {ep_ranges_text(_held)} 集：这几集的槽位被别的季的旧种子占着（同集号、发布比本季首播早得多），"
+                "补齐也下不了 —— 补回来的本季这几集会被『同集已有』挡住。先处理绑定（看『绑定看着不对』）。")
         # 【锁定源落后】别的组已有后续集、锁定源迟迟不跟（判据见 core.anime.locked_out_episodes）
         _lo = anime.locked_out_episodes([cur]).get(cur.id)
         if _lo:
             warn_banner(
                 f"锁定的下载源『{cur.pref_source}』停在第 {_lo['lock_max']} 集，"
                 f"{'、'.join(_lo['groups'])} 已经发了第 {ep_ranges_text(_lo['eps'])} 集，"
-                "因为锁了源一集都不会下。可以只用别的组补上锁定源之后这几集（不改锁），或改回按优先级。",
+                + (f"锁定组停更满 {config.ANIME_LOCK_FALLBACK_DAYS} 天、核对无误的会自动用别的组补一份；"
+                   "如果锁定组其实发了（采集漏收），先点『自动补齐』。不想等也"
+                   if config.ANIME_LOCK_FALLBACK_DAYS > 0 else "因为锁了源一集都不会下。")
+                + "可以只用别的组补上锁定源之后这几集（不改锁），或改回按优先级。",
                 action=[("只补这几集", "download", _download_locked_out),
                         ("改回按优先级", "lock_open", _unlock_source)])
         if not eps:
@@ -324,9 +387,17 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         plan = anime.download_plan(anime_id)
         backfill_plan = anime.download_plan(anime_id, for_backfill=True)
         # 这一集是否『有着落』：将下(plan) 或 已有一份(HAVE_STATUSES：已下/在下/停滞)。与 flush 同口径——
-        # stalled 也算有着落(不再误报缺集，B4)；deleted 不算(删了同集新 hash 会当将下载来下)。
+        # stalled 也算有着落(不再误报缺集，B4)；deleted 不在这里算：只删了重复份的同集照常会下，
+        # "该集已删"的 pending 行由下面的 _dropped 单独标，走不到用 covered 的那一支（E-73）。
         covered = {t.episode for t in eps
                    if t.id in plan or t.id in backfill_plan or t.status in anime.HAVE_STATUSES}
+        # 【该集已删】(E-73) 组内有"该集已删"(deleted+ep_dropped) 行、且一份都不在盘上的集：后台任何自动路径
+        # 都不再为它下别的版本。分组键与 flush / 计划 / 即时同集闸同口径（dedup_key，歧义段带源）。
+        _amb = anime.ambiguous_range(cur)
+        _dropped = ({anime.dedup_key(_amb, 0, t.episode, t.source) for t in eps
+                     if t.status == "deleted" and t.ep_dropped}
+                    - {anime.dedup_key(_amb, 0, t.episode, t.source) for t in eps
+                       if t.status in anime.HAVE_STATUSES})
         # 单部作品（剧场版/WEB 等只有 1 集）的 -2 按特别篇算、标 SP —— 与仪表盘同一判据（engine.is_special_ep）
         _single = engine.is_single_work(cur.platform, cur.total_episodes)
         for t in eps:
@@ -347,6 +418,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     else:
                         ui.label(ep_txt).classes("shrink-0")              # 主要信息：集号（已下等不可改）
                     ui.label(t.source or "—").classes("shrink-0")         # 主要信息：字幕组（同色）
+                    if t.lock_fallback:   # 锁定源停更时后台替你补的那一份（E-74）：让人事后找得到、删得掉
+                        ui.badge("兜底").props("color=teal outline").tooltip(
+                            "锁定的组停更了一阵，后台用这个组给这一集补了一份。锁定组以后补发这一集会再自动下它的版本；"
+                            "这一份不会自动删，不要了点右边删除。"
+                            "锁定组补发之前别删：删了等于这一集不要了，它的版本也不会再自动下")
                     ui.label(engine.torrent_time(t)).classes(
                         "shrink-0 text-gray-500 text-xs")                 # 次要：时间(12px)
                     ui.space()
@@ -405,6 +481,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                 "这部番已按 bgm 总集数下齐，且设置页开着『下齐后停止自动下新集』，所以它的新集"
                                 "一律不自动下（含失败后的自动重发）。要这一集就点右边『下载』；"
                                 "若其实还没播完，点上方的『继续订阅』。")
+                        elif anime.dedup_key(_amb, 0, t.episode, t.source) in _dropped:
+                            # 【要排在 retry / plan / covered 之前】(E-73) 删除时这一行可能正在退避队列里（retry_at 非空），
+                            # 落进下面的『重试中』会承诺"X 之后自动重发"——flush 与同集闸都认这一集有着落，永不重发。
+                            ui.badge("该集已删·不自动下").props("color=grey").tooltip(
+                                "你删掉了这一集的最后一份，后台不会再自动下它的其它版本；要就点右边『下载』")
                         elif t.retry_at:   # 暂时性失败排队中：它仍是待下，但要让人看见"为什么还没下"
                             ui.badge(f"重试中·第{t.retry_count}次").props("color=orange").tooltip(
                                 f"{t.fail_reason or '暂时性失败'} · "
@@ -452,7 +533,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.badge("停滞").props(f"color={SEVERITY_COLOR['stalled']}").tooltip(
                             (f"{t.fail_reason}；" if t.fail_reason else "")
                             + "半成品文件在下载目录里。停滞集不会自动重下/换源："
-                              "要重试点右边『下载』，要放弃点『删除』")
+                              "要重试点右边『下载』；要换源：在同集别的版本那一行点『下载』；"
+                              "点『删除』＝这一集不要了，后台不会再自动下")
                     else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删/已排除)按状态
                         # 【严重度色取公共表】写死 blue-grey 会让同一条 stalled/error 在仪表盘是
                         # 橙红、在详情页是中性灰——而两边渲染的是同一列 status。
@@ -471,7 +553,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     # 会被渲染成"已归档：只能标记已删"这种错话（E-49 后占位段不清归档标记）。
                     if t.status in engine.HAVE_STATUSES and t.status != "downloading":
                         ui.button(icon="delete_forever",
-                                  on_click=_del_one(t.id, t.archived_at, t.save_path)).props(
+                                  on_click=_del_one(t.id, t.archived_at, t.save_path,
+                                                    t.episode is not None and t.episode < 0 and not _single)).props(
                             "flat dense color=negative").classes("btn-sm").tooltip(
                             "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
                             else "删除这一集的文件（qB+硬盘，不可撤销）")
@@ -498,19 +581,27 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 点『确认下载』会把卡片上那个旧值（往往是"按优先级"）带回去，把刚锁的源静默解掉。
         _after()
         if e.value:
-            ui.notify(f"已锁定：之后只下 {e.value}（缺集不兜底，自己来点下载）", type="warning")
+            ui.notify(f"已锁定：之后只下 {e.value}（它停更满 {config.ANIME_LOCK_FALLBACK_DAYS} 天、"
+                      "核对无误的缺集才自动用别的组补）" if config.ANIME_LOCK_FALLBACK_DAYS > 0 else
+                      f"已锁定：之后只下 {e.value}（缺集不兜底，自己来点下载）", type="warning")
         else:
             ui.notify("已改回『按优先级』：多源自动挑、缺集用别的源兜底", type="positive")
 
-    def _set_keyword(val):
+    def _set_keyword(val, inp):
         v = (val or "").strip()
+        # 【回写 strip 后的值】(r39 F37) 输入框不再随 body.refresh() 重建，不回写的话填『 繁日 』后
+        # 库里是『繁日』、框里还是『 繁日 』。放在『没改』判断之前：库里已是『繁日』时再填带空格的也要规整。
+        # 值相同时 NiceGUI 不发更新，回车那一路焦点/光标不受影响
+        inp.value = v
         # 【没改就什么都不做】blur 每次失焦都触发——点一下输入框再点别处，本来什么都没改，
-        # 却会写一次库、整块 body.refresh()（正在滚动/展开的状态全丢）、还弹一条橙色警告。
+        # 却会写一次库、重建一遍分集区（正在滚动/展开的状态全丢）、还弹一条橙色警告。
         cur_kw = getattr(anime.get_anime(anime_id), "pref_keyword", "") or ""
         if v == cur_kw:
             return
         anime.set_pref_keyword(anime_id, v)
-        body.refresh()
+        # 【只刷分集区，不刷 body】理由见 ep_section：body.refresh() 会删掉同一行的按钮，
+        # 紧跟在 blur 后面到达的那次点击就被吞了。
+        ep_section.refresh()
         ui.notify(f"版本限定『{v}』：只下原名含此词的版本（缺此版本的集不兜底）" if v
                   else "已取消版本限定", type="warning" if v else "positive")
 
@@ -711,29 +802,32 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ui.notify(f"补齐出错：{e}", type="negative")
             return
         _after()
+        # (r39 DEC1x) 自动补齐不收没有发布时间的目标组结果（判断不了是不是前几季的同号集）：入库与没入库都要说一句
+        _nt = (f"；另有 {res['no_time']} 条没有发布时间、判断不了是不是本季的，自动补齐没收；"
+               "要的话用『补齐该源』（会转待确认人工过目）" if res.get("no_time") else "")
         if res.get("error"):
             ui.notify(res["error"], type="warning")
         elif res["ingested"]:
             if res.get("direct"):
                 n = res.get("downloaded", 0)
-                ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}），已下发 {n} 集"
-                          if n else
-                          f"补入库 {res['ingested']} 条（搜到 {res['found']}），但没有新下发："
-                          "补到的集已经有了、是特别篇，或不合『版本』关键词；qB 连不上时也会这样",
+                ui.notify((f"补入库 {res['ingested']} 条（搜到 {res['found']}），已下发 {n} 集"
+                           if n else
+                           f"补入库 {res['ingested']} 条（搜到 {res['found']}），但没有新下发："
+                           "补到的集已经有了、是特别篇，或不合『版本』关键词；qB 连不上时也会这样") + _nt,
                           type="positive" if n else "info")
             elif res.get("to_confirm"):
-                ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}）→ 已转『待确认』，去点『确认下载』",
+                ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}）→ 已转『待确认』，去点『确认下载』" + _nt,
                           type="positive")
             else:   # rejected 番：入库了但订阅态没变，不会自动下
                 ui.notify(f"补入库 {res['ingested']} 条（搜到 {res['found']}），但本番仍在『已忽略』；"
-                          "需先『恢复订阅』这些才会下载", type="warning")
+                          "需先『恢复订阅』这些才会下载" + _nt, type="warning")
         else:
             # 归属检查跳掉的那些要单独说：它与两个补齐按钮的松紧【无关】，换另一个按钮再点结果一样，
             # 不点明的话用户只会以为"过滤太严"而白试一遍。
             _st = (f"；其中 {res['stolen']} 条对照表显示属于别的番（详见 /logs）" if res.get("stolen") else "") + (
                 f"；另有 {res['too_old']} 条发布时间不在本季播出期（多半是前几季的同号集），没收" if res.get("too_old") else "")
             ui.notify(f"当前下载源没有新种子可补（搜到 {res['found']}，都已有或被季号/名字过滤{_st}）"
-                      + ("；别的组有，见弹出的列表" if res.get("others") else ""), type="info")
+                      + _nt + ("；别的组有，见弹出的列表" if res.get("others") else ""), type="info")
         if res.get("others"):
             await _offer_other_groups(res["others"])
 
@@ -827,34 +921,37 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.notify("下载失败，看日志", type="negative")
         return h
 
-    def _del_one(torrent_id, archived=None, save_path=""):
+    def _del_one(torrent_id, archived=None, save_path="", special=False):
         async def h():
+            # 【删 = 这一集不要了】(E-73) 删的若是同集最后一份，后台不再自动下这一集的其它版本；同集还留着别的份时只删这一份。
+            # 是哪一种问 core（与真正写库的 _is_last_copy 同一个判据），别按页面上已渲染的行自己数。
+            drops = anime.delete_drops_episode(torrent_id)
+            _what = ("这是这一集仅剩的一份：删掉后后台不会再自动下这一集的其它版本（想换版本就在那一行点『下载』）。"
+                     if drops else "同集还留着别的版本，只删这一份；留下那份以后若失败，后台照常会补。")
+            if special:   # (r39 F17) 普通番的特别篇 / 未知集：彼此不是"同一集"，后台也本来就不自动下，上面两句都不对
+                _what = "特别篇 / 未知集后台本来就不自动下，只删这一份。"
             if archived:   # 已归档：种子早已移出 qB，删不到文件 → 明确告知路径与后果，让用户自己清理
                 if not await confirm(
                         "这一集已归档，只能标记已删",
                         f"它已从 qB 移除，本工具删不到文件。确认后仅标记为『已删』。\n\n"
                         f"⚠️ 文件仍在（需你手动删）：{save_path or '（未记录路径，请到下载目录自行查找）'}\n\n"
-                        f"注意：标记后这一集就算『没有了』，若该集还有别的源的待下版本，"
-                        f"后台可能自动补下一份——旧文件不会被覆盖，会变成同一集两份。"
-                        f"请尽快自行删除上面的文件；只是不想要这个版本的话，用『排除』更合适。\n"
+                        f"{_what}请尽快自行删除上面的文件。\n"
                         f"想连文件一起删：先点『下载』把它重新挂回 qB，再删。",
                         ok_label="标记已删", ok_icon="delete_forever"):
                     return
-            # 已归档那个分支早就写明了"备用源会自动补下"，普通删除这条一直没提——
-            # 而它才是最常走的路径。用户多半是为了腾磁盘，二十分钟后文件换个字幕组回来了。
             elif not await confirm("删除这一集的文件？",
-                                   "通过 qB 连同硬盘文件一起删除，不可撤销。\n"
-                                   "这一集若还有别的源的『备用项』待下，后台会在下一轮采集自动补下一份（删的是这一条种子，不是整集）。不想让它回来：先把备用项『排除』，或整部番用『忽略』。",
+                                   "通过 qB 连同硬盘文件一起删除，不可撤销。\n" + _what,
                                    ok_label="删除文件", ok_icon="delete_forever"):
                 return
             ok = await anime.delete_anime_torrent(torrent_id)
             _after()
+            _tail = "；同集其它版本不会再自动下" if ok and drops else ""
             if ok and (archived or ok == "gone"):
                 # 已归档的、或早就在 qB 里被手动移除的：本工具删不到文件，只标记了已删
-                ui.notify(f"这一集已经不在 qB 里，只标记为已删；文件仍在 {save_path or '下载目录'}，需手动清理",
+                ui.notify(f"这一集已经不在 qB 里，只标记为已删；文件仍在 {save_path or '下载目录'}，需手动清理{_tail}",
                           type="warning")
             else:
-                ui.notify("已删除该集文件" if ok else "没删成（qB 未连上或该集无文件）",
+                ui.notify(("已删除该集文件" + _tail) if ok else "没删成（qB 未连上或该集无文件）",
                           type="positive" if ok else "warning")
         return h
 

@@ -63,49 +63,7 @@ def test_the_exemption_list_is_not_stale():
     assert not stale, f"这些已经不再匹配扫描条件了，请从 _EXEMPT 删掉：{stale}"
 
 
-async def test_movie_manual_binding_during_the_await_wins(clean_tables, monkeypatch):
-    """行为验证（剧场版侧）：await 期间用户手工绑定的 id 必须胜出。"""
-    from core import movies as M
-    from db.models import Movie
-
-    with clean_tables.get_session() as s:
-        m = Movie(title="某片", bangumi_id=None)
-        s.add(m); s.commit(); s.refresh(m)
-        mid = m.id
-
-    async def _slow_resolve(*a_, **k_):
-        with clean_tables.get_session() as s2:      # 模拟 await 期间的人工绑定
-            row = s2.get(Movie, mid)
-            row.bangumi_id = 501958
-            s2.add(row); s2.commit()
-        return {"bangumi_id": 999999, "display_name": "后台自动匹配到的另一部",
-                "air_date": "2020-01-01"}
-
-    monkeypatch.setattr(M.enrich, "resolve", _slow_resolve)
-    await M.enrich_movie(mid)
-
-    with clean_tables.get_session() as s:
-        got = s.get(Movie, mid)
-    assert got.bangumi_id == 501958, f"用户绑的 501958 被盖成了 {got.bangumi_id}"
-    assert got.display_name != "后台自动匹配到的另一部"
-
-
-async def test_movie_reidentify_still_overwrites_when_nobody_touched_it(clean_tables, monkeypatch):
-    """【别扩太宽】无人改动时，『重新识别』照旧覆写——那正是这个按钮的用途。"""
-    from core import movies as M
-    from db.models import Movie
-
-    with clean_tables.get_session() as s:
-        m = Movie(title="某片", bangumi_id=111, display_name="旧名")
-        s.add(m); s.commit(); s.refresh(m)
-        mid = m.id
-
-    async def _resolve(*a_, **k_):
-        return {"bangumi_id": 222, "display_name": "新名", "air_date": "2026-01-05"}
-
-    monkeypatch.setattr(M.enrich, "resolve", _resolve)
-    await M.enrich_movie(mid)
-
-    with clean_tables.get_session() as s:
-        got = s.get(Movie, mid)
-    assert (got.bangumi_id, got.display_name) == (222, "新名")
+# (r39 M2) 剧场版侧原有两条行为用例（await 期间人工绑定胜出 / 无人改动时照旧覆写）随 enrich_movie 一起撤了：
+# 『重新识别』改成 core.movies.suggest_movie_bgm 只出候选、不写库，写库只在带回显的 bind_movie_bgm 上发生，
+# 这条路上已没有"await 之后覆写 bangumi_id"的对象。它不写库这件事由
+# tests/test_wrong_season_match.py::test_no_identification_path_calls_a_merge 与 tests/test_r39_movies.py 钉住。

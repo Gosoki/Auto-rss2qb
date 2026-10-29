@@ -42,6 +42,8 @@ def library(clean_tables):
                 (3, "error", "ANi", 90, "繁日"), (3, "pending", "Mikan", 10, "简日"),
                 (4, "stalled", "ANi", 50, "繁日"), (4, "pending", "Mikan", 90, "简日"),
                 (5, "deleted", "ANi", 50, "繁日"), (5, "pending", "Mikan", 90, "简日"),
+                # (r39 E-73) 第 8 集删的是最后一份（ep_dropped）：该集已删，两边都得跳过；第 5 集只删了重复份，照常下
+                (8, "deleted", "ANi", 50, "繁日"), (8, "pending", "Mikan", 90, "简日"),
                 (13, "pending", "ANi", 50, "繁日"), (13, "pending", "Mikan", 90, "简日"),
                 (-1, "pending", "ANi", 50, "繁日"), (-2, "pending", "ANi", 50, "繁日"),
                 (6, "skipped", "ANi", 50, "繁日"), (7, "excluded", "ANi", 50, "繁日"),
@@ -50,9 +52,22 @@ def library(clean_tables):
                 s.add(AnimeTorrent(anime_id=a.id, info_hash=f"{k:040x}",
                                    raw_title=f"[{src}] {a.title} - {ep} [1080p][{kw}]",
                                    episode=ep, status=status, source=src, priority=pri,
-                                   created_at=now - timedelta(minutes=k)))
+                                   created_at=now - timedelta(minutes=k),
+                                   ep_dropped=(ep == 8 and status == "deleted")))
         s.commit()
         return [a.id for a in animes]
+
+
+@pytest.mark.parametrize("for_backfill", [False, True])
+def test_a_dropped_episode_is_skipped_by_both_sides(library, clean_tables, for_backfill):
+    """(r39 E-73) 逐番版与批量版一起改：该集已删（第 8 集）的待下两边都不标；只删了重复份的（第 5 集）两边都标。"""
+    with clean_tables.get_session() as s:
+        aid = s.exec(select(Anime.id).where(Anime.title == "普通番")).one()
+        ep_ids = {ep: t for t, ep in s.exec(select(AnimeTorrent.id, AnimeTorrent.episode).where(
+            AnimeTorrent.anime_id == aid, AnimeTorrent.status == "pending", AnimeTorrent.source == "Mikan"))}
+    for plan in (A.download_plan(aid, for_backfill=for_backfill),
+                 A.download_plan_for_ids([aid], for_backfill=for_backfill)):
+        assert ep_ids[8] not in plan and ep_ids[5] in plan, plan
 
 
 @pytest.mark.parametrize("for_backfill", [False, True])

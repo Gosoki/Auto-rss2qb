@@ -13,7 +13,7 @@ import asyncio
 import logging
 import re
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import func, select
@@ -65,6 +65,14 @@ def _merge_movie(s, loser_id: int, keeper_id: int) -> None:
         # R36 体检 logic-7 补齐）—— 否则合并后新版本去了 keeper 的年份目录，与已落盘的旧版本散在两处。
         if loser.quarter and not _has_handled_torrents(s, keeper_id) and _has_handled_torrents(s, loser_id):
             keeper.quarter = loser.quarter
+            # 采用的若正是用户锁定过的年份，锁跟着过来（否则下一轮扫描又把它改回 bgm 的值）
+            keeper.quarter_locked = keeper.quarter_locked or loser.quarter_locked
+        elif loser.quarter_locked and not keeper.quarter_locked and not _has_handled_torrents(s, keeper_id):
+            # 【年份锁随合并继承】(r39 M1y) loser 的年份是用户在详情页『编辑年份』亲手改的、keeper 的只是 bgm 算的：
+            # 合并后留下的是 keeper 这一行，不继承就等于把用户的纠正随 loser 一起删掉。
+            # 优先级低于上面那条『loser 已下就采用 loser 季度』（那条管的是盘上文件的位置）；keeper 已下过则不动它的目录。
+            keeper.quarter = loser.quarter
+            keeper.quarter_locked = True
         s.add(keeper)
     for t in s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == loser_id)):
         t.movie_id = keeper_id
@@ -91,6 +99,10 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         if movie is None:
             movie = s.exec(select(Movie).where(Movie.mikan_id == mikan_id)).first()
         is_new = movie is None
+        # 【年份锁】(r39 M1y) 用户在详情页『编辑年份』改过的片：下面重套 bgm 元数据会按
+        # movie_quarter_of(air_date) 把年份写回去（keep_path 只在片已下过时为真），
+        # 当年桶每周扫一次，人工纠正一周内就被冲掉。必须在任何写入之前取；只冻年份，名字与元数据照常刷新。
+        lock_q = movie.quarter if (not is_new and movie.quarter_locked) else None
         if movie is None:
             movie = Movie(title=title, mikan_id=mikan_id)
         # 【先把这个 mikan_id 从别的行上摘下来】mikan_id 现在是唯一索引，而下一行是
@@ -149,6 +161,8 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         if snap is not None:
             for k, v in snap.items():
                 setattr(movie, k, v)
+        if lock_q is not None:
+            movie.quarter = lock_q
         s.add(movie)
         s.commit()
         s.refresh(movie)
@@ -242,7 +256,7 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
     seasons：['A','B','C','D'] 子集（冬春夏秋），None=全年四季。
     『是不是电影』以 Mikan 桶为准——桶里的一律当剧场版/OVA 收进 Movie（哪怕 bgm 把类型识别成 TV，
     也只是详情页的 bgm 元数据，不改变它在剧场版列表里）。本函数只碰 Movie/MovieTorrent，不写 TV 表。
-    返回 {'movies','torrents','seen','errors'}。
+    返回 {'movies','torrents','seen','errors','bgm_down','mikan_ids'}（后两项见 _discover_loop）。
     """
     seasons = seasons or ["A", "B", "C", "D"]
     try:
@@ -255,12 +269,22 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
         # 『立即扫描』按钮的 on_click：先弹"扫描中…请稍候"，然后永远没有下文，页面零反馈。
         # refresh_movie_torrents 早就为这件事加了同款守卫（47 行之下），这里没跟上。
         log.error("剧场版扫描失败 %s：%s: %s", year, type(e).__name__, e)
-        return {"movies": 0, "torrents": 0, "seen": 0, "errors": 1}
+        return {"movies": 0, "torrents": 0, "seen": 0, "errors": 1, "bgm_down": False, "mikan_ids": set()}
 
 
 async def _discover_loop(client, year: int, seasons: list) -> dict:
-    """discover_movies 的主体（拆出来只是为了让建 client 也能被同一个 try 罩住）。"""
+    """discover_movies 的主体（拆出来只是为了让建 client 也能被同一个 try 罩住）。
+
+    【bgm_down：一部都没问成】(r39 M8) Mikan 给了 bgm id 的片才问 bgm：问到了记 hit；没问到、
+    且这次调用期间 enrich.net_failures() 没涨（对方答了『没有』，如 404：条目被合并/删除、NSFW 对未登录返回 404）
+    记 reached。tries>0 且 hit/reached 都为 0 才算 bgm 挂了 —— 判据必须是『一部都没问成』，
+    不能是『一部都没命中』：年初当年桶里只有一两部且恰好都 404 时，后者会每轮误判、把扫描基准冻住（同 retry_unmatched）。
+    【mikan_ids】本轮已经拉过种子 RSS 的 Mikan 番组，auto_scan_tick 往前刷新时跳过它们（M3）。
+    """
     added_movies = added_torrents = seen = errors = 0
+    tries = hits = reached = 0
+    mikan_ids: set[str] = set()
+    rows_hit: dict[int, dict[str, int | None]] = {}   # {movie_id: {mikan_id: bgm_id}}，只为 M7 那行日志
     for letter in seasons:
         try:
             bucket = await mikan.discover_movie_bucket(client, year, letter)
@@ -273,18 +297,37 @@ async def _discover_loop(client, year: int, seasons: list) -> dict:
         for mikan_id, title, mlabel in bucket:
             try:
                 bgm_id = await mikan.fetch_detail(client, mikan_id)
-                info = await enrich.fetch_by_id(bgm_id) if bgm_id is not None else None
+                info = None
+                if bgm_id is not None:
+                    tries += 1
+                    before = enrich.net_failures()
+                    info = await enrich.fetch_by_id(bgm_id)
+                    if info:
+                        hits += 1
+                    elif enrich.net_failures() == before:
+                        reached += 1      # 问到了、对方说没有：bgm 是通的
                 movie_id, is_new = _upsert_movie(mikan_id, title, bgm_id, info, mlabel)
                 seen += 1
                 added_movies += 1 if is_new else 0
+                rows_hit.setdefault(movie_id, {})[mikan_id] = bgm_id
                 items = await mikan.fetch_bangumi_torrents(client, mikan_id)
+                mikan_ids.add(mikan_id)
                 added_torrents += _store_movie_torrents(movie_id, items)
             except Exception as e:
                 log.error("处理剧场版失败 mikan=%s(%s): %s", mikan_id, title, e)
                 errors += 1
-    log.info("剧场版发现完成 %s：命中 %d/新增 %d/种子 %d，出错 %d",
-             year, seen, added_movies, added_torrents, errors)
-    return {"movies": added_movies, "torrents": added_torrents, "seen": seen, "errors": errors}
+    # 【两个 Mikan 番组落到同一行】(r39 M7，只留痕不改数据) 两个番组链到同一个 bgm 时，_upsert_movie 按 bgm
+    # 命中同一行，mikan_id 在两者之间来回翻：『刷新版本』只拉当前挂着的那个，另一个番组的新版本要等整年扫描。
+    # 生产上没见过，所以只打一行事实、不推送、不合并不拆分。
+    for mid, by_mk in rows_hit.items():
+        if len(by_mk) >= 2:
+            bgms = "、".join(sorted({str(b) for b in by_mk.values() if b is not None})) or "?"
+            log.warning("Mikan 番组 %s 都链到 bgm %s，已归入同一行 #%s", "、".join(sorted(by_mk)), bgms, mid)
+    bgm_down = tries > 0 and hits == 0 and reached == 0
+    log.info("剧场版发现完成 %s：命中 %d/新增 %d/种子 %d，出错 %d；bgm 问 %d 部，取到 %d、答无 %d",
+             year, seen, added_movies, added_torrents, errors, tries, hits, reached)
+    return {"movies": added_movies, "torrents": added_torrents, "seen": seen, "errors": errors,
+            "bgm_down": bgm_down, "mikan_ids": mikan_ids}
 
 
 async def refresh_movie_torrents(movie_id: int) -> dict:
@@ -333,35 +376,156 @@ async def _refresh_movie_torrents_inner(movie_id: int) -> dict:
     return {"ok": True, "msg": "", "added": added, "seen": len(items)}
 
 
+# 【/movies『自动扫描』卡上两个整数项的合法范围】(r39 M3/M8) 界值只定义这一处：读取（auto_scan_tick、
+# scan_now、_refresh_back_years）与页面保存（pages/movies._save_scan）都经 clamp_scan_setting 钳。
+# 不进 config._RANGE：那张表登记的是【设置页】上的项（tests/test_r39_thresholds 会要求它们出现在设置页），
+# 这两项放在 /movies 的自动扫描卡里，和扫描开关、间隔挨着。
+SCAN_SETTING_RANGE: dict[str, tuple[int, int]] = {
+    "MOVIE_REFRESH_BACK_YEARS": (0, 3),
+    "MOVIE_SCAN_RETRY_MIN": (5, 1440),
+}
+
+
+def clamp_scan_setting(key: str, value) -> int:
+    """把 /movies 自动扫描卡上的整数项钳进 SCAN_SETTING_RANGE。读当前值：clamp_scan_setting(k, getattr(config, k))。"""
+    lo, hi = SCAN_SETTING_RANGE[key]
+    return max(lo, min(hi, int(value)))
+
+
+# 【基准型扫描的失败退避】(r39 M8) 只对『当年 + 四季』这种会推进 MOVIE_SCAN_LAST 的扫描维护。
+# 内存态：进程重启清零（代价只是多扫一次）。整轮失败时基准不推进，原来于是每 5 分钟心跳整轮重打一遍
+# Mikan（Mikan 全挂时）；现在按 MOVIE_SCAN_RETRY_MIN × 2^(连续失败-1) 退避，封顶在 MOVIE_SCAN_INTERVAL ——
+# 最坏也只是每个正常间隔扫一次。成功一次清零。手动『立即扫描』不受这道闸（直接走 scan_now）；
+# 『重新激活全部任务』也不受（auto_scan_tick(respect_backoff=False)）。重试到期即视同到点，见 auto_scan_tick。
+_scan_fail_streak = 0
+_scan_retry_at: datetime | None = None
+
+
 async def scan_now(year: int, seasons: list[str] | None = None) -> dict:
-    """扫描一次并记下扫描时间（手动『立即扫描』与后台自动扫描共用）。只碰剧场版，不涉 TV。"""
+    """扫描一次并记下扫描时间（手动『立即扫描』与后台自动扫描共用）。只碰剧场版，不涉 TV。
+
+    在 discover_movies 的返回值上补 res['failed']（整轮失败：Mikan 一部没处理成，或 bgm 一部都没问成）
+    与 res['retry_at']（本次排了自动重试时为 ISO 时间串，否则 None）。
+    """
+    global _scan_fail_streak, _scan_retry_at
     res = await discover_movies(year, seasons)
     # 只有覆盖当年四季的完整扫描才刷新自动扫描时间基准；手动只扫单季(回填历史)不该顶掉它、推迟自动全年扫。
-    # 整轮网络故障（一部没命中且有报错）不刷新基准——否则一次抓取失败就要等满一个间隔才重试；留给 5 分钟心跳重扫。
+    # 整轮网络故障（一部没命中且有报错）不刷新基准——否则一次抓取失败就要等满一个间隔才重试；改由下面的退避重扫。
     total_fail = res["seen"] == 0 and res["errors"] > 0
+    # 【bgm 一部都没问成也不推进】(r39 M8) 否则 bgm 全挂的那一轮照样推进基准：新片全以『待识别』落库，
+    # 而剧场版线没有后台重识别，要等满一个间隔（默认 7 天）下一轮才有机会补上。判据见 _discover_loop。
+    res["failed"] = bool(total_fail or res.get("bgm_down"))
+    res["retry_at"] = None
     # 【还必须是"当年"】MOVIE_SCAN_LAST 是自动扫描的节拍基准，而自动扫描扫的恒是【当年】四季
     # （见 auto_scan_tick）。手动去补抓 2023 年的老片同样是"四季全选"，不加年份判断就会把基准
     # 顶到现在 —— 当年的新片最长 MOVIE_SCAN_INTERVAL（默认 7 天）不再被自动抓，
     # 而 /movies 上"上次扫描 刚刚"看起来一切正常，没有任何迹象说明漏了。
-    if (year == datetime.now().year
-            and (seasons is None or set(seasons) >= {"A", "B", "C", "D"}) and not total_fail):
-        config.set_many({"MOVIE_SCAN_LAST": datetime.now().isoformat(timespec="seconds")})
+    if year == datetime.now().year and (seasons is None or set(seasons) >= {"A", "B", "C", "D"}):
+        if res["failed"]:
+            _scan_fail_streak += 1
+            base = clamp_scan_setting("MOVIE_SCAN_RETRY_MIN", config.MOVIE_SCAN_RETRY_MIN) * 60
+            # 指数封顶 2^20：连续失败上千次也不让整数无谓变大（反正早已被下面的间隔封顶）
+            delay = min(base * 2 ** min(_scan_fail_streak - 1, 20), max(60, config.MOVIE_SCAN_INTERVAL))
+            _scan_retry_at = datetime.now() + timedelta(seconds=delay)
+            res["retry_at"] = _scan_retry_at.isoformat(timespec="seconds")
+            why = "Mikan 一部都没处理成" if total_fail else "bgm 一部都没问成（连接失败/限流/5xx）"
+            # (r39 F25) 『自动重试』只在自动扫描开着时成立（auto_scan_tick 关着时直接 return）；关着就如实说。
+            then = (f"{_scan_retry_at.strftime('%m-%d %H:%M')} 自动重试" if config.MOVIE_SCAN_ENABLED
+                    else "自动扫描关着，稍后再扫一次")
+            log.warning("剧场版扫描整轮失败（%s，连续第 %d 次），不推进扫描基准；%s",
+                        why, _scan_fail_streak, then)
+        else:
+            _scan_fail_streak, _scan_retry_at = 0, None
+            config.set_many({"MOVIE_SCAN_LAST": datetime.now().isoformat(timespec="seconds")})
     return res
 
 
-async def auto_scan_tick() -> bool:
-    """后台心跳调用：开了自动扫描且到点（距上次 ≥ MOVIE_SCAN_INTERVAL）就扫当年四季。扫了返回 True。"""
+async def _refresh_back_years(year: int, skip: set) -> dict:
+    """自动扫描时顺带刷新往前几年【已有片】的版本：只按 mikan_id 重拉种子 RSS。(r39 M3)
+
+    【为什么不整年重扫往年的桶】往年桶里很难再冒出新番组页（首发晚于 bgm 年份的片都落进了【当年】的桶，
+    生产 76 部里 38 部的首个版本发布在 bgm 年份的次年，都是只扫当年的周扫描发现的），真正缺的是
+    已有番组页晚到的 BD 版本。整年重扫还会把 _upsert_movie 的全部自动身份判断（按 bgm 定位、摘 mikan_id、
+    合并删行、重套元数据）扩大 K 倍 —— 这里一样都不碰：不调 fetch_detail / fetch_by_id / _upsert_movie，
+    不新建行、不改元数据、不改 mikan_id、不合并，零 bgm 请求。
+    窗口：quarter 年份落在 [year-K, year]（K = MOVIE_REFRESH_BACK_YEARS），跳过本轮当年扫描已经拉过的番组 skip。
+    只入库：新版本 pending，已忽略的片记 skipped（_store_movie_torrents 的规则）；剧场版没有任何自动下载路径。
+    已知缺口（只报不改）：上一年最后一次扫描之后才建、又归进上一年秋季桶的番组页，这里补不到，需要时人工扫一次上一年。
+    返回 {'movies': 拉成功的部数, 'added': 新增版本数, 'errors': 出错数}。
+    """
+    out = {"movies": 0, "added": 0, "errors": 0}
+    lo = year - clamp_scan_setting("MOVIE_REFRESH_BACK_YEARS", config.MOVIE_REFRESH_BACK_YEARS)
+    with get_session() as s:
+        rows = list(s.exec(select(Movie.id, Movie.mikan_id, Movie.quarter).where(Movie.mikan_id.is_not(None))))
+    todo = []
+    for movie_id, mk, q in rows:
+        mk = (mk or "").strip()
+        y = engine.quarter_year(q or "")
+        if mk and mk not in skip and y is not None and lo <= y <= year:
+            todo.append((movie_id, mk))
+    if not todo:
+        return out
+    try:
+        async with mikan.make_client() as client:
+            for movie_id, mk in todo:
+                try:
+                    items = await mikan.fetch_bangumi_torrents(client, mk)
+                    # _store_movie_torrents 自带"入库前重取、片已不存在就放弃"的守卫（我们刚 await 过网络）
+                    out["added"] += _store_movie_torrents(movie_id, items)
+                    out["movies"] += 1
+                except Exception as e:
+                    out["errors"] += 1
+                    log.warning("往前刷新剧场版版本失败 movie=%s mikan=%s: %s: %s",
+                                movie_id, mk, type(e).__name__, fetch.redact(e))
+    except Exception as e:
+        # 建 client 那一步也会抛（代理漏 scheme / 缺 socksio），理由同 discover_movies
+        out["errors"] += 1
+        log.error("往前刷新剧场版版本失败：%s: %s", type(e).__name__, fetch.redact(e))
+    log.info("往前刷新剧场版版本 %d–%d：%d 部，新增 %d 个版本，出错 %d",
+             lo, year, out["movies"], out["added"], out["errors"])
+    return out
+
+
+async def auto_scan_tick(respect_backoff: bool = True) -> bool:
+    """后台心跳调用：开了自动扫描且到点（距上次 ≥ MOVIE_SCAN_INTERVAL，或挂着的失败重试到期）就扫当年四季。
+    扫了返回 True。
+
+    respect_backoff=False：用户明确点的『重新激活全部任务』（worker.run_all_once）—— 不等退避窗口，
+    挂着失败重试就当到点，口径同手动『立即扫描』。用户多半是修好网络才点的，被退避闸静默挡掉
+    （窗口最长一个扫描间隔，默认 7 天）而页面还显示绿色成功，正是 run_all_once 要避免的。
+    当年那一轮没失败、且 MOVIE_REFRESH_BACK_YEARS > 0 时，顺带刷新往前几年已有片的版本（_refresh_back_years）。
+    两个调用方（worker.run_movie_scan / run_all_once）都持 _scan_lock。
+    """
     if not config.MOVIE_SCAN_ENABLED:
         return False
+    # 【挂着的失败重试到期 → 视同到点】(r39 F25) 排了退避就说明上一轮基准型扫描（当年四季）失败了、
+    # 基准没推进，本来就该重扫。不先看这个的话：手动扫描失败而 MOVIE_SCAN_LAST 还是最近的
+    # （开着周扫描时是常态），下面『距上次 < 间隔』直接 return，重试永远轮不到 —— 要等满一个间隔，
+    # 期间新片一直待识别，而页面和日志都写着『自动重试』。
+    retry_due = _scan_retry_at is not None and (not respect_backoff or _scan_retry_at <= datetime.now())
     last = config.MOVIE_SCAN_LAST
-    if last:
+    if last and not retry_due:
         try:
             elapsed = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
             if 0 <= elapsed < config.MOVIE_SCAN_INTERVAL:
                 return False  # 还没到点（elapsed<0=系统时钟被回拨，视作到点、照扫，自愈不停摆）
         except ValueError:
             pass
-    await scan_now(datetime.now().year)
+    # 【上一轮整轮失败 → 退避窗口内不重扫】(r39 M8) 见 _scan_retry_at。剩余时长超过一个扫描间隔
+    # （系统时钟被回拨、或用户刚把间隔调小）视作到点，同上面的自愈口径。
+    if respect_backoff and _scan_retry_at is not None:
+        remaining = (_scan_retry_at - datetime.now()).total_seconds()
+        if 0 < remaining <= max(60, config.MOVIE_SCAN_INTERVAL):
+            return False
+    year = datetime.now().year
+    res = await scan_now(year)
+    # 当年那轮失败（Mikan 打不开 / bgm 一部都没问成）就先不往前刷：失败已排了退避重试，重试成功的那一轮再一起刷。
+    # 不碰 MOVIE_SCAN_LAST；出错只记日志（这一段坏了不该让本轮扫描显示成失败）。
+    if not res["failed"] and clamp_scan_setting("MOVIE_REFRESH_BACK_YEARS", config.MOVIE_REFRESH_BACK_YEARS) > 0:
+        try:
+            await _refresh_back_years(year, res.get("mikan_ids") or set())
+        except Exception as e:
+            log.warning("往前刷新剧场版版本出错（不影响本轮扫描）：%s: %s", type(e).__name__, fetch.redact(e))
     return True
 
 
@@ -490,9 +654,16 @@ def get_movie(movie_id: int) -> Movie | None:
 
 
 def movie_torrents(movie_id: int) -> list[MovieTorrent]:
+    """某片的全部版本，按【发布时间】从新到旧（详情页的版本列表靠这个顺序）。
+
+    【不按 created_at】(r39 M6) _store_movie_torrents 按 RSS 从新到旧逐条 commit，首批入库里
+    最早发布的那条 created_at 反而最大，列表就倒着排。发布时间为空的老行退回入库时间。
+    torrents_by_movie（卡片只数状态）与 movie_save_path 的『最新种子行』回退有意不改：后者决定未识别片的目录。
+    """
     with get_session() as s:
         return list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)
-                           .order_by(MovieTorrent.created_at.desc())))
+                           .order_by(func.coalesce(MovieTorrent.release_time, MovieTorrent.created_at).desc(),
+                                     MovieTorrent.id.desc())))
 
 
 def source_map() -> dict:
@@ -635,107 +806,67 @@ def unexclude_torrent(mt_id: int) -> bool:
     return engine.unexclude_torrent(MovieTorrent, mt_id)
 
 
-async def enrich_movie(movie_id: int) -> bool:
-    """页面入口：整段登记在途（从第一次读主键到最后一次写回），理由见 `engine.in_flight`。(R33)"""
-    with engine.in_flight("识别剧场版"):
-        return await _enrich_movie_inner(movie_id)
+async def suggest_movie_bgm(movie_id: int) -> dict:
+    """『重新识别』(详情页) /『重试识别』(待识别) 的候选：**只出候选、不写库**。(r39 M2)
 
+    返回 {'bgm_id': 候选或 None, 'via': 'mikan'|'search'|'', 'current': 当前 bangumi_id, 'msg': 给用户看的话}。
+    写库一律由页面走『绑定 bgm』那条带回显的路（require_bind_confirm → bind_movie_bgm）。
 
-async def _enrich_movie_inner(movie_id: int) -> bool:
-    """手动重识别某剧场版：用已有名字 + 最近一条种子回退，重取 bgm 元数据覆盖。"""
+    【为什么拆掉原来的 enrich_movie】它按名字模糊搜、不设日期基准（上架日不是首映日，见下），
+    剧场版的续作/重制/总集编彼此极像，认错是常态；撞上别人已占的 bgm 时不写绑定，却照样回 True、
+    页面弹『识别成功』；而 Mikan 番组页上那条精确的 bgm 链接从头到尾没用上。
+    现在 Mikan 优先，模糊搜只在『没有 mikan_id』或『页面打开了但没有 bgm 链接』时才用；
+    Mikan 打不开就直接报错 —— 页面上很可能有精确链接，只是此刻打不开，这时递一个模糊候选
+    等于把一个不确定的判断推给用户。与 E-13（改绑入口一律回显）、R21（识别路径不合并）一致。
+    await 之后不再开会话，所以不是 E-46 的跨 await 持主键函数。
+    """
     with get_session() as s:
         m = s.get(Movie, movie_id)
         if m is None:
-            return False
+            return {"bgm_id": None, "via": "", "current": None, "msg": "这部片已不存在（可能刚被合并）"}
         t = s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)
                    .order_by(MovieTorrent.created_at.desc())).first()
         names = [n for n in (m.display_name, m.jp_name, m.title) if n]
         info_hash = t.info_hash if t else None
-        bgm_before = m.bangumi_id      # 见下面 await 之后的那道 compare-and-set
+        mid = (m.mikan_id or "").strip()
+        current = m.bangumi_id
+
+    def _vs_current(bid: int) -> str:
+        """候选与当前绑定的关系：同一个就说清『只是刷新』，不同就明说会改掉现绑定（可能是用户手动改过的）。"""
+        if bid == current:
+            return "就是当前绑定，确认即刷新元数据"
+        if current is not None:
+            return f"与当前绑定 {current} 不同（可能是你手动改过），要保留现绑定请点取消"
+        return ""
+
+    if mid:
+        try:
+            async with mikan.make_client() as client:
+                bid = await mikan.fetch_detail(client, mid)
+        except Exception as e:
+            # 脱敏：msg 会被页面原样弹出来，而 MIKAN_BASE 是设置页可改的地址（理由同 _refresh_movie_torrents_inner）
+            emsg = fetch.redact(e)
+            log.warning("重新识别剧场版：Mikan 取不到 movie=%s mikan=%s: %s: %s",
+                        movie_id, mid, type(e).__name__, emsg)
+            return {"bgm_id": None, "via": "mikan", "current": current,
+                    "msg": f"Mikan 取不到：{type(e).__name__}: {emsg}，稍后再试或直接粘 bgm 链接"}
+        if bid is not None:
+            rel = _vs_current(bid)
+            msg = (f"Mikan 链到的{rel}" if bid == current
+                   else f"Mikan 链到 bgm {bid}" + (f"，{rel}" if rel else "，请核对片名后确认"))
+            return {"bgm_id": bid, "via": "mikan", "current": current, "msg": msg}
     # 【不传 release_time】那是【种子上架日】，不是【首映日】。剧场版的 BD/WEB 版普遍在首映后
     # 6~18 个月才发，把上架日当首映日去做日期校验，会把正确的 subject 判成"日期对不上"而排除，
-    # 转而命中同系列的【另一部】（续作/重制版往往就在那个年份）。而下面紧接着就是
-    # `Movie.bangumi_id == m.bangumi_id → _merge_movie` —— 认错的直接后果是把【正主那一行】
-    # 连同它已下好的版本一起删掉，UI 上还弹一句绿色的"识别成功 ✓"。
-    # TV 侧 services/enrich.py 早有同一条规矩："基准不可靠就【不设】基准"，这里把它用上。
+    # 转而命中同系列的【另一部】。TV 侧 services/enrich.py 早有同一条规矩："基准不可靠就【不设】基准"。
+    # 所以这里的候选是【未校验日期】的，msg 必须如实说出来。
     info = await enrich.resolve(names, None, None, info_hash)
-    with get_session() as s:
-        m = s.get(Movie, movie_id)
-        if m is None:
-            return False
-        # 【await 期间别人改了 bangumi_id 就让路】与番剧侧 core.anime.enrich_anime 同一道闸——
-        # 那边修好之后【这边漏了】，是本项目最常见的广度错误（同一件事有两处，只改了一处）。
-        # enrich.resolve 的整体预算是 120 秒，是全项目最长的 await 窗口之一；原来这里只重取了
-        # 一次 m，挡住的是"这条记录在 await 期间被删了"，没挡"绑定在 await 期间变了"——
-        # 而 apply_bgm_meta 对 bangumi_id 是【无条件覆写】的，紧接着下面就是 _merge_movie，
-        # 它的最后一步是 s.delete(loser)：用户在同一个弹窗里点『重新识别』又点『绑定 bgm』填了
-        # 正确的 subject，几十秒后后台回来把它盖掉，还顺手删掉正主那一行（可能是已经下完的那部），
-        # UI 上弹的却是绿色的『识别成功 ✓』。
-        # 判据用 compare-and-set 而不是"有值就不覆盖"：『重新识别』本来就是"我要你重算"，
-        # 它读到的 bgm_before 与回来时相同、照常覆写；只有【第三方在这段窗口里改过】才让路。
-        dup_names = ""
-        if m.bangumi_id != bgm_before:
-            log.info("重新识别期间该片的 bgm 绑定已被改动（%s → %s），本次结果作废、以后者为准：%s",
-                     bgm_before, m.bangumi_id, m.display_name or m.title)
-            return m.bangumi_id is not None
-        # 【撞车时干脆不写 bangumi_id】(R22)
-        # R21 只是把这里的"合并删行"去掉了，可**删除动作在 `_upsert_movie` 里原样保留着**，
-        # 而那一处的立论是 R20 写的「keeper 是按 bgm_id 查出来的、两行本来就声称同一个 subject」——
-        # 一旦这里把一个**未经证明**的 bgm_id 写进去，那个立论就变成循环论证：
-        # 下一轮剧场版扫描（自动到点，或用户点一次『扫描』）处理另一部片时调 `_upsert_movie`，
-        # 它按这个 bgm_id 查出 keeper、`s.delete` 掉正确的那一行 —— 删除只是被**推迟**了一轮，
-        # 而且这一次是全自动发生的，连日志都归在扫描那一侧。
-        # 所以撞车时连绑定本身都不写：只记日志 + 推 backlog，等用户走带回显的『绑定 bgm』落定。
-        # 那条路有 `bind_preview` + `require_bind_confirm`，"这两行是同一部"由用户明确说出来。
-        new_bgm = (info or {}).get("bangumi_id")
-        clash = list(s.exec(select(Movie).where(
-            Movie.bangumi_id == new_bgm, Movie.id != m.id))) if new_bgm else []
-        if clash:
-            names = "、".join(f"#{o.id}「{o.display_name or o.title}」" for o in clash)
-            log.warning("识别把 #%s「%s」认成了 bgm %s，而 %s 已经占着它 —— "
-                        "本次不写绑定（写进去会让下一轮扫描的 _upsert_movie 按它删掉正主那一行）。"
-                        "要合并请到 /movies 走带回显的『绑定 bgm』",
-                        m.id, m.display_name or m.title, new_bgm, names)
-            dup_bgm, dup_me, dup_names = new_bgm, (m.display_name or m.title), names
-        else:
-            # 手动重识别：允许更新季度（哪怕已下过）——季度变了由 UI 层确认后 relocate_movie 搬已下文件
-            engine.apply_bgm_meta(m, info, keep_path=False)
-            s.add(m)
-            s.commit()
-        # 【识别路径一律不合并、不删行】(R21，与 core.anime.enrich_anime 同一条规矩)
-        # 原来这里是 `Movie.bangumi_id 相同 → _merge_movie`，而 _merge_movie 的最后一步是
-        # `s.delete(loser)`，没有撤销入口。合并的前提是"用户明确说这两条是同一部"——
-        # 而本函数的入口（详情页/『待识别』的『重新识别』、后台重识别）没有一个满足它：
-        # 人点下去之前【根本不知道会绑到哪个 subject】，没法预先回显。
-        # 上面那段注释自己就写着这条路的风险：剧场版的续作/重制/总集编彼此极像，
-        # 而"上架日当首映日"的日期校验对它们系统性地判错。
-        #
-        # 【番剧侧 R20 就收口了，这一半漏到 R21 才补】——同一件事有两处、只改了一处，
-        # 本项目第①号形状。R20 当时还特意回退过 `_upsert_movie` 那一处的同款改动，
-        # 理由是"那里的 keeper 是按 bgm_id 查出来的、合并是构造上正确的"——
-        # 那个判断对 `_upsert_movie` 成立，但**这里不是那条路**：这里的 bgm_id 来自一次
-        # 全新的 `enrich.resolve`，两行"是同一部"从没被证明过。
-        #
-        # 留下的两条同 bgm_id 记录靠日志 + backlog 通知报出来，
-        # 用户到 /movies 走『绑定 bgm』那条带回显（bind_preview + require_bind_confirm）的路合并。
-        if not clash and m.bangumi_id is not None:
-            # 兜底：撞车判定与写入之间没有 await，正常到不了这里；
-            # 留着是因为"两条同 bgm_id"还可能由别的路径造出来（历史数据、并发的绑定）。
-            dup = list(s.exec(select(Movie).where(
-                Movie.bangumi_id == m.bangumi_id, Movie.id != m.id)))
-            if dup:
-                dup_names = "、".join(f"#{o.id}「{o.display_name or o.title}」" for o in dup)
-                log.warning("识别把 %s 绑到了 bgm %s，而 %s 已经占着这个 bgm —— "
-                            "本路径不合并、不删行（合并只在『绑定 bgm』那条带回显的路上做），"
-                            "请人工核对",
-                            f"#{m.id}「{m.display_name or m.title}」", m.bangumi_id, dup_names)
-                dup_bgm, dup_me = m.bangumi_id, (m.display_name or m.title)
-    if dup_names:
-        await notify_event(
-            "backlog", f"{dup_me} 与 {dup_names} 绑到了同一个 bgm，"
-                       "识别没有合并（合并会删记录）。到剧场版页核对一下",
-            key=f"dupmovie:{dup_bgm}", cooldown=24 * 3600)
-    return bool(info)
+    bid = (info or {}).get("bangumi_id")
+    if bid is None:
+        return {"bgm_id": None, "via": "search", "current": current,
+                "msg": "按名字没搜到候选（可粘贴 bgm 链接绑定）"}
+    rel = _vs_current(bid)
+    return {"bgm_id": bid, "via": "search", "current": current,
+            "msg": "按名字搜到的候选，未校验日期，请核对" + (f"；{rel}" if rel else "")}
 
 
 def bind_preview(movie_id: int, bgm_id: int) -> dict:
@@ -795,7 +926,16 @@ async def _bind_movie_bgm_inner(movie_id: int, bgm_id: int, report: dict | None 
         _frozen = engine.has_unmovable_files(s, MovieTorrent, MovieTorrent.movie_id, movie_id)
         if report is not None:
             report["frozen"] = _frozen
+        # 【年份锁】(r39 M1y) 换绑到另一个 subject（含原来没绑）→ 先解锁，年份跟着新条目重算：
+        # 用户改年份针对的是旧条目，换了条目那个纠正就不再成立。绑的还是同一个 subject（『重新识别』
+        # 确认的多半就是现绑定，只为刷新元数据）→ 锁保留，apply 之后把年份还原成锁定值。
+        # 在 await 之后的会话里判断：await 期间绑定可能被别处改过，以此刻库里的为准。
+        relock_q = m.quarter if (m.quarter_locked and m.bangumi_id == bgm_id) else None
+        if m.quarter_locked and m.bangumi_id != bgm_id:
+            m.quarter_locked = False
         engine.apply_bgm_meta(m, info, keep_path=_frozen)
+        if relock_q is not None:
+            m.quarter = relock_q
         s.add(m)
         s.commit()
         for other in list(s.exec(select(Movie).where(
@@ -837,6 +977,10 @@ def set_quarter(movie_id: int, quarter: str) -> bool:
     页面上那一栏就叫『年份』、归档目录走 MOVIE_QUARTER_FMT（默认 {yyyy}）。
     所以 UI 收的是年份，由调用方拼成 `{yy}A` 交给这里；这里仍按番剧的格式校验，
     免得两条线的键格式分家。
+
+    【同时置年份锁】(r39 M1y) 只写 quarter 的话，同一个 bgm 的下一轮扫描（_upsert_movie 重套元数据）
+    会按上映日把年份算回去，人工纠正留不住。锁的作用域只有年份；换绑到别的 bgm 时解锁（见 _bind_movie_bgm_inner）。
+    没有单独的『解锁』入口：要改就再编辑一次年份。
     """
     q = (quarter or "").strip().upper()
     if not re.fullmatch(r"\d{2}[A-D]", q):
@@ -846,6 +990,7 @@ def set_quarter(movie_id: int, quarter: str) -> bool:
         if m is None:
             return False
         m.quarter = q
+        m.quarter_locked = True
         s.add(m)
         s.commit()
     return True
@@ -868,6 +1013,34 @@ def movie_save_path(movie_id: int) -> str | None:
         folder = _movie_folder(m, t)
     return engine.build_save_path(quarter, folder, sub_dir=config.MOVIE_DOWN_PATH,
                                   quarter_fmt=config.MOVIE_QUARTER_FMT)
+
+
+def _placed_movie_rows(s) -> list:
+    """盘上有文件、且记着落点的行 [(movie_id, save_path)]。与番剧侧 _placed_anime_rows 对称，口径同 rows_in_wrong_dir。"""
+    return list(s.exec(select(MovieTorrent.movie_id, MovieTorrent.save_path).where(
+        MovieTorrent.status.in_(engine.HAVE_STATUSES), MovieTorrent.archived_at.is_(None),
+        MovieTorrent.save_path != "")))
+
+
+def movie_path_snapshot() -> dict:
+    """改设置之前按旧规则算的归档目录 {movie_id: 路径或 None}。番剧侧 anime_path_snapshot 的对称实现。(r39 U7)
+
+    DOWN_PATH 两侧都管，MOVIE_DOWN_PATH / MOVIE_QUARTER_FMT 只管这侧——只报番剧会漏掉这一半。
+    """
+    with get_session() as s:
+        ids = {mid for mid, _ in _placed_movie_rows(s)}
+    return {mid: movie_save_path(mid) for mid in ids}
+
+
+def movie_split_count(before: dict) -> tuple[int, int]:
+    """这次改设置让多少剧场版的已下文件留在了旧目录：(部数, 版本数)。判据同 anime_split_count。(r39 U7)
+    版本数按行计（一行 MovieTorrent 就是一个版本），文案说『个版本』，与 relocate_movie 的 noun 一致(r39 F36)。"""
+    with get_session() as s:
+        rows = [(mid, sp) for mid, sp in _placed_movie_rows(s) if before.get(mid)]
+    after = {mid: movie_save_path(mid) for mid in {mid for mid, _ in rows}}
+    split = [mid for mid, sp in rows
+             if after[mid] and engine.same_dir(sp, before[mid]) and not engine.same_dir(sp, after[mid])]
+    return len(set(split)), len(split)
 
 
 async def relocate_movie(movie_id: int, old_path: str | None = None) -> dict:

@@ -382,6 +382,23 @@ def test_the_archive_list_is_a_dialog_not_an_inline_expansion():
         "_open_acked 没有用既有的 list_dlg 对话框"
 
 
+@pytest.mark.parametrize("panel", ["overview_head", "overview_tail"])
+def test_timer_rebuilt_panels_build_no_menu_or_dialog(panel):
+    """(r39 U15) 每 30 秒被定时器重建的两个面板里，不许出现 menu / expansion / dialog 调用。
+
+    上一条只管 overview_head；『刷新资料』的范围菜单就挂在 overview_tail 里：菜单开着时被定时器收掉，
+    更糟的是菜单项就是几分钟长操作的处理器槽位，跑完时槽位早被回收，完成/失败提示都发不出来。
+    要选项就用 page 级、只建一次的对话框（见 pages/anime.py 的 reident_dlg）。
+    """
+    src = (Path(__file__).resolve().parent.parent / "pages/anime.py").read_text(encoding="utf-8")
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef) and n.name == panel), None)
+    assert fn is not None, f"{panel} 改名了？这条守卫的前提坏了"
+    bad = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+           and getattr(n.func, "attr", "") in ("menu", "expansion", "dialog")]
+    assert not bad, f"{panel} 里出现了菜单/就地展开/对话框构造（第 {bad} 行）：30 秒后会被重建掉"
+
+
 def test_the_banner_text_has_exactly_one_definition():
     """三段横幅文案只许有一份（在 core/alerts）。
 
