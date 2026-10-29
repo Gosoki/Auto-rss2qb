@@ -798,3 +798,23 @@ async def test_movie_enrich_still_writes_a_clean_binding(clean_tables, monkeypat
     with clean_tables.get_session() as s:
         me = s.get(Movie, my_id)
         assert me.bangumi_id == 777002 and me.display_name == "认对了"
+
+
+async def test_existing_record_of_the_wrong_season_is_not_reused(monkeypatch, clean_tables, cfg):
+    """(r38) 库里已有绑第一季（140001，超期忽略）的记录；第四季的『- 85』搜到的还是 140001。
+    以前按 bgm 命中就直接复用并登记别名 —— 这个组此后每一集都落进那条超期忽略的记录、一集不下。
+    现在不并进去：另建一条『待确认·疑似绑错季』（不带 bgm），后台也不再自动重试把它绑回去。"""
+    import config
+    cfg(ANIME_START_DATE="2026-05-30")
+    with clean_tables.get_session() as s:
+        old = Anime(title="Re:从零开始的异世界生活", season=1, quarter="16B", confirmed=False, rejected=True,
+                    bangumi_id=140001, total_episodes=26, air_date="2016-04-03")
+        s.add(old); s.commit(); s.refresh(old)
+        old_id = old.id
+    a = await _ingest(monkeypatch, clean_tables, cfg,
+                      {"bangumi_id": 140001, "display_name": "第一季",
+                       "air_date": "2016-04-03", "total_episodes": 26},
+                      ep=85, release=datetime(2026, 9, 20))
+    assert a is not None and a.id != old_id, "不能并进第一季那条"
+    assert (a.bangumi_id, a.confirmed, a.rejected, a.confirm_reason) == (None, False, False, "wrong_season")
+    assert a.enrich_tries >= config.REENRICH_MAX_TRIES

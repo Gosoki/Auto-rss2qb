@@ -1,11 +1,11 @@
 """番剧详情组件：render_anime_detail 渲染进列表页的悬浮框(dialog)，不再有独立页路由。"""
-from nicegui import context, ui
+from nicegui import ui
 
 from core import anime, engine
 import config
 from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, require_bind_confirm,
                      ep_label, ep_ranges_text, ep_str, finished_tip, meta_card,
-                     name_of, parse_bgm_id,
+                     name_of, page_dialog, parse_bgm_id, wait_dialog,
                      qb_live_text, season_label, source_options, torrent_status_cn,
                      warn_banner)
 
@@ -341,7 +341,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.label(ep_txt).classes(
                             "shrink-0 cursor-pointer hover:underline"
                             + (" text-blue-400" if _neg else "")).on(
-                            "click", _set_ep(t.id)).tooltip(
+                            "click", _set_ep(t.id, t.episode)).tooltip(
                             "集号没解析出来；点这里补集号或设为特别篇" if _neg
                             else "特别篇（SP）；其实是正片？点这里改集号" if _sp else "集号不对？点这里改")
                     else:
@@ -475,7 +475,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             "flat dense color=negative").classes("btn-sm").tooltip(
                             "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
                             else "删除这一集的文件（qB+硬盘，不可撤销）")
-                    _dlb = ui.button("下载", icon="download", on_click=_force(t.id)).props(  # 下载放最后
+                    _dlb = ui.button("下载", icon="download", on_click=_force(t.id, t.archived_at)).props(  # 下载放最后
                         "flat dense").classes("btn-sm")
                     _dlb.set_enabled(config.QB_ENABLED)
                     _dlb.tooltip("强制下这一条到文件夹（无视去重/优先级）" if config.QB_ENABLED
@@ -531,7 +531,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         await busy_action(e.sender, f"enrich:{anime_id}", _go, fail="识别失败")
 
     async def _bind():
-        dlg = ui.dialog()
+        dlg = page_dialog()
+        if dlg is None:
+            return
         with dlg, ui.card().classes("gap-2"):
             ui.label("绑定 bgm").classes("font-bold")
             ui.label("自动认错了就把正确的 bgm 链接或 ID 填这——直接取权威元数据覆盖。").classes(
@@ -542,7 +544,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("绑定", icon="link",
                           on_click=lambda: dlg.submit(inp.value)).props("unelevated color=primary")
-        val = await dlg
+        try:
+            val = await wait_dialog(dlg)
+        finally:
+            dlg.delete()
         if not val:
             return
         bid = parse_bgm_id(val)
@@ -574,7 +579,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
 
     async def _edit_quarter():
         cur = anime.get_anime(anime_id)
-        dlg = ui.dialog()
+        dlg = page_dialog()
+        if dlg is None:
+            return
         with dlg, ui.card().classes("gap-2"):
             ui.label("编辑归档季度").classes("font-bold")
             ui.label("内部键 = 两位年 + 季母（A冬 B春 C夏 D秋），如 26A=2026年冬。"
@@ -593,7 +600,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("保存", icon="save",
                           on_click=lambda: dlg.submit(inp.value)).props("unelevated color=primary")
-        val = await dlg
+        try:
+            val = await wait_dialog(dlg)
+        finally:
+            dlg.delete()
         if val is None:
             return
         old_path = anime.anime_save_path(anime_id)
@@ -720,7 +730,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         else:
             # 归属检查跳掉的那些要单独说：它与两个补齐按钮的松紧【无关】，换另一个按钮再点结果一样，
             # 不点明的话用户只会以为"过滤太严"而白试一遍。
-            _st = f"；其中 {res['stolen']} 条对照表显示属于别的番（详见 /logs）" if res.get("stolen") else ""
+            _st = (f"；其中 {res['stolen']} 条对照表显示属于别的番（详见 /logs）" if res.get("stolen") else "") + (
+                f"；另有 {res['too_old']} 条发布时间不在本季播出期（多半是前几季的同号集），没收" if res.get("too_old") else "")
             ui.notify(f"当前下载源没有新种子可补（搜到 {res['found']}，都已有或被季号/名字过滤{_st}）"
                       + ("；别的组有，见弹出的列表" if res.get("others") else ""), type="info")
         if res.get("others"):
@@ -755,7 +766,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         【必须建在 client.layout 里、用完销毁】理由同 layout.confirm：调用方刚 _after()（body.refresh）过，
         刷新排在下一个挂起点才真正执行 —— 对话框若建在点击按钮所在的槽位里，`await dlg` 那一刻
         槽位被整块清掉，对话框还没显示就被销毁（第一版就是这样：补齐跑完、列表根本没弹出来）。"""
-        with context.client.layout, ui.dialog() as dlg, ui.card().classes("gap-2 w-full max-w-xl"):
+        dlg = page_dialog()
+        if dlg is None:
+            return
+        with dlg, ui.card().classes("gap-2 w-full max-w-xl"):
             ui.label("别的组还有本番没下过的集").classes("font-bold")
             ui.label("这些是搜索时顺带看到的别的组，没有入库。挑一个组：只把它这几集入库、各下一份，"
                      "不改下载源，也不把番打回待确认。看一眼原名再挑——同名的别的作品偶尔也会混进来。").classes(
@@ -772,7 +786,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             with ui.row().classes("justify-end w-full"):
                 ui.button("关闭", on_click=lambda: dlg.submit(None)).props("flat")
         try:
-            pick = await dlg
+            pick = await wait_dialog(dlg)
         finally:
             dlg.delete()
         if not pick:
@@ -797,7 +811,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
     async def _backfill_auto():
         await _run_backfill(True)
 
-    def _force(torrent_id):
+    def _force(torrent_id, archived=None):
         async def h():
             ok = await anime.download_anime_torrent(torrent_id, force=True)
             _after()
@@ -805,6 +819,10 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.notify("已强制下载到文件夹", type="positive")
             elif not config.QB_ENABLED:
                 ui.notify("未启用 qB（QB_ENABLED=false），无法真正下载", type="warning")
+            elif not archived and anime.torrent_status(torrent_id) in engine.TRACKED_STATUSES:
+                # 幂等短路（已在下/已下、或连点了两次）不是失败，日志里也不会有东西。
+                # 已归档的行 force 是『重新交回 qB』，失败会原样还原成 sent —— 那是真失败，不走这句
+                ui.notify("这一条已经在下载或已经下好了", type="info")
             else:
                 ui.notify("下载失败，看日志", type="negative")
         return h
@@ -831,29 +849,38 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 return
             ok = await anime.delete_anime_torrent(torrent_id)
             _after()
-            if ok and archived:
-                ui.notify(f"已标记为已删；文件仍在 {save_path or '下载目录'}，需手动清理", type="warning")
+            if ok and (archived or ok == "gone"):
+                # 已归档的、或早就在 qB 里被手动移除的：本工具删不到文件，只标记了已删
+                ui.notify(f"这一集已经不在 qB 里，只标记为已删；文件仍在 {save_path or '下载目录'}，需手动清理",
+                          type="warning")
             else:
                 ui.notify("已删除该集文件" if ok else "没删成（qB 未连上或该集无文件）",
                           type="positive" if ok else "warning")
         return h
 
-    def _set_ep(torrent_id):
+    def _set_ep(torrent_id, cur_ep=None):
         async def h():
-            dlg = ui.dialog()
+            dlg = page_dialog()
+            if dlg is None:
+                return
             with dlg, ui.card().classes("gap-2"):
                 ui.label("改集号").classes("font-bold")
                 ui.label("填对集号，它就进正常下载+去重流程，支持 .5（如 12.5）。"
                          "是特别篇/OVA/总集篇就点『设为特别篇』：不再挂在未知集，也不会自动下。").classes(
                     "text-xs text-gray-400")
-                num = ui.number("集号", value=1, min=0, step=1, format="%g").props("autofocus")
+                # 默认填当前集号（没解析出来的才填 1）：以前恒为 1，误按回车就把集号改成了 1
+                num = ui.number("集号", value=(cur_ep if cur_ep is not None and cur_ep >= 0 else 1),
+                                min=0, step=1, format="%g").props("autofocus")
                 num.on("keydown.enter", lambda: dlg.submit(num.value))
                 with ui.row().classes("gap-2 justify-end w-full"):
                     ui.button("设为特别篇", on_click=lambda: dlg.submit(-1)).props("flat color=primary")
                     ui.space()
                     ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                     ui.button("确定", on_click=lambda: dlg.submit(num.value)).props("unelevated color=primary")
-            val = await dlg
+            try:
+                val = await wait_dialog(dlg)
+            finally:
+                dlg.delete()
             if val is None:
                 return
             if val < 0 and val != -1:   # -1 只能经『设为特别篇』按钮来；输入框里的负数一律不收

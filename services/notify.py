@@ -35,6 +35,7 @@ EVENTS: dict[str, tuple[str, str]] = {
     "source_down": ("源抓取失败", "🚫"),  # 状态型：有源组连续 N 轮抓不到
     "feed_gap": ("RSS 断档", "🕳️"),       # 一次性：两轮之间有一段发布滚出了 RSS，可能漏集
     "lock_lag": ("锁定源落后", "🔒"),     # 别的组已有后续集，锁定的源迟迟不跟（core.anime.locked_out_episodes）
+    "gap": ("缺集", "🧩"),               # r38：在追的番按开播日早该播了、库里一条种子都没有的集（core.anime.episode_gaps）
 }
 
 # (事件, key) → 上次发送时刻（monotonic）。进程内，重启即忘。

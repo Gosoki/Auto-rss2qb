@@ -413,3 +413,19 @@ async def test_manual_movie_bind_still_merges(clean_tables, monkeypatch):
     with clean_tables.get_session() as s:
         assert s.get(Movie, a_id) is None, "人工路径的合并被一起关掉了"
         assert s.get(Movie, b_id) is not None
+
+
+async def test_scan_keeps_a_manually_corrected_binding(clean_tables):
+    """Mikan 把片链到了错的 subject（777），用户在详情页改绑到 888。下一轮扫描 Mikan 仍给 777：
+    按 bgm 找不到这一行、按 mikan_id 找回来 —— 这时绑定要留着用户改的 888，不能被改回去。"""
+    with clean_tables.get_session() as s:
+        m = Movie(title="改过绑定的片", display_name="正确的片", quarter="26A", mikan_id="4001", bangumi_id=888)
+        s.add(m)
+        s.commit()
+        mid0 = m.id
+    info = {"bangumi_id": 777, "display_name": "Mikan 链错的那部", "jp_name": "まちがい", "air_date": "2020-01-01"}
+    mid, is_new = M._upsert_movie("4001", "改过绑定的片", 777, info, "剧场版")
+    assert mid == mid0 and not is_new
+    with clean_tables.get_session() as s:
+        m = s.get(Movie, mid0)
+        assert (m.bangumi_id, m.display_name, m.mikan_id) == (888, "正确的片", "4001")

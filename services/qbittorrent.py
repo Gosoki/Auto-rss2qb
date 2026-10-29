@@ -226,7 +226,7 @@ class QBittorrent:
         return await self._request("GET", "/api/v2/app/version") is not None
 
     async def add_torrent(self, torrent_bytes: bytes, save_path: str,
-                          category: str, tags: str) -> bool | None:
+                          category: str, tags: str, content_layout: str | None = None) -> bool | None:
         """True=已受理，False=qB 明确拒了这一条，【None=根本没连上 qB】。
 
         三态而不是两态：连不上是【暂时性】的（qB 重启/网络抖动），种子本身没问题，
@@ -241,6 +241,10 @@ class QBittorrent:
         data = {"savepath": save_path, "autoTMM": "false",
                 "paused": "false", "stopped": "false",
                 "category": category, "tags": tags}
+        if content_layout:
+            # qB 4.3.2+ 认 contentLayout（Original/Subfolder/NoSubfolder）；更老的版本认 root_folder。两个都带，各自忽略不认识的
+            data["contentLayout"] = content_layout
+            data["root_folder"] = "true" if content_layout == "Subfolder" else "false"
         resp = await self._request("POST", "/api/v2/torrents/add", data=data, files=files)
         if resp is None:
             return None

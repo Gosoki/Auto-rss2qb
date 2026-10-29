@@ -136,7 +136,16 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
         # 就把这两个字段填上，于是归档目录整个换了地方，而盘上的文件没人去搬——
         # 页面显示的目录与实际落地从此分家，删除/重定位都会打空。
         # 想把它挪到正确目录，走详情页的『重新识别』：那条路径带 relocate，会把文件一起搬过去。
-        engine.apply_bgm_meta(movie, info, keep_path=keep_path)
+        # 【别把人改过的绑定改回去】这一行是按 mikan_id 找回来的、而它现在绑的 bgm 与 Mikan 给的不同 ——
+        # 扫描自己从不改绑，不同就只能是用户在详情页『绑定 bgm / 重新识别』改过（Mikan 的链接本来就会错）。
+        # 照旧写会让每一轮扫描都把它改回 Mikan 那个，用户的纠正永远留不住。此时只更新 mikan 侧字段，不动 bgm 元数据。
+        manual_rebound = (not is_new and bgm_id is not None and movie.bangumi_id is not None
+                          and movie.bangumi_id != bgm_id)
+        if manual_rebound:
+            log.info("剧场版『%s』已绑到 bgm %s（与 Mikan 给的 %s 不同，按人工绑定为准，扫描不改）",
+                     movie.display_name or movie.title, movie.bangumi_id, bgm_id)
+        else:
+            engine.apply_bgm_meta(movie, info, keep_path=keep_path)
         if snap is not None:
             for k, v in snap.items():
                 setattr(movie, k, v)
@@ -185,7 +194,7 @@ def _upsert_movie(mikan_id: str, title: str, bgm_id: int | None,
 
 
 def _store_movie_torrents(movie_id: int, items: list) -> int:
-    """把某剧场版番组抓来的种子入库（按 hash 去重、逐条提交），全部 pending。返回新增数。
+    """把某剧场版番组抓来的种子入库（按 hash 去重、逐条提交），pending（片已被忽略则 skipped）。返回新增数。
 
     【入库前先确认这部 Movie 还在】movie_id 是本轮扫描早些时候 _upsert_movie 拿到的，
     而拿到它之后我们又 await 了两次网络（fetch_detail / fetch_bangumi_torrents，各可能几秒）。
@@ -196,7 +205,8 @@ def _store_movie_torrents(movie_id: int, items: list) -> int:
     """
     n = 0
     with get_session() as s:
-        if s.get(Movie, movie_id) is None:
+        m = s.get(Movie, movie_id)
+        if m is None:
             log.info("剧场版 %s 在抓种期间已被合并/删除，本轮的 %d 个版本不入库（下轮扫描会重新归位）",
                      movie_id, len(items))
             return 0
@@ -213,7 +223,10 @@ def _store_movie_torrents(movie_id: int, items: list) -> int:
             s.add(MovieTorrent(
                 info_hash=item.info_hash, movie_id=movie_id, source=item.source,
                 site=item.site, raw_title=item.raw_title, download_url=item.download_url,
-                release_time=item.release_time, priority=item.priority, status="pending",
+                release_time=item.release_time, priority=item.priority,
+                # 被忽略的片：新版本直接记 skipped（与 reject_movie 对已有版本的处理一致），
+                # 否则『可下载』与年度小结的数字被它们撑大；恢复时 restore_movie 照常放回 pending。
+                status="skipped" if m.rejected else "pending",
             ))
             try:
                 s.commit()
@@ -881,6 +894,13 @@ async def download_movie_torrent(mt_id: int) -> bool:
     """
     with engine.delivering(MovieTorrent, mt_id):
         return await _download_movie_torrent_inner(mt_id)
+
+
+def torrent_status(mt_id: int) -> str | None:
+    """某个版本此刻的状态：页面据此分辨"没下成"是失败，还是它本来就在下 / 已下（幂等短路）。"""
+    with get_session() as s:
+        t = s.get(MovieTorrent, mt_id)
+        return t.status if t else None
 
 
 async def _download_movie_torrent_inner(mt_id: int) -> bool:

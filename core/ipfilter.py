@@ -53,12 +53,14 @@ from services import fetch
 log = logging.getLogger("autorss")
 
 _DIR = config.DATA_DIR / "ipfilter"
+_lock = asyncio.Lock()
 NAME = "ipfilter.p2p"              # qB 那边的文件名固定，换国家不用去 qB 改路径
 _TAG = "AutoRSS-IPFilter"
 _PIECE = 256 * 1024
 _CAP = 64 * 1024 * 1024            # 单个数据源的上限：最大的 DB-IP IPv6 表约 20MB
 _PARALLEL = 3                      # 同时下几个源：全部加起来约 150MB，一次只在内存里留几份原文
 _DONE_WAIT = timedelta(hours=1)    # 交给 qB 后这么久还没下完就报错（局域网里几 MB 是秒级的事）
+_LIST_GRACE = timedelta(minutes=10)   # 交给 qB 后这么久之内列表里查不到，当它"还没入库"而不是"被删了"
 _RETRY = timedelta(hours=6)        # 生成失败（有源取不到）后隔多久再试，别每 10 分钟把几十个源轮一遍
 
 # ① RIR 分配记录：按登记国筛（含在别的 RIR 登记的该国机构）
@@ -483,12 +485,16 @@ async def update() -> str:
         await qb.delete([run_state()["pending"]], delete_files=False)
     torrent, h = build_torrent(data, NAME, f"{seed_base()}/api/ipfilter/{digest}/{NAME}")
     _save(serving=f"{digest}/{NAME}", pending="")
-    ok = await qb.add_torrent(torrent, target_dir(), "", _TAG)
+    # 原始布局：qB 若设了『创建子文件夹』，单文件种子会落进 IPBlocker/ipfilter/ 下面，与要让 qB 指向的路径对不上
+    ok = await qb.add_torrent(torrent, target_dir(), "", _TAG, content_layout="Original")
     if not ok:
         return _status("交给 qB 失败：" + ("连不上 qB" if ok is None else "qB 拒收（看日志）"))
-    summary = f"{','.join(res['countries'])}：IPv4 {res['v4']} 条 + IPv6 {res['v6']} 条"
+    # 国家与反 P2P 名单分开报：以前写成『JP：IPv4 418141 条』，其中 41 万条其实是反 P2P 名单
+    summary = ("、".join(f"{c} {res['per'].get(c, 0)} 条" for c in res["countries"])
+               + (f" + 反 P2P 名单 {res['per'][_P2P]} 条" if res["per"].get(_P2P) else "")
+               + f"（IPv4）+ IPv6 {res['v6']} 条")
     log.info("IP 屏蔽规则已交给 qB 下载（%s）→ %s", summary, qb_file_path())
-    return _status(f"已交给 qB 下载（{summary}），等它下完", pending=h, summary=summary,
+    return _status(f"已交给 qB 下载（{summary}），等它下完", pending=h, summary=summary, target=qb_file_path(),
                    last=datetime.now().isoformat(timespec="seconds"))
 
 
@@ -497,7 +503,7 @@ def _same_path(a: str, b: str) -> bool:
 
 
 async def finish_pending() -> str | None:
-    """qB 下完了没有：下完就把种子摘掉（留文件），qB 已指向这个文件就让它重新读一次。没有待办返回 None。"""
+    """qB 下完了没有：下完就把种子摘掉（留文件），再让 qB 的 IP 过滤指向它、重新读一次。没有待办返回 None。"""
     qb = engine.qb
     st = run_state()
     h = st.get("pending")
@@ -507,37 +513,66 @@ async def finish_pending() -> str | None:
     if info is None:
         return None                   # 连不上 qB：下轮再看
     d = info.get(h)
+    last = st.get("last")
+    age = (datetime.now() - datetime.fromisoformat(last)) if last else None
     if d is None:
+        # qB 收下种子是异步的：刚交过去几秒钟它的列表里可能还没有，别当成"被删了"把待办丢掉（r38）
+        if age is not None and age < _LIST_GRACE:
+            return None
         return _status("种子在 qB 里不见了（被手动删了？），下次到期再更新", pending="")
-    if float(d.get("progress", 0) or 0) < 1.0:
-        last = st.get("last")
-        if last and datetime.now() - datetime.fromisoformat(last) > _DONE_WAIT:
-            return _status(f"qB 一直没下完：确认 qB 那台能打开 {seed_base()}（不通就在设置里填『qB 访问本程序的地址』）")
+    st_qb = d.get("state", "") or ""
+    done = (float(d.get("progress", 0) or 0) >= 1.0 - 1e-9 and st_qb in engine._QB_SEEDING
+            and st_qb not in engine._QB_TRANSIENT)
+    if not done:
+        if age is not None and age > _DONE_WAIT:
+            # 一直下不完（qB 连不上本程序、目录不可写…）：摘掉这个种子、清掉待办，按失败的节奏过 6 小时再试，
+            # 别让它永远挂在 qB 里、自动更新也永远停着（due() 见到待办就不开新的一轮）
+            await qb.delete([h], delete_files=False)
+            return _status(f"qB 一个小时都没下完，已撤下这次的种子，6 小时后再试。确认 qB 那台能打开 {seed_base()}"
+                           "（不通就在设置里填『qB 访问本程序的地址』，设了允许访问的网段要把 qB 那台放进去）",
+                           pending="", last="")      # 清掉"上次更新"：按失败的节奏 6 小时后重试，而不是等满 30 天
         return None
     await qb.delete([h], delete_files=False)
-    path = qb_file_path()
+    # 以 qB 回报的实际路径为准：qB 若设了『创建子文件夹』，文件落在 IPBlocker/ipfilter/ 下面；
+    # 交出去之后用户也可能改了存放目录。老版本 qB 不回 content_path 才按交付时记下的路径算。
+    path = d.get("content_path") or st.get("target") or qb_file_path()
     manual = f"去 qB 设置 → 连接 → IP 过滤，勾上并填 {path}"
     prefs = await qb.preferences()
     if prefs is None:
-        tail = f"，但没读到 qB 的设置：{manual}"
+        tail, ok = f"，但没读到 qB 的设置：{manual}", False
     elif prefs.get("ip_filter_enabled") and _same_path(prefs.get("ip_filter_path", ""), path):
-        # qB 只在路径变了或开关切换时重读文件；路径没变，就关掉再打开一次
-        await qb.set_preferences({"ip_filter_enabled": False})
-        await qb.set_preferences({"ip_filter_enabled": True})
-        tail = "，qB 已重新加载"
+        # qB 只在路径变了或开关切换时重读文件；路径没变，就关掉再打开一次。两次都要成功：
+        # 关成功、开失败的话 qB 的 IP 过滤就停在关闭状态 —— 屏蔽悄悄失效，状态还写着"已重新加载"
+        ok = await qb.set_preferences({"ip_filter_enabled": False})
+        if ok:
+            ok = (await qb.set_preferences({"ip_filter_enabled": True})
+                  or await qb.set_preferences({"ip_filter_enabled": True}))
+        tail = "，qB 已重新加载" if ok else f"，但让 qB 重新加载失败（IP 过滤可能停在关闭状态）：{manual}"
     else:
         # 打开 IP 过滤并指向这个文件（路径变了或开关打开，qB 都会当场读一次）。qB 文档要求路径用正斜杠
         old = prefs.get("ip_filter_path", "") if prefs.get("ip_filter_enabled") else ""
-        if await qb.set_preferences({"ip_filter_enabled": True, "ip_filter_path": path.replace("\\", "/")}):
-            tail = "，已在 qB 里打开 IP 过滤并指向它" + (f"（原来指向 {old}）" if old else "")
-        else:
-            tail = f"，但改 qB 设置失败：{manual}"
-    log.info("IP 屏蔽规则更新完成：%s%s", path, tail)
+        ok = await qb.set_preferences({"ip_filter_enabled": True, "ip_filter_path": path.replace("\\", "/")})
+        tail = (("，已在 qB 里打开 IP 过滤并指向它" + (f"（原来指向 {old}）" if old else "")) if ok
+                else f"，但改 qB 设置失败：{manual}")
+    (log.info if ok else log.warning)("IP 屏蔽规则更新完成：%s%s", path, tail)
     return _status(f"已更新（{st.get('summary', '')}）{tail}", pending="")
 
 
 async def run_once() -> str:
-    """更新一次并等 qB 下完收尾（局域网里几百 KB 是秒级的事，最多等一分钟；没等到就留给后台协程）。"""
+    """更新一次并等 qB 下完收尾（局域网里几百 KB 是秒级的事，最多等一分钟；没等到就留给后台协程）。
+    与后台协程互斥（_lock）：两边同时各生成、各交一个种子的话，其中一个会成孤儿、状态也会互相覆盖。"""
+    async with _lock:
+        return await _run_once()
+
+
+async def tick() -> None:
+    """后台协程每 10 分钟调一次：有待办就收尾，到期了就更新。与『立即更新』互斥。"""
+    async with _lock:
+        if await finish_pending() is None and due():
+            await _run_once()
+
+
+async def _run_once() -> str:
     res = await update()
     for _ in range(12):
         if not run_state().get("pending"):

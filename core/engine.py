@@ -23,7 +23,7 @@ from db.models import AnimeTorrent, MovieTorrent, Setting
 from core import ssrf
 from services import fetch
 from services.qbittorrent import QBittorrent
-from sources.parse import format_quarter
+from sources.parse import format_quarter, parse_version
 from sources.parse import quarter_year as _quarter_year
 
 log = logging.getLogger("autorss")
@@ -404,7 +404,8 @@ def is_special_ep(ep, single_work: bool = False) -> bool:
     return ep == -1 or (ep == -2 and single_work)
 
 
-# 【暂时性失败】的重试退避（分钟）。第 n 次失败后等 RETRY_BACKOFF_MIN[n] 分钟再发，用满就落 error 等人工。
+# 【暂时性失败】的重试退避（分钟）：设置项 ANIME_RETRY_BACKOFF_MIN（默认 1,5,30,180,720,1440）。
+# 第 n 次失败后等第 n 项那么多分钟再发，用满就落 error 等人工。
 # 只给两类用：取种失败（nyaa/Mikan 超时、502、DNS…）和关停中断（重启时正在交付的那几条）——
 # 它们与种子本身无关，重发大概率就好了。其余一律不进队列，重试没有意义甚至有害：
 #   · 越界保存路径 → 配置问题，重试多少次都一样
@@ -413,14 +414,37 @@ def is_special_ep(ep, single_work: bool = False) -> bool:
 #                    有过进度的落 stalled（盘上有半成品）、没有的落 error —— E-3，见 _sync_qb_status
 # 注意实际间隔会被采集轮询周期【量化】：flush 每轮才跑一次（ANIME_POLL_INTERVAL，默认 1200s），
 # 所以 1 分钟这一档实质是"下一轮"。这是有意的——不为重试单开一条更快的循环。
-RETRY_BACKOFF_MIN = (1, 5, 30, 180, 720, 1440)
+def parse_retry_backoff(raw) -> tuple[int, ...] | None:
+    """把重试间隔表解析成分钟元组；不合法返回 None。设置页校验与运行时读取共用这一份。
+
+    接受字符串或列表；全角逗号、顿号按半角逗号处理（中文输入法打出来的也认）。
+    要求 1~20 项、每项 1~10080（7 天）分钟。"""
+    if isinstance(raw, (list, tuple)):
+        raw = ",".join(str(x) for x in raw)
+    parts = [x.strip() for x in str(raw or "").replace("，", ",").replace("、", ",").split(",")]
+    parts = [x for x in parts if x]
+    try:
+        vals = tuple(int(x) for x in parts)
+    except ValueError:
+        return None
+    if not 1 <= len(vals) <= 20 or any(not 1 <= v <= 10080 for v in vals):
+        return None
+    return vals
+
+
+def retry_backoff_min() -> tuple[int, ...]:
+    """当前生效的重试间隔表。库里的值坏了（手改/旧版写入）回落默认表——【绝不返回空表】：
+    空表等于第一次暂时性失败就落 error，断一下网就漏集。"""
+    return (parse_retry_backoff(config.ANIME_RETRY_BACKOFF_MIN)
+            or parse_retry_backoff(config._SPEC["ANIME_RETRY_BACKOFF_MIN"][1]))
 
 
 def next_retry_at(retry_count: int):
     """已重试 retry_count 次之后，下一次重发的时刻；退避表用满返回 None（＝放弃，落 error）。"""
-    if retry_count >= len(RETRY_BACKOFF_MIN):
+    table = retry_backoff_min()
+    if retry_count >= len(table):
         return None
-    return datetime.now() + timedelta(minutes=RETRY_BACKOFF_MIN[retry_count])
+    return datetime.now() + timedelta(minutes=table[retry_count])
 
 # 写回 Anime/Movie 的 bgm 字段；多数两者同名，个别（duration=片长）仅剧场版有，靠下方 hasattr 跳过番剧
 _BGM_FIELDS = ("bangumi_id", "display_name", "jp_name", "air_date", "air_weekday",
@@ -836,10 +860,13 @@ async def fill_content_paths() -> int:
             return n
         with get_session() as s:
             for tid, h in rows:
-                cp = (info.get(h) or {}).get("content_path")
+                d = info.get(h) or {}
+                cp = d.get("content_path")
                 if not cp:
                     _path_miss.add((name, tid))
                     continue
+                if (d.get("state") or "") in _QB_TRANSIENT:
+                    continue          # 正在搬移/校验：回的可能还是旧路径，下轮再补
                 t = s.get(model_cls, tid)
                 if t is not None and t.content_path is None and t.archived_at is None:
                     t.content_path = cp
@@ -851,9 +878,57 @@ async def fill_content_paths() -> int:
     return n
 
 
+async def recheck_stalled() -> int:
+    """停滞的种子低频复查一次。挂在归档轮上、与归档同一把 `_archive_lock`（读主键 → await qb → 按主键写回）。(r38)
+
+    【为什么要有】停滞（stalled）一落定就脱离了同步轮询，此后只有 qB 的完成回调（/api/qb/done）救得回来 ——
+    没配回调的话（生产上就没配），用户在 qB 里点了继续、种子早已下完做种，库里却永远是停滞：
+    失败/异常计数常驻、告警反复、永不归档。
+    · qB 里已下完（进度满、处于做种/已停止，不是校验之类的过渡态）→ 与完成回调同口径落成已下完；
+    · 在下、而且进度比停滞时多了 → 放回跟踪（sent），交给同步接着跟；
+    · 其余（仍是 error、文件缺失、毫无进展、qB 里没有）不动 —— 停滞本来就是留给人工的。"""
+    if not config.QB_ENABLED or not config.QB_SYNC_STATUS:
+        return 0
+    rows = []
+    with get_session() as s:
+        for model_cls in (AnimeTorrent, MovieTorrent):
+            rows += [(model_cls, t.id, t.info_hash, t.qb_progress or 0.0) for t in s.exec(select(model_cls).where(
+                model_cls.status == "stalled", model_cls.archived_at.is_(None))) if t.info_hash]
+    if not rows:
+        return 0
+    info = await qb.torrents_info([h for _, _, h, _ in rows])
+    if info is None:
+        return 0
+    n = 0
+    now = datetime.now()
+    for model_cls, tid, h, prog in rows:
+        d = info.get(h)
+        if not d:
+            continue
+        st = d.get("state", "") or ""
+        p = float(d.get("progress", 0) or 0)
+        if p >= 1.0 - 1e-9 and st in _QB_SEEDING and st not in _QB_TRANSIENT:
+            if mark_done_by_hash(h):
+                n += 1
+        elif p > prog + 1e-9 and st not in ("error", "missingFiles") and st not in _QB_TRANSIENT:
+            with get_session() as s:
+                t = s.get(model_cls, tid)
+                if t is not None and t.status == "stalled":
+                    t.status, t.qb_state, t.qb_progress = "sent", st, p
+                    t.qb_progress_at = t.qb_synced_at = now
+                    t.fail_reason = ""
+                    s.add(t)
+                    s.commit()
+                    n += 1
+    if n:
+        log.info("停滞复查：%d 个停滞的种子在 qB 里已经下完或恢复推进，已放回正常状态", n)
+        qb_kick.set()
+    return n
+
+
 def pick_order(torrents, pref=None, prefer_fresh: bool = False):
     """把候选种子排成『该先试哪一个』的顺序：钉了首选源就先只看它（没有才退回全部），
-    再按（优先级降序, 入库时间升序）排。返回排好序的列表（可能为空，调用方自理）。
+    再按（优先级降序, 版本号降序, 入库时间升序）排。返回排好序的列表（可能为空，调用方自理）。
 
     prefer_fresh=True 时在最前面再压两个键：【没失败过的排在失败过的前面】。
     否则会出现这样的死结：某集优先级最高的那一份种子是坏的（源下架/磁链失效），
@@ -866,12 +941,17 @@ def pick_order(torrents, pref=None, prefer_fresh: bool = False):
     cands = torrents
     if pref:
         cands = [t for t in torrents if pref == (t.source or "")] or torrents
+
+    def _ver(t) -> int:
+        # 同优先级（通常就是同一个组）里修正版优先：v1、v2 都还没下时直接挑 v2，
+        # 不然先下 v1、再被『修正版替换』换成 v2，白下一遍。列投影的 Row 没有 raw_title 时当 v1。
+        return parse_version(getattr(t, "raw_title", "") or "")
     if prefer_fresh:
         # retry_count 用 getattr 兜底：算下载计划的路径喂进来的是列投影出来的 Row（见 _PLAN_COLS），
         # 上面没有这一列。取不到就当 0（等价于"没失败过"），排序自然退化成原来的两键。
         return sorted(cands, key=lambda t: (t.status == "error", (getattr(t, "retry_count", 0) or 0) > 0,
-                                            -(t.priority or 0), t.created_at))
-    return sorted(cands, key=lambda t: (-(t.priority or 0), t.created_at))
+                                            -(t.priority or 0), -_ver(t), t.created_at))
+    return sorted(cands, key=lambda t: (-(t.priority or 0), -_ver(t), t.created_at))
 
 
 def pick_best(torrents, pref=None, prefer_fresh: bool = False):
@@ -1820,6 +1900,9 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int | None:
             # 与 d is None 分支同款：已落定(进度满且态已清)的行不被陈旧快照回退。
             if (t.qb_progress or 0.0) >= 0.999 and not t.qb_state:
                 t.qb_synced_at = now
+                # 路径不随快照陈旧：这一支也顺手记下，免得每轮靠 fill_content_paths 补（过渡态时不记，理由同下）
+                if d.get("content_path") and (d.get("state") or "") not in _QB_TRANSIENT:
+                    t.content_path = d["content_path"]
                 s.add(t)
                 updated += 1
                 continue
@@ -1831,7 +1914,8 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int | None:
             t.qb_progress = float(d.get("progress", 0) or 0)
             t.qb_dlspeed = int(d.get("dlspeed", 0) or 0)
             t.qb_size = int(d.get("size", 0) or 0)
-            if d.get("content_path"):          # 播放用（见 models）；qB 4.3.2 之前的版本不回这个字段
+            # 播放用（见 models）；qB 4.3.2 之前的版本不回这个字段。搬移/校验这类过渡态时 qB 回的可能还是旧路径，不记
+            if d.get("content_path") and state not in _QB_TRANSIENT:
                 t.content_path = d["content_path"]
             t.qb_synced_at = now
             # 【比较要带 epsilon】这是第二道保险：即便列类型退回窄浮点（MySQL 的 4 字节 FLOAT
@@ -1880,9 +1964,15 @@ async def _sync_qb_status(model_cls, manual: bool = False) -> int | None:
                   and now - t.qb_progress_at > timedelta(minutes=config.QB_STALL_TIMEOUT_MIN)):
                 # 已交付但进度长期(默认1天)零推进 → 标『停滞(异常)』：脱离 in-flight、【不自动换源】、供人工处理。
                 # 只看进度是否推进：慢但在动的种子 qb_progress_at 持续刷新→不会误杀；真卡死(无源0速)才中招。
-                t.status = "stalled"
-                t.fail_reason = f"{config.QB_STALL_TIMEOUT_MIN} 分钟进度无推进（{t.qb_progress * 100:.0f}%）"
-                log.warning("种子停滞标为异常（%d 分钟进度无推进，%.1f%%）- %s",
+                # 【一点都没下到的落 error，不落 stalled】(r38) E-3 的定义：stalled＝盘上有半成品，error＝一个字节都没下到。
+                # 死种（没人做种）一天下来 0%，以前也记 stalled —— stalled 算"这一集已有"，同集别的组有健康的种子
+                # 也永远不换，这一集就漏了。记 error 之后换源兜底接手；最坏是死种日后复活、同集多一份。
+                dead = (t.qb_progress or 0.0) <= 0.0
+                t.status = "error" if dead else "stalled"
+                t.fail_reason = (f"{config.QB_STALL_TIMEOUT_MIN} 分钟一点进度都没有（多半没人做种）：已转为失败，"
+                                 "后台会换别的源下这一集；qB 里那条可以删掉" if dead else
+                                 f"{config.QB_STALL_TIMEOUT_MIN} 分钟进度无推进（{t.qb_progress * 100:.0f}%）")
+                log.warning("种子%s（%d 分钟进度无推进，%.1f%%）- %s", "零进度、转为失败以便换源" if dead else "停滞标为异常",
                             config.QB_STALL_TIMEOUT_MIN, t.qb_progress * 100, h[:12])
             s.add(t)
             updated += 1

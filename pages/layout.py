@@ -767,6 +767,40 @@ def expand_collapse_bar(state: dict, refresh) -> None:
                 "tabindex=0").on("click", lambda v=val: _set(v)).on("keydown.enter", lambda v=val: _set(v))
 
 
+def page_client():
+    """发起这次操作的页面（Client）。
+
+    NiceGUI 的 context.client 是顺着【按钮所在的容器】往上找的：处理器里先刷新了面板（KPI 弹窗、
+    『待识别』tab 的刷新都是同步清空），按钮连同容器已经被删，再取就抛 RuntimeError ——
+    于是绑定成功之后那句『要不要把文件搬过去』整个弹不出来，还被 busy_action 报成『绑定失败』。
+    这时退回到唯一还连着的页面（自用工具通常只开一个）；同时开着好几个就不猜，返回 None。"""
+    try:
+        return context.client
+    except RuntimeError:
+        live = [c for c in Client.instances.values() if c.has_socket_connection]
+        return live[0] if len(live) == 1 else None
+
+
+def page_dialog():
+    """在页面级槽位里建一个对话框（理由见 confirm 的 docstring）；页面找不到时返回 None。
+    调用方用完要 delete()，并用 wait_dialog 等结果。"""
+    client = page_client()
+    if client is None:
+        return None
+    with client.layout:
+        return ui.dialog()
+
+
+async def wait_dialog(dlg):
+    """等对话框给结果。页面在等待期间被关掉（刷新、关标签页）时当作取消、返回 None。
+
+    NiceGUI 的 `await dialog` 只认『点了按钮 / 关掉对话框』，整个页面被删时它【永远】不返回：
+    处理器协程就此挂住，busy_action 的去重键一直占着 —— 例如切库的确认框开着时刷新了页面，
+    之后五个数据库按钮（包括自救用的『切回本地 SQLite』）都只会说『上一次还没跑完』，只能重启进程。"""
+    dlg.client.on_delete(lambda: dlg.submit(None))
+    return await dlg
+
+
 async def confirm(title: str, note: str = "", ok_label: str = "确定",
                   ok_icon: str = "", ok_color: str = "negative") -> bool:
     """弹一个确认框，等用户选择，用完即销毁自身（不残留隐藏 dialog 累积）。返回是否点了确认。
@@ -778,7 +812,11 @@ async def confirm(title: str, note: str = "", ok_label: str = "确定",
     对话框在显示前就被销毁，await 永不返回、处理器协程静默泄漏，用户只看到操作"没反应"。
     包进 client.layout 后 canary 落在页面级槽位，面板 refresh 碰不到它；销毁仍由末尾 finally 负责。
     """
-    with context.client.layout, ui.dialog() as dlg, ui.card().style("max-width:92vw"):
+    dlg = page_dialog()
+    if dlg is None:
+        log.warning("确认框没地方弹（发起操作的页面已经刷新或关闭，或同时开着好几个页面）：%s", title)
+        return False
+    with dlg, ui.card().style("max-width:92vw"):
         ui.label(title).classes("font-bold")
         if note:
             # pre-line：保留 note 里的换行（如"文件仍在 <路径>"这类要单独成行的提示），
@@ -791,7 +829,7 @@ async def confirm(title: str, note: str = "", ok_label: str = "确定",
             if ok_icon:
                 ok.props(f"icon={ok_icon}")
     try:
-        return bool(await dlg)         # 点叉/点外部关闭 → None → False（当取消）
+        return bool(await wait_dialog(dlg))   # 点叉/点外部关闭/页面被关 → None → False（当取消）
     finally:
         dlg.delete()
 

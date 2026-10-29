@@ -172,7 +172,7 @@ def anime_page(t: str = ""):
                 _plain = [f for f in _ign if not f.get("impossible")]
                 _txt = ""
                 if _plain:
-                    _txt += (f"{len(_plain)} 部番开播早于『开始使用日』被自动判了超期忽略，但最近 30 天还在收新集："
+                    _txt += (f"{len(_plain)} 部番开播早于『开始使用日』被自动判了超期忽略，但最近 {config.ANIME_IGNORED_AIRING_DAYS} 天还在收新集："
                              + "、".join(f["text"].split("』")[0] + "』" for f in _plain)
                              + "。要追就去『已忽略』页点『恢复订阅』。")
                 for f in _odd:
@@ -1128,10 +1128,17 @@ def anime_page(t: str = ""):
                                      "这一集若还有别的源的『备用项』待下，后台会在下一轮采集自动补下一份（删的是这一条种子，不是整集）。不想让它回来：先把备用项『排除』，或整部番用『忽略』。",
                                      ok_label="删除文件", ok_icon="delete_forever"):
                     return
-                n = await anime.delete_anime_files(anime_id)
+                r = await anime.delete_anime_files(anime_id)
                 refresh_all()
-                ui.notify(f"已删除 {n} 个文件" if n else "没删成（qB 未连上或已无文件）",
-                          type="positive" if n else "warning")
+                if not r or not r["total"]:
+                    ui.notify("没删成（qB 未连上或已无文件）", type="warning")
+                elif r["left"]:
+                    # qB 对不认识的种子也回成功：已经不在 qB 里的（归档了、或在 qB 里手动移除过）删不到文件，如实说
+                    ui.notify(f"删了 {r['deleted']} 个；另有 {r['left']} 个已经不在 qB 里、文件没删，"
+                              f"要自己去删：{'；'.join(r['paths'][:3])}", type="warning", timeout=0,
+                              close_button="知道了")
+                else:
+                    ui.notify(f"已删除 {r['deleted']} 个文件", type="positive")
             return h
 
         def _redownload(tid):

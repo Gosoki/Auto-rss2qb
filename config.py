@@ -115,7 +115,14 @@ _SPEC = {
     "ANIME_POLL_ENABLED": (bool, True),           # 后台采集总开关（全新库首启默认关，见 load_from_db）
     "ANIME_POLL_INTERVAL": (int, 1200),
     "ANIME_DOWNLOAD_GRACE_MIN": (int, 120),
+    # 取种失败（源站超时/502/DNS）或重启打断交付时，依次等这么多分钟再试；用完转 error（error 不自动重试）。
+    # 合计就是"断网能扛多久"。解析/校验只此一份：core.engine.parse_retry_backoff
+    "ANIME_RETRY_BACKOFF_MIN": (list, "1,5,30,180,720,1440"),
     "ANIME_TOP_PRIORITY_INSTANT": (bool, True),
+    "ANIME_BACKFILL_PREAIR_DAYS": (int, 30),    # 补齐时，发布早于本季开播日这么多天的种子当成前几季的、不收（0=不限）
+    "ANIME_BACKFILL_EXTRA_EPS": (int, 4),       # 补齐搜不全时，对还缺的集按"番名 集号"再补搜，最多几集（0=不补搜）
+    "ANIME_BACKFILL_PREFER": (str, "1080"),     # 补齐时同一集多个版本：版本关键词之后，先试含这个词的（空=不偏好）
+    "ANIME_SINGLE_WORK_AUTO": (bool, True),     # 在追的单部作品（bgm 只有 1 集的 WEB/剧场版/OVA）没标集号的种子：一份都没下时自动挑一份下
     "ANIME_REPLACE_VERSIONS": (bool, True),     # 同一个组发了修正版（v2…）：先下好新版，再删掉旧版（种子和文件）
     "ANIME_START_DATE": (str, ""),          # 开始使用日 YYYY-MM-DD：早于这天开播的番自动判『超期忽略』、不自动下载
                                             # （种子照常入库）；空=不限。改日期可逆，只动待确认/超期番，不碰人工确认/拒绝。
@@ -138,9 +145,11 @@ _SPEC = {
     # 这与本项目别处"留空=不限"（字幕组白名单、标题关键词）恰好相反，设置页上写明了。
     # 默认值含 delivered，所以老库升级后【行为一字不变】（load_from_db 只补缺键）。
     "NOTIFY_EVENTS": (list, "delivered,movie,failed,stalled,finished,idle,qb_down,db_down,backlog,"
-                            "poll_stall,source_down,feed_gap,lock_lag"),
+                            "poll_stall,source_down,feed_gap,lock_lag,gap"),
     "NOTIFY_MAX_PER_HOUR": (int, 20),       # 全事件合计的限流上限（0=不限）。被丢弃的条数会挂在下一条消息尾巴上
     "NOTIFY_BACKLOG_MIN": (int, 5),         # 『待识别』积压到几部才提醒
+    "ALERT_REPEAT_HOURS": (int, 6),         # 下载失败/停滞/绑定看着不对：同一批多少小时内只说一次（有新成员立刻再说）
+    "ALERT_REPEAT_DAYS": (int, 7),          # 已下齐/缺集/锁定源落后：同一部番的同一件事多少天内只推一次
     # ---- 完结 / 断更巡检（见 core.anime.sweep_finished / sweep_idle）----
     "ANIME_FINISH_ENABLED": (bool, True),   # 判定完结（只打标记 + 发通知，不改下载行为）
     # 【默认关】判定完结后是否【真的停止自动下新集】。判据已经很保守（要 bgm 给出总集数、
@@ -148,9 +157,13 @@ _SPEC = {
     # 永远下不下来。开之前请先让它跑一阵、看『已完结』的标记打得对不对。
     "ANIME_FINISH_UNSUB": (bool, False),
     "ANIME_IDLE_DAYS": (int, 14),           # 一部追番中的番多少天没有新种子就提醒（0=关）
+    "ANIME_IDLE_WINDOW_X": (int, 4),        # 提醒过的番静默超过"阈值×倍数"天就不再提醒（每段静默最多提醒 倍数−1 次；最小 2）
+    "ANIME_IGNORED_AIRING_DAYS": (int, 30), # 超期忽略的番最近这么多天还收到正片新集 → 仪表盘提示（只报不改）
     "ANIME_GAP_SLACK_WEEKS": (int, 2),      # 缺集提示：按开播日推算"应已播到第几集"时少算几周（休播一周/字幕组晚发不误报）
     "ANIME_GAP_MAX_EPISODES": (int, 100),   # 缺集提示：应播集数超过这么多的长番不判（航海王这类只收最近几集，报缺上千集是噪音）
+    "ANIME_RERELEASE_WEEKS": (int, 20),     # 同号新集：新来的种子比这一集已下的那份晚这么多周以上就提醒（多半是新一季用季内编号；0=关）
     "ANIME_LOCK_LAG_DAYS": (int, 7),        # 锁定源落后提醒：别的组已有后续集、锁定源过了这么多天还没跟上才提醒（0=关）
+    "ANIME_LOCK_SYNC_DAYS": (int, 2),       # 锁定组在别组发某集前后这么多天内也在发（且集号差得远）→ 当两套编号同步在发，不算落后（只影响提醒）
     "SWEEP_INTERVAL_MIN": (int, 180),       # 完结/断更巡检的间隔（分钟）
     # ---- 采集健康（见 core/health.py；r37：容器停了 15 天全程零提醒）----
     "ALERT_POLL_STALL_MIN": (int, 90),      # 采集开着却这么多分钟没有任何动静 → 停摆提醒（实际取它与 3 个轮询间隔的较大者）
@@ -195,6 +208,18 @@ _SPEC = {
     "DB_MYSQL_PASSWORD": (str, ""),
     "DB_MYSQL_NAME": (str, ""),             # 库名（database），需已存在
     "DB_MYSQL_CHARSET": (str, "utf8mb4"),   # 必须是 utf8mb4，否则日文/emoji 番名存不进去
+}
+
+# 【合法范围】只登记 r39 起新加的整数阈值（已有键不搬进来，行为一字不变）。读取时钳到范围内
+# （库里被手改成越界值也不会让判据退化，例如 ANIME_IDLE_WINDOW_X=1 会让提醒过一次的番永不再提醒），
+# 设置页保存时越界直接拒收。raw() 仍返回存储值。
+_RANGE: dict[str, tuple[int, int]] = {
+    "ANIME_LOCK_SYNC_DAYS": (0, 14),
+    "ANIME_IDLE_WINDOW_X": (2, 52),
+    "ANIME_IGNORED_AIRING_DAYS": (1, 365),
+    "ANIME_BACKFILL_EXTRA_EPS": (0, 8),
+    "ALERT_REPEAT_HOURS": (1, 720),
+    "ALERT_REPEAT_DAYS": (1, 90),
 }
 
 # 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集
@@ -246,7 +271,8 @@ def __getattr__(name):
     if name == "QUARTER_FMT_UI":
         return _v["QUARTER_FMT_UI"] or _v["QUARTER_FMT"]  # 空则跟随文件夹模板
     if name in _v:
-        return _v[name]
+        b = _RANGE.get(name)
+        return max(b[0], min(b[1], _v[name])) if b else _v[name]
     raise AttributeError(f"module 'config' has no attribute {name!r}")
 
 

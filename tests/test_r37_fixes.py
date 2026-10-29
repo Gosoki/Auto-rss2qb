@@ -806,7 +806,14 @@ def _versions_setup(clean_tables, cfg, monkeypatch, rows, qb_paths):
         return True
 
     async def fake_info(hs):
-        return {hashes[k]: {"content_path": p} for k, p in qb_paths.items() if p is not None}
+        # qb_paths 的值：路径串（=已下完、已停止做种），或 (路径, 进度, 状态)
+        out = {}
+        for k, p in qb_paths.items():
+            if p is None:
+                continue
+            path, prog, st = (p, 1.0, "stoppedUP") if isinstance(p, str) else p
+            out[hashes[k]] = {"content_path": path, "progress": prog, "state": st}
+        return out
 
     async def fake_delete(hs, delete_files=True):
         calls.append(("delete", tuple(hs), delete_files))
@@ -851,21 +858,42 @@ def test_v2_picks_same_variant_and_keeps_shared_file(clean_tables, cfg, monkeypa
 
 
 def test_old_version_kept_until_new_one_finishes(clean_tables, cfg, monkeypatch):
-    """新版还没下完：旧版一根头发都不动（漏集不可逆）。开关关掉：什么都不做。"""
+    """新版还没下完：旧版一根头发都不动（漏集不可逆）。以 qB 此刻的回报为准 —— 关掉实时跟踪时库里交付当场
+    就记 100%，只看库会在同一轮把旧版连文件删掉。开关关掉：什么都不做。"""
+    paths = {"v1": "E:/A/a.mp4", "v2": ("E:/A/b.mp4", 0.4, "downloading")}
     ids, hashes, calls = _versions_setup(clean_tables, cfg, monkeypatch, [
         ("v1", "ANi", "[ANi] x - 04 [1080P][CHT][MP4]", "sent", None),
         ("v2", "ANi", "[ANi] x - 04 [1080P][CHT][V2][MP4]", "sent", None),
-    ], {"v1": "E:/A/a.mp4", "v2": "E:/A/b.mp4"})
-    with clean_tables.get_session() as s:
-        t = s.get(AnimeTorrent, ids["v2"])
-        t.qb_progress = 0.4
-        s.add(t)
-        s.commit()
-    assert asyncio.run(A.replace_versions()) == (0, 0) and calls == []
+    ], paths)
+    assert asyncio.run(A.replace_versions()) == (0, 0) and calls == [], "库里 100%、qB 里 40%：不删"
+    paths["v2"] = ("E:/A/b.mp4", 1.0, "checkingUP")
+    assert asyncio.run(A.replace_versions()) == (0, 0) and calls == [], "校验中这类过渡态也不算下完"
+    del paths["v2"]
+    assert asyncio.run(A.replace_versions()) == (0, 0) and calls == [], "新版不在 qB 里：不动旧版"
+    paths["v2"] = "E:/A/b.mp4"
     cfg(ANIME_REPLACE_VERSIONS=False)
-    with clean_tables.get_session() as s:
-        t = s.get(AnimeTorrent, ids["v2"])
-        t.qb_progress = 1.0
-        s.add(t)
-        s.commit()
     assert asyncio.run(A.replace_versions()) == (0, 0) and calls == []
+
+
+def test_v2_of_another_variant_does_not_replace(clean_tables, cfg, monkeypatch):
+    """旧版是简体内嵌，组只发了繁体内嵌的 v2：那不是对我们那份的修正，不下也不删。"""
+    ids, hashes, calls = _versions_setup(clean_tables, cfg, monkeypatch, [
+        ("v1", "桜都字幕组", "[桜都字幕组] 鼠标 / Mouse [04][1080P][简体内嵌]", "sent", "E:/A/04.mp4"),
+        ("tc", "桜都字幕组", "[桜都字幕组] 鼠标 / Mouse [04v2][1080P][繁体内嵌]", "pending", None),
+    ], {"v1": "E:/A/04.mp4"})
+    assert asyncio.run(A.replace_versions()) == (0, 0) and calls == []
+
+
+def test_pick_order_prefers_newer_version_within_same_priority():
+    """同组 v1、v2 都还没下：直接挑 v2（省掉"先下 v1 再被替换"那一遍）。优先级仍然最先比。"""
+    from types import SimpleNamespace as NS
+    from core import engine
+    t0 = datetime(2026, 10, 1)
+    v1 = NS(id=1, source="ANi", priority=100, raw_title="[ANi] x - 04 [1080P][CHT][MP4]", created_at=t0, status="pending")
+    v2 = NS(id=2, source="ANi", priority=100, raw_title="[ANi] x - 04 [1080P][CHT][V2][MP4]",
+            created_at=t0 + timedelta(hours=5), status="pending")
+    hi = NS(id=3, source="喵萌", priority=120, raw_title="[喵萌] x [04][1080p]", created_at=t0 + timedelta(hours=9),
+            status="pending")
+    assert [t.id for t in engine.pick_order([v1, v2])] == [2, 1]
+    assert [t.id for t in engine.pick_order([v1, v2], prefer_fresh=True)] == [2, 1]
+    assert engine.pick_order([v1, v2, hi])[0].id == 3, "优先级高的组照样排第一"

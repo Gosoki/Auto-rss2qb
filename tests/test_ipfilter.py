@@ -143,10 +143,14 @@ def test_build_torrent_is_private_web_seed_only():
 class _FakeQB:
     def __init__(self, qb_path="E:/Anime/AutoRSS/IPBlocker/ipfilter.p2p", enabled=True):
         self.calls, self.progress = [], 0.0
+        self.content_path = None          # None＝老版本 qB，不回这个字段
+        self.listed = True
+        self.prefs_ok = [True]            # set_preferences 依次返回的结果（用完后一直 True）
         self.prefs = {"ip_filter_enabled": enabled, "ip_filter_path": qb_path}
 
-    async def add_torrent(self, torrent, save_path, category, tags):
+    async def add_torrent(self, torrent, save_path, category, tags, content_layout=None):
         self.calls.append(("add", save_path, tags))
+        self.layout = content_layout
         return True
 
     async def delete(self, hashes, delete_files=True):
@@ -154,14 +158,19 @@ class _FakeQB:
         return True
 
     async def torrents_info(self, hashes):
-        return {h: {"progress": self.progress} for h in hashes}
+        if not self.listed:
+            return {}
+        d = {"progress": self.progress, "state": "stoppedUP" if self.progress >= 1 else "downloading"}
+        if self.content_path:
+            d["content_path"] = self.content_path
+        return {h: dict(d) for h in hashes}
 
     async def preferences(self):
         return dict(self.prefs)
 
     async def set_preferences(self, prefs):
         self.calls.append(("prefs", prefs))
-        return True
+        return self.prefs_ok.pop(0) if self.prefs_ok else True
 
 
 def _setup(cfg, monkeypatch, tmp_path, qb, failed=(), v4=4):
@@ -257,3 +266,45 @@ def test_route_serves_only_current_file(testdb, cfg, monkeypatch, tmp_path):
     for d, n in (("0000", "ipfilter.p2p"), ("abcd", "../autorss.db")):
         with pytest.raises(HTTPException):
             asyncio.run(api.ipfilter_file(d, n))
+
+
+
+def test_finish_uses_the_path_qb_reports_and_original_layout(testdb, cfg, monkeypatch, tmp_path):
+    """qB 设了『创建子文件夹』或用户事后改了目录：以 qB 回报的实际路径为准；加种子时要求原始布局。"""
+    qb = _FakeQB(qb_path="", enabled=False)
+    _setup(cfg, monkeypatch, tmp_path, qb)
+    asyncio.run(F.update())
+    assert qb.layout == "Original"
+    qb.progress, qb.content_path = 1.0, "D:/Elsewhere/ipfilter.p2p"
+    asyncio.run(F.finish_pending())
+    assert qb.calls[-1] == ("prefs", {"ip_filter_enabled": True, "ip_filter_path": "D:/Elsewhere/ipfilter.p2p"})
+
+
+def test_stuck_download_is_withdrawn_and_retried_later(testdb, cfg, monkeypatch, tmp_path):
+    """qB 一个小时都没下完（连不上本程序等）：撤下这次的种子、清掉待办，6 小时后再试 —— 以前待办永远占着，
+    due() 一直为假，自动更新从此停摆。刚交过去几分钟、列表里还没有的，不当成"被删了"。"""
+    from datetime import datetime, timedelta
+    qb = _FakeQB()
+    _setup(cfg, monkeypatch, tmp_path, qb)
+    asyncio.run(F.update())
+    h = F.run_state()["pending"]
+    qb.listed = False
+    assert asyncio.run(F.finish_pending()) is None and F.run_state()["pending"] == h, "刚交付：还没入库"
+    qb.listed = True
+    F._save(last=(datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds"))
+    res = asyncio.run(F.finish_pending())
+    assert "撤下" in res and not F.run_state()["pending"]
+    assert ("delete", (h,), False) in qb.calls
+    F._save(tried=datetime.now().isoformat(timespec="seconds"))
+    assert not F.due(datetime.now() + timedelta(hours=5)) and F.due(datetime.now() + timedelta(hours=7)), \
+        "6 小时后重试，不是等满 30 天"
+
+
+def test_reload_failure_is_reported_not_claimed(testdb, cfg, monkeypatch, tmp_path):
+    """关掉再打开 IP 过滤：打开那一下失败（重试一次也失败）就如实说，不能写"已重新加载"。"""
+    qb = _FakeQB()
+    _setup(cfg, monkeypatch, tmp_path, qb)
+    asyncio.run(F.update())
+    qb.progress, qb.prefs_ok = 1.0, [True, False, False]
+    res = asyncio.run(F.finish_pending())
+    assert "重新加载失败" in res and "已重新加载" not in res

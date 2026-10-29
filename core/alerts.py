@@ -34,6 +34,7 @@ INTEGER PRIMARY KEY —— 删掉最大号那行之后 id 会被回收（实测�
 `confirmed` 尤其不能漏：它在入库链路上是**自动**升的（见 core/anime 的自动升确认分支），
 一对"待确认+待确认"的重复番被读过之后会被后台各自升成追番中 —— 那正是危险变真的一刻。
 """
+import config
 import logging
 from datetime import datetime
 
@@ -49,7 +50,7 @@ log = logging.getLogger("autorss")
 # 三类的键与人话名。加一类要同时给出 _IDENT/_FACT/_TEXT 三个构造式，
 # 下面 `scan()` 的断言会逼着你补齐。
 KINDS = {"dup": "同一部番被拆成两条", "mva": "番剧与剧场版重号", "wrb": "绑定看着不对",
-         "ign": "超期忽略但还在更新"}
+         "ign": "超期忽略但还在更新", "rer": "同号新集被当成旧集"}
 
 
 def _tag(row_id, created_at) -> str:
@@ -148,16 +149,34 @@ def _ign(g: dict) -> dict:
         # 一部番一条：点过『知道了』就一直收着，番停了更新自然消失；别的番新冒出来才重新提示。
         "ident": f"ign:{_tag(g['id'], g['born'])}",
         # 【ast 必须进】那部番被恢复订阅（不再是超期忽略）又被打回来时该重新说一次；集号不进 —— 每周来一集就重报是噪音
-        "fact": f"bgm={g['bgm']};st={_bits(g['confirmed'], g['rejected'])}",
-        "text": f"『{g['name']}』(#{g['id']}) 最近 30 天还在收新集（第 {ign_eps_text(g['eps'])} 集）{tail}",
+        # 【imp 也进】(r38) 先是普通的"跨季连播"、点了知道了；之后别的季的集被分错到这条（Re:Zero 第四季的
+        # 『- 85』落进第一季那条），性质变成"在追的那一季终集要漏" —— 指纹不变的话横幅不再出现。
+        # 只在是"分错了记录"时才带这一项：普通的跨季连播指纹保持原样，已点过『知道了』的不会因为升级重新冒出来。
+        "fact": f"bgm={g['bgm']};st={_bits(g['confirmed'], g['rejected'])}" + (";imp=1" if g["impossible"] else ""),
+        "text": f"『{g['name']}』(#{g['id']}) 最近 {config.ANIME_IGNORED_AIRING_DAYS} 天还在收新集（第 {ign_eps_text(g['eps'])} 集）{tail}",
         "impossible": g["impossible"],
+    }
+
+
+def _rer(g: dict) -> dict:
+    eps = ign_eps_text(g["eps"])
+    return {
+        "kind": "rer",
+        "ident": f"rer:{_tag(g['id'], g['born'])}",
+        # 进指纹的是出问题的集号集合：又有新的集撞上才重新提示，同一集多来几个版本不算
+        "fact": f"eps={_eps_str(g['eps'])}",
+        "text": (f"『{g['name']}』(#{g['id']}) 第 {eps} 集新来的种子（{'、'.join(g['groups'])}）"
+                 f"比已经下好的那份晚了 {config.ANIME_RERELEASE_WEEKS} 周以上 —— 多半是新一季用季内编号、"
+                 "标题又没写第几季，被当成了已下过的旧集，这几集不会下。去详情页看一眼：真是新一季，"
+                 "就把旧的那几条『排除』或给新一季单独绑 bgm；只是很晚的重发版（比如 BD 版）就不用管。"),
     }
 
 
 _BUILD = {"dup": (_anime.suspect_duplicate_anime, _dup),
           "mva": (_anime.suspect_movie_as_anime, _mva),
           "wrb": (_anime.suspect_wrong_binding, _wrb),
-          "ign": (_anime.suspect_ignored_airing, _ign)}
+          "ign": (_anime.suspect_ignored_airing, _ign),
+          "rer": (_anime.suspect_rerelease_collision, _rer)}
 
 
 def scan() -> list[dict]:
@@ -167,7 +186,7 @@ def scan() -> list[dict]:
     """
     assert set(_BUILD) == set(KINDS), "加了一类却没给全 判据/构造式/人话名"
     out = []
-    for kind in ("dup", "mva", "wrb", "ign"):
+    for kind in ("dup", "mva", "wrb", "ign", "rer"):
         find, build = _BUILD[kind]
         for raw in find():
             out.append(build(raw))
@@ -228,7 +247,8 @@ def view() -> dict:
 
 FACT_LABEL = {"abgm": "左边那条绑的 bgm", "bbgm": "右边那条绑的 bgm",
               "ast": "左边那条的订阅状态", "bst": "右边那条的订阅状态",
-              "bgm": "绑的 bgm", "season": "季号", "eps": "出问题的集号", "st": "订阅状态"}
+              "bgm": "绑的 bgm", "season": "季号", "eps": "出问题的集号", "st": "订阅状态",
+              "imp": "是不是别的季的集被分到了这条"}
 _BITS_CN = {"00": "待确认", "01": "超期忽略", "10": "追番中", "11": "人工拒绝"}
 
 

@@ -213,6 +213,10 @@ async def poll_once() -> None:
         await anime.replace_versions(qb_alive=qb_alive)   # 同组修正版：先下新版、下完删旧版
     except Exception as e:
         loop_error("修正版替换", e)
+    try:
+        await anime.deliver_single_works(qb_alive=qb_alive)   # 在追的单部作品一份都没下：挑一份下
+    except Exception as e:
+        loop_error("单部作品放行", e)
     # 【落一行"这一轮发生了什么"】(R36 体检 ux-5) 抓取失败以前只进日志 —— /logs 是 200 条环形缓冲，
     # 真库每天 400+ 行、约 10 小时就冲掉；一天看一次的用户在页面上看不到夜里的失败，6 条 feed 全 403 时
     # 仪表盘与正常时逐字相同。与剧场版的 MOVIE_SCAN_LAST 同一条路：运行时键、只记最近一轮、不做历史。
@@ -279,6 +283,7 @@ def init_business_state(sweep_leftovers: bool = True) -> None:
         _stale_sweep_pending = True     # 记账，等协程里补做（清扫要 await 问 qB）
     engine.backfill_legacy_progress_once()   # 一次性：历史 sent 标记为已完成
     anime.rekey_aliases()                    # 幂等：解析规则变了就给存量别名补新键（E-39）
+    anime.retry_unmatched_once_after_upgrade()   # 一次性：试满次数的待识别番用新的搜索名再排一次（r38）
     anime.backfill_confirm_reasons()         # 幂等：给早先就在待确认里的番补推断的原因
     anime.repair_truncated_episodes()        # 幂等：S01E1174 早年被截成 117 的存量行改回四位
 
@@ -393,6 +398,9 @@ async def run_worker() -> None:
              "开" if config.ANIME_POLL_ENABLED else "关·在设置页开启", config.ANIME_POLL_INTERVAL)
     while True:
         if not config.ANIME_POLL_ENABLED or db.is_data_down():
+            # 暂停/停摆不是"停摆（卡死）"：各有各的提醒（暂停太久、数据库停摆）。这里不刷"最近有动静"的话，
+            # 一恢复就会拿几个小时前的时刻去判，先推一条『已经 N 小时没动静，重启可恢复』再推『恢复正常』（r38）
+            health.touch()
             await asyncio.sleep(15)  # 暂停中/数据库停摆：短睡轮询开关，恢复后约 15s 内继续
             continue
         try:
@@ -433,8 +441,7 @@ async def run_ipfilter() -> None:
     while True:
         await asyncio.sleep(600)
         try:
-            if await ipfilter.finish_pending() is None and ipfilter.due():
-                await ipfilter.run_once()
+            await ipfilter.tick()
         except Exception as e:
             loop_error("屏蔽列表更新", e)
 
@@ -479,6 +486,10 @@ async def archive_round() -> None:
             await engine.fill_content_paths()     # 先补文件路径（播放用），再归档：归档后 qB 里就问不到了
         except Exception as e:
             loop_error("补记文件路径（忽略，下轮再来）", e)
+        try:
+            await engine.recheck_stalled()        # 停滞的种子复查一次：qB 那边恢复/下完了就放回来（r38）
+        except Exception as e:
+            loop_error("停滞复查（忽略，下轮再来）", e)
         await engine.archive_old_completed()
 
 
@@ -502,7 +513,8 @@ async def sweep_round() -> None:
                          ("下齐判定", anime.sweep_finished),
                          ("断更提醒", anime.sweep_idle),
                          ("积压告警", anime.sweep_alerts),
-                         ("锁源落后提醒", anime.sweep_lock_lag)):
+                         ("锁源落后提醒", anime.sweep_lock_lag),
+                         ("缺集提醒", anime.sweep_gaps)):
             try:
                 r = fn()
                 if asyncio.iscoroutine(r):    # 清扫是同步的（一条 SQL），其余三段是协程

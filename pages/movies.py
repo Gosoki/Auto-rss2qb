@@ -13,7 +13,7 @@ from db.models import MovieTorrent
 from core import engine, movies as mov, worker
 from sources.parse import SEASON_CN
 from .layout import (SEVERITY_COLOR, WEEKDAY_CN, barline, busy_action, confirm, cover_box, cover_title,
-                     page_visibility,
+                     page_dialog, page_visibility, wait_dialog,
                      rating_spec, require_bind_confirm, sources_spec,
                      require_config_loaded,
                      expand_collapse_bar, frame,
@@ -249,7 +249,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                         elif t.fail_reason:
                             _b.props("color=orange").tooltip(
                                 f"上次失败：{t.fail_reason}（剧场版不自动重发，要重试就点右边『下载』）")
-                    _vdl = ui.button("下载", icon="download", on_click=_force(t.id)).props(
+                    _vdl = ui.button("下载", icon="download", on_click=_force(t.id, t.archived_at)).props(
                         "flat dense").classes("btn-sm")
                     _vdl.set_enabled(config.QB_ENABLED)
                     _vdl.tooltip("强制下这一版本到文件夹" if config.QB_ENABLED
@@ -296,7 +296,9 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         """
         cur_m = mov.get_movie(movie_id)
         _y = engine.quarter_year(cur_m.quarter) if cur_m else None
-        dlg = ui.dialog()
+        dlg = page_dialog()
+        if dlg is None:
+            return
         with dlg, ui.card().classes("gap-2"):
             ui.label("编辑归档年份").classes("font-bold")
             ui.label("剧场版按年份归档（下载目录里那一层就是它）。bgm 把 12 月首映的片算成次年时，"
@@ -315,7 +317,10 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("保存", icon="save",
                           on_click=lambda: dlg.submit(inp.value)).props("unelevated color=primary")
-        val = await dlg
+        try:
+            val = await wait_dialog(dlg)
+        finally:
+            dlg.delete()
         if val is None:
             return
         v = (val or "").strip()
@@ -354,7 +359,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         _after()
         ui.notify("已恢复", type="positive")
 
-    def _force(mt_id):
+    def _force(mt_id, archived=None):
         async def h():
             ok = await mov.download_movie_torrent(mt_id)
             _after()
@@ -362,6 +367,10 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.notify("已强制下载到文件夹", type="positive")
             elif not config.QB_ENABLED:
                 ui.notify("未启用 qB（QB_ENABLED=false），无法真正下载", type="warning")
+            elif not archived and mov.torrent_status(mt_id) in engine.TRACKED_STATUSES:
+                # 幂等短路（连点、或另一个标签页已经点过）：这一版已经在下 / 已下，不是失败。
+                # 已归档的版本是『重新交回 qB』，失败会原样还原成 sent —— 那是真失败
+                ui.notify("这一版已经在下载或已经下好了", type="info")
             else:
                 ui.notify("下载失败，看日志", type="negative")
         return h
@@ -409,7 +418,9 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         return h
 
     async def _bind():
-        dlg = ui.dialog()
+        dlg = page_dialog()
+        if dlg is None:
+            return
         with dlg, ui.card().classes("gap-2"):
             ui.label("绑定 bgm").classes("font-bold")
             ui.label("自动认错了就把正确的 bgm 链接或 ID 填这——直接取权威元数据覆盖。").classes(
@@ -420,7 +431,10 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
                 ui.button("绑定", icon="link",
                           on_click=lambda: dlg.submit(inp.value)).props("unelevated color=primary")
-        val = await dlg
+        try:
+            val = await wait_dialog(dlg)
+        finally:
+            dlg.delete()
         if not val:
             return
         bid = parse_bgm_id(val)

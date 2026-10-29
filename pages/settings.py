@@ -20,15 +20,18 @@ from .layout import busy_action, confirm, frame, reload_other_tabs, require_conf
 
 _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "NOTIFY_MAX_PER_HOUR", "NOTIFY_BACKLOG_MIN", "ANIME_IDLE_DAYS", "ANIME_GAP_SLACK_WEEKS",
-            "ANIME_GAP_MAX_EPISODES", "ANIME_LOCK_LAG_DAYS", "SWEEP_INTERVAL_MIN",
+            "ANIME_GAP_MAX_EPISODES", "ANIME_LOCK_LAG_DAYS", "SWEEP_INTERVAL_MIN", "ANIME_RERELEASE_WEEKS",
             "ALERT_POLL_STALL_MIN", "ALERT_POLL_PAUSED_HOURS", "ALERT_SOURCE_FAIL_ROUNDS",
             "ANIME_POLL_INTERVAL", "ANIME_DOWNLOAD_GRACE_MIN", "WEB_PORT", "QB_SYNC_INTERVAL",
             "QB_SYNC_BACKSTOP_MIN", "QB_ACTIVE_FLOOR_KBPS", "QB_SLOW_ROUNDS",
             "QB_IDLE_RECHECK_MIN", "QB_STALL_TIMEOUT_MIN", "QB_ARCHIVE_AFTER_DAYS",
             "ANIME_PAGE_YEARS", "MOVIE_PAGE_YEARS",
             "ENRICH_RETRY_TIMES", "REENRICH_RETRY_BASE", "REENRICH_RETRY_MAX", "REENRICH_MAX_TRIES",
-            "ANIME_META_REFRESH_EPS", "IPFILTER_DAYS", "IPFILTER_GAP_FILL",
-            "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT", "DB_MYSQL_PORT"}
+            "ANIME_META_REFRESH_EPS", "IPFILTER_DAYS", "IPFILTER_GAP_FILL", "ANIME_BACKFILL_PREAIR_DAYS",
+            "ENRICH_TIMEOUT", "NOTIFY_TIMEOUT", "DB_MYSQL_PORT",
+            # r39：带合法范围的新阈值（config._RANGE），保存时越界拒收
+            "ANIME_BACKFILL_EXTRA_EPS", "ANIME_LOCK_SYNC_DAYS", "ANIME_IDLE_WINDOW_X",
+            "ANIME_IGNORED_AIRING_DAYS", "ALERT_REPEAT_HOURS", "ALERT_REPEAT_DAYS"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
@@ -338,7 +341,40 @@ def _db_panel(f: dict) -> None:
              "（需要该账号有 CREATE 权限），表由本工具自动建。"
              "字符集保持 utf8mb4，否则日文番名和 emoji 存不进去。").classes("text-xs text-gray-500")
 
+    def _unsaved() -> bool:
+        """表单上的连接参数和【已保存】的不一样 → 提示并返回 True。
+
+        下面四个按钮（测试/建库/切换/迁移）全按已保存的参数连。不拦的话：改了地址没保存就点
+        『切到 MySQL』，切去的是旧地址那个库，确认框上也看不出来 —— 等于对着一个看不见的目标做不可逆操作。"""
+        diff = []
+        for key, label in (("DB_MYSQL_HOST", "地址"), ("DB_MYSQL_PORT", "端口"), ("DB_MYSQL_USER", "用户名"),
+                           ("DB_MYSQL_PASSWORD", "密码"), ("DB_MYSQL_NAME", "库名"),
+                           ("DB_MYSQL_CHARSET", "字符集")):
+            ctrl = f.get(key)
+            if ctrl is None:
+                continue
+            v, cur = ctrl.value, getattr(config, key)
+            if key == "DB_MYSQL_PASSWORD":
+                same = not str(v or "").strip() or str(v).strip() == (cur or "")   # 留空=不改
+            elif key == "DB_MYSQL_PORT":
+                try:
+                    same = int(v) == int(cur)
+                except (TypeError, ValueError):
+                    same = False
+            elif key == "DB_MYSQL_CHARSET":
+                same = (str(v or "").strip() or "utf8mb4") == ((cur or "").strip() or "utf8mb4")
+            else:
+                same = str(v or "").strip() == (cur or "").strip()
+            if not same:
+                diff.append(label)
+        if diff:
+            ui.notify(f"连接参数改了还没保存（{'、'.join(diff)}）—— 这几个按钮按【已保存】的参数连，"
+                      "先点页面底部的『保存』", type="warning")
+        return bool(diff)
+
     async def _test():
+        if _unsaved():
+            return
         url = db.configured_mysql_url()
         if url is None:
             ui.notify("MySQL 地址与库名都要填", type="warning")
@@ -368,6 +404,8 @@ def _db_panel(f: dict) -> None:
                 ui.notify(f"连不上：{type(e).__name__}: {str(e)[:160]}", type="negative")
 
     async def _create_db():
+        if _unsaved():
+            return
         name = (config.DB_MYSQL_NAME or "").strip()
         host = (config.DB_MYSQL_HOST or "").strip()
         if not host or not name:
@@ -402,11 +440,16 @@ def _db_panel(f: dict) -> None:
 
     async def _switch_backend(to_mysql: bool):
         """只切连接、不动数据。"""
+        if to_mysql and _unsaved():
+            return
         url = db.configured_mysql_url() if to_mysql else None
         if to_mysql and url is None:
             ui.notify("MySQL 地址与库名都要填，并先点页面底部的『保存』", type="warning")
             return
         target = "MySQL" if to_mysql else "本地 SQLite"
+        # 确认框写明【具体是哪台、哪个库】：只写"MySQL"时，用户核对不了自己要切去的是不是那个库
+        where = (f"MySQL {config.DB_MYSQL_HOST.strip()}:{config.DB_MYSQL_PORT} 上的库 "
+                 f"`{config.DB_MYSQL_NAME.strip()}`" if to_mysql else f"本地 SQLite {config.DB_PATH}")
         # 【切之前先确认没有协程跨 await 持着旧库的主键】理由见 core.engine.maintenance_blockers：
         # 交付协程回来后按整数主键回写，而两个库里同一个 id 是两条毫不相干的种子。
         # 【这一次只是提前告诉用户，别让他填完确认框才被拒】真正把关的是下面
@@ -417,6 +460,7 @@ def _db_panel(f: dict) -> None:
             return
         if not await confirm(
                 f"把业务数据库切到 {target}？",
+                f"目标：{where}\n"
                 "【只改连接，不搬任何数据】。切过去之后你看到的就是那个库里已有的内容——\n"
                 "如果目标库是空的，页面上会变成一部番都没有（数据仍在原库、切回来就还在）。\n"
                 "想把数据带过去，请先用下面的『迁移数据』。",
@@ -493,6 +537,8 @@ def _db_panel(f: dict) -> None:
 
     async def _migrate(to_mysql: bool):
         """复制数据；连接不变。"""
+        if _unsaved():
+            return
         url = db.configured_mysql_url()
         if url is None:
             ui.notify("MySQL 地址与库名都要填，并先点页面底部的『保存』", type="warning")
@@ -937,7 +983,10 @@ def settings():
                      "『留空＝不限』（字幕组白名单、标题关键词）的含义相反。\n"
                      "『qB 连不上』『数据库停摆』『待识别积压』是状态型：只在状态【翻转】的那一刻"
                      "各发一条（进一条、出一条），不会每轮重复轰炸。\n"
-                     "『下载失败』『停滞异常』由后台巡检合并上报，同样的条数 6 小时内只说一次。")
+                     f"『下载失败』『停滞异常』『绑定看着不对』由后台巡检合并上报，同一批 {config.ALERT_REPEAT_HOURS} 小时内"
+                     "只说一次（有新成员立刻再说）；改这一项不会清掉正在计的冷却。\n"
+                     f"『已下齐』『缺集』『锁定源落后』：同一部番的同一件事 {config.ALERT_REPEAT_DAYS} 天内只推一次"
+                     "（又缺了别的集、锁定源又被甩开一集，算新的一件事）。")
             f["NOTIFY_EVENTS"] = ui.select(
                 {k: f"{icon} {cn}" for k, (cn, icon) in notify.EVENTS.items()},
                 value=list(config.NOTIFY_EVENTS or []), multiple=True,
@@ -949,6 +998,10 @@ def settings():
             with ui.element("div").classes("field-grid w-full"):
                 _num("NOTIFY_MAX_PER_HOUR", "每小时最多几条（0=不限）", config.NOTIFY_MAX_PER_HOUR)
                 _num("NOTIFY_BACKLOG_MIN", "待识别积压到几部才提醒", config.NOTIFY_BACKLOG_MIN)
+                _num("ALERT_REPEAT_HOURS", "积压告警重复间隔（小时）", config.ALERT_REPEAT_HOURS,
+                     *config._RANGE["ALERT_REPEAT_HOURS"])
+                _num("ALERT_REPEAT_DAYS", "同番同一提醒间隔（天）", config.ALERT_REPEAT_DAYS,
+                     *config._RANGE["ALERT_REPEAT_DAYS"])
 
         # ========== 折叠 ③ 巡检 / 健康 ==========
         with ui.card().classes("w-full"), ui.expansion(
@@ -964,7 +1017,13 @@ def settings():
                      "余量＝推算时少算几周，休播一周或字幕组晚发几天都不误报；调大更不容易误报，但发现得更晚。"
                      "应播集数超过『长番上限』的不判（航海王这类只收最近几集，报缺上千集是噪音）。\n"
                      "锁定源落后：锁了下载源的番，别的组已经发了锁定源之后的集、锁定源过了这么多天还没跟上，"
-                     "就在详情页和仪表盘提醒（只提醒，不改下载行为；0=关）。")
+                     "就在详情页和仪表盘提醒（只提醒，不改下载行为；0=关）。"
+                     "同步窗口：锁定组在别组发某集的前后这么多天内也在发、而集号差得远（季内号对绝对号）时，"
+                     "当成两套编号同步在发，不算落后；只对锁定组最新一集之后的集生效，调大提醒更少。\n"
+                     "断更提醒窗口：一段静默里每满一个阈值提醒一次，静默超过『阈值×倍数』天就不再提醒，"
+                     "即最多提醒『倍数−1』次（默认 4：阈值 14 天时在第 14、28、42 天各一次）；"
+                     "从没成功提醒过的番不受这个限制，一定会先提醒一次。最小 2。\n"
+                     "超期忽略·仍在更新：被自动判成超期忽略的番，最近这么多天里还收到正片新集，就在仪表盘提示（只报不改）。")
             with ui.element("div").classes("field-grid w-full"):
                 f["ANIME_FINISH_ENABLED"] = ui.switch(
                     "判定已下齐（只标记+通知）", value=config.ANIME_FINISH_ENABLED)
@@ -974,6 +1033,13 @@ def settings():
                 _num("ANIME_GAP_SLACK_WEEKS", "缺集提示余量（周）", config.ANIME_GAP_SLACK_WEEKS, 0, 8)
                 _num("ANIME_GAP_MAX_EPISODES", "缺集提示长番上限（集）", config.ANIME_GAP_MAX_EPISODES, 1, 10000)
                 _num("ANIME_LOCK_LAG_DAYS", "锁定源落后提醒（天，0=关）", config.ANIME_LOCK_LAG_DAYS, 0, 90)
+                _num("ANIME_RERELEASE_WEEKS", "同号新集晚几周算可疑（0=关）", config.ANIME_RERELEASE_WEEKS, 0, 520)
+                _num("ANIME_LOCK_SYNC_DAYS", "锁定源同步窗口（天）", config.ANIME_LOCK_SYNC_DAYS,
+                     *config._RANGE["ANIME_LOCK_SYNC_DAYS"])
+                _num("ANIME_IDLE_WINDOW_X", "断更提醒窗口（×阈值）", config.ANIME_IDLE_WINDOW_X,
+                     *config._RANGE["ANIME_IDLE_WINDOW_X"])
+                _num("ANIME_IGNORED_AIRING_DAYS", "超期忽略·仍在更新（天）", config.ANIME_IGNORED_AIRING_DAYS,
+                     *config._RANGE["ANIME_IGNORED_AIRING_DAYS"])
                 # 【给下限】这一项没有"0=关"的语义（关完结/断更各有自己的开关），
                 # 而 run_sweep 里是 max(60, ...) 秒——填 0 会变成每 60 秒来一次全表扫描。
                 _num("SWEEP_INTERVAL_MIN", "巡检间隔（分钟，最少 5）", config.SWEEP_INTERVAL_MIN, 5, 1440)
@@ -1068,8 +1134,29 @@ def settings():
                 _num("ANIME_POLL_INTERVAL", "轮询间隔（秒）", config.ANIME_POLL_INTERVAL)
                 _num("ANIME_DOWNLOAD_GRACE_MIN", "下载缓冲窗口（分钟，多源等偏好组补齐）",
                      config.ANIME_DOWNLOAD_GRACE_MIN)
+            # 渲染【实际生效】的表而不是库里的原始值：原始值坏了还原样渲染的话，_save 的强校验会让这一页
+            # 任何设置都存不下去（与 WEB_HOST 那条"校验不过就回落到运行值"同一个规矩）
+            _text("ANIME_RETRY_BACKOFF_MIN", "取种失败重试间隔（分钟，逗号分隔）",
+                  ",".join(map(str, engine.retry_backoff_min())), "1,5,30,180,720,1440")
+            if engine.parse_retry_backoff(config.raw("ANIME_RETRY_BACKOFF_MIN")) is None:
+                ui.label("库里的值无效，正按默认表执行，保存会写回上面这张表").classes("text-xs text-amber-500")
+            ui.label("取种失败（源站超时/502/DNS）或重启打断交付时，按这张表依次等这么多分钟再试；用完转『失败』，"
+                     "失败不会自动重试。默认合计约 40 小时，断网更久就往后加（如 …,1440,2880,2880）。"
+                     "实际间隔按轮询周期取整。").classes("text-xs text-gray-500")
             _switch_field("ANIME_TOP_PRIORITY_INSTANT", "最高优先级组入库即下（跳过缓冲窗口）",
                     config.ANIME_TOP_PRIORITY_INSTANT)
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ANIME_BACKFILL_PREAIR_DAYS", "补齐不收开播前几天以前的（0=不限）",
+                     config.ANIME_BACKFILL_PREAIR_DAYS, 0, 3650)
+                _num("ANIME_BACKFILL_EXTRA_EPS", "补齐按集补搜最多几集", config.ANIME_BACKFILL_EXTRA_EPS,
+                     *config._RANGE["ANIME_BACKFILL_EXTRA_EPS"])
+                _text("ANIME_BACKFILL_PREFER", "补齐同集优先含此词", config.ANIME_BACKFILL_PREFER, "1080；空=不偏好")
+            ui.label("补齐搜不全时，对还缺的集再按『番名 集号』补搜，最多这么多集（每集 2 个站 × 2 个名字各搜一次，"
+                     "同时发出；0=不补搜）。同一集有多个版本时，先试本番『版本』关键词，再试含『优先词』的。"
+                     ).classes("text-xs text-gray-500")
+            _switch_field("ANIME_SINGLE_WORK_AUTO",
+                    "在追的单部作品（bgm 只有 1 集的网络番/剧场版）一份都没下时，自动挑一份下（种子没标集号也下）",
+                    config.ANIME_SINGLE_WORK_AUTO)
             _switch_field("ANIME_REPLACE_VERSIONS",
                     "同一个组发了修正版（v2…）就替换：先下好新版，再删掉旧版的种子和文件",
                     config.ANIME_REPLACE_VERSIONS)
@@ -1206,6 +1293,17 @@ def settings():
                         return
                 else:
                     updates[key] = str(v).strip()
+            for k, (lo, hi) in config._RANGE.items():
+                if k in updates and not lo <= int(updates[k]) <= hi:
+                    ui.notify(f"{k} 需在 {lo}~{hi} 之间，已取消保存", type="negative")
+                    return
+            if "ANIME_RETRY_BACKOFF_MIN" in updates:
+                parsed = engine.parse_retry_backoff(updates["ANIME_RETRY_BACKOFF_MIN"])
+                if parsed is None:
+                    ui.notify("取种失败重试间隔要写成逗号分隔的正整数分钟，1~20 项、每项不超过 10080，已取消保存",
+                              type="negative")
+                    return
+                updates["ANIME_RETRY_BACKOFF_MIN"] = ",".join(map(str, parsed))
             # 保存前校验绑定项：非法值提前拦下，别写进 .env/库导致启动失败或静默锁死
             port = updates.get("WEB_PORT")
             if port is not None and not (1 <= int(port) <= 65535):
@@ -1261,7 +1359,6 @@ def settings():
                            if k in _RESTART_ONLY and v != (_env_now.get(k) or "")}
             if db_updates:
                 sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
-                qb_was_on = config.QB_ENABLED
                 changed = config.set_many(db_updates)   # 写数据库 + 更新内存，即时生效；返回真的变了的键
                 # 通知的冷却/状态记忆是【进程内】的：不清的话，用户刚把某个事件勾上，
                 # 还要等冷却过期或状态再翻转一次才看得到效果——那看起来就像"设置没生效"。
@@ -1289,12 +1386,13 @@ def settings():
                     else:
                         await client.aclose()
                         engine.qb_kick.set()      # 连上了：立即唤醒同步循环自查，别等一个保底周期
-                # 关跟踪/关发送 → 落定切换时刻仍在下的旧种子，
-                # 否则它们再无路径推进、永久卡『正在下载』、has_inflight 恒真。
-                #
+                # 关跟踪 → 落定切换时刻仍在下的旧种子，否则它们再无路径推进、永久卡『正在下载』、has_inflight 恒真。
                 # 只对用户显式关闭落定（探测失败不再自动关开关，见上，所以这里关掉的一定是用户自己关的）。
-                explicit_off = ((sync_was_on and not config.QB_SYNC_STATUS)
-                                or (qb_was_on and not config.QB_ENABLED))
+                #
+                # 【关『发送到 qB』不落定】(r38) 那通常是临时的（qB 维护、换机器），重新打开后同步会接着跟这些种子。
+                # 以前这里也落定：关的那一刻所有在下的种子被永久记成已下完 100%，再打开已不在跟踪范围，
+                # 没下完的一直显示已完成、停滞检测也查不到，全程没有任何提示。
+                explicit_off = sync_was_on and not config.QB_SYNC_STATUS
                 if explicit_off:
                     engine.settle_inflight_off()
             if env_updates:

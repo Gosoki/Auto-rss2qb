@@ -760,3 +760,29 @@ def test_the_identity_matches_the_same_database_predicate(tmp_path):
     assert transfer.same_database(a, c) is False
     assert _db.data_identity(a) != _db.data_identity(c), \
         "两个不同的库拿到了同一个身份串 —— 标记会串库"
+
+
+async def test_idle_counts_from_the_last_successful_poll(clean_tables, make, cfg, monkeypatch):
+    """(r38) 采集暂停了 20 天：这段时间本来就收不到新种子，不能把所有在追的番都报成断更。"""
+    sent = []
+    monkeypatch.setattr(A, "notify_event", lambda k, m, **kw: (sent.append((k, m)), _async(True))[1])
+    cfg(ANIME_IDLE_DAYS=14, ANIME_POLL_OK_LAST=(datetime.now() - timedelta(days=20)).isoformat(timespec="seconds"))
+    make(12, [(1, "sent")])
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.created_at = datetime.now() - timedelta(days=30)   # 暂停前 10 天还在更
+        s.commit()
+    assert await A.sweep_idle() == 0 and not sent
+
+
+async def test_long_finished_and_complete_show_is_not_idle(clean_tables, make, cfg, monkeypatch):
+    """(r38) 用绝对编号的续作（库里 13~25、bgm 记 13 集）判不了已下齐：早就播完、集数也收齐了，不是断更。"""
+    sent = []
+    monkeypatch.setattr(A, "notify_event", lambda k, m, **kw: (sent.append((k, m)), _async(True))[1])
+    cfg(ANIME_IDLE_DAYS=14, ANIME_POLL_OK_LAST="")
+    make(13, [(e, "sent") for e in range(13, 26)], air_date="2026-04-03")
+    with clean_tables.get_session() as s:
+        for t in s.exec(select(AnimeTorrent)):
+            t.created_at = datetime.now() - timedelta(days=30)
+        s.commit()
+    assert await A.sweep_idle() == 0 and not sent
