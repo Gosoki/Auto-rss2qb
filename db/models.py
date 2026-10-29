@@ -206,6 +206,13 @@ class AnimeTorrent(SQLModel, table=True):
     ep_dropped: bool = Field(default=False)
     # 【用户亲手改过集号】set_torrent_episode 真改了值（值没变的空确认不算）。集号展开/回折与截断修复都跳过这一行。
     episode_manual: bool = Field(default=False)
+    # ---- E-77 方案 C（revision 41998a08995d）----
+    # 【不属于本季】用户在详情页标的：这一行是别的季的（典型：续季下面挂着第一季的旧正片 '- 01..12'），
+    # 不占本季的集号 —— 集去重（_covered）、"最后一份"、巡检统计、绑定可疑都当它不存在，本季那一集照常自动下。
+    # 文件不动、行也还在（删除、手动 force 下照常可用）；任何自动路径都不会下它、不拿它当修正版的旧版去替换，
+    # 搬迁时 qB 不认识它也不清成待下。只能由用户点按钮产生（set_foreign_season / mark_slot_impostors_foreign），
+    # 后台永不自动打；可撤销，撤销后原样恢复占位（ep_dropped 等其它列在标记期间不动）。
+    foreign_season: bool = Field(default=False)
 
 
 class Movie(SQLModel, table=True):

@@ -368,6 +368,7 @@ TRACKED_STATUSES = ("sent", "downloading")
 #    【不含 deleted】——用户删的那条不会自己回来（它自身是终态，flush/plan 只挑 pending/error 永不选它）。
 #    【番剧侧集去重不直接用它】(E-73，推翻 cf00748 的"同集来新 hash 照常自动下") 用的是 core.anime._covered：
 #    HAVE，或 deleted 且 ep_dropped（用户删的是该集最后一份＝这一集不要了）。只删了重复份的 deleted 不挡。
+#    用户标了『不属于本季』（foreign_season，E-77 C）的行不论状态都不算。
 HAVE_STATUSES = TRACKED_STATUSES + ("stalled",)
 # ③ HANDLED：『这一集/这部番处理过』——在 ② 基础上 +deleted。用于"下过没有"一类判断
 #    （季度已落盘不改、自动升确认只救没下过的番、剧场版侧持有）。
@@ -1103,7 +1104,7 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
     · 【qB 连不上】→ 一行都不动，只回 error 让用户稍后重试（与"qB 说没有"是两码事，见下方长注释）
     · setLocation 报 403/409(新目录不可写) → 只报告、不动状态
     返回 {new_path, old_path, moved, redownload, redownload_dirs, stalled_dirs, untracked, in_place, failed,
-    stalled_kept, special_kept, delivering, fail_code?, error?}。
+    stalled_kept, special_kept, foreign_kept, delivering, fail_code?, error?}。
     走到问完 qB 那一步时，old_path 已改写成【被清/停滞行实际所在的目录】或 None（见下方 ③），不会是 new_path；
     提前返回（error、没有要搬的行）时保持调用方传入的值。页面的两句指路提示不用它，各取
     redownload_dirs（被清的那几集）/ stalled_dirs（停滞行自己），理由见 ③。
@@ -1115,6 +1116,9 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
            "in_place": 0,       # qB 已不跟踪、但文件本就在当前目录的行：未改动（r39 Q2）
            "stalled_kept": 0,   # 停滞行不降级也不重下，文件留在旧目录，需提示用户
            "special_kept": 0,   # 特别篇(-1)/未知集(-2)：清成 pending 没有路径会再下它，同样不动（E-4）
+           # 番剧侧用户标了『不属于本季』的行（foreign_season，E-77 C）：自动路径永不下它，清成 pending 同样
+           # 是一条回不来的路 —— 与特别篇同样不动、不进任何清理提示，报告单列（剧场版没有这一列，恒 0）
+           "foreign_kept": 0,
            "delivering": 0}     # 交付中的占位行：本次不动它，交付完仍会落旧目录，需提示用户再点一次
     if new_path is None:
         rep["error"] = f"算不出新路径（越界或无{'番' if noun == '集' else '片'}）"
@@ -1139,7 +1143,8 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         # 现在既不 setLocation 也不 _clear；hash 照样随下面那次 torrents_info 一起问，
         # 只为数出『qB 已不跟踪、文件本就在当前目录』的条数（rep['in_place']）。save_path 为空的老行判不了，照常参与。
         where = {t.id: t.save_path for t in rows}
-        special = {t.id for t in rows if not auto_downloadable_ep(getattr(t, "episode", 0))}   # 见下方 ③
+        special = {t.id for t in rows if not auto_downloadable_ep(getattr(t, "episode", 0))
+                   or getattr(t, "foreign_season", False)}   # 见下方 ③（不属于本季的同样是唯一一份）
         here = [(t.id, t.info_hash) for t in live if t.save_path and same_dir(t.save_path, new_path)]
         pairs = [(t.id, t.info_hash) for t in live if not (t.save_path and same_dir(t.save_path, new_path))]
     if not pairs:
@@ -1176,9 +1181,13 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         特别篇(-1)/未知集(-2) 被四条自动/批量路径一律挡在外面（见 auto_downloadable_ep），
         清成 pending 等于把它送进一条**永远不会再下**的路，而报告还会提示"旧文件需你手动清理"——
         用户照做就删光了唯一一份。这类行与 stalled 同样处理：不动，报告里单列。
-        MovieTorrent 没有 episode 列（剧场版没有集号），getattr 兜底 → 一律可重下。
+        番剧侧标了『不属于本季』的行（E-77 C）同理：所有自动路径都不下它。
+        MovieTorrent 没有 episode / foreign_season 列（剧场版没有集号），getattr 兜底 → 一律可重下。
         """
-        return auto_downloadable_ep(getattr(t, "episode", 0))
+        return auto_downloadable_ep(getattr(t, "episode", 0)) and not _foreign(t)
+
+    def _foreign(t) -> bool:
+        return bool(getattr(t, "foreign_season", False))
 
     def _stalled_of(ids) -> list:
         with get_session() as s:
@@ -1189,7 +1198,14 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         with get_session() as s:
             return sum(1 for tid in ids
                        if (t := s.get(model_cls, tid)) is not None
-                       and t.status in TRACKED_STATUSES and not _auto_redownloadable(t))
+                       and t.status in TRACKED_STATUSES and not _auto_redownloadable(t) and not _foreign(t))
+
+    def _foreign_of(ids) -> int:
+        """不属于本季的行另计一个键（foreign_kept）：提示里的说法与特别篇不同（它不是特别篇）。"""
+        with get_session() as s:
+            return sum(1 for tid in ids
+                       if (t := s.get(model_cls, tid)) is not None
+                       and t.status in TRACKED_STATUSES and _foreign(t))
 
     def _mark_moved(ids):
         with get_session() as s:
@@ -1237,6 +1253,7 @@ async def relocate(model_cls, owner_col, owner_id: int, new_path: str | None,
         stalled = _stalled_of(untracked)
         rep["stalled_kept"] += len(stalled)
         rep["special_kept"] += _special_of(untracked)     # -1/-2：不清（E-4），报告单列
+        rep["foreign_kept"] += _foreign_of(untracked)     # 不属于本季：不清（E-77 C），报告单列
         cleared = _clear(untracked)
         rep["untracked"] = rep["redownload"] = len(cleared)
         # 提示里『这 N 集的旧文件在哪』只取【实际被清】的行（r39 Q2）。经过上面的『已在位不碰』，

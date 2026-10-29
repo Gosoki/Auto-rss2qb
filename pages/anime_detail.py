@@ -41,12 +41,17 @@ def notify_relocate_anime(rep):
         parts.append(f"{rep['special_kept']} 条特别篇/未知集 qB 未跟踪、未移动（这类不会自动重下；"
                      "要搬到新目录：先对准那条点『删除』（只标记，文件留在原处）再点『下载』，"
                      "或手动把文件挪过去、状态不用改）")
+    if rep.get("foreign_kept"):   # (E-77 C) 标了『不属于本季』的：自动路径永不下它，清成待下就回不来了，同样不动
+        # 与特别篇同理：那是这一条唯一的一份、行还指着它，不进下面任何一句清理提示
+        parts.append(f"{rep['foreign_kept']} 条标了『不属于本季』的 qB 未跟踪、未移动（它们不会自动重下；"
+                     "要搬就手动把文件挪过去、状态不用改）")
     if rep.get("delivering"):     # 正在交付给 qB 的集：路径在交付前就定死了，搬不了也不能碰
         parts.append(f"{rep['delivering']} 集正在交付给 qB、未移动"
                      "（它会先落到旧目录，交付完成后再点一次『编辑季度』即可搬过来）")
     msg = "；".join(parts) or "无需移动"
     warn = bool(rep.get("redownload") or rep.get("failed")
-                or rep.get("stalled_kept") or rep.get("special_kept") or rep.get("delivering"))
+                or rep.get("stalled_kept") or rep.get("special_kept") or rep.get("foreign_kept")
+                or rep.get("delivering"))
     # (r39 Q2) 旧的一句『旧文件在 {old_path} 需你手动清理』有两处会删掉唯一一份：『搬回来』入口里
     # old_path 就是当前目录；而且一个目录里可能还混着停滞/特别篇/移动被拒/交付中的文件，整目录删就全没了。
     # 现在目录只取【实际被清的那几集】所在处（engine 给的 redownload_dirs），并写明下完再删、只删这几集。
@@ -60,6 +65,8 @@ def notify_relocate_anime(rep):
         # (r39 F1) 不断言『该目录里』：这几类行在哪个目录没有逐一核对，只提醒它们也没跟着搬
         if any(rep.get(k) for k in ("stalled_kept", "special_kept", "failed", "delivering")):
             msg += "；另有停滞、特别篇、移动被拒或交付中的文件没跟着搬、仍在用，删之前认准是哪几集"
+        if rep.get("foreign_kept"):   # (E-77 C) 别季那几条的集号可能与被清的这几集相同，最容易被当成旧文件删掉
+            msg += "；标了『不属于本季』的文件也没跟着搬、仍在用，别当成这几集的旧文件删"
     # (r39 F1) 只用停滞行自己的目录（engine 已排除特别篇与当前目录），不用 old_path：那是被清行与停滞行的并集
     if rep.get("stalled_kept") and rep.get("stalled_dirs"):
         msg += f"。⚠️ 停滞的半成品留在 {'、'.join(rep['stalled_dirs'])}，需你手动处理"
@@ -362,10 +369,31 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 f"缺第 {ep_ranges_text(_free)} 集：按 bgm 开播日推算早该播了，库里却一条种子都没有。"
                 "采集停过一阵（RSS 只留最近几天，停久了那几集就滚出去了）或锁定的源中途断更都会这样。"
                 "点『自动补齐』去搜（在追的番补到就直接下）：当前下载源搜不到时，会列出别的组有哪些集，挑一个就能补。")
+        # (E-77 C) 出路就在横幅上：把占槽的旧行标成『不属于本季』。条数与 mark_slot_impostors_foreign 同一个判据
+        # （_foreign_markable）——它会把整部番里认得出的占槽行一次标完，不只是缺的这几集。
+        _nmark = sum(1 for t in eps if anime._foreign_markable(cur, t))
         if _held:
-            warn_banner(
-                f"缺第 {ep_ranges_text(_held)} 集：这几集的槽位被别的季的旧种子占着（同集号、发布比本季首播早得多），"
-                "补齐也下不了 —— 补回来的本季这几集会被『同集已有』挡住。先处理绑定（看『绑定看着不对』）。")
+            _held_txt = (f"缺第 {ep_ranges_text(_held)} 集：这几集的槽位被别的季的旧种子占着（同集号、发布比本季首播早得多），"
+                         "补齐也下不了 —— 补回来的本季这几集会被『同集已有』挡住；删掉旧种子也不行（会被当成这一集不要了）。")
+            if _nmark:
+                warn_banner(_held_txt + f"点右边把这 {_nmark} 条旧种子标为『不属于本季』：文件不动、可逐条撤销，"
+                            "本季这几集就会照常自动下。",
+                            action=(f"把占槽的 {_nmark} 条旧种子标为不属于本季", "playlist_remove",
+                                    _mark_impostors(_nmark)))
+            else:   # 占槽行正在交付中（标不了）：等它落定再来
+                warn_banner(_held_txt + "占槽的那条正在交付中，等它落定后再回来把它标为『不属于本季』。")
+        else:
+            # #6 的真实形状：本季那几集早就入了库（被同集闸压成 skipped / 停在待下），算"见过"、不报缺集，
+            # 上面那条横幅就不出 —— 批量按钮在这里同样给一份。只在占槽行【真挡着】某一集时出（_covered 的那种）。
+            _block = sorted({int(t.episode) for t in eps if anime._foreign_markable(cur, t) and anime._covered(t)})
+            if _block:
+                warn_banner(
+                    f"第 {ep_ranges_text(_block)} 集的位置被别的季的旧种子占着（同集号、发布比本季首播早得多）："
+                    "本季这几集的种子（已经来了的和以后来的）会被『同集已有』挡住、不会自动下；"
+                    "删掉旧种子也不行（会被当成这一集不要了）。"
+                    f"点右边把这 {_nmark} 条旧种子标为『不属于本季』：文件不动、可逐条撤销。",
+                    action=(f"把占槽的 {_nmark} 条旧种子标为不属于本季", "playlist_remove",
+                            _mark_impostors(_nmark)))
         # 【锁定源落后】别的组已有后续集、锁定源迟迟不跟（判据见 core.anime.locked_out_episodes）
         _lo = anime.locked_out_episodes([cur]).get(cur.id)
         if _lo:
@@ -389,15 +417,18 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 这一集是否『有着落』：将下(plan) 或 已有一份(HAVE_STATUSES：已下/在下/停滞)。与 flush 同口径——
         # stalled 也算有着落(不再误报缺集，B4)；deleted 不在这里算：只删了重复份的同集照常会下，
         # "该集已删"的 pending 行由下面的 _dropped 单独标，走不到用 covered 的那一支（E-73）。
+        # 标了『不属于本季』的行（E-77 C）不算这一集有着落，与 core 的 _covered 同口径
         covered = {t.episode for t in eps
-                   if t.id in plan or t.id in backfill_plan or t.status in anime.HAVE_STATUSES}
+                   if t.id in plan or t.id in backfill_plan
+                   or (t.status in anime.HAVE_STATUSES and not t.foreign_season)}
         # 【该集已删】(E-73) 组内有"该集已删"(deleted+ep_dropped) 行、且一份都不在盘上的集：后台任何自动路径
         # 都不再为它下别的版本。分组键与 flush / 计划 / 即时同集闸同口径（dedup_key，歧义段带源）。
         _amb = anime.ambiguous_range(cur)
+        # 『不属于本季』的行两边都不算（它的标记不起作用、它在盘上也不算本季这一集有货），同 core 的 _covered
         _dropped = ({anime.dedup_key(_amb, 0, t.episode, t.source) for t in eps
-                     if t.status == "deleted" and t.ep_dropped}
+                     if t.status == "deleted" and t.ep_dropped and not t.foreign_season}
                     - {anime.dedup_key(_amb, 0, t.episode, t.source) for t in eps
-                       if t.status in anime.HAVE_STATUSES})
+                       if t.status in anime.HAVE_STATUSES and not t.foreign_season})
         # 单部作品（剧场版/WEB 等只有 1 集）的 -2 按特别篇算、标 SP —— 与仪表盘同一判据（engine.is_special_ep）
         _single = engine.is_single_work(cur.platform, cur.total_episodes)
         for t in eps:
@@ -423,6 +454,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                             "锁定的组停更了一阵，后台用这个组给这一集补了一份。锁定组以后补发这一集会再自动下它的版本；"
                             "这一份不会自动删，不要了点右边删除。"
                             "锁定组补发之前别删：删了等于这一集不要了，它的版本也不会再自动下")
+                    if t.foreign_season:   # (E-77 C) 用户标的：别的季的，不占本季的集号
+                        ui.badge("不属于本季").props("color=grey").tooltip(
+                            "你标过：这一条是别的季的。它不占本季这一集的位置（本季那一集照常自动下），"
+                            "文件不动、还在原目录；后台不会自动下它、不会拿它做修正版替换，搬迁时也不会清它的状态。"
+                            "标错了点右边『撤销』")
                     ui.label(engine.torrent_time(t)).classes(
                         "shrink-0 text-gray-500 text-xs")                 # 次要：时间(12px)
                     ui.space()
@@ -453,6 +489,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                 _neg_tip
                                 + (_retry_tip.replace("后重试", "后仍不会自动重发，需人工下")
                                    if t.retry_at else ""))
+                        elif t.foreign_season:
+                            # 【要排在 retry / plan / covered 之前】(E-77 C) 任何自动路径都不下它：落进『重试中』会承诺
+                            # "X 之后自动重发"，落进『备用项』/『锁源缺集』则说的是本季这一集的事 —— 都不对
+                            ui.badge("不自动下").props("color=grey").tooltip(
+                                "标了『不属于本季』，后台任何自动路径都不会下它；要就点右边『下载』")
                         elif not cur.confirmed and not cur.rejected:
                             # 【subscribed_where 的第三半】flush 的判据是"已确认 且 未忽略 且
                             # （开停订时）未判完结"。上面那条完结分支与 download_plan 里的 rejected
@@ -548,13 +589,26 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "flat dense color=grey").classes("btn-sm").tooltip(
                             "不想要这条：从待下直接排除（不删文件，只改状态；可撤销）")
+                    # (E-77 C)『不属于本季』只由这里（和缺集横幅上的批量按钮）产生，后台永不自动打。
+                    # 只对看着像别季的正集给按钮（判据见 anime.foreign_season_suspect）。
+                    # 交付中的不给（set_foreign_season 也不改它）：等它落定。
+                    if t.foreign_season:
+                        ui.button("撤销", icon="undo", on_click=_set_foreign(t.id, False, t.episode)).props(
+                            "flat dense color=primary").classes("btn-sm").tooltip(
+                            "撤销『不属于本季』：这一条重新占用本季这一集的位置")
+                    elif t.status != "downloading" and anime.foreign_season_suspect(cur, t):
+                        ui.button("不属于本季", icon="playlist_remove",
+                                  on_click=_set_foreign(t.id, True, t.episode)).props(
+                            "flat dense color=grey").classes("btn-sm").tooltip(
+                            "这一条是别的季的（同集号的旧正片）：标记后不再占用本季这一集的位置，文件不动，可撤销")
                     # 下过/在下/停滞(盘上有文件)都可删（delete 函数亦接受 stalled）。交付中的占位行不给按钮：
                     # delete_anime_torrent 对 downloading 直接返回 False，而它身上可能还挂着旧的 archived_at，
                     # 会被渲染成"已归档：只能标记已删"这种错话（E-49 后占位段不清归档标记）。
                     if t.status in engine.HAVE_STATUSES and t.status != "downloading":
                         ui.button(icon="delete_forever",
                                   on_click=_del_one(t.id, t.archived_at, t.save_path,
-                                                    t.episode is not None and t.episode < 0 and not _single)).props(
+                                                    t.episode is not None and t.episode < 0 and not _single,
+                                                    t.foreign_season)).props(
                             "flat dense color=negative").classes("btn-sm").tooltip(
                             "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
                             else "删除这一集的文件（qB+硬盘，不可撤销）")
@@ -921,7 +975,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.notify("下载失败，看日志", type="negative")
         return h
 
-    def _del_one(torrent_id, archived=None, save_path="", special=False):
+    def _del_one(torrent_id, archived=None, save_path="", special=False, foreign=False):
         async def h():
             # 【删 = 这一集不要了】(E-73) 删的若是同集最后一份，后台不再自动下这一集的其它版本；同集还留着别的份时只删这一份。
             # 是哪一种问 core（与真正写库的 _is_last_copy 同一个判据），别按页面上已渲染的行自己数。
@@ -930,6 +984,8 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                      if drops else "同集还留着别的版本，只删这一份；留下那份以后若失败，后台照常会补。")
             if special:   # (r39 F17) 普通番的特别篇 / 未知集：彼此不是"同一集"，后台也本来就不自动下，上面两句都不对
                 _what = "特别篇 / 未知集后台本来就不自动下，只删这一份。"
+            elif foreign:   # (E-77 C) 别季的行：删它不是"本季这一集不要了"（delete_drops_episode 对它恒 False），上面两句都不对
+                _what = "这一条标了『不属于本季』：只删这一份，不影响本季这一集（本季那一集照常自动下）。"
             if archived:   # 已归档：种子早已移出 qB，删不到文件 → 明确告知路径与后果，让用户自己清理
                 if not await confirm(
                         "这一集已归档，只能标记已删",
@@ -1008,6 +1064,40 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ok = anime.unexclude_torrent(torrent_id)
             _after()
             ui.notify("已放回待下" if ok else "取消失败", type="positive" if ok else "warning")
+        return h
+
+    def _set_foreign(torrent_id, flag, episode):
+        """(E-77 C) 那一条的『不属于本季』/『撤销』。标上要先确认（会放行本季那一集的自动下载），撤销直接做。"""
+        async def h():
+            if flag and not await confirm(
+                    "这一条不属于本季？",
+                    f"标记后这一条不再占用本季第 {ep_str(episode)} 集的位置，本季那一集会照常自动下载；"
+                    "文件不动、还在原目录；它不会被自动下载、替换或搬迁清状态；可以撤销。",
+                    ok_label="不属于本季", ok_icon="playlist_remove", ok_color="primary"):
+                return
+            ok = anime.set_foreign_season(torrent_id, flag)
+            _after()
+            if ok:
+                ui.notify("已标为『不属于本季』：本季这一集照常自动下" if flag
+                          else "已撤销：这一条重新占用本季这一集的位置", type="positive")
+            else:
+                ui.notify("没改成（这一条正在交付中，或状态已经变了），刷新后再试", type="warning")
+        return h
+
+    def _mark_impostors(n):
+        """(E-77 C) 缺集横幅上的批量按钮：把整部番里认得出的占槽旧行一次标成『不属于本季』。"""
+        async def h():
+            if not await confirm(
+                    f"把 {n} 条占槽的旧种子标为『不属于本季』？",
+                    "这些是集号落在本季范围内、发布却比本季首播早得多的旧种子（多半是前一季的正片）。"
+                    "标记后它们不再占用本季的集号，本季那几集会照常自动下载；文件不动、还在原目录；"
+                    "它们不会被自动下载、替换或搬迁清状态；每一条都可以在下面单独撤销。",
+                    ok_label="全部标记", ok_icon="playlist_remove", ok_color="primary"):
+                return
+            k = anime.mark_slot_impostors_foreign(anime_id)
+            _after()
+            ui.notify(f"已把 {k} 条旧种子标为『不属于本季』：本季那几集照常自动下" if k
+                      else "没有可标的了（可能已经标过，或正在交付中）", type="positive" if k else "info")
         return h
 
     body()

@@ -63,14 +63,20 @@ MANUAL_TERMINAL_STATUSES = engine.MANUAL_TERMINAL_STATUSES
 # 前置过滤漏改一处的后果不是"多下"：页面标『将下载』，即时同集闸却把整组兄弟静默改成 skipped。
 # 只删重复份的 deleted 行（ep_dropped=0）不算：留下那份以后被清回待下 / 落 error，还得能自动补回来。
 # 分组键照旧是 dedup_key（歧义段带源）；只有"是不是最后一份"按粗键 (番, 集) 判（见 _is_last_copy）。
+# 【用户标了『不属于本季』的行一律不算】(E-77 方案 C，foreign_season) 那是别的季的旧正片，不占本季的集号：
+# 它在这里不算，上面列的十几条路径就全部跟着放行本季那一集（不用逐处再改）。标记只能由用户点按钮产生。
 def _covered(t) -> bool:
-    """这一行让它所在的那一集"有着落"吗（见上）。t 可以是 ORM 行，也可以是带 status/ep_dropped 两列的投影 Row。"""
+    """这一行让它所在的那一集"有着落"吗（见上）。t 可以是 ORM 行，也可以是带 status/ep_dropped/foreign_season
+    三列的投影 Row（列漏了会当场 AttributeError，别用 getattr 兜成 False —— 那会静默把别季行算回占位）。"""
+    if t.foreign_season:
+        return False
     return t.status in HAVE_STATUSES or (t.status == "deleted" and bool(t.ep_dropped))
 
 
-# 同一判据的 SQL 写法（WHERE 里用）。改判据时与 _covered 一起改。
-_COVERED_SQL = or_(AnimeTorrent.status.in_(HAVE_STATUSES),
-                   and_(AnimeTorrent.status == "deleted", AnimeTorrent.ep_dropped == True))  # noqa: E712
+# 同一判据的 SQL 写法（WHERE 里用）。改判据时与 _covered 一起改（含 foreign_season 那一半）。
+_COVERED_SQL = and_(AnimeTorrent.foreign_season == False,   # noqa: E712
+                    or_(AnimeTorrent.status.in_(HAVE_STATUSES),
+                        and_(AnimeTorrent.status == "deleted", AnimeTorrent.ep_dropped == True)))  # noqa: E712
 
 
 def _is_last_copy(s, t) -> bool:
@@ -79,10 +85,15 @@ def _is_last_copy(s, t) -> bool:
     "一份" = status ∈ HAVE（含交付中、停滞、已归档）。【用粗键 (番, 集)，不用 dedup_key】：
     歧义段里按源判会判出更多 True，之后集号身份一变（ambiguous_range 变了、_refold 折号），
     这个 True 就盖住整集，留下的那份一死就漏。粗键判出的 True 是 dedup_key 判出的子集，只会更保守。
+    【『不属于本季』的行】(E-77 C) t 本身是 → 恒 False：删一条别季的行永远不是"本季这一集不要了"；
+    兄弟里的别季行也不算"还剩一份"（它不占本季的集号）。
     """
+    if t.foreign_season:
+        return False
     return s.exec(select(AnimeTorrent.id).where(
         AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode,
-        AnimeTorrent.id != t.id, AnimeTorrent.status.in_(HAVE_STATUSES))).first() is None
+        AnimeTorrent.id != t.id, AnimeTorrent.foreign_season == False,   # noqa: E712
+        AnimeTorrent.status.in_(HAVE_STATUSES))).first() is None
 
 
 def _mark_user_deleted(s, t) -> None:
@@ -108,10 +119,12 @@ def _clear_stale_dropped(s, anime_id: int) -> None:
     """集号身份变了（并番搬行 / 折号展开）之后：该番里"该集已删"的行，所在那一集若已有一份（HAVE），清掉标记。
 
     并番时两边各自的 True 会盖住对方同集那份；折号会把一行挪进另一集 —— 那一集明明有货，标记却说"不要了"，
-    留下那份以后被清回待下 / 落 error 就再也补不回来。按粗键清，清多了只会多下。调用方负责 commit。"""
+    留下那份以后被清回待下 / 落 error 就再也补不回来。按粗键清，清多了只会多下。调用方负责 commit。
+    标了『不属于本季』的行不碰（E-77 C）：它的标记在标记期间本来就不起作用（_covered 不算它），留着是为了
+    用户撤销时原样恢复；而 _is_last_copy 对它恒 False，不跳过就会被顺手清掉。"""
     for t in s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id == anime_id, AnimeTorrent.status == "deleted",
-            AnimeTorrent.ep_dropped == True)):   # noqa: E712
+            AnimeTorrent.ep_dropped == True, AnimeTorrent.foreign_season == False)):   # noqa: E712
         if not _is_last_copy(s, t):
             t.ep_dropped = False
             s.add(t)
@@ -260,9 +273,12 @@ class _EpRow(NamedTuple):
 
     判据只读 `episode` 与 `release_time` 两个属性，所以全库扫的时候按列投影成它，
     不去建整行的 ORM 实体。字段名必须与 AnimeTorrent 一致——判据是同一份代码。
+    foreign_season（E-77 C）只给 `_binding_looks_wrong_rows` 剔『不属于本季』的行用；投影成 _EpRow 的调用方
+    要么在 SQL 里已经滤掉了这类行（suspect_wrong_binding），要么根本不问它（_slot_impostor），所以默认 False。
     """
     episode: float | None
     release_time: object
+    foreign_season: bool = False
 
 
 def _episode_cannot_belong(a, item) -> bool:
@@ -369,9 +385,13 @@ def _binding_looks_wrong_rows(a, rows) -> bool:
         逐部番各查一次是 N+1：真库 99 部番实测 120~155ms，而它跑在
         **同步的页面构建路径**上，30 秒的定时刷新还会再来一遍。
     判据只有这一份实现，两个形态都指向它——别把判据抄第二遍（见 tests/test_single_definition.py）。
+    【用户标了『不属于本季』的行不算证据】(E-77 C) 用户已经看过、说了"这批是别的季的"，绑定本身就是对的；
+    再拿它们报"绑定看着不对"只会让告警永远消不掉。剔在这一处，四个调用点（单部番 / 全库扫 / 锁源兜底 /
+    待确认原因回填）一起生效。
     """
     if a is None or a.bangumi_id is None:
         return False
+    rows = [t for t in rows if not t.foreign_season]
     if any(_episode_cannot_belong(a, t) for t in rows):
         return True
     # 【第二条判据：单集条目收到了多集正片】bgm 上一部作品常拆成很多条目——正片、
@@ -719,8 +739,11 @@ def suspect_wrong_binding() -> list[dict]:
         # 而这里本来就要扫全表，交给下面的 `if aid in wanted` 在 Python 侧筛更稳。
         wanted = {a.id for a in animes}
         by_anime: dict = {}
+        # 『不属于本季』的行（E-77 C）在 SQL 里就滤掉：判据（_binding_looks_wrong_rows）本来就不认它，
+        # 下面的 bad / trigger_eps 也不该再数它 —— 用户标完，这条告警就该自然消失。
         for aid, ep, rel in s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode,
-                                          AnimeTorrent.release_time)):
+                                          AnimeTorrent.release_time).where(
+                AnimeTorrent.foreign_season == False)):   # noqa: E712
             if aid in wanted:
                 by_anime.setdefault(aid, []).append(_EpRow(ep, rel))
         for a in animes:
@@ -1363,6 +1386,12 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False,
                 return False  # 已在下/已下：幂等短路（force 也不例外）。例外：已归档的可 force 重新下（重新交回 qB）
             if not force and t.status not in DOWNLOADABLE_STATUSES:
                 return False  # 非 force：只放行 pending/error；skipped/deleted 需 force 才强制下
+            # 【『不属于本季』的行永不自动下】(E-77 C) 兜底总闸：各自动/批量入口的候选里都已剔掉它，这里再挡一次，
+            # 免得哪条前置过滤漏改。与下面的放行前复核同口径：在 HAVE 去重之前、什么状态都不写、返回 False（不是 None，
+            # 别让批量补下因为一条别季行整批收手）。force（用户对准这一条点『下载』）不受影响。
+            if not force and t.foreign_season:
+                log.info("这条标了『不属于本季』，自动路径不下它，留在原状态 - #%s %s", torrent_id, t.raw_title)
+                return False
             # 【放行前按番此刻的偏好复核】(r39 D4) 调用方的候选是在 await 之前一次选好的，而每次交付最长 180 秒：
             # flush 一轮放行十几集的途中，用户改了锁定源 / 版本关键词、点了忽略或打回待确认，后面那些条目
             # 照旧按旧偏好下出去（下错组的那份盘上多一份，忽略了的番还在下）。这里在锁内、任何 await 之前再核一次。
@@ -1433,6 +1462,7 @@ async def _download_anime_torrent_inner(torrent_id: int, force: bool = False,
                 _dropped_any = s.exec(select(AnimeTorrent.id).where(
                     AnimeTorrent.anime_id == anime_id, AnimeTorrent.episode == episode,
                     AnimeTorrent.status == "deleted", AnimeTorrent.ep_dropped == True,   # noqa: E712
+                    AnimeTorrent.foreign_season == False,   # noqa: E712  别季行的标记不起作用（同 _covered）
                     AnimeTorrent.id != torrent_id,
                     *([AnimeTorrent.source == (t.source or "")] if (
                         _amb_f and _amb_f[0] < episode <= _amb_f[1]) else []),   # 分组同 dedup_key
@@ -1643,10 +1673,13 @@ def _revive_orphaned_skipped() -> None:
         # 只取判断要用的四列：这一段几乎是全表扫（error+skipped+已处理的全部状态），
         # 整行 ORM 装配的开销随 sent 行数线性增长，而下面只用到 (id, 番, 集, 状态)。
         # 真正要改写的那几行在下面按 id 单独取（通常只有个位数）。
+        # 『不属于本季』的行（E-77 C）整个不取：它不复活（永不自动下），它的 error/排除也不算"本季首选源不行了"。
+        # foreign_season 列仍要投影出来 —— 下面的 _covered 读它。
         rows = list(s.exec(select(AnimeTorrent.id, AnimeTorrent.anime_id,
                                   AnimeTorrent.episode, AnimeTorrent.status,
-                                  AnimeTorrent.source, AnimeTorrent.retry_count, AnimeTorrent.ep_dropped).where(
-            AnimeTorrent.anime_id.in_(auto_ids),
+                                  AnimeTorrent.source, AnimeTorrent.retry_count, AnimeTorrent.ep_dropped,
+                                  AnimeTorrent.foreign_season).where(
+            AnimeTorrent.anime_id.in_(auto_ids), AnimeTorrent.foreign_season == False,   # noqa: E712
             AnimeTorrent.status.in_(("error", "skipped", "excluded", "pending") + HANDLED_STATUSES))))
         # 【分组键必须与 flush 同口径：dedup_key，不是 (番, 集)】歧义段（O<T 的番在 (O,T] 上
         # 两套编号重叠）里，同一个集号在不同源下指的是【不同的集】——flush 正因如此才按
@@ -1780,6 +1813,7 @@ async def flush_ready_downloads(qb_alive: bool | None = None) -> int:
         for t in s.exec(select(*_PLAN_COLS).where(
                 AnimeTorrent.status == "pending",
                 AnimeTorrent.anime_id.in_(auto_ids),
+                AnimeTorrent.foreign_season == False,   # noqa: E712  『不属于本季』的永不自动下（E-77 C）
                 or_(AnimeTorrent.retry_at.is_(None), AnimeTorrent.retry_at <= now))):
             lock = pref_map.get(t.anime_id)
             if lock and lock != (t.source or ""):
@@ -1956,15 +1990,18 @@ def episode_progress(anime_ids) -> dict:
     return {aid: (len(have), len(seen)) for aid, (have, seen) in _episode_sets(anime_ids).items()}
 
 
-def _counts_as_seen(win, ep, status, rel) -> bool:
+def _counts_as_seen(win, ep, status, rel, foreign) -> bool:
     """这一行算不算"库里见过这一集"。_episode_sets（seen/have）与 _tail_anchors（缺集尾巴的锚点）只用它，
     保证 max(seen) 和锚点出自同一批行（两份口径一旦分家，锚点会对不上 max(seen) 那一集）。(r39 A8)
       · 正整数集号（小数集不计，理由同 episode_coverage）；
       · 不是人工排除的：排除了某集唯一的一份，这一集就该显示成缺（r38）；
-      · 不是占槽的别季行（_slot_impostor，r39 A6）。
+      · 不是占槽的别季行（_slot_impostor，r39 A6）；
+      · 不是用户标了『不属于本季』的行（foreign_season，E-77 C）—— 不论集号在不在 1..T 内都不算：
+        它们是别的季的集，算进 seen 只会让本季的缺集提示被超界集号的闸（missing_episodes 的 over）压掉。
+        只多报不少报（下齐判定走 episode_coverage，那边超界的别季行照旧计，理由见那里）。
     win 只读 total_episodes / air_date（Anime 或 _AnimeWin 都行）。"""
     return (isinstance(ep, (int, float)) and ep >= 1 and float(ep).is_integer()
-            and status != "excluded" and not _slot_impostor(win, _EpRow(ep, rel)))
+            and status != "excluded" and not foreign and not _slot_impostor(win, _EpRow(ep, rel)))
 
 
 def _episode_sets(anime_ids) -> dict:
@@ -1978,16 +2015,16 @@ def _episode_sets(anime_ids) -> dict:
         # 外连接：种子挂在已不存在的番 id 上时照旧计数（窗口全空 → 不剔），与改之前一致。
         rows = list(s.exec(select(
             AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.status, AnimeTorrent.release_time,
-            Anime.total_episodes, Anime.air_date)
+            AnimeTorrent.foreign_season, Anime.total_episodes, Anime.air_date)
             .join(Anime, Anime.id == AnimeTorrent.anime_id, isouter=True).where(
             AnimeTorrent.anime_id.in_(ids), AnimeTorrent.episode >= 1)))
     out: dict = {}
-    for aid, ep, status, rel, total, air in rows:
+    for aid, ep, status, rel, foreign, total, air in rows:
         if not (isinstance(ep, (int, float)) and float(ep).is_integer()):
             continue          # 小数集不计，理由同 episode_coverage
         have, seen = out.setdefault(aid, (set(), set()))
-        if not _counts_as_seen(_AnimeWin(total, air), ep, status, rel):
-            continue          # 人工排除的、占槽的别季行不算"见过"，见 _counts_as_seen
+        if not _counts_as_seen(_AnimeWin(total, air), ep, status, rel, foreign):
+            continue          # 人工排除的、占槽的别季行、标了不属于本季的不算"见过"，见 _counts_as_seen
         k = int(ep)
         seen.add(k)
         if status in HAVE_STATUSES:
@@ -2085,9 +2122,11 @@ def suspect_rerelease_collision() -> list[dict]:
         animes = {a.id: a for a in s.exec(select(Anime).options(_NO_SUMMARY).where(*subscribed_where()))}
         if not animes:
             return []
+        # 『不属于本季』的行（E-77 C）两侧都不取：它不占这一集（HAVE 侧），用户也已经认定它是别季的（待下侧再报一遍是噪音）
         rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.status,
                                   AnimeTorrent.release_time, AnimeTorrent.source).where(
-            AnimeTorrent.anime_id.in_(list(animes)), AnimeTorrent.episode >= 1)))
+            AnimeTorrent.anime_id.in_(list(animes)), AnimeTorrent.episode >= 1,
+            AnimeTorrent.foreign_season == False)))   # noqa: E712
     first_have: dict = {}
     for aid, ep, st, rt, _ in rows:
         if st in HAVE_STATUSES and rt is not None:
@@ -2191,11 +2230,11 @@ def _tail_anchors(wins: dict, his: dict) -> dict:
         return {}
     with get_session() as s:
         rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.status,
-                                  AnimeTorrent.release_time).where(
+                                  AnimeTorrent.release_time, AnimeTorrent.foreign_season).where(
             AnimeTorrent.anime_id.in_(ids), AnimeTorrent.episode.in_(sorted({float(h) for h in his.values()})))))
     out: dict = {}
-    for aid, ep, status, rel in rows:
-        if rel is None or ep != his.get(aid) or not _counts_as_seen(wins[aid], ep, status, rel):
+    for aid, ep, status, rel, foreign in rows:
+        if rel is None or ep != his.get(aid) or not _counts_as_seen(wins[aid], ep, status, rel, foreign):
             continue
         d = rel.date()
         if aid not in out or d < out[aid]:
@@ -2245,8 +2284,10 @@ def slot_held_gaps(gaps: dict) -> dict:
     但那条旧行多半已经 sent，下载闸 have_eps 照 R26『只报不改』仍认它是"这一集已有一份"：『自动补齐』拿回来的
     本季那一集被『同集已有』挡成待下、永远不下，补完它又算见过、缺集提示随即消失 —— 用户以为补好了，其实一集没下（漏集）。
     删掉旧行让出槽位也不行：E-73 按粗键判它是这一集最后一份，落成『该集已删』照样挡。所以这几集的提示（详情页横幅、
-    列表 tooltip、sweep_gaps 推送）不能再引导去点补齐，要先处理绑定。
+    列表 tooltip、sweep_gaps 推送）不能再引导去点补齐，要先把占槽的旧行标成『不属于本季』（或重绑）。
     只认真会挡住下载的那种占槽行（_COVERED_SQL：已有一份 / 该集已删）；占槽行还在待下/跳过时补齐照常有用，不算。
+    用户标了『不属于本季』的占槽行（E-77 C）不挡下载 —— _COVERED_SQL 本身就不认它，这里随之不算。
+    详情页横幅上的『标为不属于本季』按钮就是给这类缺集的出路（mark_slot_impostors_foreign）。
     按粗键 (番, 集) 看就够：有集号歧义段的番 episode_gaps 本来就不判（expected_aired 返回 None）。一条 SQL。"""
     want = {aid: set(eps) for aid, eps in gaps.items() if aid and eps}
     if not want:
@@ -2311,9 +2352,13 @@ def locked_out_episodes(animes, today=None, lag_days: int | None = None) -> dict
     now = today or datetime.now()
     sync = timedelta(days=config.ANIME_LOCK_SYNC_DAYS)
     with get_session() as s:
+        # 『不属于本季』的行（E-77 C）整个不取：锁定组的别季行不算它发过的集（不抬高 lock_max），
+        # 别的组的别季行也不是"被锁挡住的本季集"。foreign_season 照样投影 —— 下面的 _covered 读它。
         rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.source,
-                                  AnimeTorrent.status, AnimeTorrent.created_at, AnimeTorrent.ep_dropped).where(
-            AnimeTorrent.anime_id.in_(set(locked)), AnimeTorrent.episode >= 1)))
+                                  AnimeTorrent.status, AnimeTorrent.created_at, AnimeTorrent.ep_dropped,
+                                  AnimeTorrent.foreign_season).where(
+            AnimeTorrent.anime_id.in_(set(locked)), AnimeTorrent.episode >= 1,
+            AnimeTorrent.foreign_season == False)))   # noqa: E712
     by: dict = {}
     for r in rows:
         by.setdefault(r.anime_id, []).append(r)
@@ -2459,7 +2504,9 @@ def dropped_torrent_ids(ts) -> set:
     同一 dedup_key 组（歧义段带源）里有 deleted+ep_dropped 行、且一份都不在盘上（没有 HAVE 行）。
     后台任何自动路径都不再为这一集下别的版本，所以仪表盘不能再对它说『重试中』——那次重发永远不会发生。(r39 F14)
     只看正集待下行：-1/-2 在 live_status 里最先判（特别篇 / 未知集），走不到这一档。"""
-    cand = [t for t in ts if t.status == "pending" and t.anime_id and auto_downloadable_ep(t.episode)]
+    # HAVE 侧经 _COVERED_SQL 已不含『不属于本季』的行（E-77 C）；它们自己也不是"本季这一集"的待下行，不进候选
+    cand = [t for t in ts if t.status == "pending" and t.anime_id and auto_downloadable_ep(t.episode)
+            and not t.foreign_season]
     if not cand:
         return set()
     aids = {t.anime_id for t in cand}
@@ -2483,7 +2530,9 @@ def dropped_torrent_ids(ts) -> set:
 def locked_out_torrent_ids(ts) -> set:
     """给定一批种子行，挑出"被锁定源挡住"的那些 id：所属番已确认且锁了源、这条来自别的组、待下、
     集号在锁定源最大集号之后、这一集一份都没下过。与 pending_breakdown 的『锁源缺集』同一判据。一条 SQL。"""
-    cand = [t for t in ts if t.status == "pending" and t.anime_id and t.episode and t.episode >= 1]
+    # 『不属于本季』的待下行（E-77 C）不是"被锁挡住的本季集"，不进候选（与 locked_out_episodes 同口径）
+    cand = [t for t in ts if t.status == "pending" and t.anime_id and t.episode and t.episode >= 1
+            and not t.foreign_season]
     if not cand:
         return set()
     with get_session() as s:
@@ -2493,8 +2542,9 @@ def locked_out_torrent_ids(ts) -> set:
         if not locks:
             return set()
         rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.source,
-                                  AnimeTorrent.status, AnimeTorrent.ep_dropped).where(
-            AnimeTorrent.anime_id.in_(set(locks)), AnimeTorrent.episode >= 1)))
+                                  AnimeTorrent.status, AnimeTorrent.ep_dropped, AnimeTorrent.foreign_season).where(
+            AnimeTorrent.anime_id.in_(set(locks)), AnimeTorrent.episode >= 1,
+            AnimeTorrent.foreign_season == False)))   # noqa: E712  锁定组的别季行不算它发过的集（E-77 C）
     lock_eps: dict = {}
     have: dict = {}
     for r in rows:
@@ -2556,6 +2606,9 @@ def episode_coverage(anime_ids) -> dict:
     取整行会把整张种子历史装配成 ORM 对象。
     【占槽的别季行不计】(r39 A6) 见 _slot_impostor：第一季的旧正片占满本季 1..T，会把才播 8 集的番判成下齐。
     只剔 1..T 内的，所以 is_finished 只可能从 True 变 False（撤销是安全方向）；超界行照旧计入，两套编号闸照常生效。
+    【用户标了『不属于本季』的行同理】(E-77 C) 也只剔 1..T 内的：它们不占本季的集号，不该把本季凑成下齐；
+    而超界的别季行剔掉会让 _coverage_has_two_numberings 少数几个超界集号，is_finished 可能从 False 翻成 True
+    （开了停订就停掉一部还在播的番）—— 那是不安全的方向，所以照旧计入。代价只是"判不了下齐"，与两套编号同一处理。
     要逐行看 release_time，所以不再 distinct；番侧窗口 join 一次取齐（外连接，理由同 _episode_sets）。
     """
     ids = {i for i in anime_ids if i}
@@ -2563,19 +2616,22 @@ def episode_coverage(anime_ids) -> dict:
         return {}
     with get_session() as s:
         rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.release_time,
-                                  Anime.total_episodes, Anime.air_date)
+                                  AnimeTorrent.foreign_season, Anime.total_episodes, Anime.air_date)
                            .join(Anime, Anime.id == AnimeTorrent.anime_id, isouter=True).where(
             AnimeTorrent.anime_id.in_(ids),
             AnimeTorrent.status.in_(HAVE_STATUSES),
             AnimeTorrent.qb_progress >= 1.0,
             AnimeTorrent.episode >= 1)))
     out: dict = {}
-    for aid, ep, rel, total, air in rows:
+    for aid, ep, rel, foreign, total, air in rows:
         # 小数集（11.5 插入话）不计：bgm 的 total_episodes 不含它，计进去会让 12 集番
         # "凑够 12 个集号"却其实缺一整集。整数判断放 Python 侧：SQLite 的 floor()
         # 要编译期开关才有，不可移植。
-        if (isinstance(ep, (int, float)) and float(ep).is_integer()
-                and not _slot_impostor(_AnimeWin(total, air), _EpRow(ep, rel))):
+        if not (isinstance(ep, (int, float)) and float(ep).is_integer()):
+            continue
+        if foreign and ep <= (total or 0):
+            continue          # 标了不属于本季、落在 1..T 内：不计（超界的照旧计，理由见上）
+        if not _slot_impostor(_AnimeWin(total, air), _EpRow(ep, rel)):
             out.setdefault(aid, set()).add(int(ep))
     return out
 
@@ -3080,8 +3136,8 @@ async def sweep_gaps() -> int:
             parts.append(f"缺第 {ep_ranges(free)} 集 —— 按开播日早该播了，库里一条种子都没有"
                          "（采集停过一阵、或锁定的源断更都会这样）。去详情页点『自动补齐』")
         if h:
-            parts.append(f"缺第 {ep_ranges(h)} 集 —— 这几集的槽位被别的季的旧种子占着，补齐也下不了，"
-                         "先处理绑定（看『绑定看着不对』）")
+            parts.append(f"缺第 {ep_ranges(h)} 集 —— 这几集的槽位被别的季的旧种子占着，补齐也下不了。"
+                         "去详情页点『把占槽的旧种子标为不属于本季』（文件不动），本季这几集就会照常下")
         msg = f"{display_of(a)}：" + "；".join(parts)
         if await notify_event("gap", msg, key=f"{a.id}:{','.join(str(e) for e in miss)}", cooldown=config.ALERT_REPEAT_DAYS * 86400):
             n += 1
@@ -3176,7 +3232,8 @@ async def sweep_alerts() -> dict:
         ok = await notify_event(
             "backlog",
             "有 %d 部番的 bgm 绑定看着不对（集号不可能属于所绑的那一季）：%s。"
-            "去详情页核对绑定，或删掉那批不属于本季的种子" % (
+            "去详情页核对绑定；那批种子确实是别的季的，就在详情页把它们标为『不属于本季』"
+            "（文件不动；别删，删掉会被当成这一集不要了）" % (
                 len(suspects), "、".join(f"#{x['id']}「{x['name']}」({x['bad']} 条)"
                                         for x in suspects[:4])),
             key=_wb_key, cooldown=six_h)
@@ -3325,8 +3382,11 @@ def episode_numbering_conflict(anime_id: int) -> list:
         # 学到 offset 之前入库的绝对编号行不会自动变，于是"学到 offset"这件事本身
         # 反而把人工兜底提示永久关掉了。现在存量行会被 _refold_absolute_episodes 回折，
         # 而这里继续按【实际集号分布】判，才兜得住回折判据覆盖不到的残留。
+        # 『不属于本季』的行（E-77 C）不算：用户已经认定它们是别的季的集，不是本番的另一套编号
         eps = {t.episode for t in s.exec(
-            select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)) if t.episode and t.episode >= 1}
+            select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id,
+                                       AnimeTorrent.foreign_season == False))   # noqa: E712
+               if t.episode and t.episode >= 1}
     over = sorted(e for e in eps if e > a.total_episodes)
     within = [e for e in eps if e <= a.total_episodes]
     return over if (over and within) else []
@@ -3348,8 +3408,10 @@ def episode_ranges_by_source(anime_id: int) -> list[tuple]:
     与其给一个 6/8 情况下说假话的断言，不如把事实摆出来让人判断。
     """
     with get_session() as s:
+        # 与 episode_numbering_conflict 同口径：『不属于本季』的行（E-77 C）不算（这一份就是给那条横幅当证据的）
         rows = s.exec(select(AnimeTorrent.source, AnimeTorrent.episode).where(
-            AnimeTorrent.anime_id == anime_id, AnimeTorrent.episode >= 1)).all()
+            AnimeTorrent.anime_id == anime_id, AnimeTorrent.episode >= 1,
+            AnimeTorrent.foreign_season == False)).all()   # noqa: E712
     by: dict = {}
     for src, ep in rows:
         by.setdefault(src or "?", set()).add(ep)
@@ -4065,6 +4127,11 @@ def _download_candidates(rows: list, pref: str | None = None, have_eps: set | No
     for t in rows:
         if not auto_downloadable_ep(t.episode):
             continue
+        # 『不属于本季』的行（E-77 C）不是本季的候选：补下 / 计划 / 锁源缺集『只补这几集』都不挑它。
+        # getattr：真实调用方喂的是整行 ORM 或 _PLAN_COLS 投影（都带这一列）；兜底只给只造了几列的用例替身
+        # （同 engine.pick_order 对 retry_count 的写法）。漏了也只是标注偏一条，交付里的非 force 总闸照样挡下。
+        if getattr(t, "foreign_season", False):
+            continue
         k = dedup_key(amb, 0, t.episode, t.source)[1:]   # 单番内不必带 anime_id
         if k in have:
             continue
@@ -4120,10 +4187,11 @@ async def _download_pending_for_anime_inner(anime_id: int) -> int:
 # Row 支持属性访问，所以 _download_candidates / pick_order 里仍旧是 t.episode、t.priority 这样用，无需改动。
 # 【下游要用新字段时，必须同步加到这里】——漏了会在运行时抛 AttributeError。
 # ep_dropped(E-73)：download_plan 用 _covered 判"该集已删"要它。
+# foreign_season(E-77 C)：_covered 与 _download_candidates 都读它（不属于本季的不占位、也不当候选）。
 _PLAN_COLS = (AnimeTorrent.id, AnimeTorrent.anime_id, AnimeTorrent.status, AnimeTorrent.episode,
               AnimeTorrent.source, AnimeTorrent.raw_title, AnimeTorrent.priority,
               AnimeTorrent.created_at, AnimeTorrent.retry_count, AnimeTorrent.retry_at,
-              AnimeTorrent.ep_dropped)
+              AnimeTorrent.ep_dropped, AnimeTorrent.foreign_season)
 
 
 def _retry_ready(t, now) -> bool:
@@ -4268,7 +4336,8 @@ def pending_breakdown() -> dict:
               但不用处理（要就到详情页对准那一条点『下载』），所以与未知集分开，只作提示、不进待办。
               两类都【最先判】：否则会掉进『备用项』，而那张卡的说明是『同集已有更优版本』，纯属误导。
     · 将下载 = 已确认番·本集首选（download_plan 会挑中，会自动下；只有正集会被标）
-    · 备用   = 已确认番·同集已有更优版本，或该集已人工删除（E-73，不会自动下）；含已拒绝番/孤儿的残留
+    · 备用   = 已确认番·同集已有更优版本，或该集已人工删除（E-73，不会自动下），或标了『不属于本季』（E-77 C，
+              不会自动下）；含已拒绝番/孤儿的残留
     · 待确认 = 番还没确认（要点确认才下）；集号 -2 的已归入『未知』，不重复计
     · 已下齐·停订 = 番已按 bgm 总集数下齐且开了停订（不会自动下）——【必须单列】，否则它们会掉进『备用项』，
               而那张卡的说明是"同集已有更优版本"，纯属误导。
@@ -4280,11 +4349,14 @@ def pending_breakdown() -> dict:
             select(Anime.id, Anime.confirmed, Anime.finished_at, Anime.pref_source)
             .where(Anime.rejected.is_not(True)))}
         pend = list(s.exec(select(AnimeTorrent.id, AnimeTorrent.anime_id, AnimeTorrent.episode,
-                                  AnimeTorrent.source).where(AnimeTorrent.status == "pending")))
+                                  AnimeTorrent.source, AnimeTorrent.foreign_season).where(
+            AnimeTorrent.status == "pending")))
         locked_ids = {aid for aid, (c, _, lock) in conf.items() if c and lock}
+        # 锁定组的『不属于本季』行（E-77 C）不算它发过的集，与 locked_out_episodes / locked_out_torrent_ids 同口径
         lrows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.source,
-                                   AnimeTorrent.status, AnimeTorrent.ep_dropped).where(
-            AnimeTorrent.anime_id.in_(locked_ids), AnimeTorrent.episode >= 1))) if locked_ids else []
+                                   AnimeTorrent.status, AnimeTorrent.ep_dropped, AnimeTorrent.foreign_season).where(
+            AnimeTorrent.anime_id.in_(locked_ids), AnimeTorrent.episode >= 1,
+            AnimeTorrent.foreign_season == False))) if locked_ids else []   # noqa: E712
     lock_eps: dict = {}
     have: dict = {}
     for r in lrows:
@@ -4297,7 +4369,7 @@ def pending_breakdown() -> dict:
     sw = single_work_ids()
     will = backup = unconfirmed = unknown = special = finished = locked = 0
     unsub = config.ANIME_FINISH_UNSUB
-    for tid, aid, ep, src in pend:
+    for tid, aid, ep, src, foreign in pend:
         row = conf.get(aid)
         c = row[0] if row else None
         if not auto_downloadable_ep(ep):   # 特别篇/未知集最先判：不论番确不确认，后台都不自动下。
@@ -4313,9 +4385,10 @@ def pending_breakdown() -> dict:
             finished += 1
         elif tid in plan:        # 已确认·本集首选（只有正集进得了 plan）
             will += 1
-        elif (row[2] and (src or "") != row[2] and _lock_blocks(ep, lock_eps.get(aid, set()), lock_max.get(aid, 0))
+        elif (row[2] and not foreign and (src or "") != row[2]
+              and _lock_blocks(ep, lock_eps.get(aid, set()), lock_max.get(aid, 0))
               and ep not in have.get(aid, ())):
-            locked += 1          # 已确认·被锁定源挡住、这一集一份都没有
+            locked += 1          # 已确认·被锁定源挡住、这一集一份都没有（『不属于本季』的不算，落『备用项』）
         else:                    # 已确认·非首选（同集有更优）
             backup += 1
     return {"will": will, "backup": backup, "unconfirmed": unconfirmed,
@@ -4474,6 +4547,116 @@ def unexclude_torrent(torrent_id: int) -> bool:
     return engine.unexclude_torrent(AnimeTorrent, torrent_id)
 
 
+# ---------------- 『不属于本季』（E-77 方案 C，foreign_season）----------------
+# 续季下面挂着前一季的旧正片（#6 第三季挂了第一季的 '- 01..24'），占住本季 1..T 的集号：集去重把它们算"这一集已有"，
+# 本季真正的那几集永远下不下来；删掉又会被 E-73 判成"该集已删"照样挡。标成『不属于本季』之后这一行对本番的集号逻辑
+# "不存在"（_covered / _is_last_copy / 巡检 / 绑定可疑都不认它），文件和行都在。
+# 【只能由用户点按钮产生】下面两个函数只给详情页调；后台任何路径都不许自己打这个标记 —— 判错了就是把本季正片当成
+# 别季的、让同一集再下一份（不致命），但"自动化替用户认定哪批是别季的"正是本项目最忌讳的误判。
+
+def _foreign_markable(a, t) -> bool:
+    """『把占槽的旧种子标为不属于本季』会标的行：占槽别季行（_slot_impostor）、还没标、不在交付中。
+    mark_slot_impostors_foreign 与详情页横幅按钮上报的条数共用这一个判据，两边数出来的必须是同一批。"""
+    return not t.foreign_season and t.status != "downloading" and _slot_impostor(a, t)
+
+
+def foreign_season_suspect(a, t) -> bool:
+    """详情页给不给这一条『不属于本季』按钮：看着像别季的正集才给（按钮只是入口，标不标由人定）。
+
+    · 占槽别季行（_slot_impostor）；或
+    · 解析出的季号与本番不同，【并且】发布早于本季首播减 ANIME_BACKFILL_PREAIR_DAYS 天（与补齐"开播前这么多天
+      以前的当成前几季"同一个口径）。只看季号不够：很多组发续作不写季号、标题解析成第 1 季，生产 #6 就有本季播出期间
+      发布、季号解析成 1 的本季正片 —— 给它们按钮只会招来误点（标错了就是本季那一集再下一份）。"""
+    if t.episode is None or t.episode < 1:
+        return False
+    if _slot_impostor(a, t):
+        return True
+    d = _parse_date(a.air_date or "")
+    if not (d and t.release_time and t.season and a.season and t.season != a.season):
+        return False
+    return t.release_time.date() < d - timedelta(days=max(0, config.ANIME_BACKFILL_PREAIR_DAYS))
+
+
+def _release_freed_slots(s, a, eps) -> int:
+    """刚标成『不属于本季』的行让出了 eps 这几个集号：这几集因此没有着落了的，把被同集闸压成 skipped 的兄弟放回待下。
+    返回放回的条数。调用方负责 commit。
+
+    【为什么必须做】(#6 的真实形状) 本季的第 9~12 集早就入了库，却被即时同集闸当场落成 skipped（槽位上有第一季的 sent）。
+    flush / 补下 / 计划只挑 pending（补下还挑 error），换源兜底只在组里有失败行时才复活 skipped —— 不放回的话，
+    标完"本季那一集会照常自动下载"就是一句假话，漏集照旧。
+    【只放回真没着落的】判据就是 _covered（标完的别季行已经不算），分组键 dedup_key，与 restore_anime 同口径：
+    同集还有别的本季份（已下 / 在下 / 停滞 / 该集已删）的不放；放回的也只是候选，每集照旧只下一份。
+    skipped 只有两个来源：即时同集闸、忽略本番（reject_anime）。已忽略的番不放回 —— 那是用户自己压下去的，
+    恢复订阅（restore_anime，同一判据）时自然会放回来。
+    【认得出是别季的不放回，哪怕还没标】逐条按钮只标了一行时，同一集里别的组发的前一季旧集多半也躺在 skipped 里；
+    放回去的话 flush 可能正好挑中它，把前一季的内容又下进本季这个槽位（错内容占槽 = 本季那一集照样下不来）。"""
+    if a is None or a.rejected or not eps:
+        return 0
+    rows = list(s.exec(select(AnimeTorrent).where(
+        AnimeTorrent.anime_id == a.id, AnimeTorrent.episode.in_(sorted({float(e) for e in eps})))))
+    amb = ambiguous_range(a)
+    have = {dedup_key(amb, 0, t.episode, t.source)[1:] for t in rows if _covered(t)}
+    n = 0
+    for t in rows:
+        if (t.status == "skipped" and not t.foreign_season and not _slot_impostor(a, t)
+                and dedup_key(amb, 0, t.episode, t.source)[1:] not in have):
+            t.status = "pending"
+            s.add(t)
+            n += 1
+    return n
+
+
+def set_foreign_season(torrent_id: int, flag: bool) -> bool:
+    """详情页那一条的『不属于本季』（flag=True）/『撤销』（flag=False）。返回是否改了（已经是这个值返回 False）。
+
+    · 只许标正集（episode ≥ 1）：特别篇 / 未知集本来就不占集号、不自动下，标了没有意义。
+      撤销不看集号 —— 标完之后待下行的集号还能改（set_torrent_episode），别让它撤不回来。
+    · 交付中（downloading）的不动：占位协程回写时不该撞上标记翻转，等它落定再点。
+    · 标上时顺手放回本季这一集被压成 skipped 的兄弟（_release_freed_slots），本季那一集才会真的照常自动下。
+    · 撤销只翻回这一列：它重新占位，本季那一集若还没下，下一轮起又会被它挡住（标记期间下到的那份留着，不删）。
+      ep_dropped 等其它列在标记期间没被动过（_clear_stale_dropped 跳过别季行），所以撤销是原样恢复。"""
+    flag = bool(flag)
+    with get_session() as s:
+        t = s.get(AnimeTorrent, torrent_id)
+        if t is None or t.status == "downloading" or bool(t.foreign_season) == flag:
+            return False
+        if flag and not (isinstance(t.episode, (int, float)) and t.episode >= 1):
+            return False
+        t.foreign_season = flag
+        s.add(t)
+        freed = 0
+        if flag:
+            s.flush()
+            freed = _release_freed_slots(s, s.get(Anime, t.anime_id) if t.anime_id else None, {t.episode})
+        s.commit()
+        log.info("%s『不属于本季』- #%s %s%s", "标为" if flag else "撤销", torrent_id, t.raw_title,
+                 f"（本季同集 {freed} 条跳过的放回待下）" if freed else "")
+    return True
+
+
+def mark_slot_impostors_foreign(anime_id: int) -> int:
+    """详情页『把占槽的 N 条旧种子标为不属于本季』：该番所有 _foreign_markable 的行一次标上。返回标了几条（幂等：再点一次是 0）。
+    只标 _slot_impostor 认得出的那一类（集号在 1..T 内、发布比本季首播早 T+26 周以上）—— 判据宁严勿宽，
+    认不出的（比如没有发布时间的）留给逐条的按钮由人去点。标完同 set_foreign_season 放回让出的那几集的 skipped 兄弟。"""
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is None:
+            return 0
+        marked = [t for t in s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id))
+                  if _foreign_markable(a, t)]
+        if not marked:
+            return 0
+        for t in marked:
+            t.foreign_season = True
+            s.add(t)
+        s.flush()
+        freed = _release_freed_slots(s, a, {t.episode for t in marked})
+        s.commit()
+        log.info("把 %d 条占槽的旧种子标为『不属于本季』- %s（第 %s 集%s）", len(marked), display_of(a),
+                 ep_ranges({t.episode for t in marked}), f"；本季同集 {freed} 条跳过的放回待下" if freed else "")
+    return len(marked)
+
+
 # ---------------- 修正版替换（同一个组重发的 v2、v3…）----------------
 # 【为什么要有它】集去重是"一集只下一份"：v1 下过之后，同组的 v2 进来只会被当成备用项、永远不下
 # （真库：学生会也有洞 第 4 集，ANi 发了 V2，被判成 skipped）。字幕组重发修正版是因为 v1 有错（时间轴、错字、
@@ -4533,6 +4716,7 @@ async def deliver_single_works(qb_alive: bool | None = None) -> int:
                 log.info("单部作品像是剧场版，没下、打回待确认等你决定 - %s", display_of(a))
                 continue
             cands = [t for t in rs if t.status == "pending" and t.episode == -2 and t.info_hash not in movie_have
+                     and not t.foreign_season   # 『不属于本季』只能标在正集上，这里只是与别的入口同口径（E-77 C）
                      and t.created_at and t.created_at <= now - grace and _retry_ready(t, now)]
             if a.pref_source:
                 cands = [t for t in cands if (t.source or "") == a.pref_source]
@@ -4635,7 +4819,10 @@ def lock_fallback_plan(today=None, extra_gaps=None, sources_failing: bool = Fals
     if not animes:
         return {}
     with get_session() as s:
-        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id.in_([a.id for a in animes]))))
+        # 『不属于本季』的行（E-77 C）整个不取：不当候选、不算锁定组发过的集（lock_at / rel）、
+        # 不当发布时间单调 / 一致两道闸的证据、也不算"绑定看着不对"的证据（与 locked_out_episodes 同口径）
+        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id.in_([a.id for a in animes]),
+                                                      AnimeTorrent.foreign_season == False)))   # noqa: E712
     gaps = list(health.gaps()) + list(extra_gaps or [])
     by: dict = {}
     for r in rows:
@@ -4689,8 +4876,11 @@ def _lock_catchup_plan(now=None) -> dict:
     now = now or datetime.now()
     grace = timedelta(minutes=max(0, config.ANIME_DOWNLOAD_GRACE_MIN))
     with get_session() as s:
+        # 『不属于本季』的行（E-77 C）两头都不取：标成别季的兜底那份不再算"这一集是兜底来的"（本季那一集
+        # 没有着落，锁定组的版本由 flush 照常下，用不着 force）；锁定组的别季行也不是候选、不挡 A 步
         fb = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.source).where(
-            AnimeTorrent.lock_fallback == True, AnimeTorrent.status.in_(HAVE_STATUSES))))   # noqa: E712
+            AnimeTorrent.lock_fallback == True, AnimeTorrent.status.in_(HAVE_STATUSES),   # noqa: E712
+            AnimeTorrent.foreign_season == False)))   # noqa: E712
         if not fb:
             return {}
         animes = {a.id: a for a in s.exec(select(Anime).options(_NO_SUMMARY).where(
@@ -4699,7 +4889,7 @@ def _lock_catchup_plan(now=None) -> dict:
         if not animes:
             return {}
         rows = list(s.exec(select(AnimeTorrent).where(
-            AnimeTorrent.anime_id.in_(list(animes)),
+            AnimeTorrent.anime_id.in_(list(animes)), AnimeTorrent.foreign_season == False,   # noqa: E712
             AnimeTorrent.episode.in_({r.episode for r in fb if r.anime_id in animes}))))
     fb_src: dict = {}
     for r in fb:
@@ -4734,17 +4924,22 @@ def _lock_fallback_ok(tid: int, lock: str, kw: str, *, catchup: bool, fb_days: i
         a = s.get(Anime, t.anime_id) if t is not None else None
         if t is None or not is_subscribed(a) or (a.pref_source or "") != lock or (a.pref_keyword or "") != kw:
             return False
+        if t.foreign_season:
+            return False          # 交付期间被标成『不属于本季』（E-77 C）：两步都不下它（A 步走 force，交付里的总闸挡不住）
         if not catchup:
             return (t.status == "pending" and (t.source or "") != lock
                     and fb_days > 0 and config.ANIME_LOCK_FALLBACK_DAYS == fb_days)
         if t.status not in ("pending", "skipped") or (t.source or "") != lock:
             return False
+        # 下面三问都不认『不属于本季』的行（E-77 C），与 _lock_catchup_plan 同口径
         if s.exec(select(AnimeTorrent.id).where(
                 AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode, AnimeTorrent.source == lock,
+                AnimeTorrent.foreign_season == False,   # noqa: E712
                 AnimeTorrent.status.in_(HAVE_STATUSES + MANUAL_TERMINAL_STATUSES))).first() is not None:
             return False
         # A 步的范围没有集号歧义段（_lock_catchup_plan 已排除），按 (番, 集) 判就是 dedup_key 那一组
-        same_ep = (AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode)
+        same_ep = (AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode,
+                   AnimeTorrent.foreign_season == False)   # noqa: E712
         if s.exec(select(AnimeTorrent.id).where(
                 *same_ep, AnimeTorrent.status == "deleted", AnimeTorrent.ep_dropped == True)).first() is not None:   # noqa: E712
             return False
@@ -4850,8 +5045,11 @@ async def _deliver_new_versions() -> int:
         auto = {a.id: a for a in s.exec(select(Anime).where(*subscribed_where()))}
         if not auto:
             return 0
+        # 『不属于本季』的行（E-77 C）两头都不认：别季的 v2 不自动下（这里走 force，交付里的总闸挡不住），
+        # 别季的旧版也不当成"我们那份"去替换 —— 别季的内容不替用户做主
         cands = [t for t in s.exec(select(AnimeTorrent).where(
             AnimeTorrent.anime_id.in_(list(auto)), AnimeTorrent.status.in_(("pending", "skipped")),
+            AnimeTorrent.foreign_season == False,   # noqa: E712
             AnimeTorrent.created_at <= now - grace))
             if auto_downloadable_ep(t.episode) and parse_version(t.raw_title) >= 2
             and _retry_ready(t, now)]           # 取种失败在退避排队的不抢跑（同 flush）
@@ -4860,7 +5058,8 @@ async def _deliver_new_versions() -> int:
         keys = {(t.anime_id, t.episode) for t in cands}
         have: dict = {}
         for t in s.exec(select(AnimeTorrent).where(
-                AnimeTorrent.anime_id.in_({k[0] for k in keys}), AnimeTorrent.status.in_(HAVE_STATUSES))):
+                AnimeTorrent.anime_id.in_({k[0] for k in keys}), AnimeTorrent.status.in_(HAVE_STATUSES),
+                AnimeTorrent.foreign_season == False)):   # noqa: E712
             if (t.anime_id, t.episode) in keys:
                 have.setdefault((t.anime_id, t.episode, t.source), []).append(t)
         groups: dict = {}
@@ -4904,18 +5103,20 @@ def _version_pick_ok(tid: int) -> bool:
     订阅 / 锁定 / 关键词由交付里的 prefs_gate=True 复核，这里不重复。"""
     with get_session() as s:
         t = s.get(AnimeTorrent, tid)
-        if t is None or t.status not in ("pending", "skipped"):
-            return False
+        if t is None or t.status not in ("pending", "skipped") or t.foreign_season:
+            return False      # foreign：窗口期里被标成『不属于本季』（E-77 C），同 _deliver_new_versions 不下它
         v = parse_version(t.raw_title)
         if not any(parse_version(o.raw_title) < v and _replaceable(o, t) for o in s.exec(select(AnimeTorrent).where(
                 AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode,
                 AnimeTorrent.source == t.source, AnimeTorrent.id != t.id,
+                AnimeTorrent.foreign_season == False,   # noqa: E712  别季的旧版不算（E-77 C）
                 AnimeTorrent.status.in_(HAVE_STATUSES), AnimeTorrent.archived_at.is_(None)))):
             return False
         amb = ambiguous_range(s.get(Anime, t.anime_id)) if t.anime_id else None
         return s.exec(select(AnimeTorrent.id).where(
             AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode,
             AnimeTorrent.status == "deleted", AnimeTorrent.ep_dropped == True,   # noqa: E712
+            AnimeTorrent.foreign_season == False,   # noqa: E712
             *([AnimeTorrent.source == (t.source or "")] if (
                 amb and amb[0] < t.episode <= amb[1]) else []),   # 分组同 dedup_key（同 download_anime_torrent 的 _dropped_any）
         )).first() is None
@@ -4926,8 +5127,10 @@ async def _retire_old_versions() -> int:
     新旧两版是同一个文件（qB 原地覆盖）时只删种子、不删文件——否则删掉的就是新版。"""
     jobs: list[tuple[int, str, int, list[tuple[int, str, str | None]]]] = []
     with get_session() as s:
+        # 『不属于本季』的行（E-77 C）两头都不认：别季的新版不拿来顶掉本季那份，别季的旧版也不自动删
         news = [t for t in s.exec(select(AnimeTorrent).where(
-            AnimeTorrent.status == "sent", AnimeTorrent.qb_progress >= 1.0 - 1e-9))
+            AnimeTorrent.status == "sent", AnimeTorrent.qb_progress >= 1.0 - 1e-9,
+            AnimeTorrent.foreign_season == False))   # noqa: E712
             if parse_version(t.raw_title) >= 2 and auto_downloadable_ep(t.episode)]
         if not news:
             return 0
@@ -4936,6 +5139,7 @@ async def _retire_old_versions() -> int:
             olds = [(o.id, o.info_hash, o.content_path) for o in s.exec(select(AnimeTorrent).where(
                 AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode,
                 AnimeTorrent.source == t.source, AnimeTorrent.id != t.id,
+                AnimeTorrent.foreign_season == False,   # noqa: E712
                 AnimeTorrent.status.in_(("sent", "stalled")),       # 交付中的（downloading）不碰
                 AnimeTorrent.archived_at.is_(None)))
                 if parse_version(o.raw_title) < v and _replaceable(o, t)]
@@ -5193,8 +5397,9 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
     # 【不看第一轮有没有搜到这一集】第一轮里可能只搜到了这一集的生肉/英文字幕版，真正要的版本还在后面几页。
     # 最多补 ANIME_BACKFILL_EXTRA_EPS 集（默认 4，0=不补搜）、只用前两个搜索名，免得请求数翻几倍。
     # 占槽的别季行（_slot_impostor，r39 A6）不算见过：第三季的 9..12 被第一季旧行占着时也要补搜。只会多搜几集，不改入库判据。
+    # 标了『不属于本季』的（E-77 C）同样不算见过（与 _counts_as_seen 同口径）。
     seen_eps = {int(t.episode) for t in rows if t.episode and t.episode >= 1 and float(t.episode).is_integer()
-                and not _slot_impostor(a, t)}
+                and not t.foreign_season and not _slot_impostor(a, t)}
     extra = missing_episodes(a, seen_eps)[:config.ANIME_BACKFILL_EXTRA_EPS]
     if extra:
         more = [_fetch_one(site_, f"{q} {e:02d}") for site_ in search_sites for q in queries[:2] for e in extra]
@@ -5355,7 +5560,8 @@ async def _download_new_rows(anime_id: int, row_ids: list, kw: str | None = None
     by_ep: dict = {}
     for t in rows:
         k = dedup_key(amb, 0, t.episode, t.source)[1:]
-        if not auto_downloadable_ep(t.episode) or k in have:
+        # 刚入库的行不会带『不属于本季』；剔掉它只为与别的自动入口同口径（E-77 C，交付里的非 force 总闸照样会挡）
+        if not auto_downloadable_ep(t.episode) or k in have or t.foreign_season:
             continue
         if strict_kw and kw and not _kw_match(kw, t.raw_title):
             continue
@@ -5396,7 +5602,9 @@ def locked_out_candidates(anime_id: int) -> dict:
         lock = a.pref_source
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
     amb = ambiguous_range(a)
-    lock_eps = {t.episode for t in rows if (t.source or "") == lock and t.episode and t.episode > 0}
+    # 锁定组的『不属于本季』行（E-77 C）不算它发过的集，与 locked_out_episodes 同口径；候选里的别季行由 _download_candidates 剔掉
+    lock_eps = {t.episode for t in rows if (t.source or "") == lock and t.episode and t.episode > 0
+                and not t.foreign_season}
     lock_max = max(lock_eps, default=0)
     have = {dedup_key(amb, 0, t.episode, t.source)[1:] for t in rows if _covered(t)}   # 含该集已删(E-73)
     cands = [t for t in rows if t.status in DOWNLOADABLE_STATUSES and (t.source or "") != lock
@@ -5495,7 +5703,7 @@ def anime_split_count(before: dict) -> tuple[int, int, int]:
 async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
     """把该番已下/在下/停滞的种子移到当前归档目录（改季度/重绑后调用；调用方应已落新 a.quarter/名/季号）。
     实现见 engine.relocate（两条线共用）。返回 {new_path, old_path, moved, redownload, redownload_dirs,
-    stalled_dirs, untracked, in_place, failed, stalled_kept, special_kept, delivering, fail_code?, error?}，
+    stalled_dirs, untracked, in_place, failed, stalled_kept, special_kept, foreign_kept, delivering, fail_code?, error?}，
     各键含义以 engine.relocate 的 docstring 为准。
     页面入口：整段登记在途，理由见 `engine.in_flight`（跨 await 的那段在 engine.relocate 里：
     读 (id, hash) → await setLocation → 按 id 写 save_path）。(R33 对抗审计补)"""
