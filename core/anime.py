@@ -447,6 +447,12 @@ async def _resolve_anime(item) -> int:
                             item.release_time.date() if item.release_time else "?")
             elif _aired_before_start(anime.air_date):
                 anime.confirmed, anime.rejected = False, True   # 早于开始使用日 → 超期忽略，不自动下（种子照常入库）
+            elif auto and _movie_like(s, anime, item.info_hash):
+                # 混进番剧表的剧场版：剧场版逐版本人工点下，别自动追，放进待确认等人看（理由见 _movie_like）
+                anime.confirmed, anime.rejected = False, False
+                anime.confirm_reason = "movie"
+                log.info("像是剧场版（%s），不自动追、留待确认：%s", anime.platform or "剧场版表里也有",
+                         item.anime_title)
             if misfit is not None:
                 anime.confirmed, anime.rejected = False, False
                 anime.confirm_reason = "wrong_season"
@@ -635,6 +641,25 @@ def suspect_wrong_binding() -> list[dict]:
                         "bad": len(bad), "born": a.created_at, "trigger_eps": _trigger,
                         "eps": sorted(_bad_eps)[:8]})
     return out
+
+
+def _movie_like(s, a, extra_hash: str | None = None) -> bool:
+    """这条番剧记录像不像一部【混进番剧表的剧场版】：bgm 说它是剧场版、同一个 bgm 在剧场版表里也有一条、
+    或它的种子（含正要入库的 extra_hash）剧场版表也收了。
+
+    剧场版是"逐版本人工点下"的（见 config.ANIME_START_DATE 那条产品决定）。像剧场版的番不自动追，
+    放进『待确认·像是剧场版』让人决定 —— 不是静默跳过：要在番剧表里下就点确认（单部作品会自动挑一份），
+    想放剧场版目录就去剧场版页下。后两种判据还是 E-52 那个形状（两张表各交付同一个 hash）。"""
+    if (a.platform or "") == "剧场版":
+        return True
+    if a.bangumi_id is not None and s.exec(
+            select(Movie.id).where(Movie.bangumi_id == a.bangumi_id)).first() is not None:
+        return True
+    hashes = [extra_hash] if extra_hash else []
+    if a.id is not None:
+        hashes += list(s.exec(select(AnimeTorrent.info_hash).where(AnimeTorrent.anime_id == a.id)))
+    return bool(hashes) and s.exec(
+        select(MovieTorrent.id).where(MovieTorrent.info_hash.in_(hashes))).first() is not None
 
 
 def movie_twin(anime_id: int) -> dict | None:
@@ -1033,7 +1058,14 @@ async def process_item(item, known_hashes: set | None = None,
             # 而用户按指引回到『待确认』时那里是空的，只会以为"绑完就再没更新过"。
             # 新入库的番仍在 _resolve_anime 建番处按开始使用日判超期（见上面 auto 分支），这条没丢；
             # 对【已有】的番重算超期本来就有设置页那个带二次确认的显式入口，不该由后台悄悄代劳。
-            if not _aired_before_start(a.air_date):
+            if _movie_like(s, a):
+                # 像剧场版的不自动升确认（同建番那一支，理由见 _movie_like）；原因改成『像是剧场版』，
+                # 待确认卡上说得清为什么要人看
+                if a.confirm_reason != "movie":
+                    a.confirm_reason = "movie"
+                    s.add(a)
+                    s.commit()
+            elif not _aired_before_start(a.air_date):
                 a.confirmed = True
                 s.add(a)
                 s.commit()
@@ -2022,6 +2054,8 @@ CONFIRM_REASONS = {
     "bind": ("手动绑定了 bgm", "你手动绑定/换绑了 bgm，核对无误后点确认下载。"),
     "backfill": ("补齐入库了新种子", "『补齐该源/自动补齐』搜到了新种子，先过目再下；确认前后台暂停自动下新集。"),
     "released": ("超期忽略已解除", "改了『开始使用日』之后它不再算超期，从超期忽略放回来等你决定。"),
+    "movie": ("像是剧场版", "bgm 说它是剧场版，或剧场版页也收了这部 / 这个种子。剧场版按规矩逐个版本人工下，所以没自动追。"
+                            "要在番剧表里下就点确认下载（只有 1 集的会自动挑一份）；想放剧场版目录就去剧场版页下、这里忽略。"),
 }
 
 
@@ -4066,13 +4100,18 @@ def _variant_tags(raw: str) -> set:
 
 
 async def deliver_single_works(qb_alive: bool | None = None) -> int:
-    """在追的【单部作品】（bgm 总共 1 集、类型不是 TV：WEB/剧场版/OVA…）一份都还没下时，挑一份下。返回交付数。(r38)
+    """在追的【单部作品】（bgm 总共 1 集、类型不是 TV：WEB/OVA/剧场版…）一份都还没下时，挑一份下。返回交付数。(r38)
 
     【为什么要有它】这类作品的种子通常不写集号（『[组] 缎带英雄 [WebRip 1080p]』），解析成未知集 -2，
     按规矩"特别篇/未知集不自动下"—— 于是一部在追的作品永远一份都不会下（真库：缎带英雄，3 个版本全在待下）。
     只认没标集号的（-2）；人工『设为特别篇』（-1）的不动。下过一份（含人工删过的）就不再下：删了就是不要了。
     挑法与正集同口径：锁定源只看锁定的组、版本关键词硬过滤、优先级 → 版本号 → 入库时间，过了缓冲窗口才下。
-    开关：ANIME_SINGLE_WORK_AUTO。"""
+    开关：ANIME_SINGLE_WORK_AUTO。
+
+    【像剧场版的先问人】(见 _movie_like) 一份都没下过、又不是用户在『待确认·像是剧场版』上亲手确认过的
+    （confirm_reason 不是 movie）—— 不下，打回待确认、原因写"像是剧场版"。用户点了确认下载之后
+    （confirm_anime 不清原因，movie 就是"人看过了"的记号），下一轮照常挑一份下。
+    剧场版那边已经下过的同一个种子不再从这边下（文件已经在了，再交一次只会两条都显示已交付、文件只有一份）。"""
     if not config.ANIME_SINGLE_WORK_AUTO or not config.QB_ENABLED or qb_alive is False:
         return 0
     grace = timedelta(minutes=max(0, config.ANIME_DOWNLOAD_GRACE_MIN))
@@ -4084,11 +4123,21 @@ async def deliver_single_works(qb_alive: bool | None = None) -> int:
         if not works:
             return 0
         rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id.in_([a.id for a in works]))))
+        movie_have = set(s.exec(select(MovieTorrent.info_hash).where(
+            MovieTorrent.info_hash.in_([t.info_hash for t in rows]),
+            MovieTorrent.status.in_(HANDLED_STATUSES))))
         for a in works:
             rs = [t for t in rows if t.anime_id == a.id]
             if any(t.status in HANDLED_STATUSES for t in rs):
                 continue                  # 已经有一份（或人工删过）
-            cands = [t for t in rs if t.status == "pending" and t.episode == -2
+            if a.confirm_reason != "movie" and _movie_like(s, a):
+                a.confirmed, a.rejected = False, False
+                a.confirm_reason = "movie"
+                s.add(a)
+                s.commit()
+                log.info("单部作品像是剧场版，没下、打回待确认等你决定 - %s", display_of(a))
+                continue
+            cands = [t for t in rs if t.status == "pending" and t.episode == -2 and t.info_hash not in movie_have
                      and t.created_at and t.created_at <= now - grace and _retry_ready(t, now)]
             if a.pref_source:
                 cands = [t for t in cands if (t.source or "") == a.pref_source]

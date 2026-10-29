@@ -332,6 +332,94 @@ def test_single_work_without_episode_number_gets_one_copy(clean_tables, cfg, mon
     assert asyncio.run(A.deliver_single_works()) == 0 and sent == []
 
 
+def test_movie_like_single_works_go_back_to_pending_confirm(clean_tables, cfg, monkeypatch):
+    """剧场版逐版本人工点下：混进番剧表、在追、只有 1 集的剧场版（类型是剧场版 / bgm 剧场版表里也有 /
+    种子剧场版表也收了）不自动下，打回『待确认·像是剧场版』等人决定 —— 不是静默跳过。
+    用户在待确认上点了确认（confirm_anime 不清原因），下一轮照常挑一份下；
+    剧场版那边已经下过的同一个种子不再从这边下。WEB 单部作品照常下。"""
+    import asyncio
+    from datetime import datetime, timedelta
+    from core import anime as A
+    from db.models import Anime, AnimeTorrent, Movie, MovieTorrent
+    cfg(ANIME_SINGLE_WORK_AUTO=True, QB_ENABLED=True, ANIME_DOWNLOAD_GRACE_MIN=0, ANIME_FINISH_UNSUB=False)
+    old = datetime.now() - timedelta(hours=3)
+    with clean_tables.get_session() as s:
+        film = Anime(title="剧场版 甲", season=1, quarter="26C", confirmed=True, rejected=False,
+                     total_episodes=1, platform="剧场版", bangumi_id=11)
+        twin = Anime(title="乙", season=1, quarter="26C", confirmed=True, rejected=False,
+                     total_episodes=1, platform="WEB", bangumi_id=12)
+        shared = Anime(title="丙", season=1, quarter="26C", confirmed=True, rejected=False,
+                       total_episodes=1, platform="WEB", bangumi_id=13)
+        web = Anime(title="丁", season=1, quarter="26C", confirmed=True, rejected=False,
+                    total_episodes=1, platform="WEB", bangumi_id=14)
+        for a in (film, twin, shared, web):
+            s.add(a)
+        s.commit()
+        m1 = Movie(title="乙", bangumi_id=12)
+        m2 = Movie(title="丙剧场版", bangumi_id=99)
+        s.add(m1); s.add(m2); s.commit()
+        s.add(MovieTorrent(movie_id=m2.id, info_hash=f"{3:040x}", raw_title="[X] 丙", status="sent"))
+        ids, aids = [], [a.id for a in (film, twin, shared, web)]
+        for i, a in enumerate((film, twin, shared, web)):
+            t = AnimeTorrent(anime_id=a.id, info_hash=f"{i + 1:040x}", source="X", priority=10,
+                             raw_title=f"[X] {a.title} [1080p]", episode=-2, status="pending", created_at=old)
+            s.add(t)
+            s.commit()
+            ids.append(t.id)
+    sent = []
+
+    async def fake_dl(tid, force=False):
+        sent.append(tid)
+        with clean_tables.get_session() as s:
+            t = s.get(AnimeTorrent, tid)
+            t.status = "sent"
+            s.add(t)
+            s.commit()
+        return True
+    monkeypatch.setattr(A, "download_anime_torrent", fake_dl)
+    assert asyncio.run(A.deliver_single_works()) == 1
+    assert sent == [ids[3]], "只下 WEB 的丁"
+    with clean_tables.get_session() as s:
+        for aid in aids[:3]:
+            a = s.get(Anime, aid)
+            assert (a.confirmed, a.rejected, a.confirm_reason) == (False, False, "movie"), a.title
+        assert s.get(Anime, aids[3]).confirmed
+    # 用户在待确认上点了确认：下一轮挑一份下；丙的种子剧场版那边已经下过，不再从这边下
+    for aid in aids[:3]:
+        A.confirm_anime(aid)
+    sent.clear()
+    assert asyncio.run(A.deliver_single_works()) == 2
+    assert sorted(sent) == sorted([ids[0], ids[1]])
+    with clean_tables.get_session() as s:
+        assert s.get(Anime, aids[2]).confirmed, "人确认过的不再打回待确认"
+
+
+async def test_new_movie_from_auto_source_is_not_auto_confirmed(monkeypatch, clean_tables, cfg):
+    """自动源新收的番，bgm 说是剧场版：不自动追，进『待确认·像是剧场版』；之后的新种子也不会把它自动升成追番。"""
+    from datetime import datetime
+    from core import anime as A
+    from db.models import Anime, AnimeTorrent
+    from sources.base import ParsedItem
+    from sqlmodel import select
+    cfg(ANIME_START_DATE="")
+
+    async def _fake_resolve(*a_, **k_):
+        return {"bangumi_id": 777, "display_name": "某剧场版", "air_date": "2026-09-01",
+                "total_episodes": 1, "platform": "剧场版"}
+    monkeypatch.setattr(A.enrich, "resolve", _fake_resolve)
+    for n in (1, 2):
+        item = ParsedItem(info_hash=f"{n:040x}", raw_title=f"[组] 某剧场版 [{n}080p]", anime_title="某剧场版",
+                          season=1, episode=-2, quarter="26C", release_time=datetime(2026, 9, 2),
+                          download_url="http://x/y.torrent", source="组", site="nyaa", policy="auto")
+        item.search_names = ["某剧场版"]
+        await A.process_item(item)
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).first()
+        a = s.get(Anime, t.anime_id)
+        assert (a.confirmed, a.rejected, a.confirm_reason) == (False, False, "movie")
+        assert A.confirm_reason_text(a.confirm_reason)[0] == "像是剧场版"
+
+
 def test_gap_is_pushed(clean_tables, cfg, monkeypatch):
     """在追的番有缺集：推一条 gap（以前只挂在仪表盘上）。没订阅这个事件就不推。"""
     import asyncio

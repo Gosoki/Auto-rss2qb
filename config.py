@@ -122,7 +122,7 @@ _SPEC = {
     "ANIME_BACKFILL_PREAIR_DAYS": (int, 30),    # 补齐时，发布早于本季开播日这么多天的种子当成前几季的、不收（0=不限）
     "ANIME_BACKFILL_EXTRA_EPS": (int, 4),       # 补齐搜不全时，对还缺的集按"番名 集号"再补搜，最多几集（0=不补搜）
     "ANIME_BACKFILL_PREFER": (str, "1080"),     # 补齐时同一集多个版本：版本关键词之后，先试含这个词的（空=不偏好）
-    "ANIME_SINGLE_WORK_AUTO": (bool, True),     # 在追的单部作品（bgm 只有 1 集的 WEB/剧场版/OVA）没标集号的种子：一份都没下时自动挑一份下
+    "ANIME_SINGLE_WORK_AUTO": (bool, True),     # 在追的单部作品（bgm 只有 1 集的 WEB/OVA/剧场版）没标集号的种子：一份都没下时自动挑一份下；像剧场版的先打回待确认，你点了确认才下
     "ANIME_REPLACE_VERSIONS": (bool, True),     # 同一个组发了修正版（v2…）：先下好新版，再删掉旧版（种子和文件）
     "ANIME_START_DATE": (str, ""),          # 开始使用日 YYYY-MM-DD：早于这天开播的番自动判『超期忽略』、不自动下载
                                             # （种子照常入库）；空=不限。改日期可逆，只动待确认/超期番，不碰人工确认/拒绝。

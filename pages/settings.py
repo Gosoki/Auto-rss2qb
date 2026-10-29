@@ -1155,7 +1155,7 @@ def settings():
                      "同时发出；0=不补搜）。同一集有多个版本时，先试本番『版本』关键词，再试含『优先词』的。"
                      ).classes("text-xs text-gray-500")
             _switch_field("ANIME_SINGLE_WORK_AUTO",
-                    "在追的单部作品（bgm 只有 1 集的网络番/剧场版）一份都没下时，自动挑一份下（种子没标集号也下）",
+                    "在追的单部作品（bgm 只有 1 集的网络番/OVA）一份都没下时，自动挑一份下（种子没标集号也下；像剧场版的先进待确认，你确认了才下）",
                     config.ANIME_SINGLE_WORK_AUTO)
             _switch_field("ANIME_REPLACE_VERSIONS",
                     "同一个组发了修正版（v2…）就替换：先下好新版，再删掉旧版的种子和文件",
