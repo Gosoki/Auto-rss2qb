@@ -196,6 +196,16 @@ class AnimeTorrent(SQLModel, table=True):
     # 【占位前的状态】(E-49) force 重下进锁时记下 status，交付成功/失败回写时清空。
     # 崩溃后行停在 downloading，sweep_stale_delivering 按它还原（None = 按老规矩落 pending）。
     prev_status: str | None = Field(default=None)
+    # ---- r39 新增（revision a7d3c5e91f42）----
+    # 【锁定源兜底下的这一份】锁定源停更满 ANIME_LOCK_FALLBACK_DAYS 天、编号核对无误时，后台用别的组补下的那一行。
+    # 锁定组以后补发同一集时据此再自动下它的版本（误判的代价就只是多一份）；兜底那份永不自动删。
+    lock_fallback: bool = Field(default=False)
+    # 【该集已删】用户删除这一行时，它是同集（同番同集号，不分源）的最后一份 → 这一集用户不要了：
+    # 任何自动路径都不再为这一集下别的版本（force 照下，force 成功会清掉同集的这个标记）。
+    # 只删重复份的不置位 —— 留下那份以后被清回待下 / 落 error，还得能自动补回来。
+    ep_dropped: bool = Field(default=False)
+    # 【用户亲手改过集号】set_torrent_episode 真改了值（值没变的空确认不算）。集号展开/回折与截断修复都跳过这一行。
+    episode_manual: bool = Field(default=False)
 
 
 class Movie(SQLModel, table=True):
@@ -218,6 +228,8 @@ class Movie(SQLModel, table=True):
     # 【剧场版实际只用其中的年份】归档目录走 MOVIE_QUARTER_FMT（默认 {yyyy}）、统计与分组按年，
     # 页面上也叫『年份』——与番剧侧的"季度"语义不同，别按 TV 的口径读它。
     # 列名不改（改列要迁移、且它确实存着一个季度键），取年份一律用 core.engine.quarter_year()。
+    # 【年份锁】(r39) 人工『编辑年份』时置位：后台扫描不再用 Mikan/bgm 的值覆盖 quarter（换绑到别的 bgm 时解锁）。
+    quarter_locked: bool = Field(default=False)
     # ---- bgm 元数据 ----
     air_date: str | None = Field(default=None)
     air_weekday: int | None = Field(default=None)

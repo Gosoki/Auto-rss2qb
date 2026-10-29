@@ -57,12 +57,14 @@ def test_old_db_with_duplicate_mikan_ids_upgrades_cleanly(upgrade_from):
     合并会删行，而"两行是不是同一部"在迁移里没有可靠判据。
     """
     eng = upgrade_from("d3f8b21c5e40")           # uniq_mikan 的前一版
-    with Session(eng) as s:
-        s.add(Movie(title="重复A", mikan_id="1000", quarter="26A"))
-        s.add(Movie(title="重复B", mikan_id="1000", quarter="26A", bangumi_id=777))
-        s.add(Movie(title="重复C", mikan_id="1000", quarter="26A"))
-        s.add(Movie(title="独立", mikan_id="2000", quarter="26A"))
-        s.commit()
+    # 【按老表结构用 SQL 插，别用 ORM】模型里有这一版之后才加的列（如 r39 的 quarter_locked），
+    # ORM 的 INSERT 会带上它们、在老表上直接报 no such column（同下面 trim_alias 那条用例）。
+    with eng.begin() as c:
+        for title, bgm in (("重复A", None), ("重复B", 777), ("重复C", None)):
+            c.execute(sa.text("INSERT INTO movie (title, mikan_id, quarter, bangumi_id, rejected, created_at) "
+                              "VALUES (:t, '1000', '26A', :b, 0, CURRENT_TIMESTAMP)"), {"t": title, "b": bgm})
+        c.execute(sa.text("INSERT INTO movie (title, mikan_id, quarter, rejected, created_at) "
+                          "VALUES ('独立', '2000', '26A', 0, CURRENT_TIMESTAMP)"))
 
     upgrade_from.to_head(eng)
 
