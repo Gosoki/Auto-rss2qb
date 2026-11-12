@@ -222,7 +222,7 @@ def test_prune_counts_each_scope_separately(clean_tables, fresh_backup_dir):
     assert sum(1 for d in left if d["scope"] == "meta") == 2
 
 
-def test_scope_is_not_full_when_the_business_db_is_configured_as_mysql(tmp_path, monkeypatch):
+def test_scope_is_not_full_when_the_business_db_is_configured_as_mysql(clean_tables, tmp_path, monkeypatch):
     """DB_BACKEND=mysql 时不得标成 full——哪怕此刻 engine 还指着本地 SQLite。
 
     参数不全时 apply_configured_backend 走 mark_data_fatal，engine 保持在本地 SQLite，

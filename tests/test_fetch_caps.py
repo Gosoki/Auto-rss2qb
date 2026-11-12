@@ -57,6 +57,81 @@ async def test_identity_is_requested():
     assert seen["ae"] == "identity"
 
 
+async def test_feed_path_asks_for_gzip_but_only_what_we_can_stream():
+    """(E-61, r40) feed / HTML 这条路放开压缩：四个真 feed 每天 37 MB → 5 MB。
+
+    【发的值必须是我们自己写死的那一句】不能把头去掉交给 httpx：装了 brotli/zstandard 的环境里它会
+    自己加 br/zstd，服务端照发就落进没有增量解压的回退路径。所以每个 token 都得在 `_ZLIB_WBITS` 里。"""
+    seen = {}
+
+    def h(r):
+        seen["ae"] = r.headers.get_list("accept-encoding")
+        return _resp(b"ok")
+    async with _client(h) as c:
+        assert await get_bytes(c, "http://x/", gzip_ok=True) == b"ok"
+        assert await get_text(c, "http://x/", gzip_ok=True) == "ok"
+    assert len(seen["ae"]) == 1, "不能发出两条 Accept-Encoding"
+    tokens = [t.strip() for t in seen["ae"][0].split(",")]
+    assert "gzip" in tokens
+    assert all(t in fetch._ZLIB_WBITS for t in tokens), f"只许请求能增量解压的编码：{tokens}"
+
+
+async def test_gzip_ok_feed_is_decoded_and_still_capped():
+    """放开压缩之后闸②照旧：正常的 gzip feed 解得出来，压缩炸弹照样按解压后字节封顶。"""
+    body = ("<rss>" + "内容" * 500 + "</rss>").encode()
+    async with _client(lambda r: _resp(gzip.compress(body), headers={"content-encoding": "gzip"})) as c:
+        assert await get_bytes(c, "http://x/", gzip_ok=True) == body
+    bomb = gzip.compress(b"A" * (4 * 1024 * 1024), 1)
+    async with _client(lambda r: _resp(bomb, headers={"content-encoding": "gzip"})) as c:
+        with pytest.raises(TooLarge):
+            await get_bytes(c, "http://x/", cap=256 * 1024, gzip_ok=True)
+
+
+async def test_non_feed_paths_still_ask_for_identity():
+    """bgm 接口（request_capped）与不传 gzip_ok 的取回（取种 / 推送 / 心跳）仍然要求 identity。"""
+    seen = []
+
+    def h(r):
+        seen.append(r.headers.get("accept-encoding"))
+        return _resp(b"ok")
+    async with _client(h) as c:
+        await fetch.request_capped(c, "GET", "http://x/")
+        await fetch.request_capped(c, "POST", "http://x/")
+        await get_text(c, "http://x/")
+    assert seen == ["identity"] * 3
+
+
+def test_only_feed_and_html_call_sites_opt_into_gzip():
+    """结构守卫：gzip_ok=True 只出现在 sources/（feed 与 Mikan 页面），而且那里的每一处取回都带着它。
+
+    正向：sources/base.py、sources/mikan.py 里每个 `get_bytes / get_text` 调用都必须写 gzip_ok=True
+    （漏一处那条 feed 就照旧按 identity 抓，省流量这件事只落了一半 —— 第①号形状）。
+    反向：别处（取种、推送、心跳、屏蔽列表）一处都不许带。"""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+
+    def calls(rel):
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr in ("get_bytes", "get_text", "request_capped")):
+                on = any(k.arg == "gzip_ok" and isinstance(k.value, ast.Constant) and k.value.value is True
+                         for k in n.keywords)
+                yield f"{rel}:{n.lineno}", on
+
+    feed = [c for rel in ("sources/base.py", "sources/mikan.py") for c in calls(rel)]
+    assert len(feed) >= 4, f"守卫前提坏了：sources/ 里只找到 {len(feed)} 处取回"
+    assert not [w for w, on in feed if not on], \
+        f"这些 feed/HTML 取回没带 gzip_ok=True：{[w for w, on in feed if not on]}"
+    others = [c for rel in ("core/engine.py", "core/worker.py", "core/ipfilter.py",
+                            "services/notify.py", "services/enrich.py") for c in calls(rel)]
+    assert others, "守卫前提坏了：别处一处取回都没找到"
+    assert not [w for w, on in others if on], \
+        f"这些不是 feed/HTML 的取回不该放开压缩：{[w for w, on in others if on]}"
+
+
 async def test_oversized_plain_body_is_rejected():
     async with _client(lambda r: _resp(b"x" * 5000)) as c:
         with pytest.raises(TooLarge):

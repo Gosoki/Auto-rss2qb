@@ -16,7 +16,7 @@ _RING_CAPACITY = 200            # /logs 页最多回看的最近条数（更早�
 # /logs 页『警告以上』『仅错误』【单独】保留的最近条数。以前这两档是从上面那 200 条全量日志里筛的 ——
 # 真库每天 400+ 行 INFO，几个小时前的警告早被挤出去了，筛出来常常是空的。（用户 2026-10-19 提的）
 _ALERT_CAPACITY = 100
-_FILE_MAXBYTES = 2_000_000      # 单个日志文件上限≈2MB，滚动保留 5 份 → 最多约 10MB
+_FILE_MAXBYTES = 2_000_000      # 单个日志文件上限≈2MB，当前文件 + 滚动保留 5 份 → 最多约 12MB
 _FILE_BACKUPS = 5
 
 _FMT = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -77,9 +77,9 @@ class _RedactUrls(logging.Filter):
             # 先渲染成字符串再脱敏；`Formatter.format` 见到 exc_text 非空就跳过 formatException，
             # 所以栈照样是脱敏后的那一份。
             #
-            # 【绝不能把 exc_info 清成 None】(R22) 本过滤器挂在三个 handler 上，其中 ring 挂在
+            # 【绝不能把 exc_info 清成 None】(R22) 本过滤器挂在好几个 handler 上，其中 ring 挂在
             # 'autorss' logger 上，而 `logging.callHandlers` 先走本 logger 的 handler 再往 root 传
-            # —— ring 上这一个**总是第一个**跑。清掉 exc_info 之后，root 那两个 handler 上的
+            # —— ring 上这一个**总是第一个**跑。清掉 exc_info 之后，root 那几个 handler 上的
             # `_SuppressDeletedSlot.filter` 里 `record.exc_info[1] if record.exc_info else None`
             # 恒为 None，它要滤的那一族 NiceGUI 断连噪声（消息体是通用的
             # `按钮操作失败：%s`，特征全在异常里）**整个失效**，日志被刷屏并掩盖真错。

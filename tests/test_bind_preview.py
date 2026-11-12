@@ -97,7 +97,7 @@ def test_every_bind_call_site_has_the_gate():
     而"不存在第三个没加闸的入口"只能靠静态扫描回答。本项目最常见的缺陷形状就是
     同一件事只改了一半——bind_anime_bgm 的注释点名了两个调用点，第一版修复也确实只改了详情页那个。
     """
-    offenders = []
+    offenders, n_sites = [], 0
     # 【递归 glob】pages 现在没有子包，但新建一个 pages/sub/binder.py 就能绕过 *.py ——
     # 实测过。守卫的扫描面必须比"当前的目录结构"更宽。
     for path in sorted((_ROOT / "pages").rglob("*.py")):
@@ -140,6 +140,7 @@ def test_every_bind_call_site_has_the_gate():
             called = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
             if called not in ("bind_anime_bgm", "bind_movie_bgm"):
                 continue
+            n_sites += 1
             cur, gated, where = node, False, f"{path.relative_to(_ROOT)}:{node.lineno}"
             while cur in parent:
                 cur = parent[cur]
@@ -151,6 +152,7 @@ def test_every_bind_call_site_has_the_gate():
                         break
             if not gated:
                 offenders.append(where)
+    assert n_sites, "pages/ 里一个 bind_*_bgm 调用点都没扫到 —— 函数改名或调用形态变了，判据已经失效"
     assert not offenders, f"这些绑定入口没有过回显闸：{offenders}"
 
 
@@ -252,7 +254,7 @@ async def test_binding_freezes_the_path_when_files_cannot_be_moved(line, clean_t
 
 
 def test_the_unmovable_gate_exists_on_both_lines():
-    """反向：两条线的 `bind_*_bgm` 都必须把 `_has_unmovable_files` 喂给 keep_path。
+    """反向：两条线的 `bind_*_bgm` 都必须把 `has_unmovable_files` 喂给 keep_path。
 
     上面那条行为用例只要求"名字没变"，把 `keep_path=True` 写死也能过 ——
     那会让"没有归档文件时的正常改名"一起失效。这里钉住的是判据本身。

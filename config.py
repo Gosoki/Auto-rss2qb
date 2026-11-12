@@ -2,7 +2,7 @@
 
 读取一律走 `config.<KEY>`（经模块 __getattr__ 返回当前值），别再 `from config import KEY`
 （那样会在导入时绑死快照，改了不生效）。设置页保存 → 写库 + 更新内存 → 即时生效。
-例外：DB_PATH（开库前提）、WEB_PORT（绑端口）本质上就得重启，走 .env/硬编码默认，不进 settings 表。
+例外：DB_PATH（开库前提）、WEB_HOST / WEB_PORT（绑监听）本质上就得重启，走 .env/硬编码默认，不进 settings 表。
 """
 import ipaddress
 import logging
@@ -27,7 +27,7 @@ except Exception:
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 try:
-    # 0700：库里存着 qB 明文密码与 bgm token，默认的 0755/0644 意味着同机任何账号都能读走。
+    # 0700：库里存着 qB 明文密码与 Mikan 订阅 token，默认的 0755/0644 意味着同机任何账号都能读走。
     # 每次启动都收一遍（不只是新建时），好让老库也能被一次升级修好。失败不致命——
     # 挂载点是 NTFS/exFAT 或跑在非 owner 身份下时 chmod 会抛，那种环境本来也谈不上文件权限。
     DATA_DIR.chmod(0o700)
@@ -65,8 +65,9 @@ _SPEC = {
                                             # 每隔这么久自查一次（介于高频轮询与保底长睡之间），别等一个保底周期才发现完成
     "QB_ACTIVE_FLOOR_KBPS": (int, 50),      # 慢速地板（KB/s）：下载慢于此算『没在真下』；0=只要有速度就算
     "QB_SLOW_ROUNDS": (int, 3),             # 连续几轮都没在真下才退出高频轮询、休眠（防单次抖动误判）
-    "QB_STALL_TIMEOUT_MIN": (int, 1440),    # 停滞超时（分钟）：已交付的在下种子若进度连续这么久无推进，标『停滞(异常)』
-                                            # 供人工处理——不自动换源、脱离轮询。默认 1 天；0=关闭该检测
+    "QB_STALL_TIMEOUT_MIN": (int, 1440),    # 停滞 / 死种超时（分钟）：已交付的在下种子进度连续这么久无推进时，下了一部分的标
+                                            # 『停滞(异常)』供人工处理（不自动换源、脱离轮询）；一个字节都没下到的（死种）转『失败』，
+                                            # 番剧同集有别的版本时后台换一个下（剧场版不换）。默认 1 天；0=两样都不做，死种一直占着这一集
     "QB_ARCHIVE_AFTER_DAYS": (int, 0),      # 完成归档（天）：种子下载完成超过这么多天后，自动从 qB 移除【只删种子、留文件】
                                             # 并标『已归档』(不再跟踪)。默认 0=关闭；如设 7=完成 7 天后清出 qB 列表
     "QB_CALLBACK_TOKEN": (str, ""),         # qB 完成回调 /api/qb/done 的校验 token（空=不校验；填了 qB 命令里要带 &t=）
@@ -96,10 +97,8 @@ _SPEC = {
     "DOWN_PATH": (str, ""),                 # 工作目录=下载根；番剧/剧场版留空时都直接落它下面
     # 【留空 = 直接落工作目录，不额外分类】——不是 DOWN_PATH/番剧。实测落的是 /home/26C/<番名>。
     # 想要 DOWN_PATH/番剧/… 就把这两项填成【相对名】（如 番剧 / 剧场版），engine.build_save_path
-    # 会把它拼在工作目录下面；填绝对路径则整个换根（可另一块盘）。
-    # 早先这两行注释写的是"空=用工作目录 DOWN_PATH/番剧"，与实现不符——engine.py 与 settings.py
-    # 两处的说明都是对的，只有这里错，而这里恰恰是读代码的人最先看到的地方。
-    "ANIME_DOWN_PATH": (str, ""),           # 番剧独立下载根（空=直接落工作目录；相对名=拼在其下；绝对路径=换根）
+    # 会把它拼在工作目录下面；没设工作目录时须填绝对路径，它自己就是根（可另一块盘）。
+    "ANIME_DOWN_PATH": (str, ""),           # 番剧独立下载根（空=直接落工作目录；相对名=拼在其下；没设工作目录时填绝对路径=它自己就是根）
     "MOVIE_DOWN_PATH": (str, ""),           # 剧场版独立下载根（同上）
     "ANIME_SEASON_SUBFOLDER": (bool, False),
     "QUARTER_FMT": (str, "{yy}{q}"),   # 番剧下载文件夹的季度目录名
@@ -149,9 +148,13 @@ _SPEC = {
     # 这与本项目别处"留空=不限"（字幕组白名单、标题关键词）恰好相反，设置页上写明了。
     # 默认值含 delivered，所以老库升级后【行为一字不变】（load_from_db 只补缺键）。
     "NOTIFY_EVENTS": (list, "delivered,movie,failed,stalled,finished,idle,qb_down,db_down,backlog,"
-                            "poll_stall,source_down,feed_gap,lock_lag,gap,lock_fallback"),
+                            "poll_stall,source_down,feed_gap,lock_lag,gap,lock_fallback,digest"),
     "NOTIFY_MAX_PER_HOUR": (int, 20),       # 全事件合计的限流上限（0=不限）。被丢弃的条数会挂在下一条消息尾巴上
     "NOTIFY_BACKLOG_MIN": (int, 5),         # 『待识别』积压到几部才提醒
+    # 每日摘要（core/digest.py）：每天 NOTIFY_DIGEST_AT 点之后、距上次满这么多小时就发一条（0=关）
+    "NOTIFY_DIGEST_HOURS": (int, 24),
+    "NOTIFY_DIGEST_AT": (int, 9),           # 几点之后发（本机时区，0~23）
+    "NOTIFY_DIGEST_LAST": (str, ""),        # 上次摘要送达时间（ISO，运行时更新；非用户填）
     "ALERT_REPEAT_HOURS": (int, 6),         # 下载失败/停滞/绑定看着不对：同一批多少小时内只说一次（有新成员立刻再说）
     "ALERT_REPEAT_DAYS": (int, 7),          # 已下齐/缺集/锁定源落后：同一部番的同一件事多少天内只推一次
     # ---- 完结 / 断更巡检（见 core.anime.sweep_finished / sweep_idle）----
@@ -165,9 +168,10 @@ _SPEC = {
     "ANIME_IGNORED_AIRING_DAYS": (int, 30), # 超期忽略的番最近这么多天还收到正片新集 → 仪表盘提示（只报不改）
     "ANIME_GAP_SLACK_WEEKS": (int, 2),      # 缺集提示：按开播日推算"应已播到第几集"时少算几周（休播一周/字幕组晚发不误报）
     "ANIME_GAP_MAX_EPISODES": (int, 100),   # 缺集提示：应播集数超过这么多的长番不判（航海王这类只收最近几集，报缺上千集是噪音）
+    "ANIME_GAP_AUTOFILL_DAYS": (int, 2),    # 缺集出现满这么多天，后台按原来那个组搜回这几集（只收缺的集、发布时间对得上的；0=关，只提醒）
     "ANIME_RERELEASE_WEEKS": (int, 20),     # 同号新集：新来的种子比这一集已下的那份晚这么多周以上就提醒（多半是新一季用季内编号；0=关）
-    "ANIME_LOCK_LAG_DAYS": (int, 7),        # 锁定源落后提醒：别的组已有后续集、锁定源过了这么多天还没跟上才提醒（0=关）
-    "ANIME_LOCK_SYNC_DAYS": (int, 2),       # 锁定组在别组发某集前后这么多天内也在发（且集号差得远）→ 当两套编号同步在发，不算落后（只影响提醒）
+    "ANIME_LOCK_LAG_DAYS": (int, 7),        # 锁定源落后提醒：别的组已有后续集、锁定源过了这么多天还没跟上才提醒（0=关）；版本关键词挡住新集的提醒共用这个天数
+    "ANIME_LOCK_SYNC_DAYS": (int, 2),       # 锁定组在别组发某集前后这么多天内也在发（且集号差得远）→ 当两套编号同步在发，不算落后（只影响提醒；版本关键词挡住提醒对命中关键词的行用同一个窗口）
     # 锁定源停更兜底（E-74）：锁定组满这么多天没新东西、编号/发布时间核对无误的缺集，用别的组补一份（0=关）。
     # 判据见 core.anime.lock_fallback_plan。应不小于 ANIME_LOCK_LAG_DAYS：提醒先到，人才来得及介入
     "ANIME_LOCK_FALLBACK_DAYS": (int, 14),
@@ -180,14 +184,15 @@ _SPEC = {
                                             # 整台机器/容器停了时程序自己什么都做不了，只有外部监控能发现；空=不发
     "NOTIFY_TIMEOUT": (int, 10),
     "ENRICH_TIMEOUT": (int, 15),
-    "ENRICH_RETRY_TIMES": (int, 3),          # bgm 请求瞬时失败(超时/连接)的即时重试次数
+    "ENRICH_RETRY_TIMES": (int, 3),          # bgm 请求遇瞬时失败(超时/连接)时最多尝试几次（含首次）
     "REENRICH_RETRY_BASE": (int, 30),        # 『待识别』番延迟重试基准等待（分钟），每失败一次翻倍（默认 30 分钟）
     "REENRICH_RETRY_MAX": (int, 1440),       # 延迟重试等待上限（分钟），翻倍到此封顶（默认 1440=24 小时）
-    "REENRICH_MAX_TRIES": (int, 5),          # 每部『待识别』番最多自动重试几次（满则停自动、留手动）
+    "REENRICH_MAX_TRIES": (int, 5),          # 每部『待识别』番最多自动重试几次（满则停；之后每来一个新集号再试一次，也可手动重新识别）
     "ANIME_META_REFRESH_EPS": (int, 4),      # 已绑 bgm 的番每收录这么多集（不同集号）自动刷一次 bgm 资料（评分/总集数等，0=关）
+    # 下面三项只在首次建库种默认源组时读（core.anime.seed_source_groups）；之后在订阅源页改，没有设置页入口
     "ANI_RSS_URL": (str, "https://nyaa.si/?page=rss&u=ANiTorrent"),
     "MIKAN_ENABLED": (bool, False),
-    "MIKAN_RSS_URL": (str, "https://mikanani.me/RSS/Classic"),
+    "MIKAN_RSS_URL": (str, "https://mikanani.me/RSS/Classic"),  # 另作 feed 为空的 Mikan 源组的回落（sources/mikan.py）
     "MIKAN_BASE": (str, "https://mikanani.me"),
     "BGM_API": (str, "https://api.bgm.tv"),
     # ---- 剧场版/OVA 自动扫描（来源固定为 Mikan 季度桶）----
@@ -233,6 +238,9 @@ _RANGE: dict[str, tuple[int, int]] = {
     "ALERT_REPEAT_DAYS": (1, 90),
     # 上限 60：12 集一季两季紧挨着播时同集号相隔约 84 天，放到 85 以上就分不开了；合法修正版实测最大间隔 20.5 天
     "ANIME_REPLACE_MAX_GAP_DAYS": (1, 60),
+    "NOTIFY_DIGEST_HOURS": (0, 720),
+    "NOTIFY_DIGEST_AT": (0, 23),
+    "ANIME_GAP_AUTOFILL_DAYS": (0, 60),
 }
 
 # 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集
@@ -377,8 +385,12 @@ def http_client_kwargs(timeout: int = 30, url=None, force_direct=None) -> dict:
     # extensions 浅拷贝语义顺着链传下去的——自己写循环必须把这条一并接管，
     # 写错就是守卫整个失效。压跳数是几行的事，立刻把最坏值压掉一个数量级，且不碰守卫。
     # 3 跳够用：真实的 feed/取种最多是 "http→https" + "裸域→www" 这两跳。
+    # 【中间跳的 Content-Encoding 要摘掉】aread() 会按它解压且没有上限：一跳 302 线上 1 MB 的 gzip
+    # 就能解出 2 GB。response 钩子 drop_redirect_body_encoding 让中间跳按线上原始字节读——
+    # 只去掉了解压放大，原始字节仍不封顶（3 跳 × 带宽 × 总超时 120/180 秒），不是根治。
     kwargs = {"timeout": timeout, "follow_redirects": True, "max_redirects": _MAX_REDIRECTS,
-              "event_hooks": {"request": [ssrf.guard_redirect_request]}}
+              "event_hooks": {"request": [ssrf.guard_redirect_request],
+                              "response": [ssrf.drop_redirect_body_encoding]}}
     mounts = _direct_mounts(url, force_direct)
     if mounts:
         # 【即使没配代理也挂上】它同时挡住环境变量里的 HTTP_PROXY——
@@ -525,7 +537,7 @@ def _merge_new_notify_events(have: dict) -> None:
 
 # 后台每轮自己写的运行时键：改动不进『设置已修改』日志（每 20 分钟一行只会把真改动冲掉）
 _RUNTIME_KEYS = {"MOVIE_SCAN_LAST", "ANIME_POLL_LAST", "ANIME_POLL_FAILED", "ANIME_POLL_OK_LAST",
-                 "BACKUP_LAST", "SOURCE_FEED_SEEN", "FEED_GAPS", "IPFILTER_STATE"}
+                 "BACKUP_LAST", "SOURCE_FEED_SEEN", "FEED_GAPS", "IPFILTER_STATE", "NOTIFY_DIGEST_LAST"}
 # 值里带密钥的键：日志只说"改了"，不写值（NOTIFY_URL 的 Bark/Server酱 密钥在路径里，PROXY_URL 可内嵌口令）
 _SECRET_KEYS = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD", "QB_CALLBACK_TOKEN",
                 "NOTIFY_URL", "PROXY_URL", "HEARTBEAT_URL"}
@@ -547,23 +559,34 @@ def set_many(updates: dict) -> dict:
     『设置已修改』日志（密码类打码、运行时键不记）—— 以前改了什么、什么时候改的无从查起
     （r37 审计：09-27 采集停了半个月，事后没法判断是不是开关被关了）。
     """
+    from sqlalchemy.exc import StatementError
+
     from db import get_meta_session
     from db.models import Setting
     applied, changed = {}, {}
-    with get_meta_session() as s:   # 同 load_from_db：配置恒走本地 SQLite
-        for k, raw in updates.items():
-            if k not in _SPEC:
-                continue
-            row = s.get(Setting, k)
-            if row is None:
-                s.add(Setting(key=k, value=str(raw)))
-            else:
-                row.value = str(raw)
-                s.add(row)
-            applied[k] = _coerce(_SPEC[k][0], raw)
-            if applied[k] != _v.get(k):
-                changed[k] = (_v.get(k), applied[k])
-        s.commit()               # 先落库成功
+    # 【写库失败时异常串不许带参数】SQLAlchemy 的报错默认附 `[parameters: ('<新值>', '<键>')]`，
+    # 设置页的保存外面没有 try，NiceGUI 默认处理器 log.exception 会把刚填的 qB 密码 / 回调令牌
+    # 明文写进 autorss.log 与 /logs（URL 脱敏只认 https?://）。必须包住整段而不只是 commit()：
+    # 第二个键的 s.get() 会触发 autoflush，第一个键的 UPDATE 在 commit 之前就发出去了。
+    # 不给引擎设 hide_parameters：SQLite 下 meta_engine 就是业务引擎，那样全部业务报错都丢参数回显。
+    try:
+        with get_meta_session() as s:   # 同 load_from_db：配置恒走本地 SQLite
+            for k, raw in updates.items():
+                if k not in _SPEC:
+                    continue
+                row = s.get(Setting, k)
+                if row is None:
+                    s.add(Setting(key=k, value=str(raw)))
+                else:
+                    row.value = str(raw)
+                    s.add(row)
+                applied[k] = _coerce(_SPEC[k][0], raw)
+                if applied[k] != _v.get(k):
+                    changed[k] = (_v.get(k), applied[k])
+            s.commit()               # 先落库成功
+    except StatementError as e:
+        e.hide_parameters = True
+        raise
     _v.update(applied)           # 再更新内存：commit 抛异常时不会留下未持久化、重启即回退的幽灵值
     shown = [f"{k}: {_log_value(k, o)} → {_log_value(k, n)}"
              for k, (o, n) in changed.items() if k not in _RUNTIME_KEYS]

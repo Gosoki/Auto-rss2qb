@@ -35,7 +35,7 @@ async def test_every_page_renders_something(user: User, path):
     ("/", ["番剧", "剧场版", "设置"]),
     ("/movies", ["剧场版"]),
     ("/settings", ["qBittorrent", "代理", "通知"]),
-    ("/sources", ["源管理", "字幕组白名单"]),
+    ("/sources", ["订阅源", "字幕组白名单"]),
 ])
 async def test_pages_contain_their_own_content(user: User, path, keywords):
     """再往前一步：不只是"有元素"，而是**这个页面自己的内容**在里面。

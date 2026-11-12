@@ -5,6 +5,7 @@
 接入 **Mikan 发现非 ANi 番**（人工确认）、**Bangumi 识别**（真实放送日→季度、规范番名），
 以及 **剧场版/OVA 按季度发现**（Mikan 季度页发现 + bgm 识别，`/movies` 审批下载）
 和 **qBittorrent 实时状态**（下载进度/速度/做种态回显）。
+后来陆续加了：后台巡检（完结 / 断更 / 缺集 / 锁定源落后）与推送、采集健康横幅、qB 的 IP 过滤、业务库可切 MySQL。
 
 技术栈：**Python + NiceGUI（界面）+ FastAPI（内核，NiceGUI 自带）+ SQLite/SQLModel + asyncio 轮询器**。
 
@@ -26,8 +27,8 @@ python main.py            # 浏览器打开 http://127.0.0.1:2333（启动横幅
 需要 **Python ≥ 3.11**（网络层用了 3.11 才有的 `asyncio.timeout`——所有抓取/识别/取种都靠它做总超时；
 3.10 上界面能开，但采集、bgm 识别、下载会全部静默失败）。`deploy.sh` 走 uv 独立 Python 3.12，不受系统版本影响。
 
-qB 账号、下载目录、代理、面板显示等设置都在启动后的 Web「设置」/「源管理」页里填（存数据库、即时生效）。
-一条命令同时跑：后台轮询下载 + Web 面板。数据库在 `data/autorss.db`（首次自动建，加字段会自动迁移，并写入默认设置）。
+qB 账号、下载目录、代理、面板显示等设置都在启动后的 Web『全局设置』页里填（存数据库、即时生效）；源组在番剧页的『订阅源』标签里配。
+一条命令同时跑：后台轮询下载 + Web 面板。数据库在 `data/autorss.db`（首次自动建并写入默认设置；建表与升级走 Alembic，启动时自动迁移）。
 
 ## 部署（Debian/Ubuntu 服务器、PVE LXC）
 
@@ -48,47 +49,58 @@ systemctl restart autorss         # 重启
 ```
 
 > ⚠️ **本工具没有鉴权**，设置页还存着 qB 密码。绑 `0.0.0.0` 后请进设置页把 `WEB_ALLOW_CIDRS`
-> 填成你的网段（如 `192.168.1.0/24`）收窄访问——该项走数据库、改完即时生效，回环地址恒放行不会把自己锁在外面。
+> （页面上是「站点 / Web 访问 / 高级」里的『允许网段(CIDR)』）填成你的网段（如 `192.168.1.0/24`）收窄访问——该项走数据库、改完即时生效，回环地址恒放行不会把自己锁在外面。
 > 要暴露到公网请在前面套反向代理做鉴权（此时白名单应留空，因为对端 IP 会变成代理）。
+
+## 装好之后的 5 步
+
+全新库的后台采集默认是**关着**的，按顺序在设置页 / 订阅源页填完再打开：
+
+1. **qB 连接与下载目录**：qB 地址、账号密码、工作目录（下载根）。
+2. **网段白名单**：『允许网段(CIDR)』（`WEB_ALLOW_CIDRS`）填你的网段（见上面的警告）。
+3. **开始使用日**：填本季第一天之类。**空着＝不限**——默认的 ANi 是自动下载，
+   第一轮会把它 feed 里的几十部番、几十 GB 全当新番下下来；早于这天开播的番判『超期忽略』，不自动下。
+4. **订阅源与策略**：『订阅源』页看一遍源组，自动下载还是人工审核（先进『待确认』，你点头才下）、优先级、字幕组白名单。
+5. **推送与心跳**：通知 URL 收告警与交付；外部心跳地址让机器整台停了也有人知道。
+
+最后回设置页打开『启用后台采集』。开始使用日还空着时会再问你一次。
+
+## 升级、回退与备份
+
+- **升级不可回退**：数据库只往前迁移。库比代码新时程序拒绝启动，所以回滚代码前要先有一份旧库备份。业务库是本地 SQLite 时，真要迁移的那次启动会先自动留一份（备份列表里标『升级前』）；用 MySQL 的请自己先备份。
+- **备份与恢复**：设置页『备份』一栏，恢复步骤在那里的 ⓘ 说明里（只记这一份，别处不抄）。
+
+## 测试
+
+`.venv/bin/python -m pytest`（零网络）；分组、夹具与注意事项见 [tests/README.md](tests/README.md)。
 
 ## 结构
 
 **TV 番剧与剧场版/OVA 分表、分模块、互不相干,只共用 `engine` 底层。**
 
-| 文件 | 职责 |
-| --- | --- |
 根目录只留入口 + 基础层，逻辑收进 `core/`，外部客户端/源/界面各成一包：
 
 | 路径 | 职责 |
 | --- | --- |
 | `main.py` | 入口 |
-| `config.py` | 配置：默认值硬编码，建库时写入数据库 `settings` 表；运行时读、设置页可改（`.env` 只留 WEB_PORT/DB_PATH 结构项） |
-| `db/` | 数据层：`__init__`(SQLite/WAL 引擎 + 会话 + 开发期加列自动迁移) / `models`(数据模型:`Setting`/`SourceGroup`;TV=`Anime`+`AnimeTorrent`+`AnimeAlias`;剧场版=`Movie`+`MovieTorrent`) |
-| `core/` | **核心逻辑**：`engine`(TV/剧场版共用底层:qB客户端+实时态同步+下载原语+bgm落库+路径季度) / `anime`(TV 番剧线) / `movies`(剧场版/OVA 线,对 anime 零依赖) / `worker`(后台三协程:采集/qB同步/剧场版扫描) |
+| `config.py` | 配置：默认值硬编码，建库时写入数据库 `settings` 表；运行时读、设置页可改（`.env` 只留 WEB_HOST/WEB_PORT/DB_PATH 结构项） |
+| `db/` | 数据层：`__init__`(SQLite/WAL 引擎 + 会话) / `schema`(建表与升级走 Alembic，迁移脚本在 `alembic/`) / `models`(数据模型:`Setting`/`SourceGroup`/`AlertAck`;TV=`Anime`+`AnimeTorrent`+`AnimeAlias`;剧场版=`Movie`+`MovieTorrent`) / `backup`(整库快照) / `transfer`(SQLite ⇄ MySQL 整体搬运) / `dialect`(跨方言适配) |
+| `core/` | **核心逻辑**：`engine`(TV/剧场版共用底层:qB客户端+实时态同步+下载原语+bgm落库+路径季度) / `anime`(TV 番剧线) / `movies`(剧场版/OVA 线,对 anime 零依赖) / `worker`(后台协程:采集 / qB 同步 / 剧场版扫描 / 待识别重试 / 备份 / 巡检 / IP 过滤 / 库看守，见 `main._startup`) / `alerts`(只报不改的巡检发现与『知道了』) / `health`(采集健康) / `digest`(每日摘要) / `ipfilter`(qB 的 IP 过滤) / `netguard`(网段白名单) / `manual`(手动下载) / `logsetup`(日志) |
 | `core/ssrf.py` | 出站请求的内网守卫：取种【每一跳都判】，其余出站【首跳与同主机跳转放行、其余跳判】（config.http_client_kwargs 默认装上） |
-| `services/` | 外部服务客户端：`enrich`(bgm 识别) / `qbittorrent`(qB 客户端) / `notify`(通知推送) |
+| `services/` | 外部服务客户端：`enrich`(bgm 识别) / `qbittorrent`(qB 客户端) / `notify`(通知推送) / `fetch`(带字节上限与总超时的取回) |
 | `sources/` | 订阅源：`base`(`ParsedItem` + `RssSource` —— 取回/校验/过滤/解析/构造【全部】共用逻辑) / `parse`(标题季度解析) / `nyaa`、`mikan`(各只剩 `site`/`TZ`/`_hash_of`/`_url_of` 四个覆写点) / `__init__` 的 `SOURCES` 表(站点→源类，加源只改这一处) |
-| `pages/` | NiceGUI 界面：`anime`(番剧主页 tab:仪表盘/番剧表/待确认/待识别/已忽略/订阅源) / `anime_detail`(番剧详情组件,渲染进悬浮框) / `movies`(剧场版 tab:仪表盘/列表/待识别/已忽略/订阅源) / `parse_test`(解析测试页 `/parse`) / `settings` / `sources` / `layout` |
+| `pages/` | NiceGUI 界面：`anime`(番剧主页 tab:仪表盘/番剧表/待确认/待识别/已忽略/订阅源) / `anime_detail`(番剧详情组件,渲染进悬浮框) / `movies`(剧场版 tab:仪表盘/列表/待识别/已忽略/订阅源) / `parse_test`(解析测试页 `/parse`) / `settings` / `sources` / `manual`(手动下载) / `logs`(运行日志) / `api`(qB 完成回调) / `layout` |
+| `alembic/` | 数据库迁移脚本 |
+| `tools/` | 命令行小工具（手动生成 IP 过滤规则） |
+| `tests/` | 回归用例，见 [tests/README.md](tests/README.md) |
 
 ## 文档
 
 | 文件 | 内容 |
 | --- | --- |
-| [docs/audit-2026-08.md](docs/audit-2026-08.md) | 第 1 轮审计：已修缺陷、未修清单、插件架构裁决、命名待判项、**需要拍板的 9 个问题** |
-| [docs/audit-2026-08-r2.md](docs/audit-2026-08-r2.md) | 第 2 轮审计：**第 1 轮引入的 2 个 P0 回归**及修法、上轮盲区（手动线/白名单/Alembic/qB 客户端/取回层）、**新增 8 个待拍板** |
-| [docs/audit-2026-08-r3.md](docs/audit-2026-08-r3.md) | 第 3 轮审计：性能/备份/取回层三块新东西的成色（**备份模块自己带着 2 条 critical 上线**）、测试套件自身的质量问题、**新增 9 个待拍板** |
-| [docs/audit-2026-08-r4.md](docs/audit-2026-08-r4.md) | 第 4 轮审计：ani-rss「三件套」落地 + 它引入的 3 条 P0（归纳成两条结构性根因）、完结判据的风险专节 |
-| [docs/audit-2026-08-r5.md](docs/audit-2026-08-r5.md) | 第 5 轮（收官）：交付状态、五轮修复的交叉验证、**这五轮的复盘**（为什么每轮的改动都要靠下一轮才发现 P0） |
-| [docs/audit-2026-08-r6.md](docs/audit-2026-08-r6.md) | 第 6 轮：**MySQL 四条缺陷在真库上修复并验证**、`sources/` 重复合并（前提更正：本项目无插件系统） |
-| [docs/audit-2026-08-r7.md](docs/audit-2026-08-r7.md) | 第 7 轮：第 6 轮那三块改动各自引入的回归（含**一条就写在自己警示注释下面 3 行**的）、**ani-rss 对标收官** |
+| `docs/audit-*.md` | 各轮审计记录，按轮次存档（文件名带年月与轮次；第 1 轮是 [docs/audit-2026-08.md](docs/audit-2026-08.md)） |
 | [docs/GLOSSARY.md](docs/GLOSSARY.md) | **术语表**：两条线哪些用词分歧是有意的、哪些字段容易读反 |
-| [docs/audit-2026-08-r8.md](docs/audit-2026-08-r8.md) | 第 8 轮（收官）：**DECISIONS 24 条全部清空**、三条「比描述要大」的改动（SSRF 同主机放行 / 唯一约束差点变成每轮崩 / batch 迁移静默失效） |
-| [docs/audit-2026-08-r9.md](docs/audit-2026-08-r9.md) | 第 9 轮（回顾）：45 agent 对抗复查上一轮的 12 项改动——**没有一项做错，漏的全是覆盖面**；归纳出一种新病「约束的作用域比验证的作用域大」 |
-| [docs/audit-2026-08-r10.md](docs/audit-2026-08-r10.md) | 第 10 轮：**仓库 HEAD 曾经起不来**、双引擎设计评估（结论：骨架都对，不要重构）、4 条运行时缺陷、**3 条守卫回退掉照样全绿** |
-| [docs/audit-2026-08-r11.md](docs/audit-2026-08-r11.md) | 第 11 轮：**上一轮的修复引入了一个 P0**（全括号标题的首块被当番名）、通知的三条缺陷、以及「已应用的 revision 不可变」这条教训 |
-| [docs/audit-2026-08-r12.md](docs/audit-2026-08-r12.md) | 第 12 轮（收官）：**又一条 P0 来自上一轮的修复**（搜索词塌成季名）、alembic 并发实测 4/6 留下「版本号到了而 DDL 没跑」+ 2/6 段错误、设计语言第二层落地 |
-| [docs/audit-2026-08-r13.md](docs/audit-2026-08-r13.md) | 第 13 轮：停机时间被当成「种子停滞」、missingFiles 行被中间态吃掉三道闸、三条凭据泄露、以及**一条我自己刚写下的假用例** |
-| **[docs/DECISIONS.md](docs/DECISIONS.md)** | 拍板清单（**24/24 已全部实施**）——保留每条的**为什么**，回退时要用 |
+| **[docs/DECISIONS.md](docs/DECISIONS.md)** | 拍板与待拍板清单——保留每条的**为什么**，回退时要用 |
 | [docs/benchmark-ani-rss.md](docs/benchmark-ani-rss.md) | 与 [ani-rss](https://github.com/wushuo894/ani-rss) 的逐维度差距分析、值得借鉴的 Top 5、明确不做的 |
 
 ## 加一个订阅源要做什么
@@ -113,7 +125,7 @@ UI 的类型下拉、`engine` 的时区查询、`anime` 的补齐分派都从 `S
 
 - **去重键 = 种子 info_hash**（40位hex）。nyaa 从 `<nyaa:infoHash>` 白拿，Mikan 从 `/Home/Episode/<hash>` 链接取——跨源/跨站同一种子精确相等。
 - **身份 = bangumi_id**：不同组不同写法经 `AnimeAlias` 指到同一部番；未匹配 bgm 的进「待识别」人工绑定，绝不自动下。
-- **下不下 = `confirmed` 且未 `rejected`**：自动源默认确认、待确认源留人工确认；剧场版/OVA 一律人工逐版本点下（独立 `Movie` 表，与番剧分离）。
+- **下不下 = `confirmed` 且未 `rejected`**：自动源默认确认、人工审核源留人工确认；剧场版/OVA 一律人工逐版本点下（独立 `Movie` 表，与番剧分离）。
 - **逻辑集去重**：同一 (番, 集) 只下一份，跨源/跨组去重（缓冲窗口内等更高优先级的源补齐，到点选优先级最高的一份）。
 - **季度**：以 **Bangumi 真实放送日** 定季度（首播季）；bgm 拿不到才退回集数倒推。
 
@@ -133,8 +145,9 @@ Bangumi 识别恒开（真实放送日定季度 + 规范番名 + 类型），无
 
 ## qBittorrent 实时状态
 
-交给 qB 的种子，后台每 `QB_SYNC_INTERVAL` 秒回拉一次实时态（下载中/做种/进度/速度），
-在仪表盘「种子状态」和详情页逐集回显；进度到 100% 的把应用侧状态收敛为「已下」。
+交给 qB 的种子，后台按三档节奏回拉实时态（下载中/做种/进度/速度）：有种子在活跃下载时每 `QB_SYNC_INTERVAL` 秒；
+还有没下完的但都不活跃（慢 / 停滞 / 暂停）时每 `QB_IDLE_RECHECK_MIN` 分钟；全无在下时每 `QB_SYNC_BACKSTOP_MIN` 分钟保底。
+在仪表盘「种子状态」和详情页逐集回显，下完的显示『已完成』（关了 qB 跟踪时发送即算下完，显示『已下』）。
 
 ## 路线
 

@@ -34,7 +34,7 @@ command -v uv >/dev/null 2>&1 || { echo "❌ uv 安装失败，检查容器能�
 echo "✔ uv $(uv --version)"
 
 # ---- 3. 虚拟环境 + 依赖（uv 下载独立 CPython，与系统 python 版本无关）----
-# 项目用了 PEP 604 的 `str | None`，需要 Python ≥ 3.10；Debian 11 自带 3.9 跑不了，故这里固定装 3.12。
+# 需要 Python ≥ 3.11（asyncio.timeout，main.py 启动时会核）；Debian 11 自带 3.9 跑不了，故这里固定装 3.12。
 cd "$APP"
 uv python install "$PYVER"
 # 【必须先判存在再建】`uv venv` 撞上已有目录会直接报错退出，而 set -e 会让整个脚本就此中止——
@@ -97,11 +97,22 @@ if systemctl is-active --quiet "$SVC"; then
   PORT="$(sed -n 's/^WEB_PORT=\([0-9]*\).*/\1/p' .env | head -1)"; PORT="${PORT:-2333}"
   IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
   echo
-  echo "✅ 部署完成 → http://${IP:-<容器IP>}:${PORT}"
-  echo "   ⚠ 已绑 0.0.0.0：本工具【无鉴权】，设置页存有 qB 密码，且能让 qB 往任意目录下载、"
-  echo "     能带文件删除种子。局域网内任何人访问到这个端口就等于管理员。"
-  echo "     → 请立刻进『设置』页把 WEB_ALLOW_CIDRS 填成你的网段（如 ${LAN_HINT:-192.168.1.0/24}），"
-  echo "       该项即时生效、回环地址恒放行，锁不死你自己。"
+  # >>> done-hint（tests/test_r40_docs.py 按这对标记抽出来单跑；标记之间只用 SVC / PORT / IP / LAN_HINT 与 .env）
+  # 只有 .env 里【每一条】WEB_HOST 都是回环才按"只有本机能进"提示：python-dotenv 重复键取最后一条，
+  # 这里不猜哪条生效；带引号 / 带尾注释 / 认不出的一律按对外开放提示——这条警告宁可多说。
+  # 判断必须写在 if 条件里：set -euo pipefail 下 grep 无匹配退出 1，写成裸赋值会掐死脚本。
+  if grep '^WEB_HOST=' .env | grep -qvE '^WEB_HOST=(127\.[0-9]+\.[0-9]+\.[0-9]+|localhost|::1)[[:space:]]*$'; then
+    echo "✅ 部署完成 → http://${IP:-<容器IP>}:${PORT}"
+    echo "   ⚠ 已对局域网开放（$(grep '^WEB_HOST=' .env | tail -1)）：本工具【无鉴权】，设置页存有 qB 密码，且能让 qB 往任意目录下载、"
+    echo "     能带文件删除种子。局域网内任何人访问到这个端口就等于管理员。"
+    echo "     → 请立刻进『设置』页 →「站点 / Web 访问 / 高级」→『允许网段(CIDR)』填成你的网段（如 ${LAN_HINT:-192.168.1.0/24}），"
+    echo "       该项即时生效、回环地址恒放行，锁不死你自己。"
+  else
+    echo "✅ 部署完成 → http://127.0.0.1:${PORT}（.env 里 WEB_HOST 是回环地址：只有本机能访问）"
+    echo "   要让局域网访问：把 .env 的 WEB_HOST 改成 0.0.0.0 后 systemctl restart ${SVC}；"
+    echo "   本工具【无鉴权】，开放前先在『设置』页 →「站点 / Web 访问 / 高级」→『允许网段(CIDR)』填好你的网段。"
+  fi
+  # <<< done-hint
   echo
   echo "   日志: journalctl -u ${SVC} -f     重启: systemctl restart ${SVC}"
   echo "   升级: git pull && bash deploy.sh"

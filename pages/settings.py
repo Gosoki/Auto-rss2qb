@@ -9,13 +9,14 @@ import logging
 
 from nicegui import context, run, ui
 
-from core import anime, engine, ipfilter, movies, netguard, worker
+from core import anime, digest, engine, ipfilter, movies, netguard, worker
 from urllib.parse import quote
 
 import config
 from db import backup, schema as db_schema
 from services import notify
 from db.dialect import BINARY_COLLATION
+from db.models import AnimeTorrent, MovieTorrent
 from sources.parse import format_quarter
 from .layout import busy_action, confirm, frame, reload_other_tabs, require_config_loaded, warn_banner
 
@@ -33,7 +34,8 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             # r39：带合法范围的新阈值（config._RANGE），保存时越界拒收
             "ANIME_BACKFILL_EXTRA_EPS", "ANIME_LOCK_SYNC_DAYS", "ANIME_IDLE_WINDOW_X",
             "ANIME_IGNORED_AIRING_DAYS", "ALERT_REPEAT_HOURS", "ALERT_REPEAT_DAYS",
-            "ANIME_LOCK_FALLBACK_DAYS", "ANIME_REPLACE_MAX_GAP_DAYS"}
+            "ANIME_LOCK_FALLBACK_DAYS", "ANIME_REPLACE_MAX_GAP_DAYS", "ANIME_GAP_AUTOFILL_DAYS",
+            "NOTIFY_DIGEST_HOURS", "NOTIFY_DIGEST_AT"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
@@ -78,6 +80,19 @@ def _split_notice(snaps: dict) -> str:
     return (f"下载目录规则改了：{' / '.join(parts)} 的已下文件还在改之前的目录，之后新下的会落到新目录，"
             "同一部会分在两个文件夹。误改的话把设置改回原值再保存即可。"
             + ("要搬，进该番详情点『编辑季度』原样保存（季度为空的番不适用）。" if has_anime else ""))
+
+
+def _first_run_poll_groups(was_on: bool, now_on: bool, start_date: str,
+                           auto_groups: list, has_confirmed: bool) -> list:
+    """打开采集前要不要先问一句：返回要在确认框里点名的自动下载源组，空列表=不用问。
+
+    只在【首次使用】时问：采集开关这次从关变开、开始使用日空着、有启用的自动下载源组、
+    库里还没有任何已确认的番。这时第一轮采集会把这些源组 feed 里的每一部都当新番自动确认并下载
+    （ANi 一个 feed 实测 50 多部、30 GiB）。已经确认过番的是在用的库，开始使用日空着是用户自己的选择，不问。
+    """
+    if was_on or not now_on or start_date.strip() or has_confirmed:
+        return []
+    return list(auto_groups)
 
 
 def qb_callback_curl(tok: str, port: int) -> str:
@@ -228,6 +243,8 @@ def _quarter_setting(f: dict, key: str, title: str, note: str, value: str,
 # 需要自己的一份。语义与闭包版一致（写进同一个 f 字典，由统一的 _save 收集）。
 def _text_into(f: dict, key: str, label: str, val, ph: str = "") -> None:
     f[key] = ui.input(label, value=str(val), placeholder=ph).classes("w-full")
+    if ph:   # Quasar 对带标签、未浮起的空框把 placeholder 设成透明；stack-label 让示例空着时也看得见
+        f[key].props("stack-label")
 
 
 def _num_into(f: dict, key: str, label: str, val) -> None:
@@ -246,11 +263,12 @@ def _backup_panel(f: dict) -> None:
     页面上直接给出恢复用的命令，人照着敲一次即可。
     """
     import db          # 局部导入：本模块用的是 `from db import backup, ...`，
-                       # 没有 db 这个名字（settings_page 里那处也是这么写的）
+                       # 没有 db 这个名字（_db_panel 里那处也是这么写的）
     _section("自动备份", "整库快照（VACUUM INTO，不是拷文件——本项目的 SQLite 开着 WAL，"
                          "直接拷主文件会拿到一份看着正常、其实缺最近写入的库）。"
                          "业务库切到 MySQL 时这里备的是【本地库】——里面往往还留着切换前的旧业务数据，"
-                         "下面每一份都按实际数出来的行数标注，不要按文件名猜。")
+                         "下面每一份都按实际数出来的行数标注，不要按文件名猜。"
+                         "数据库升级前程序会自动留一份（列表里标『升级前』），这批与日常备份分开数、也留『保留份数』这么多份。")
     with ui.element("div").classes("field-grid w-full"):
         f["BACKUP_ENABLED"] = ui.switch("开启自动备份", value=config.BACKUP_ENABLED)
         _num_into(f, "BACKUP_INTERVAL_HOURS", "间隔（小时）", config.BACKUP_INTERVAL_HOURS)
@@ -260,12 +278,13 @@ def _backup_panel(f: dict) -> None:
     def _list():
         items = backup.list_backups()
         if not items:
-            ui.label("还没有备份。点右边『立刻备份』或等自动备份到点。").classes(
+            ui.label("还没有备份。点『立刻备份』，或等自动备份到点。").classes(
                 "text-xs text-gray-500")
             return
-        ui.label(f"共 {len(items)} 份 · 目录 {backup.BACKUP_DIR}").classes("text-xs text-gray-400")
+        ui.label(f"共 {len(items)} 份 · 目录 {backup.BACKUP_DIR}").classes("text-xs text-gray-400 break-all")
         for d in items[:10]:
-            with ui.row().classes("items-center gap-2 w-full no-wrap"):
+            # flex-wrap 不是 no-wrap：两枚徽标 + 文件名 + 大小在手机上排不下一行（390px 实测撑到 484px）
+            with ui.row().classes("items-center gap-2 w-full flex-wrap"):
                 # 【徽标按【文件里实际有什么】走，不按文件名里的 scope】scope 是导出那一刻的
                 # 配置推出来的标签，回答不了"这份救不救得回我的番"：一个刚建好、还没跑过业务的
                 # 库照样标 full，里面一行数据都没有；而切了 MySQL 之后标 meta 的那份里
@@ -288,6 +307,9 @@ def _backup_panel(f: dict) -> None:
                         f"color={'blue-grey' if _same else 'orange'}").tooltip(
                         "恢复这份之后，业务库会指向这里"
                         + ("" if _same else "——与你【现在】用的那个不是同一个库！"))
+                if d.get("pre_upgrade"):
+                    ui.badge("升级前").props("color=purple").tooltip(
+                        "数据库升级前自动留的一份；升级出问题或要退回旧版程序时用它恢复")
                 ui.label(d["name"]).classes("text-xs text-gray-400 shrink-0")
                 ui.label(d["detail"]).classes("text-xs text-gray-500 grow break-all min-w-0")
                 ui.label(f"{d['bytes'] / 1024:.0f} KB").classes("text-xs text-gray-500 shrink-0")
@@ -321,7 +343,8 @@ def _backup_panel(f: dict) -> None:
               "2. 现役库【改名留底】，连 -wal/-shm 一起（不是删）：\n"
               "   cd data && for x in autorss.db autorss.db-wal autorss.db-shm; do "
               "[ -e \"$x\" ] && mv \"$x\" \"$x.before-restore\"; done\n"
-              "3. cp backups/<选中的那份> data/autorss.db\n"
+              "3. 接上一步，仍在 data/ 里：\n"
+              "   cp backups/<选中的那份> autorss.db\n"
               "4. systemctl start autorss —— 打开首页确认番剧数目对，再删那几个 .before-restore\n\n"
               "第 2 步为什么必须连 -wal 一起挪走：本库开着 WAL，最近的写入躺在 -wal 里。"
               "只覆盖主文件的话，SQLite 启动时会把【事故现场那份 -wal】重放到你刚恢复的库上——"
@@ -354,8 +377,10 @@ def _db_panel(f: dict) -> None:
     def _status():
         with ui.row().classes("items-center gap-2 flex-wrap"):
             ui.label("当前业务数据库：").classes("text-sm")
+            # 徽标默认不换行：手机上一条长路径 / MySQL 主机串会把整页横向撑出去（实测 996px），点击落点跟着错位
             ui.badge(db.data_target_desc()).props(
-                f"color={'purple' if db.data_backend() == 'mysql' else 'blue-grey'}")
+                f"color={'purple' if db.data_backend() == 'mysql' else 'blue-grey'}").classes(
+                "whitespace-normal break-all max-w-full")
             # 【必须兜住】这是页面【构建期】对业务库发的查询。业务库若是运行中掉线的 MySQL，
             # 异常会从构建函数冒出去让 /settings 整页 500——而『切回本地 SQLite』按钮和底部
             # 『保存』都排在本面板之后，用户就再也没有页面入口能自救了，
@@ -365,7 +390,7 @@ def _db_panel(f: dict) -> None:
                 ui.label(f"（{sum(cnt.values())} 行业务数据）").classes("text-xs text-gray-400")
             except Exception as e:
                 ui.label(f"（连不上：{type(e).__name__}）").classes("text-xs text-red-400")
-        ui.label(f"配置库（不参与迁移）：本地 SQLite {config.DB_PATH}").classes("text-xs text-gray-500")
+        ui.label(f"配置库（不参与迁移）：本地 SQLite {config.DB_PATH}").classes("text-xs text-gray-500 break-all")
 
     _status()
     if miss := driver_missing():
@@ -512,7 +537,7 @@ def _db_panel(f: dict) -> None:
             # → engine.connect()，全是同步调用；对着一台关机的主机点这个按钮，
             # 整个事件循环会被冻住到 connect_timeout 到点为止。
             # 与 pages/layout.py 的『立即重连』同款写法。
-            # 【维护窗口】期间 get_session() 一律拒绝：后台四条循环按停摆跳过本轮，
+            # 【维护窗口】期间 get_session() 一律拒绝：后台循环按停摆跳过本轮，
             # 页面上那几个写入口（补齐/新增源组/绑定 bgm）也一并被挡住。
             # 理由与"为什么闸装在 get_session 上"写在 db/__init__.py 的 maintenance() 处。
             # 【先有界地等，等不到再拒】(R33, E-46) R22 把语义定成"正忙就拒绝"，理由是
@@ -631,8 +656,8 @@ def _db_panel(f: dict) -> None:
                 note += "⚠️ 目标库【非空】，继续会先清空它的业务表再写入——那些数据将不可恢复。\n"
             # 【目标正是当前在用的业务库】这是最危险的一种：清空+逐批写入是在【线程】里跑的，
             # 而后台采集/同步/页面还在读同一个库，中间态（anime 全在、animetorrent 还空）是可见的，
-            # 集去重的 have_eps 会漏判，于是同一集被重下一份。下面用两把轮次锁把采集与扫描挡住，
-            # 但页面读取挡不住，所以这里必须把话说清楚。
+            # 集去重的 have_eps 会漏判，于是同一集被重下一份。下面的 db.maintenance() 把采集/同步/页面的业务读写
+            # 一并挡住（理由见 db/__init__.py 的 maintenance()），维护期间页面读不出数据，所以这里必须把话说清楚。
             live_target = transfer.same_database(dst, db.engine)
             if live_target:
                 note += ("⚠️ 目标就是【当前正在使用】的业务库。迁移期间采集与剧场版扫描会被暂停，"
@@ -754,22 +779,26 @@ def _db_panel(f: dict) -> None:
 def settings():
     with frame("settings") as header_right:
         with header_right:   # 顶栏右侧快捷保存：功能同页面底部『保存』（_save 在下方定义，lambda 延迟到点击时解析）
+            dirty_hdr = ui.label("未保存").classes("text-xs text-amber-400")
+            dirty_hdr.set_visibility(False)
             ui.button(icon="save", on_click=lambda: _save()).props(
                 "flat round dense color=white").tooltip("保存设置（同页面底部的『保存』按钮）")
         ui.label("全局设置").classes("text-2xl font-bold")
         if not config.loaded_from_db:
             warn_banner("配置没能从数据库读出来，下面显示的全部是【硬编码默认值】，不是你设过的。"
                         "此时保存会被拦下（否则会把原有设置整体覆盖掉）。先修好数据库再来。")
-        ui.label("保存即时生效、页面刷新可见；仅 Web 绑定地址/端口改动需重启。").classes(
+        ui.label("保存即时生效（各后台间隔从各自下一轮起按新值）、页面刷新可见；仅 Web 绑定地址/端口改动需重启。").classes(
             "text-xs text-gray-400 mb-2")
 
-        f: dict = {}  # 表单控件，key = .env 键名
+        f: dict = {}  # 表单控件，key = 配置键名
 
         def _switch_field(key, label, val):
             f[key] = ui.switch(label, value=val)
 
         def _text(key, label, val, ph=""):
             f[key] = ui.input(label, value=str(val), placeholder=ph).classes("w-full")
+            if ph:   # 理由同 _text_into：不加 stack-label，空框的示例只有点进去才出现
+                f[key].props("stack-label")
 
         def _select(key, label, options, val):
             # 下拉单选：options={键:显示名}，存的是键；当前值不在选项里时回落到第一个键
@@ -820,7 +849,9 @@ def settings():
             _section("下载 / qBittorrent",
                      "开=跟 qB 实时进度：交付即跟、活跃时高频轮询、有未完成但不活跃时按『中档自查』兜、全下完休眠；"
                      "『慢速地板+判慢轮次』判定是否还在真下。关=发送即当『已下』、完全不查 qB。"
-                     "『停滞超时』：进度连续这么久无推进→标『停滞(异常)』供人工处理（不自动换源）。"
+                     "『停滞 / 死种超时』：进度连续这么久没动 → 下了一部分的标『停滞』（不自动换源，盘上有半成品；之后又动了会自己回到在下）；"
+                     "一个字节都没下到的（死种）转『失败』——番剧同集有别的版本时后台会换一个下（锁了源 / 设了版本关键词的番不换），"
+                     "剧场版要自己在版本列表里另点一个。设成 0 两样都不做：死种会一直占着这一集。"
                      "『完成归档』：完成超这么多天→从 qB 移除【留文件】、标『已归档』、不再跟踪。\n"
                      "它依赖上面的『读取 qB 实时状态』——关掉跟踪时我们不知道种子有没有真下完，归档会整个停用（否则会把还在下的种子从 qB 摘掉、只留半成品）。")
             _switch_field("QB_ENABLED", "发送种子到 qB（关=只采集不下载）", config.QB_ENABLED)
@@ -832,7 +863,7 @@ def settings():
                 _num("QB_SYNC_BACKSTOP_MIN", "保底自查间隔（分钟）", config.QB_SYNC_BACKSTOP_MIN)
                 _num("QB_ACTIVE_FLOOR_KBPS", "慢速地板（KB/s）", config.QB_ACTIVE_FLOOR_KBPS)
                 _num("QB_SLOW_ROUNDS", "判慢轮次", config.QB_SLOW_ROUNDS)
-                _num("QB_STALL_TIMEOUT_MIN", "停滞超时（分钟，0=关）", config.QB_STALL_TIMEOUT_MIN)
+                _num("QB_STALL_TIMEOUT_MIN", "停滞 / 死种超时（分钟，0=关）", config.QB_STALL_TIMEOUT_MIN)
                 _num("QB_ARCHIVE_AFTER_DAYS", "完成归档（天，0=关）", config.QB_ARCHIVE_AFTER_DAYS)
 
             ui.separator()
@@ -856,7 +887,9 @@ def settings():
                 with ui.column().classes("gap-2 min-w-0"):   # 右列：完成回调（可选兜底）
                     _section("完成回调（可选·精确兜底）",
                              "可选兜底：慢速种子在休眠期间下完、又被 qB『完成即删种』删掉，会被误标『失败』；"
-                             "配了它就精确标『已下』。不配也行（少见）。仅 qB 与本程序同机时可用。")
+                             "配了它就精确标『已下』。不配也行（少见）。下面这条命令按同机写（127.0.0.1）；"
+                             "qB 在另一台机器时必须填 token，并把 127.0.0.1 换成 qB 能访问到的本程序地址"
+                             "（本程序须绑非回环地址；设了允许网段要放行 qB 那台）。")
                     _text("QB_CALLBACK_TOKEN", "回调 token（可选，防乱调；填了命令会自动带 &t=）",
                           config.QB_CALLBACK_TOKEN)
 
@@ -943,7 +976,7 @@ def settings():
 
             async def _ipf_now(e):
                 async def _go():
-                    ui.notify("正在取数据源、生成规则并交给 qB…（十几个源，可能要一两分钟）", type="info")
+                    ui.notify("正在取数据源、生成规则并交给 qB…（几十个源，可能要一两分钟）", type="info")
                     res = await ipfilter.run_once()
                     _ipf_status.refresh()
                     ui.notify(res, type="positive" if res.startswith(("已更新", "已交给")) else "warning")
@@ -959,7 +992,7 @@ def settings():
         with ui.card().classes("w-full"), ui.expansion(
                 "网络 / 通知（代理 / 推送）", icon="notifications", value=False).classes("w-full"):
             _section("网络 / 通知",
-                     "代理支持 http:// / https://；socks5:// 需另装 socksio 包（未装时填 socks5:// 会在请求时出错）。"
+                     "代理支持 http:// / https://；socks5:// 需另装 socksio 包（未装时保存会被拦下）。"
                      "代理账号/密码仅『需认证的代理』才填，留空=不认证。通知 URL：留空=关闭推送。")
             _switch_field("OPEN_PROXY", "启用代理", config.OPEN_PROXY)
             _switch_field("PROXY_SKIP_INTERNAL",
@@ -974,15 +1007,19 @@ def settings():
                 f["PROXY_URL"].classes(add="col-span-2")   # 代理地址占 1/2（4 列栅格里跨 2 格）
                 _text("PROXY_USER", "代理账号", config.PROXY_USER, "留空=不认证")
                 _password("PROXY_PASS", "代理密码（留空=不改）")
-            # 【必须给出格式示例】程序发的是 GET {NOTIFY_URL}/💡<消息>（见 services/notify.notify），
-            # 这是 Bark / ntfy 那一类"路径即消息"的约定，与 webhook 的 POST-JSON 完全不同。
+            # 【必须给出格式示例】程序只发 GET：地址里有 {msg} 就把正文填在那里，没有就接在路径后面
+            # （见 services/notify._send_once），与 webhook 的 POST-JSON 完全不同。
             # 没有示例时最常见的错法是把 Server酱/钉钉的完整接口地址粘进来（那要 POST），
             # 或者漏掉 https:// —— 后者的报错只出现在日志里，页面上一点提示都没有。
+            # 三个例子都是实测通的写法；ntfy 只写到主题会 404（它要 /publish?message=）。
             _text("NOTIFY_URL", "通知 URL（空=关闭）", config.NOTIFY_URL,
-                  "https://api.day.app/<你的密钥>  或  https://ntfy.sh/<你的主题>")
-            ui.label("程序会 GET『{上面这个地址}/💡消息正文』——Bark、ntfy 这类"
-                     "『把消息写在 URL 路径里』的服务可以直接用；需要 POST JSON 的"
-                     "（钉钉、企业微信机器人）填在这里不会工作。填完点右边按钮试一条。").classes(
+                  "https://api.day.app/<你的key>  （ntfy / Telegram 的写法见下方）")
+            ui.label("例：Bark  https://api.day.app/<你的key> ；"
+                     "ntfy  https://ntfy.sh/<主题>/publish?message={msg} ；"
+                     "Telegram  https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>&text={msg} 。"
+                     "地址里写 {msg} 的地方会被换成消息正文；不写就按 Bark 的习惯接在地址后面。"
+                     "程序只发 GET，需要 POST JSON 的（钉钉、企业微信机器人）填在这里不会工作。"
+                     "填完点『发送测试通知』试一条。").classes(
                 "text-xs text-gray-500 -mt-1")
 
             async def _test_notify():
@@ -1025,7 +1062,8 @@ def settings():
                      "『qB 连不上』『数据库停摆』『待识别积压』『采集停摆』『源抓取失败』是状态型：只在状态【翻转】的那一刻"
                      "各发一条（进一条、出一条），不会每轮重复轰炸；『源抓取失败』在又有新的源挂掉时也会再推一条。\n"
                      f"『下载失败』『停滞异常』『绑定看着不对』由后台巡检合并上报，同一批 {config.ALERT_REPEAT_HOURS} 小时内"
-                     "只说一次（有新成员立刻再说）；改这一项不会清掉正在计的冷却。\n"
+                     "只说一次（有新成员立刻再说）；改这一项不会清掉正在计的冷却。"
+                     "『绑定看着不对』不是下拉里的单独一项，它跟着『待识别积压』这个勾走。\n"
                      f"『已下齐』『缺集』『锁定源落后』：同一部番的同一件事 {config.ALERT_REPEAT_DAYS} 天内只推一次"
                      "（又缺了别的集、锁定源又被甩开一集，算新的一件事）。")
             f["NOTIFY_EVENTS"] = ui.select(
@@ -1039,10 +1077,20 @@ def settings():
             with ui.element("div").classes("field-grid w-full"):
                 _num("NOTIFY_MAX_PER_HOUR", "每小时最多几条（0=不限）", config.NOTIFY_MAX_PER_HOUR)
                 _num("NOTIFY_BACKLOG_MIN", "待识别积压到几部才提醒", config.NOTIFY_BACKLOG_MIN)
-                _num("ALERT_REPEAT_HOURS", "积压告警重复间隔（小时）", config.ALERT_REPEAT_HOURS,
+                _num("ALERT_REPEAT_HOURS", "失败/停滞/绑定可疑 重复提醒间隔（小时）", config.ALERT_REPEAT_HOURS,
                      *config._RANGE["ALERT_REPEAT_HOURS"])
                 _num("ALERT_REPEAT_DAYS", "同番同一提醒间隔（天）", config.ALERT_REPEAT_DAYS,
                      *config._RANGE["ALERT_REPEAT_DAYS"])
+            _section("每日摘要",
+                     "每天这个点之后发一条：下了什么、有什么等你处理、系统是否正常。"
+                     "哪天没收到，就是推送或程序出了问题。时间按本机时区。\n"
+                     "要在上面的事件里勾着『每日摘要』才发；间隔填 0 = 关。"
+                     "间隔一般填 24（每天）或 168（每周）；填别的数时，『几点之后』之前的那几个小时不发。")
+            with ui.element("div").classes("field-grid w-full"):
+                _num("NOTIFY_DIGEST_HOURS", "摘要间隔（小时，0=关）", config.NOTIFY_DIGEST_HOURS,
+                     *config._RANGE["NOTIFY_DIGEST_HOURS"])
+                _num("NOTIFY_DIGEST_AT", "几点之后发（0~23）", config.NOTIFY_DIGEST_AT,
+                     *config._RANGE["NOTIFY_DIGEST_AT"])
 
         # ========== 折叠 ③ 巡检 / 健康 ==========
         with ui.card().classes("w-full"), ui.expansion(
@@ -1054,9 +1102,37 @@ def settings():
                      "那会让最后一集永远下不下来。建议先让它跑一阵、看『已下齐』标得对不对再开。\n"
                      "断更提醒：一部追番中的番多少天没有新种子就说一声——那是发现『源失效/字幕组停更』的"
                      "唯一自动手段（那类故障不报错，表现只是『好几天没更新了』）。\n"
+                     "断更提醒窗口：一段静默里每满一个阈值提醒一次，静默超过『阈值×倍数』天就不再提醒，"
+                     "即最多提醒『倍数−1』次（默认 4：阈值 14 天时在第 14、28、42 天各一次）；"
+                     "从没成功提醒过的番不受这个限制，一定会先提醒一次。最小 2。")
+            with ui.element("div").classes("field-grid w-full"):
+                f["ANIME_FINISH_ENABLED"] = ui.switch(
+                    "判定已下齐（只标记+通知）", value=config.ANIME_FINISH_ENABLED)
+                f["ANIME_FINISH_UNSUB"] = ui.switch(
+                    "下齐后停止自动下新集", value=config.ANIME_FINISH_UNSUB)
+                _num("ANIME_IDLE_DAYS", "断更提醒阈值（天，0=关）", config.ANIME_IDLE_DAYS)
+                _num("ANIME_IDLE_WINDOW_X", "断更提醒窗口（×阈值）", config.ANIME_IDLE_WINDOW_X,
+                     *config._RANGE["ANIME_IDLE_WINDOW_X"])
+                # 【给下限】这一项没有"0=关"的语义（关完结/断更各有自己的开关），
+                # 而 run_sweep 里每轮是 max(300, ...) 秒——填 0 会变成每 5 分钟来一次全表扫描。
+                _num("SWEEP_INTERVAL_MIN", "巡检间隔（分钟，最少 5）", config.SWEEP_INTERVAL_MIN, 5, 1440)
+
+            ui.separator()
+            _section("缺集提示",
                      "缺集提示：按开播日、每周一集推算到今天应已播到第几集，库里没见过的集在番剧卡片上标橙色。"
                      "余量＝推算时少算几周，休播一周或字幕组晚发几天都不误报；调大更不容易误报，但发现得更晚。"
-                     "应播集数超过『长番上限』的不判（航海王这类只收最近几集，报缺上千集是噪音）。\n"
+                     "应播集数超过『长番上限』的不判（航海王这类只收最近几集，报缺上千集是噪音）。"
+                     "缺集自动补：缺集出现满这么多天，后台自己去搜原来那个组把它补回来"
+                     "（只补缺的那几集，发布时间要对得上）。版本按番的版本关键词和『补齐同集优先含此词』挑，不看源组的标题过滤。"
+                     "0=关，只提醒不补。")
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ANIME_GAP_SLACK_WEEKS", "缺集提示余量（周）", config.ANIME_GAP_SLACK_WEEKS, 0, 8)
+                _num("ANIME_GAP_MAX_EPISODES", "缺集提示长番上限（集）", config.ANIME_GAP_MAX_EPISODES, 1, 10000)
+                _num("ANIME_GAP_AUTOFILL_DAYS", "缺集自动补（天，0=关）", config.ANIME_GAP_AUTOFILL_DAYS,
+                     *config._RANGE["ANIME_GAP_AUTOFILL_DAYS"])
+
+            ui.separator()
+            _section("锁定源",
                      "锁定源落后：锁了下载源的番，别的组已经发了锁定源之后的集、锁定源过了这么多天还没跟上，"
                      "就在详情页和仪表盘提醒（只提醒，不改下载行为；0=关）。"
                      "同步窗口：锁定组在别组发某集的前后这么多天内也在发、而集号差得远（季内号对绝对号）时，"
@@ -1073,32 +1149,23 @@ def settings():
                      "锁定组以后补发了这一集，会再自动下它的版本（多一份；兜底那份不会自动删，到详情页删）。"
                      "锁定组补发之前别删兜底那份：删了等于这一集不要了，它的版本也不会再自动下。"
                      "设成 0 只停新的兜底；已经兜底过的集，锁定组补发后仍会下它的版本。"
-                     "建议不小于『锁定源落后提醒』的天数，好让提醒先到、你来得及介入。\n"
-                     "断更提醒窗口：一段静默里每满一个阈值提醒一次，静默超过『阈值×倍数』天就不再提醒，"
-                     "即最多提醒『倍数−1』次（默认 4：阈值 14 天时在第 14、28、42 天各一次）；"
-                     "从没成功提醒过的番不受这个限制，一定会先提醒一次。最小 2。\n"
-                     "超期忽略·仍在更新：被自动判成超期忽略的番，最近这么多天里还收到正片新集，就在仪表盘提示（只报不改）。")
+                     "建议不小于『锁定源落后提醒』的天数，好让提醒先到、你来得及介入。")
             with ui.element("div").classes("field-grid w-full"):
-                f["ANIME_FINISH_ENABLED"] = ui.switch(
-                    "判定已下齐（只标记+通知）", value=config.ANIME_FINISH_ENABLED)
-                f["ANIME_FINISH_UNSUB"] = ui.switch(
-                    "下齐后停止自动下新集", value=config.ANIME_FINISH_UNSUB)
-                _num("ANIME_IDLE_DAYS", "断更提醒阈值（天，0=关）", config.ANIME_IDLE_DAYS)
-                _num("ANIME_GAP_SLACK_WEEKS", "缺集提示余量（周）", config.ANIME_GAP_SLACK_WEEKS, 0, 8)
-                _num("ANIME_GAP_MAX_EPISODES", "缺集提示长番上限（集）", config.ANIME_GAP_MAX_EPISODES, 1, 10000)
-                _num("ANIME_LOCK_LAG_DAYS", "锁定源落后提醒（天，0=关）", config.ANIME_LOCK_LAG_DAYS, 0, 90)
-                _num("ANIME_LOCK_FALLBACK_DAYS", "锁定源停更兜底（天，0=关）", config.ANIME_LOCK_FALLBACK_DAYS,
-                     *config._RANGE["ANIME_LOCK_FALLBACK_DAYS"])
-                _num("ANIME_RERELEASE_WEEKS", "同号新集晚几周算可疑（0=关）", config.ANIME_RERELEASE_WEEKS, 0, 520)
+                _num("ANIME_LOCK_LAG_DAYS", "锁定源落后 / 版本关键词挡住提醒（天，0=关）", config.ANIME_LOCK_LAG_DAYS, 0, 90)
                 _num("ANIME_LOCK_SYNC_DAYS", "锁定源同步窗口（天）", config.ANIME_LOCK_SYNC_DAYS,
                      *config._RANGE["ANIME_LOCK_SYNC_DAYS"])
-                _num("ANIME_IDLE_WINDOW_X", "断更提醒窗口（×阈值）", config.ANIME_IDLE_WINDOW_X,
-                     *config._RANGE["ANIME_IDLE_WINDOW_X"])
+                _num("ANIME_LOCK_FALLBACK_DAYS", "锁定源停更兜底（天，0=关）", config.ANIME_LOCK_FALLBACK_DAYS,
+                     *config._RANGE["ANIME_LOCK_FALLBACK_DAYS"])
+
+            ui.separator()
+            _section("其它提示（只报不改）",
+                     "同号新集：在追的番新来的种子，集号与已经下好的那一集相同、发布却晚了这么多周以上，就在仪表盘提示（只报不改；0=关）。"
+                     "多半是新一季沿用季内编号、标题又没写第几季，被当成『这一集已有』而不会下；也可能只是很晚的重发版（如 BD 版）。\n"
+                     "超期忽略·仍在更新：被自动判成超期忽略的番，最近这么多天里还收到正片新集，就在仪表盘提示（只报不改）。")
+            with ui.element("div").classes("field-grid w-full"):
+                _num("ANIME_RERELEASE_WEEKS", "同号新集晚几周算可疑（0=关）", config.ANIME_RERELEASE_WEEKS, 0, 520)
                 _num("ANIME_IGNORED_AIRING_DAYS", "超期忽略·仍在更新（天）", config.ANIME_IGNORED_AIRING_DAYS,
                      *config._RANGE["ANIME_IGNORED_AIRING_DAYS"])
-                # 【给下限】这一项没有"0=关"的语义（关完结/断更各有自己的开关），
-                # 而 run_sweep 里是 max(60, ...) 秒——填 0 会变成每 60 秒来一次全表扫描。
-                _num("SWEEP_INTERVAL_MIN", "巡检间隔（分钟，最少 5）", config.SWEEP_INTERVAL_MIN, 5, 1440)
 
             ui.separator()
             _section("采集健康",
@@ -1232,7 +1299,7 @@ def settings():
             ui.separator()
             _section("开始使用日 · 老番过滤",
                      "排除开播早于此日的老番、不自动下（种子照常入库，『已忽略』页可看/恢复）。"
-                     "新入库的老番建库时即自动判超期忽略（不分自动源/待确认源）；对【已有】的番不自动动，需点右侧『应用』——"
+                     "新入库的老番建库时即自动判超期忽略（不分自动源/人工审核源）；对【已有】的番不自动动，需点右侧『应用』——"
                      "它会先存下这个日期、再按它重算【含当前正在追(已确认)的老番也会被判超期忽略】。\n\n"
                      "反悔：把开始日清空（或调很早）再点『应用』，就把超期忽略的番全放回待确认。")
 
@@ -1251,12 +1318,29 @@ def settings():
                     ui.notify("开始使用日格式不对（应为 YYYY-MM-DD，如 2026-07-01）", type="negative")
                     return
                 # 不拦空开始日：空=没有番算超期→apply_start_date_filter 会把所有超期忽略放回待确认（=释放/反悔）
-                if not await confirm("保存并应用开始使用日？",
-                                     "先把这个开始日存下，再把『开播早于它』的番都判为超期忽略、停止自动下载——【包括当前正在追(已确认)的老番】。"
-                                     "若把开始日改早/清空后再点，则相反：把进入范围的超期忽略放回待确认。想单独保留哪部，之后去『已忽略』页恢复。",
-                                     ok_label="保存并应用", ok_icon="filter_alt", ok_color="primary"):
+                # 【确认框报这次具体会动哪几部】停掉的在追番反悔时只回到『待确认』、要逐部重新确认；
+                # 日期显示解析后的值（填『2026』显示 2026-01-01），年份填错一位当场就看得出来。
+                pv = anime.start_date_preview(sd)
+                stop = pv["stop"]
+                lines = [f"开始使用日：{anime._parse_date(sd) or '（空＝不限）'}"]
+                if stop:
+                    lines.append(f"· 正在追的 {len(stop)} 部会停掉、移到『已忽略』：{'、'.join(stop[:8])}"
+                                 f"{' 等' if len(stop) > 8 else ''}")
+                if pv["ignored"]:
+                    lines.append(f"· 待确认里 {pv['ignored']} 部判为超期忽略")
+                if pv["released"]:
+                    lines.append(f"· {pv['released']} 部超期忽略的放回『待确认』")
+                if stop:
+                    lines.append("停掉的番以后把日期改回去也只会回到『待确认』，要逐部重新确认。")
+                if not (stop or pv["ignored"] or pv["released"]):
+                    lines.append("没有番会受影响，只保存这个日期。")
+                if not await confirm("保存并应用开始使用日？", "\n".join(lines),
+                                     ok_label="保存并应用", ok_icon="filter_alt",
+                                     ok_color="negative" if stop else "primary"):
                     return
                 config.set_many({"ANIME_START_DATE": sd})   # 存 DB + 热更内存，下面重算即读它
+                base["ANIME_START_DATE"] = f["ANIME_START_DATE"].value
+                _mark()
                 n = anime.apply_start_date_filter() + anime.ignore_confirmed_before_start()  # 待确认↔超期 + 追番中→超期
                 ui.notify(f"已保存并应用：{n} 部番状态变更" if n else "已保存；没有需要变更的番", type="positive")
 
@@ -1269,11 +1353,13 @@ def settings():
             ui.separator()
             _section("Bangumi 重试与刷新",
                      "认不到 bgm 的番进『待识别』：先即时重试挡抖动，再指数退避后台重试（每失败翻倍、封顶 24h），"
-                     "满次数就停、留手动（详情页『重新识别』清零重来）。查到 bgm 自动升『待确认』。\n"
+                     "满次数就停；之后每来一个新集号再试一次，也可以到详情页点『重新识别』清零重来。"
+                     "后台查到 bgm：自动源发现的直接转『订阅中』开始自动下（绑定看着不对、绑到只有 1 集的条目、像剧场版、"
+                     "早于开始使用日、已经下过、另有一条番绑着同一个 bgm 的留在『待确认』）；人工审核源发现的进『待确认』。\n"
                      "已绑好的番每收录 N 集（按不同集号数）自动刷一次 bgm 资料：评分、总集数、封面跟着播出更新。"
                      "只刷资料、不改绑定，也不改已下番的归档目录。")
             with ui.element("div").classes("field-grid w-full"):
-                _num("ENRICH_RETRY_TIMES", "即时重试次数（bgm 请求超时/连接错时）", config.ENRICH_RETRY_TIMES)
+                _num("ENRICH_RETRY_TIMES", "bgm 请求最多尝试几次（含首次；超时/连接错时）", config.ENRICH_RETRY_TIMES)
                 _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
                 _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
                 _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
@@ -1293,7 +1379,7 @@ def settings():
 
             ui.separator()
             _section("番剧表显示",
-                     "番剧表默认只显示订阅中，上两项决定要不要带上『待确认/已忽略』。默认标签页=进番剧页先落哪个标签"
+                     "番剧表恒显示订阅中的番；下面两个开关决定带不带『待确认/已忽略』（默认都带）。默认标签页=进番剧页先落哪个标签"
                      "（地址带 ?t= 时以其为准）。分页：1 年=4 个季度。")
             _switch_field("ANIME_SHOW_PENDING", "番剧表里也显示『待确认』的番", config.ANIME_SHOW_PENDING)
             _switch_field("ANIME_SHOW_REJECTED", "番剧表里也显示『已忽略』的番", config.ANIME_SHOW_REJECTED)
@@ -1305,7 +1391,7 @@ def settings():
         with ui.card().classes("w-full"), ui.expansion(
                 "剧场版", icon="theaters", value=True).classes("w-full"):
             _section("列表显示",
-                     "默认标签页=进剧场版页先落哪个标签。分页：1 年=4 个季度。"
+                     "默认标签页=进剧场版页先落哪个标签。分页按年。"
                      "自动扫描开关/间隔在『剧场版页 → 订阅源』里。")
             with ui.element("div").classes("field-grid w-full"):
                 _select("MOVIE_DEFAULT_TAB", "默认标签页", MOVIE_TAB_LABELS, config.MOVIE_DEFAULT_TAB)
@@ -1323,6 +1409,20 @@ def settings():
         with ui.card().classes("w-full"), ui.expansion(
                 "备份", icon="backup", value=False).classes("w-full"):
             _backup_panel(f)
+
+        # 【未保存标记】按与已保存基线的比较判，不是"碰过就标"：改回原值标记自动消失，
+        # 『应用开始使用日』单独存了那一项之后也不会假脏。不挂 onbeforeunload——切库成功后
+        # reload_other_tabs 要靠无确认地刷新别的标签页生效，弹浏览器确认等于给那条防线开口子。
+        base = {k: c.value for k, c in f.items()}
+
+        def _mark(*_):
+            d = any(c.value != base.get(k) for k, c in f.items())
+            dirty_hdr.set_visibility(d)
+            dirty_btm.set_visibility(d)
+        for c in f.values():
+            c.on_value_change(_mark)
+
+        _asking = {"v": False}     # 首次打开采集的确认框正挂着
 
         async def _save():
             if not config.loaded_from_db:
@@ -1356,6 +1456,9 @@ def settings():
                         return
                 else:
                     updates[key] = str(v).strip()
+            # 基线必须是【这一刻收进 updates 的值】：下面要等确认框、qB 登录（连不上时好几秒），
+            # 其间用户再改的项没存进库，若按保存结束时的控件值记基线，『未保存』标记会把它们一起收起
+            snap = {k: c.value for k, c in f.items()}
             for k, (lo, hi) in config._RANGE.items():
                 if k in updates and not lo <= int(updates[k]) <= hi:
                     ui.notify(f"{k} 需在 {lo}~{hi} 之间，已取消保存", type="negative")
@@ -1409,6 +1512,54 @@ def settings():
             if sd and anime._parse_date(sd) is None:
                 ui.notify("开始使用日格式不对（应为 YYYY-MM-DD，如 2026-07-01），已取消保存", type="negative")
                 return
+            poll_on = updates.get("ANIME_POLL_ENABLED") == "true"
+            # 只在开关真要从关变开时才查库：保存别的设置不多花查询，业务库停摆时也照样存得进去
+            # （查不出来就不问——宁可漏报，那时采集本来也跑不动）。
+            if poll_on and not config.ANIME_POLL_ENABLED:
+                try:
+                    autos = [g.name for g in anime.list_source_groups(enabled_only=True) if g.policy == "auto"]
+                    has_conf = anime.has_confirmed_anime()
+                except Exception:
+                    log.warning("打开采集前的首次使用检查失败，这次不提示", exc_info=True)
+                    autos, has_conf = [], True
+                names = _first_run_poll_groups(config.ANIME_POLL_ENABLED, poll_on, sd, autos, has_conf)
+                if names:
+                    # 防重入：连点两下会同时挂两个确认框，一个"继续"一个"取消"时最后那句提示就是假话
+                    if _asking["v"]:
+                        return
+                    _asking["v"] = True
+                    try:
+                        go = await confirm(
+                            "开始使用日还空着，确定打开采集？",
+                            f"打开采集后，自动下载的源组（{'、'.join(names)}）当前 feed 里的所有番都会被当成新番"
+                            "自动确认并开始下载，可能是几十部、几十 GB。\n"
+                            "只想从现在起追新番：点取消，在本页『番剧』一栏填好『开始使用日』"
+                            "（早于这天开播的番判『超期忽略』）再保存。",
+                            ok_label="继续打开")
+                    finally:
+                        _asking["v"] = False
+                    if not go:
+                        # 整次保存都不落：与上面各项校验"已取消保存"同一个口径，表单上改的内容都还在，填好再点保存即可
+                        ui.notify("已取消保存（采集仍关着，其余改动也没存，表单上的内容还在）", type="warning")
+                        return
+            # 【关跟踪先说影响面】下面的 settle_inflight_off 会把在下的种子当场记成已下完、不再跟踪，
+            # 重新打开也不恢复——卡住或失败的那一集已算到手、不会换源。这一步必须留（否则永久卡『正在下载』），
+            # 而整页一起提交，误触这个开关会被别的改动带进来，所以有在途种子时先问；没有就不打扰。取消＝整次不存。
+            if config.QB_SYNC_STATUS and updates.get("QB_SYNC_STATUS") == "false":
+                try:
+                    n = engine.inflight_count(AnimeTorrent) + engine.inflight_count(MovieTorrent)
+                except Exception:
+                    # 与上面首次开采集同一口径：查不出来就不问，别让业务库停摆把整次保存一起拖垮
+                    log.warning("关跟踪前数在途失败，这次不问", exc_info=True)
+                    n = 0
+                if n and not await confirm(
+                        "关闭 qB 状态跟踪？",
+                        f"现在有 {n} 条种子还在下载。关掉之后它们会直接记成『已下完』，不再跟踪进度；"
+                        "之后卡住或失败都不会再提醒，重新打开也不会恢复。\n"
+                        "只是 qB 临时维护的话，关上面那个『发送种子到 qB』就够了，它不改已有种子的状态。",
+                        ok_label="关闭并记为已下完"):
+                    ui.notify("已取消保存（跟踪仍开着，其余改动也没存，表单上的内容还在）", type="warning")
+                    return
             db_updates = {k: v for k, v in updates.items() if k not in _RESTART_ONLY}
             # 【只收【真的变了】的那几项】表单收的是全量而不是差量，而 WEB_HOST/WEB_PORT 的控件
             # 恒存在于 f 里，所以按"在不在 _RESTART_ONLY 里"筛出来的 env_updates 【永远非空】。
@@ -1420,6 +1571,7 @@ def settings():
             # 【已经写进库】之后抛出，页面上什么都不会显示——现在只有真改绑定地址/端口才可能撞上。
             env_updates = {k: v for k, v in updates.items()
                            if k in _RESTART_ONLY and v != (_env_now.get(k) or "")}
+            changed = {}
             if db_updates:
                 sync_was_on = config.QB_SYNC_STATUS   # 捕获切换前旧值（set_many 即时改内存），供下面判 on→off
                 # 【目录分裂提示】(r39 U7) 改下载目录规则只影响之后的新集，已下的文件留在原目录——同一部会分在两个文件夹，
@@ -1445,9 +1597,10 @@ def settings():
                 # 还要等冷却过期或状态再翻转一次才看得到效果——那看起来就像"设置没生效"。
                 # 【只在真的改了 NOTIFY_* 时才清】(R36 体检) 以前保存任何一项（改个轮询间隔）都会把
                 # failed/stalled 的 6 小时冷却整个清掉 —— 下一轮巡检把同一批告警原样再推一遍。
-                # 同文件的『发送测试通知』按钮早就为此专门避开了 reset_state（见 reset_circuit）。
+                # 同文件的『发送测试通知』按钮早就为此专门避开了 reset_state（见 clear_mute）。
                 if any(k.startswith("NOTIFY_") for k in changed):
                     notify.reset_state()
+                    digest.reset_retry()
                 # 注：改开始使用日【不】自动重算已有番——由用户在设置里点『应用』按钮显式触发（更可控）
                 # 【只在真改了 qB 连接设置时才测一次连接，连不上也【不】自动关开关】(r37 #5)
                 # 以前是：qB 发送开着 → 保存【任何一项】（改个站点名、轮询间隔）都测一次，测失败就把
@@ -1462,7 +1615,7 @@ def settings():
                     client = await engine.qb._login()
                     if client is None:
                         ui.notify("已保存，但现在连不上 qB（检查地址/端口/账号密码，或 qB 正在重启）。"
-                                  "『发送到 qB』仍开着：种子留在待下，qB 一恢复就自动继续。",
+                                  "『发送种子到 qB』仍开着：种子留在待下，qB 一恢复就自动继续。",
                                   type="warning", timeout=0, close_button="知道了")
                     else:
                         await client.aclose()
@@ -1478,8 +1631,23 @@ def settings():
                     engine.settle_inflight_off()
             if env_updates:
                 config.update_env(env_updates)  # WEB_PORT 等结构项仍走 .env
-            msg = "已保存，即时生效" + ("（Web 绑定地址/端口改动需重启）" if env_updates else "")
+            # 【说出这次真改了哪几项】整页约百项一起提交，误触一个开关会被别的改动带进来；
+            # 提示里点名改了什么，误触当场就看得见。名字取控件自己的标签，截到第一个全角括号前。
+            def _label_of(k):
+                c = f.get(k)
+                raw = ((c.props.get("label") or getattr(c, "text", "")) if c is not None else "") or k
+                raw = raw.split("（")[0].strip() or k
+                # 这三个标签番剧 / 剧场版两边同名，不加前缀就看不出改的是哪一边
+                if k.startswith("MOVIE_") and raw in {"默认标签页", "分页 · 每页年数", "命名模板"}:
+                    raw = "剧场版·" + raw
+                return raw
+            names = [_label_of(k) for k in list(changed) + list(env_updates)]
+            tail = (f"（改了 {len(names)} 项：{'、'.join(names[:6])}{' 等' if len(names) > 6 else ''}）"
+                    if names else "（没有改动）")
+            msg = "已保存，即时生效" + tail + ("（Web 绑定地址/端口改动需重启）" if env_updates else "")
             ui.notify(msg, type="positive")
+            base.update(snap)
+            _mark()
 
         _reactivate_busy = {"v": False}
 
@@ -1508,3 +1676,5 @@ def settings():
             ui.button("保存", icon="save", on_click=_save).props("unelevated color=primary")
             reactivate_btn = ui.button("重新激活全部任务", icon="restart_alt",
                                        on_click=_reactivate).props("flat")
+            dirty_btm = ui.label("有未保存的改动").classes("text-xs text-amber-400")
+            dirty_btm.set_visibility(False)

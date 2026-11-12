@@ -126,6 +126,8 @@ def parse_test_page():
                 else:
                     ui.label("（无——识别不到会进『待识别』，可手动绑定 bgm）").classes("text-sm text-gray-400")
 
+        result()   # 结果紧跟输入卡片、排在示例列表之前：排在 13 行示例下面时，粘贴后首屏什么都不变
+
         def _toggle():
             # 同上：sw 是用 config 渲染的，配置没读出来时它的值是硬编码默认
             if not require_config_loaded():
@@ -156,4 +158,3 @@ def parse_test_page():
                         "hover:bg-white/5 transition-colors").on("click", lambda e=ex: _fill(e)):
                     ui.badge(tag).props("color=blue").classes("shrink-0")
                     ui.label(ex).classes("text-xs text-gray-400 break-all")
-        result()

@@ -124,10 +124,18 @@ def manual_page():
                 r = await manual.add_manual(tin.value or "", up["bytes"], spath.value or "")
                 if r["ok"]:
                     ui.notify(f"已交给 qB → {r['save_path']}", type="positive")
+                    # 【成功后清掉用掉的来源】上传的文件优先于链接：不清的话，接着贴一条磁力 B 再点下载，
+                    # 发出去的仍是上一个文件 A，qB 对已存在的 hash 照样回成功、页面弹绿色——B 根本没发出去。
+                    # 失败不清，留着改了重试；保存目录与 bgm 框不动
+                    tin.set_value("")
+                    up.update(bytes=None, name=""); upbox.refresh()
                 else:
                     ui.notify(f"下载失败：{r['error']}", type="negative")
 
-            _dl = ui.button("下载", icon="download", on_click=_download).props(
+            # http 的 .torrent 链接取种最长 180 秒，期间按钮毫无反应用户会连点、并发取两次 —— 走 busy_action
+            _dl = ui.button("下载", icon="download",
+                            on_click=lambda e: busy_action(e.sender, "manual-download", _download,
+                                                           fail="下载失败")).props(
                 "unelevated color=primary").classes("self-start")
             _dl.set_enabled(config.QB_ENABLED)
             if not config.QB_ENABLED:

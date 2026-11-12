@@ -1,4 +1,4 @@
-"""采集健康：停摆 / 暂停 / 源连续失败 / RSS 窗口溢出。(r37 #1 #7)
+"""采集健康：停摆 / 暂停 / 源连续失败 / RSS 窗口溢出 / 后台协程退出。(r37 #1 #7)
 
 【为什么要有它】2026-09-27 宿主机关机，容器停了 15 天，10-12 才开回来 —— 采集半个月一条没进，
 全程零提醒；开回来之后也没人知道漏了哪段（ANi 的 nyaa RSS 只留最近约 9 天，Mikan Classic 约 1 天，
@@ -15,8 +15,11 @@
   · 源连续失败：同一个源组连着 N 轮抓不到（网络、403、站点返回维护页）。只看"上一轮"的话，
           一个源坏了三天，页面上和偶尔抖一下没有区别。
   · 窗口溢出：每个 feed 记下 seen ——"这之前的发布都已处理过"（正常等于上次抓取时刻）；这一轮成功抓到时，
-          若 feed 里最老一条都比它晚，中间那段就已经滚出 RSS、永远看不到了。这是零误报的：说"可能漏了"的
+          若 feed 里最老一条都比它晚，中间那段就已经滚出 RSS、永远看不到了。说"可能漏了"的
           那段时间里我们确实一条都没处理到。入库撞上连接错误时，断档也可能落在抓到但没入库的那段（r39 A13）。
+          不知道 feed 的容量，所以稀疏 feed（关键词搜索 / 单番）仍有两种误报判不掉：唯一一条被删后重发；
+          旧条目过期与新条目发布落在同一轮之内。空 feed 之后出现第一条不算（空的那一轮清掉 seen，见 poll_once）。
+  · 后台协程退出：worker.log_task_exit 记名字（被 cancel 的不记），协程不会自己复活，只有重启能清。
 """
 import hashlib
 import json
@@ -40,6 +43,8 @@ _NET_HINTS = ("name resolution", "Name or service not known", "nodename nor serv
 _seen: dict | None = None
 _GAP_MIN = timedelta(minutes=10)      # 小于这个的"断档"只是两边时钟差，不报
 _GAPS_KEEP = 10
+# 已经退出的后台协程名（worker.log_task_exit 记）。上界就是 main.py 建的那几条；协程不会自己复活，只有重启能清。
+_dead: set[str] = set()
 
 
 def touch() -> None:
@@ -91,6 +96,17 @@ def sources_problem() -> str | None:
             + "。去『订阅源』看看地址还对不对、站点是不是挂了。")
 
 
+def note_dead(name: str) -> None:
+    _dead.add(name)
+
+
+def tasks_problem() -> str | None:
+    """后台协程退出的人话描述（横幅用）；没有返回 None。"""
+    if not _dead:
+        return None
+    return f"后台协程 {'、'.join(sorted(_dead))} 已退出，对应的功能停了；重启服务可恢复，原因看运行日志"
+
+
 def fail_streak(name: str) -> int:
     return _fail.get(name, (0, ""))[0]
 
@@ -128,6 +144,11 @@ def mark_seen(url: str, t: datetime | None) -> None:
     撞上业务库连接错误时 worker 会写得更早，规则在 poll_once）。t 为 None 时不写。(r39 A13)"""
     if t is not None:
         _load_seen()[_feed_key(url)] = t.isoformat(timespec="seconds")
+
+
+def forget_seen(url: str) -> None:
+    """清掉这个 feed 的 seen：这一轮它一条带时间的都没有（合法的空 feed），下一轮出现的第一条不拿来比（规则在 poll_once）。"""
+    _load_seen().pop(_feed_key(url), None)
 
 
 def check_window(url: str, oldest: datetime | None, now: datetime | None = None, *,

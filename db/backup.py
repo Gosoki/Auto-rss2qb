@@ -39,8 +39,9 @@ from config import DATA_DIR
 log = logging.getLogger("autorss")
 
 BACKUP_DIR = DATA_DIR / "backups"
-# 文件名里带来源标签，一眼能看出这份备份含什么：meta=只有配置，full=配置+业务同库
-_NAME_RE = re.compile(r"^autorss-(meta|full)-\d{8}-\d{6}\.db$")
+# 文件名里带来源标签，只表达导出那一刻现役业务库在不在这个文件里：meta=不在（配置为 MySQL），full=配置+业务同库；文件里实际有什么以 _peek() 为准。
+# 末尾 -preupgrade = 数据库迁移前自动做的那份（见 schema._backup_before_upgrade），保留份数单独数
+_NAME_RE = re.compile(r"^autorss-(meta|full)-\d{8}-\d{6}(-preupgrade)?\.db$")
 # 同进程内串行化 backup_now：后台协程与页面按钮打的是同一个函数（见 backup_now 里的 TOCTOU 说明）
 _backup_lock = threading.Lock()
 
@@ -148,19 +149,24 @@ def has_business_data(path: str) -> bool:
     return _summarize(_peek(path))[1]
 
 
-def backup_now(keep: int = 7) -> dict:
+def backup_now(keep: int = 7, pre_upgrade: bool = False) -> dict:
     """立刻做一次备份，并把 backups/ 里最旧的删到只剩 keep 份。
+
+    pre_upgrade=True：迁移前的那份，文件名带 -preupgrade，在 prune 里与日常备份分开数
+    （否则每次升级都会把用户最旧的一份日常备份提前挤掉）。
 
     返回 {"path": str|None, "scope": "full"|"meta", "bytes": int, "pruned": [文件名],
           "note": 给用户看的一句话}。失败抛异常（调用方决定怎么呈现）。
     """
-    from db import engine, meta_engine    # 延迟导入：本模块被 db 包内部引用，避免环导入
+    # 延迟导入：db.engine 会被 switch_data_engine / apply_configured_backend 重新赋值，
+    # 模块级 from-import 会钉住导入那一刻的引擎
+    from db import engine, meta_engine
 
     meta_path = _sqlite_path(meta_engine)
     if meta_path is None:                 # 理论上不会——配置库恒为本地 SQLite
         raise RuntimeError("配置库不是本地 SQLite，无法备份")
 
-    # 业务库与配置库同一个文件时，一份快照就把两边都备了；切到 MySQL 时只备得到配置。
+    # 业务库与配置库同一个文件时，一份快照就把两边都备了；切到 MySQL 时备不到 MySQL 上的业务数据。
     # 【不能只看"两个引擎是不是同一个 SQLite 文件"】DB_BACKEND=mysql 但连接参数不全时，
     # apply_configured_backend 走 mark_data_fatal，engine 仍指着本地 SQLite ——
     # 于是 same 恒真、标成 full、note 说"含全部业务数据"，而真数据在够不着的 MySQL 上。
@@ -176,7 +182,7 @@ def backup_now(keep: int = 7) -> dict:
         pass
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = BACKUP_DIR / f"autorss-{scope}-{stamp}.db"
+    out = BACKUP_DIR / f"autorss-{scope}-{stamp}{'-preupgrade' if pre_upgrade else ''}.db"
     # 【先导出到临时名，成功了再改名】文件名精确到秒，后台协程与页面按钮同秒撞车是真实可能
     # （worker.run_backup 与 settings 的『立刻备份』）。早先的写法是 `if out.exists(): raise` +
     # 失败时无条件 unlink(out) —— 那是个 TOCTOU：输家从 VACUUM 拿到 "table already exists"，
@@ -245,6 +251,7 @@ def list_backups() -> list[dict]:
         out.append({"name": p.name, "path": str(p), "bytes": st.st_size,
                     "mtime": datetime.fromtimestamp(st.st_mtime),
                     "scope": p.name.split("-")[1],
+                    "pre_upgrade": p.name.endswith("-preupgrade.db"),
                     # 这份备份里的『业务库指向』——恢复它就会把系统切到这个库上，见 _peek
                     "backend": _pk.get("backend"), "mysql_db": _pk.get("mysql_db"),
                     # 【页面上的徽标要按这个走，不能按 scope】见 _peek 的说明：
@@ -259,7 +266,7 @@ def list_backups() -> list[dict]:
 
 
 def prune(keep: int, protect: Path | None = None) -> list[str]:
-    """每种 scope 各留最近 keep 份，返回被删的文件名。keep<=0 视作不清理（别把用户的备份全删了）。
+    """每种 scope 各留最近 keep 份（升级前的那批另算一组，也各留 keep 份），返回被删的文件名。keep<=0 视作不清理（别把用户的备份全删了）。
 
     protect：这一份【绝不删】。刚做好的备份必须传进来——排序键再怎么改也不该让
     "做一份备份"这个动作有把自己删掉的可能，这是最后一道兜底。
@@ -271,7 +278,7 @@ def prune(keep: int, protect: Path | None = None) -> list[str]:
     # 而 full 才是真正救得回番剧数据的那种。
     by_scope: dict = {}
     for d in list_backups():                 # 已按 mtime 降序
-        by_scope.setdefault(d["scope"], []).append(d)
+        by_scope.setdefault((d["scope"], d["pre_upgrade"]), []).append(d)
     # 【每种 scope 里"最新的那份真有业务数据的"永不删】——与 protect= 同一个性质的兜底。
     # R17 把"别信文件名里的 scope、现场数行数"推到了三处【读】的地方（页面徽标、verify 的说明、
     # backup_now 的 note），却没推到这里——而这里是整个模块唯一会删【已经存在、之前验过】

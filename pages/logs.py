@@ -6,7 +6,7 @@ import logging
 
 from nicegui import ui
 
-from core.logsetup import LOG_PATH, errors_ring, ring, warnings_ring
+from core.logsetup import _LINE_HEAD, LOG_PATH, errors_ring, ring, warnings_ring
 from pages.layout import frame, page_visibility
 
 # 级别过滤档位：文案 → 最低 levelno（该值及以上才显示）
@@ -18,6 +18,17 @@ _LEVELS = {"全部": 0, "警告以上": logging.WARNING, "仅错误": logging.ER
 # 顺带这也把全站的灰收成两档（gray-400 / gray-500），见 layout.warn_banner 的说明。
 _COLOR = {"DEBUG": "text-gray-500", "INFO": "",
           "WARNING": "text-amber-400", "ERROR": "text-red-400", "CRITICAL": "text-red-400"}
+
+
+def _short(line: str) -> str:
+    """显示用：行头 '2026-11-12 04:59:13,215 INFO ' 压成 '11-12 04:59:13 '；WARNING/ERROR 保留级别字样。
+    匹配不上的行（异常栈续行等）原样返回；多行记录只动首行行头。缓冲里存的与下载的文件都不变。
+
+    行头 29 个字符，手机上一行约 47 格，典型的『源 ANi：75 条，新增 0』加上它就折成两行。"""
+    m = _LINE_HEAD.match(line)
+    if not m:
+        return line
+    return f"{line[5:19]} {'' if m.group(1) == 'INFO' else m.group(1) + ' '}{line[m.end():]}"
 
 
 def _download() -> None:
@@ -57,7 +68,9 @@ def logs_page():
             buf = _buf()
             items = list(reversed(buf.snapshot()))
             what = {errors_ring: "条错误", warnings_ring: "条警告/错误"}.get(buf, "条")
-            count.text = (f"最近 {len(items)} {what}（新→旧"
+            # 缓冲只留最近一段：说出最早一条到几点，看得出昨晚的还在不在（不用滚到底）
+            oldest = items[-1]["line"][5:16] if items and _LINE_HEAD.match(items[-1]["line"]) else ""
+            count.text = (f"最近 {len(items)} {what}" + (f"，最早到 {oldest}" if oldest else "") + "（新→旧"
                           + ("，单独保留最近 %d 条、含重启前的）" % buf.buf.maxlen if buf is not ring else "）"))
             if not items:
                 ui.label("暂无日志——后台还没产出，或当前级别下没有记录。").classes(
@@ -66,7 +79,7 @@ def logs_page():
             with ui.column().classes("w-full gap-0 font-mono").style(
                     "font-size:12px;line-height:1.55"):
                 for x in items:
-                    ui.label(x["line"]).classes(
+                    ui.label(_short(x["line"])).classes(
                         _COLOR.get(x["level"], "")).style(
                         "white-space:pre-wrap;word-break:break-all")
 

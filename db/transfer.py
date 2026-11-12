@@ -168,7 +168,8 @@ def _overlong_values(src_engine, dst_engine) -> list:
     留下一个半个库：anime 全在、animetorrent 还空。用户再点一次『切换』就会把 RSS 窗口
     整批当成新种子重下一遍。
 
-    只查目标库真有长度限制的列（SQLite 侧 VARCHAR 不限长，所以目标是 SQLite 时这里恒为空）。
+    只查目标库声明了长度上限的列（SQLite 不强制 VARCHAR(n) 的长度，但建表 DDL 带着 n、
+    反射照样拿得到，所以目标是 SQLite 时同样会查）。
 
     【清空之前一共三道预检】源表读得出来(_readable_source_tables) / 值塞得下(本函数) /
     值不撞唯一约束(_dup_unique_values)。以后再给业务表加任何一类约束，都要问一句
@@ -237,7 +238,8 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
     # 【顺便升级】目标库先升到最新版本再往里灌数据：
     #   · 全新空库 → 一路建表到 head，用户不必先切过去建一遍再回来迁；
     #   · 老版本的库 → 补齐缺的 revision，免得拿新模型的列往旧表结构里插而报 Unknown column。
-    # 源库【不动】：迁移不该顺手改用户还在用的那一头，它自己启动时会升。
+    # 源库【不动】：迁移不该顺手改用户还在用的那一头。它启动时未必升过（R21 起启动只升当前业务库的 data 链），
+    # 要升由调用方在迁之前显式升（见 pages/settings.py `_migrate` 里的 R22 说明）。
     from . import schema
     schema.upgrade(dst_engine, "data")
 
@@ -270,7 +272,7 @@ def migrate_data(src_engine, dst_engine, *, overwrite: bool = False,
     dst_counts = count_rows(dst_engine)
     # 【第四道：空源 + 覆盖 = 纯破坏，没有任何正当用途】
     # 真实形态：用户先切到了 MySQL（于是本地 SQLite 的业务表一直是空的），过后"为保险"
-    # 再点一次『本地 SQLite → MySQL』—— 目标就是他当前正在用的那个库，六张表被 DELETE 干净，
+    # 再点一次『本地 SQLite → MySQL』—— 目标就是他当前正在用的那个库，所有业务表被 DELETE 干净，
     # 再从空源写入 0 行；而 verify 拿 0==0 判"一致"，页面弹的是绿色的「迁移完成并校验一致」。
     # 用户唯一可能察觉的时刻，反而确认了一切正常。而 DB_BACKEND=mysql 时备份的 scope 恒是
     # meta，业务数据一条都不在备份里 —— 没有任何退路。

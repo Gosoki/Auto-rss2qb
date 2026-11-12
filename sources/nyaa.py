@@ -33,7 +33,7 @@ def nyaa_search_url(query: str) -> str:
 
 
 class NyaaSource(RssSource):
-    """nyaa 的 RSS 源。除了下面这三样，全部逻辑在 RssSource 里（见那里的说明）。"""
+    """nyaa 的 RSS 源。除了下面这四样，全部逻辑在 RssSource 里（见那里的说明）。"""
 
     site = "nyaa"
     TZ = timezone.utc          # nyaa 的 pubDate 带 -0000，feedparser 归一后就是真 UTC

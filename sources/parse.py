@@ -38,8 +38,7 @@ ONE_COUR = 12
 
 # 批量/合集/蓝光整理帖 或 连续集范围(01-12)——不是周更单集。
 # · BDMV/BD Remux/Vol.N/第N巻/TV+SP：蓝光盘/卷/整季合集，非周更单集（不含歧义的『第N季/クール』，那些有周更单集）。
-# · EP01-28 与裸 01-12 范围：连续集合集；两侧都要 ≥2 位（真·合集用零填充），才不把『第二季 - 03』的 "2 - 03"
-#   误判成范围而丢单集；裸范围两侧还须被【非连字符】的非字母数字包围，才不把 "x264-10bit" 的 "264-10"、
+# · EP01-28 与裸 01-12 范围：连续集合集；裸范围两侧须被【非连字符】的非字母数字包围，才不把 "x264-10bit" 的 "264-10"、
 #   或日期 "[2024-05-10]" 的 "05-10" 误判成范围（相邻连字符＝编码残段/日期分段，都不是合集）。
 _BATCH_RE = re.compile(
     r"合集|BD-?RIP|BDMV|BD\s?Remux|\bBatch\b|Vol\.\s*\d+|\bTV\s*\+\s*SP\b|第\s*\d+\s*[巻卷]"
@@ -68,7 +67,7 @@ _BATCH_BODY_RE = re.compile(r"搬运|搬運|整理")
 _BARE_RANGE_RE = re.compile(r"(?<![-A-Za-z0-9])\d{1,4}\s*[-~〜]\s*\d{1,4}(?![-A-Za-z0-9])")
 
 # 集数识别（按优先级）：'- 07'/'- 11.5'/'- 07v2' → S02E07 → 第07話/第二十三话 → [07]/[07v2] → EP07
-# 第1条用负向后顾避免吃到范围 01-12 的第二个数，并容忍 v2 版本后缀；第3条兼中文数字；第4条限 1~3 位避免命中 [2024]
+# 第1条用负向后顾避免吃到范围 01-12 的第二个数，并容忍 v2 版本后缀；第3条兼中文数字；第4条放宽到 1~4 位后靠年份守卫避免命中 [2024]
 # 完结标记：字幕组常在最终话写 『- 24 END』『- 12 完』『- 13 Fin』，它卡在集号与 [tag] 之间，
 # 早先的收尾锚点容不下它 → 整条落 -2（未知集），最终话永远不会被自动下。
 _FINALE = r"(?:\s*(?:END|FIN|COMPLETE|完|終|终|エンド))?"
@@ -407,9 +406,10 @@ _LEAD_BLK_RE = re.compile(r"^\s*[\[【]([^\]】]+)[\]】]")
 
 
 # 只是一个季号、没有番名的残渣：'S2' / 'Season 2' / '2nd Season'。
-# 【为什么要单独判】strip_season 只认中文季名（第X季/期），英文写法它不动。
+# 【为什么要单独判】(R11 F2) 当时 strip_season 只认中文季名（第X季/期），英文写法它不动。
 # 于是 `【我推的孩子】 S2 - 03` 洗完剩下 'S2'，非空 → 解包回退不触发 →
 # 番名就是 'S2'：该组所有这么写的【】番全并进一部叫 S2 的假番里（与 F1 同款损坏）。
+# E-39 之后 strip_season 也剥英文与裸 S 季标记了，但罗马数字 'Ⅱ'、不带"第"的 '2期'、'Part 2' 它仍不剥。
 # 真番名不会长成这样，所以整段匹配是安全的。
 _SEASON_ONLY_RE = re.compile(
     r"(?:S|Season)\s*\d{1,2}|\d{1,2}(?:st|nd|rd|th)\s*Season"
@@ -470,8 +470,8 @@ def _clean_name(name_part: str) -> str:
     if _usable_name(s):
         return s
     # 【只解包"整段就是一个番名块"这一种形状】——那正是 D5 要修的 `【我推的孩子】 - 11`。
-    # 判据有两条，缺一不可：
-    #   ① 非标签块【恰好一个】；② 它就是【首块】。
+    # 判据有三条，缺一不可：
+    #   ① 非标签块【恰好一个】；② 它就是【首块】；③ 只有一个块，或块外还有正文。
     # 【为什么不能只看首块】第一版只判了"首块不是标签"，于是任何全括号标题的第一个块都被当成番名：
     #   [诸神字幕组][2024年10月新番][青之箱][05][1080P] → 番名 '2024年10月新番'
     #   [天使动漫论坛][www.tsdm39.com][10月新番][败犬女主太多了][01] → 番名 'www.tsdm39.com'
@@ -488,7 +488,6 @@ def _clean_name(name_part: str) -> str:
 
 
 def _clean_name_once(name_part: str) -> str:
-    # 注：_is_skip_block 定义在本文件更下方，运行时才解析名字，不影响。
     s = _PROMO_RE.sub("", _EXT_RE.sub("", _TAG_BLK_RE.sub("", name_part)))
     for pat in _STRIP_PATTERNS:
         m = pat.search(s)
@@ -621,7 +620,7 @@ def parse_version(raw: str) -> int:
 def kw_match(kw: str, raw: str) -> bool:
     """版本/标题关键词是否命中种子原名？**大小写不敏感**子串（繁日/简日/1080p 等）。
 
-    【五处共用这一个判据】源组的 title_filter 与 subgroups（nyaa/mikan 的 _parse 各两处）
+    【多处共用这一个判据】源组的 title_filter 与 subgroups（sources/base.py 的 RssSource._parse 两处）
     与单番的 pref_keyword（core.anime）。此前源组那两处用的是裸 `in`（大小写敏感）：用户在源管理页填 `1080p`
     而该组标题写的是 `1080P`，那个源组每一轮都会被整体过滤成 0 条，日志里只有一行"0 条"，
     而设置页对 pref_keyword 的示例文案用的恰恰是小写的 `1080p`——两处口径相反最容易踩。
@@ -636,7 +635,7 @@ def _is_chinese(s: str) -> bool:
 
 
 def _group_and_body(raw: str):
-    """组名 + 去掉开头 [组] 块后的正文。parse_title/candidate_names/剧场版抓取共用，省重复 _GROUP_RE.match。"""
+    """组名 + 去掉开头 [组] 块后的正文。parse_title/candidate_names/is_batch 共用，省重复 _GROUP_RE.match。"""
     m = _GROUP_RE.match(raw)
     return (m.group(1).strip() if m else ""), (raw[m.end():] if m else raw)
 
@@ -681,7 +680,7 @@ def _clean_for_search(s: str) -> str:
     （罗马音要空格才搜得准；"第二季"/S02 有助于命中正确的季条目）。"""
     # _PROMO_RE 必须一起去掉：★07月新番★ 这类促销串不在标签块里，留着会整段变成 bgm 的搜索词
     # （实测『【喵萌奶茶屋】★07月新番★[猫与龙] - 03』清完只剩 '★07月新番★'，番名反而没了）。
-    # _clean_name(157) 与 search_query_names(378) 早就在去它，唯独这条路漏了——parse.py:63 的
+    # _clean_name 与 search_query_names 早就在去它，唯独这条路漏了——_PROMO_RE 定义处的
     # 注释本来就写着它的存在理由是"污染别名键与 bgm 搜索词"。
     s = _PROMO_RE.sub("", _EXT_RE.sub("", _TAG_BLK_RE.sub("", s)))
     # 去 " - 07" / "第07话" / "EP07" 及其后（都锚定，不吃 -2nd 副标题）。集号没写在独立括号块里、
@@ -781,7 +780,8 @@ def _is_skip_block(blk: str) -> bool:
 def parse_multibracket(raw_title: str):
     """全括号命名 [组][番名块][集号][画质…] 的番名回退：挑出番名块 → 拆多语言 → 候选名。
 
-    仅当 parse_title 得空名、且开了 ANIME_MULTIBRACKET_PARSE 时兜底调用（见 nyaa/mikan 源）。
+    采集时仅当 parse_title 得空名、且开了 ANIME_MULTIBRACKET_PARSE 时兜底调用（见 sources/base.py 的 RssSource._parse）；
+    search_query_names 也用它兜底搜索词，那里不看开关（理由见那里）。
     挑名策略：① 优先【真·多语言并列】的块（一侧含 CJK、一侧不含，判据同 _split_langs）；
     ② 退而取第一个『含 CJK 且非标签』的块；③ 再退取第一个非标签块（纯拉丁名的番靠这一档）。
     带信心闸：洗完拿不到 ≥2 字符的合理候选就返回 None——宁可不猜、落『待识别』，也不建垃圾番。
@@ -822,7 +822,7 @@ def parse_multibracket(raw_title: str):
 # ---- 搜种用番名（『补齐该源』用，与搜 bgm 的 candidate_names 分开）----
 # 洗完还带括号/促销星 → candidate_names 没洗干净（全括号命名的组），改用 parse_multibracket 的块级候选
 _MANGLED_RE = re.compile(r"[\[\]【】★]")
-# candidate_names 只锚掉『 - 07』式集号，这些写法会整段留在名字里：第03话 / EP03 / - 03 END
+# 搜种词里要剥掉的集号写法：第03话 / EP03 / - 03 END（candidate_names 如今也剥这几种，这里再过一遍；parse_multibracket 的块级候选不剥）
 # 末尾允许再挂一个分隔符（'番名 - 05 -'）：清理跑在 strip 之前，不带上它就只剥掉那根光杆连字符、
 # 把 '- 05' 留在搜索词里，去种子站一条都搜不到（补齐该源因此永远空手而归）。
 # 【每个 \s* 后面都跟一个【必需】的 token，不要留相邻的可选空白】

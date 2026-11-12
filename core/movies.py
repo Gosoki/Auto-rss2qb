@@ -211,7 +211,7 @@ def _store_movie_torrents(movie_id: int, items: list) -> int:
     """把某剧场版番组抓来的种子入库（按 hash 去重、逐条提交），pending（片已被忽略则 skipped）。返回新增数。
 
     【入库前先确认这部 Movie 还在】movie_id 是本轮扫描早些时候 _upsert_movie 拿到的，
-    而拿到它之后我们又 await 了两次网络（fetch_detail / fetch_bangumi_torrents，各可能几秒）。
+    而拿到它之后我们又 await 了一次网络（fetch_bangumi_torrents，可能几秒）。
     这期间用户完全可能在页面上把这部片绑到别的 bgm 上、于是它被合并掉了——
     此时挂上去的种子会变成孤儿：它占住了 info_hash（本函数按 hash 全局去重），
     而真正那部 Movie 从此【永远收不到这几个版本】，页面上也看不到它们。
@@ -267,7 +267,7 @@ async def discover_movies(year: int, seasons: list[str] | None = None) -> dict:
         # 抛 ValueError、填 'socks5://…' 而没装 socksio 抛 ImportError —— 两者都不属 httpx 异常族，
         # 且都发生在【建 AsyncClient 时】而不是发请求时。漏出去就一路逃进 /movies 那个
         # 『立即扫描』按钮的 on_click：先弹"扫描中…请稍候"，然后永远没有下文，页面零反馈。
-        # refresh_movie_torrents 早就为这件事加了同款守卫（47 行之下），这里没跟上。
+        # refresh_movie_torrents 早就为这件事加了同款守卫（见 _refresh_movie_torrents_inner），这里没跟上。
         log.error("剧场版扫描失败 %s：%s: %s", year, type(e).__name__, e)
         return {"movies": 0, "torrents": 0, "seen": 0, "errors": 1, "bgm_down": False, "mikan_ids": set()}
 
@@ -764,7 +764,7 @@ def restore_movie(movie_id: int) -> None:
         m.rejected = False
         s.add(m)
         rows = list(s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)))
-        # deleted/stalled 也算『有过一版』：唯一版本被删/停滞后，不该把 skipped 旧版翻出来重下（与番剧 _HANDLED 一致）
+        # deleted/stalled 也算『有过一版』：唯一版本被删/停滞后，不该把 skipped 旧版翻出来重下（与番剧 HANDLED_STATUSES 一致）
         anydl = any(t.status in engine.HANDLED_STATUSES for t in rows)
         for t in rows:  # 剧场版=一部作品：已有一版就别把 skipped 旧版翻出来（deleted 是用户主动删，也不重下）
             if t.status == "skipped" and not anydl:
@@ -956,7 +956,8 @@ async def _bind_movie_bgm_inner(movie_id: int, bgm_id: int, report: dict | None 
 
 def _movie_folder(m, t=None):
     """剧场版下载文件夹名——download_movie_torrent 与 movie_save_path 统一口径（B3）：
-    bgm 日文/中文名 → 种子原始标题 → m.title → 'movie'。缺 bgm 元数据时两处都回退到同一名字。"""
+    bgm 日文/中文名 → 种子原始标题 → m.title → 'movie'。缺 bgm 元数据时回退到传入那条种子的原始标题，
+    而两处传的 t 不一定是同一条，名字可能不同（见 movie_save_path 的 docstring、DECISIONS E-62）。"""
     return (((m.jp_name or m.display_name) if m else "")
             or (t.raw_title if t else "") or (m.title if m else "") or "movie")
 
@@ -1008,7 +1009,7 @@ def movie_save_path(movie_id: int) -> str | None:
         if m is None:
             return None
         t = s.exec(select(MovieTorrent).where(MovieTorrent.movie_id == movie_id)
-                   .order_by(MovieTorrent.created_at.desc())).first()   # 最新种子行，缺元数据时回退，同下载口径
+                   .order_by(MovieTorrent.created_at.desc())).first()   # 最新种子行，缺元数据时回退（下载入口用的是正在交付的那一条，见本函数 docstring）
         quarter = (m.quarter or "unknown")
         folder = _movie_folder(m, t)
     return engine.build_save_path(quarter, folder, sub_dir=config.MOVIE_DOWN_PATH,
@@ -1192,13 +1193,13 @@ async def _download_movie_torrent_inner(mt_id: int) -> bool:
     return True
 
 
-async def delete_movie_torrent(mt_id: int) -> bool:
+async def delete_movie_torrent(mt_id: int) -> bool | str:
     """页面入口：整段登记在途，理由见 `engine.in_flight`。(R33 对抗审计补：审计探针在这一条上真把 deleted 写进了另一个库)"""
     with engine.in_flight("删除版本文件"):
         return await _delete_movie_torrent_inner(mt_id)
 
 
-async def _delete_movie_torrent_inner(mt_id: int) -> bool:
+async def _delete_movie_torrent_inner(mt_id: int) -> bool | str:
     """删除单条剧场版种子在 qB 里的文件（走 qB 接口），标记为 deleted（终态，恢复时不重下）。
 
     若同一 hash TV 管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。
@@ -1221,6 +1222,15 @@ async def _delete_movie_torrent_inner(mt_id: int) -> bool:
     if engine.hash_owned_elsewhere(h, AnimeTorrent):
         _set_status(mt_id, "deleted")  # TV 侧还持有同一种子 → 只脱手，不删文件
         return True
+    # 【先问 qB 在不在】与番剧侧 _delete_anime_torrent_inner 同口径：qB 对不认识的 hash 也回成功，种子早被人在
+    # qB 里手动移除（没标归档）时，页面会说"已删除该版本文件"而盘上的文件没动。不在了就只改状态，返回 "gone"。
+    info = await engine.qb.torrents_info([h])
+    if info is None:
+        return False
+    if h not in info:
+        _set_status(mt_id, "deleted")
+        log.info("删除（剧场版单条）- torrent=%s 已不在 qB 里，只标记已删，文件没动", mt_id)
+        return "gone"
     if not await engine.qb.delete([h], delete_files=True):
         return False
     _set_status(mt_id, "deleted")   # 用户主动删除：终态，恢复时不会被重新下（区别于 skipped）
@@ -1245,4 +1255,6 @@ def failed_rows() -> list[dict]:
                   s.exec(select(Movie).where(Movie.id.in_(ids)))} if ids else {})
     return [{"id": t.id, "movie_id": t.movie_id,
              "name": names.get(t.movie_id) or (t.raw_title or "?"),
-             "raw": t.raw_title or ""} for t in ts]
+             "raw": t.raw_title or "",
+             # 同番剧侧 _torrent_rows：清单上标出失败还是停滞、为什么
+             "status": t.status, "fail_reason": t.fail_reason or ""} for t in ts]

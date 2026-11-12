@@ -468,7 +468,7 @@ async def test_lock_group_late_episode_is_fetched_with_force(clean_tables, env, 
     fb = _get(clean_tables, fb6)
     assert fb.status == "sent" and fb.lock_fallback, "兜底那份永不自动删"
     (kind, msg), = msgs
-    assert kind == "lock_fallback" and "补发了第 6 集" in msg and "ANi" in msg
+    assert kind == "lock_fallback" and "第 6 集已下锁定的" in msg and "ANi" in msg
     assert await A.deliver_lock_fallback(qb_alive=True) == 0 and len(calls) == 1, "A 步重复跑必须幂等"
 
 

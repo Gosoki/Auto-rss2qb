@@ -3,7 +3,7 @@
 两个引擎各自独立地跑同一条版本链，各有各的 alembic_version 表：
 
     role=meta  → 本地 SQLite，只管 setting 表（配置恒在本地，不随业务库走）
-    role=data  → 业务库（SQLite 或 MySQL），管其余 6 张业务表
+    role=data  → 业务库（SQLite 或 MySQL），管其余全部业务表
 
 同一个 revision 在两边都会被执行，脚本内部按 role 决定自己要做哪部分（见 versions/ 下的脚本）。
 版本表也按 role 分名，免得两个引擎指向同一个 SQLite 文件时（默认布局就是如此）互相覆盖版本号。
@@ -53,7 +53,7 @@ def include_object(obj, name, type_, reflected, compare_to):
             return False
         return (name in META_TABLES) is (ROLE == "meta")
     if type_ == "index" and name and name.endswith("_inflight"):
-        # in-flight 的 partial index 是 db/dialect.py 按方言手工建的（带 WHERE 子句），
+        # in-flight 的 partial index 是 baseline 迁移脚本按方言手工建的（带 WHERE 子句），
         # 不在 SQLModel 的 metadata 里；不排除会被 autogenerate 当成"多余索引"生成 drop_index。
         return False
     return True

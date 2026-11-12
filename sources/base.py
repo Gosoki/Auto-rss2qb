@@ -9,6 +9,7 @@
 """
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -24,6 +25,24 @@ log = logging.getLogger("autorss")
 
 # 40 位小写 hex：跨源去重键的形状。预编译在模块级（每条种子都要过一遍）。
 _HEX40_RE = re.compile(r"[0-9a-f]{40}")
+
+# 已经记过"番名解析为空"的标题（键 raw_title，值不用）。那条种子在 feed 里待多久就被每轮重新解析多久，
+# 两个源组共用一个 feed 时还各记一行 —— 每个标题在进程里只记第一次。上限是内存界：满了挤掉最早记的，
+# 被挤掉的那条要是还在 feed 里会再记一行，无害。_parse 跑在 asyncio.to_thread 的线程里，查改要上锁。
+_EMPTY_NAME_LOGGED: dict[str, None] = {}
+_EMPTY_NAME_LOGGED_MAX = 512
+_EMPTY_NAME_LOCK = threading.Lock()
+
+
+def _first_empty_name(raw_title: str) -> bool:
+    """这个标题是第一次解析出空番名 → 记下并返回 True；记过的返回 False。"""
+    with _EMPTY_NAME_LOCK:
+        if raw_title in _EMPTY_NAME_LOGGED:
+            return False
+        _EMPTY_NAME_LOGGED[raw_title] = None
+        if len(_EMPTY_NAME_LOGGED) > _EMPTY_NAME_LOGGED_MAX:
+            del _EMPTY_NAME_LOGGED[next(iter(_EMPTY_NAME_LOGGED))]
+        return True
 
 
 @dataclass
@@ -181,7 +200,7 @@ class RssSource(Source):
             async with httpx.AsyncClient(**config.http_client_kwargs(30, url=self.rss_url)) as client:
                 # 走带上限+总超时的取回：feed 地址是用户填的、内容来自第三方，
                 # 裸 client.get + resp.content 既能被涓流响应永久挂住，也能被超大 body 撑爆内存
-                content = await _fetch.get_bytes(client, self.rss_url)
+                content = await _fetch.get_bytes(client, self.rss_url, gzip_ok=True)
             if content_cache is not None:
                 content_cache[self.rss_url] = content
         # 【解析整段丢线程】(R21) feedparser.parse 与随后的逐条 parse_title/candidate_names
@@ -234,9 +253,10 @@ class RssSource(Source):
                 # 【必须是 info】root logger 定死在 INFO 且全项目没有级别开关
                 # （core/logsetup.py，grep LOG_LEVEL 零命中），debug 这一行**永远不会输出**——
                 # 那 D5 承诺的"至少留一行痕迹"就没有兑现，用户端仍是"界面和日志零信号"。
-                # 刷屏的担心不成立：真正会大量出现的是纯标签条目，而那些在 is_batch /
-                # 白名单等更早的闸就被挡掉了；能走到这里的是"有内容但解析不出名字"，值得看见。
-                log.info("%s 番名解析为空，跳过：%s", self.name, raw_title[:80])
+                # 能走到这里的是"有内容但解析不出名字"，值得看见；但同一条每轮都会再来，
+                # 所以同一标题只记第一次（见 _first_empty_name）。
+                if _first_empty_name(raw_title):
+                    log.info("%s 番名解析为空，跳过：%s", self.name, raw_title[:80])
                 return None
             # 白名单：子串匹配、大小写不敏感（与 title_filter 同口径，见 parse.kw_match），
             # 兼顾联合发布（如 "喵萌奶茶屋&LoliHouse"）

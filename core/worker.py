@@ -13,7 +13,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 
 from core import anime
 import config
-from core import engine, health, ipfilter, movies
+from core import digest, engine, health, ipfilter, movies
 import db
 from db.models import AnimeTorrent
 from core.anime import flush_ready_downloads, list_source_groups, process_item
@@ -28,8 +28,9 @@ log = logging.getLogger("autorss")
 # 全部任务』、/movies『立即扫描』），它们做的是同一件事，并发跑就是把同一批请求重打一遍：
 #   · 采集轮：同一批 RSS 被抓两遍、同一批条目走两遍 process_item；
 #   · 剧场版整年扫描：MOVIE_SCAN_LAST 要等整轮跑完才写，扫描期间 auto_scan_tick 恒判『到点』，
-#     于是两轮 Mikan+bgm 的整年请求并发打出去（有被限流的风险），且 _upsert_movie 是"先查后插"、
-#     mikan_id 上没有唯一约束——两轮交错时未识别的番组会留下两行重复 Movie。
+#     于是两轮 Mikan+bgm 的整年请求并发打出去（有被限流的风险），且 _upsert_movie 是"先查后插"——
+#     加这把锁时 mikan_id 上还没有唯一约束，两轮交错时未识别的番组会留下两行重复 Movie
+#     （唯一约束后来由 D-12 补上；并发两轮的请求翻倍与限流风险不变）。
 # 【必须是两把、不能合成一把】采集与剧场版扫描本就互不相干（run_movie_scan 的 docstring 明写"只碰
 # 剧场版"）。合成一把的话，一次十几分钟的整年扫描会把 TV 采集连同 flush_ready_downloads 整段憋住。
 # 后台协程【等】自己那把锁（本来就在定时循环里，晚一点无所谓）；手动入口【不等】，直接回报"已有一轮在跑"。
@@ -81,17 +82,19 @@ def build_sources() -> list:
 
 
 def log_task_exit(t: asyncio.Task) -> None:
-    """(R36 体检) 后台协程任何一条意外退出都要有一行 ERROR。main.py 把它挂在七条 Task 的 done 回调上。
+    """(R36 体检) 后台协程任何一条意外退出都要有一行 ERROR，并把协程名记进 health（全站横幅）；
+    被 cancel 的不记。main.py 把它挂在每条后台 Task 的 done 回调上。
 
     住在这里不住 main.py：测试要能在 NiceGUI 应用已启动之后导入它（import main 会在应用启动后加中间件而炸）。
 
     以前是零日志：background_tasks 持强引用 ⇒ Task.__del__ 永不执行 ⇒ asyncio 那句
     'Task exception was never retrieved' 永远不打。一条线死了（R36 在 run_sweep 上就抓到一处：
     启动清扫抛一次异常整条巡检永久死掉）用户只会觉得"好几天没更新了"。逐条协程去包 try 必然漏一处，
-    挂在 Task 上的这一个回调对七条一视同仁。
+    挂在 Task 上的这一个回调对每一条一视同仁。
     """
     if t.cancelled():
-        return
+        return                          # 关服 / 主动停：不是故障，不挂横幅
+    health.note_dead(t.get_name())      # 页面横幅（health.tasks_problem）：只记日志的话不看日志的人永远不知道
     e = t.exception()
     if e is not None:
         log.error("后台协程 %s 意外退出：%s: %s", t.get_name(), type(e).__name__, e, exc_info=e)
@@ -106,7 +109,7 @@ def loop_error(what: str, e: BaseException, **kw) -> None:
     而它可能落在任意一条后台循环的轮次中间 —— 那不是"异常"，是**计划内的**、
     用户自己点出来的、秒级的暂停。逐条报成 `ERROR ...异常` 会在日志页顶出一片红，
     掩盖同一时间段里真正的错误。
-    本项目有十几处这样的记账点（数字别写死，每加一条后台线就会变），逐处判必然漏一处（第①号形状），
+    本项目有二十几处这样的记账点（数字别写死，每加一条后台线就会变），逐处判必然漏一处（第①号形状），
     所以收成一个函数。
     """
     if isinstance(e, db.DatabaseBusy):
@@ -140,104 +143,136 @@ async def poll_once() -> None:
     # （feed 为空 / 未知站点），不然配置坏了的源组在徽标上是隐形的（核实意见）。
     failed_sources: list[str] = list(_build_skipped)
     fetched_any = False              # 本轮至少一个源抓到了 → 轮末更新 ANIME_POLL_OK_LAST
-    for source in sources:
-        _url = getattr(source, "rss_url", None)
-        uses_left[_url] -= 1
-        try:
-            items = await source.fetch(content_cache=feed_cache)
-            fetched_any = True
-        except Exception as e:
-            failed_sources.append(source.name)
-            health.record_source(source.name, False, f"{type(e).__name__}: {fetch.redact(e)[:100]}")
-            # 【必须脱敏】httpx 自己抛的 HTTPStatusError/ConnectError 的 str() 带完整 URL，
-            # 而 Mikan『我的番组』订阅地址把 token 放在 query 里 ——
-            # 随便一次 403/500 就把 ?token=… 整条写进 data/autorss.log（滚动 5 份）
-            # 与 /logs 页的「下载完整日志」。这里以前既不截断也不脱敏。
-            # 【连续失败不逐轮记 ERROR】(r37) 10-14 断网 30 小时，6 个源每轮各一行 ERROR、共 480 行，
-            # 把日志缓冲冲得一条有用的都不剩。第一次记 ERROR，到告警阈值记一行 WARNING，之后每 12 轮一行 INFO。
-            n = health.fail_streak(source.name)
-            th = max(1, config.ALERT_SOURCE_FAIL_ROUNDS)
-            if n == 1:
-                log.error("抓取失败 %s: %s: %s", source.name, type(e).__name__,
-                          fetch.redact(e)[:200])
-            elif n == th:
-                log.warning("源 %s 已连续 %d 轮抓取失败：%s: %s", source.name, n, type(e).__name__,
-                            fetch.redact(e)[:200])
-            elif n % 12 == 0:
-                log.info("源 %s 仍然抓取失败（连续 %d 轮）：%s", source.name, n, type(e).__name__)
-            continue
-        finally:
-            health.touch()
-            if uses_left[_url] <= 0:
-                feed_cache.pop(_url, None)   # 后面没有源再用它了，字节不必整轮挂着
-        if health.fail_streak(source.name) >= 2:
-            log.info("源 %s 恢复了（之前连续 %d 轮抓取失败）", source.name, health.fail_streak(source.name))
-        health.record_source(source.name, True)
-        # 【窗口溢出】这一轮 feed 里最老的一条都比 seen（这之前的发布都已处理过）还晚 → 中间那段已经滚出 RSS（r37 #1）
-        # 【只算不写】(r39 A13) 抓到了不等于入库了：seen 等本组条目处理完再写，见本组末尾。
-        _key = _url or source.name
-        _t = datetime.now(timezone.utc)
-        _oldest = getattr(source, "oldest_entry_time", None)
-        if _key not in round_prev:
-            round_prev[_key] = health.seen_at(_key)
-        _gap = health.check_window(_key, _oldest, now=_t, commit=False)
-        if _gap:
-            new_gaps.append(health.gap_record(source.name, *_gap))
-            log.warning("RSS 断档：源 %s 在 %s ~ %s 之间的发布已滚出 feed（这段时间没抓到或没入库），可能漏集",
-                        source.name, _gap[0].astimezone().strftime("%m-%d %H:%M"),
-                        _gap[1].astimezone().strftime("%m-%d %H:%M"))
-        # 【本源这一批的 hash 一次查完】RSS 一轮的条目绝大多数是上一轮就见过的，
-        # 逐条各开一个 session 去查等于把 100 次数据库往返摊在采集主链路上
-        # （本地 SQLite 约 42ms/100 条；远程 MySQL 是每轮 0.4~2 秒的裸阻塞）。
-        # 预取是在【本源开抓之前】做的，所以本轮里前一个源刚入库的 hash 已经在里面了
-        # （每个源各预取一次）。缺口只有一个：同一个 feed 里出现【重复条目】——
-        # 那条 hash 预取时不存在、第一次处理后才存在，不补进集合的话第二条会再走一遍
-        # 识别与入库（唯一约束会挡下写入，但 bgm 请求已经白打出去了）。
-        # 所以处理完就补进集合：无论它是被入库还是被过滤掉，同一轮里再见到都该是同样的结局。
-        known = engine.existing_hashes(
-            AnimeTorrent, [getattr(i, "info_hash", "") for i in items])
-        # (r39 I8) 别的源先收过、行上优先级比本源低的待下种子：提到本源的优先级（见 anime.promote_known）。
-        # 本源没设优先级（0）时不查库。items 已按本组字幕组/标题过滤过，提的只是本组真会收的那些。
-        promote = anime.promotable_hashes([getattr(i, "info_hash", "") for i in items],
-                                          getattr(source, "priority", 0) or 0)
-        new = 0
-        for item in items:
+    # 抓到并处理完的源 (名字, 条数, 新增)，轮末并成一行 INFO：每源一行的话稳态一天几百行，
+    # 把 /logs 的 200 条环形缓冲几小时就冲满，"新增 / 已加入qB"反而看不见。
+    round_stats: list[tuple[str, int, int]] = []
+    # 【整轮早退时 seen 一起回滚】DatabaseBusy / existing_hashes 等从这个循环里抛出去时，前面已处理完的组
+    # 已经把 seen 推进到了抓取时刻，而它们算出的断档（new_gaps）在下面才写进 FEED_GAPS、才推送、才交给锁定源兜底
+    # —— 早退就全丢了，下一轮拿推进过的 seen 去比也再算不出来。还原成轮前的样子，下一轮整轮重算、照常报一次。
+    # 只包这个循环：收尾那几步（写 FEED_GAPS、推送）出了错不回滚，否则下一轮会把已经写过的断档再报一次。
+    # 本轮因空 feed 清掉的 seen 不还原：还原了，下一轮它出现的第一条就会拿空之前的 seen 去比、误报断档。
+    # 边界：回滚后下一轮拿更老的 seen 去比，feed 窗口短于『连续早退的轮数 + 约半个轮询间隔』的话，早退期间
+    # 已入库的那一段也可能被报成断档（与上面"撞上连接错误、seen 原地不动"同一个暴露面；现有源的 feed 窗口最短约 1 天）。
+    _seen_snap = dict(health._load_seen())
+    try:
+        for source in sources:
+            _url = getattr(source, "rss_url", None)
+            uses_left[_url] -= 1
             try:
-                if getattr(item, "info_hash", "") in promote:
-                    anime.promote_known(item)
-                if await process_item(item, known_hashes=known, qb_alive=qb_alive):
-                    new += 1
-            except db.DatabaseBusy:
-                # 【整轮早退，不要逐条记】(R22) 维护一开，后面每一条的 get_session() 都会一样失败。
-                # 逐条落成 ERROR 的量是致命的：一轮 feed 几十到几千条（真实 Mikan 番组 feed 4193 条），
-                # 而 /logs 的环形缓冲只有 200 条 —— 一次切库就把实时视图整块冲掉，
-                # 同一时间段里真正的错误全被挤出去。冒到 run_worker 的 loop_error，整轮只留一行 INFO。
-                raise
+                items = await source.fetch(content_cache=feed_cache)
+                fetched_any = True
             except Exception as e:
-                loop_error(f"处理 {getattr(item, 'anime_title', '?')}", e)
-                # 业务库连不上：这一条没入库，本组的 seen 不能推进到抓取时刻（见下）。
-                # 判据与 pages/layout.py 的页面兜底同口径：锁竞争、表结构这类不算"库停了"。
-                if isinstance(e, (OperationalError, InterfaceError)) and db.looks_like_connection_error(e):
-                    broke_urls.add(_key)
+                failed_sources.append(source.name)
+                health.record_source(source.name, False, f"{type(e).__name__}: {fetch.redact(e)[:100]}")
+                # 【必须脱敏】httpx 自己抛的 HTTPStatusError/ConnectError 的 str() 带完整 URL，
+                # 而 Mikan『我的番组』订阅地址把 token 放在 query 里 ——
+                # 随便一次 403/500 就把 ?token=… 整条写进 data/autorss.log（滚动 5 份）
+                # 与 /logs 页的「下载完整日志」。这里以前既不截断也不脱敏。
+                # 【连续失败不逐轮记 ERROR】(r37) 10-14 断网 30 小时，6 个源每轮各一行 ERROR、共 480 行，
+                # 把日志缓冲冲得一条有用的都不剩。第一次记 ERROR，到告警阈值记一行 WARNING，之后每 12 轮一行 INFO。
+                n = health.fail_streak(source.name)
+                th = max(1, config.ALERT_SOURCE_FAIL_ROUNDS)
+                if n == 1:
+                    log.error("抓取失败 %s: %s: %s", source.name, type(e).__name__,
+                              fetch.redact(e)[:200])
+                elif n == th:
+                    log.warning("源 %s 已连续 %d 轮抓取失败：%s: %s", source.name, n, type(e).__name__,
+                                fetch.redact(e)[:200])
+                elif n % 12 == 0:
+                    log.info("源 %s 仍然抓取失败（连续 %d 轮）：%s", source.name, n, type(e).__name__)
+                continue
             finally:
                 health.touch()
-                if getattr(item, "info_hash", ""):
-                    known.add(item.info_hash)   # 同一 feed 内的重复条目不再重复识别（理由见上）
-        # 【seen 推进到哪】(r39 A13) seen 的意思是"这之前的发布都处理过了"，下一轮拿它判断有没有断档。
-        # 早先抓到就写成抓取时刻：条目撞上业务库连接错误被 loop_error 吞掉，seen 照样推进 ——
-        # 库停得久一点、那几条滚出 feed，下一轮判不出断档，就是静默漏集。
-        # · 没撞上连接错误 → 推进到抓取时刻 _t（与以前相同）；
-        # · 撞上了 → 只推进到 max(本轮开头的 seen, 本轮 feed 最老一条)：本轮已报过的断档下一轮不重报；
-        #   失败的条目要是在下一轮之前滚出了 feed，[本轮最老, 下一轮最老] 会作为新断档报出来；
-        #   最老一条早于原 seen 时等于原地不动，下一轮整组重来。
-        # · 同一个 URL 被两组共用时，本轮只要有一组撞上，后面的组也按这条写（否则后一组的 _t 会把它盖掉）。
-        # DatabaseBusy / existing_hashes 抛出、整轮早退时走不到这里，什么都不写，下一轮会重新算出断档。
-        if _key in broke_urls:
-            health.mark_seen(_key, max((t for t in (round_prev[_key], _oldest) if t is not None),
-                                       default=None))
-        else:
-            health.mark_seen(_key, _t)
-        log.info("源 %s：%d 条，新增 %d", source.name, len(items), new)
+                if uses_left[_url] <= 0:
+                    feed_cache.pop(_url, None)   # 后面没有源再用它了，字节不必整轮挂着
+            if health.fail_streak(source.name) >= 2:
+                log.info("源 %s 恢复了（之前连续 %d 轮抓取失败）", source.name, health.fail_streak(source.name))
+            health.record_source(source.name, True)
+            # 【窗口溢出】这一轮 feed 里最老的一条都比 seen（这之前的发布都已处理过）还晚 → 中间那段已经滚出 RSS（r37 #1）
+            # 【只算不写】(r39 A13) 抓到了不等于入库了：seen 等本组条目处理完再写，见本组末尾。
+            _key = _url or source.name
+            _t = datetime.now(timezone.utc)
+            _oldest = getattr(source, "oldest_entry_time", None)
+            if _key not in round_prev:
+                round_prev[_key] = health.seen_at(_key)
+            _gap = health.check_window(_key, _oldest, now=_t, commit=False)
+            if _gap:
+                new_gaps.append(health.gap_record(source.name, *_gap))
+                log.warning("RSS 断档：源 %s 在 %s ~ %s 之间的发布已滚出 feed（这段时间没抓到或没入库），可能漏集",
+                            source.name, _gap[0].astimezone().strftime("%m-%d %H:%M"),
+                            _gap[1].astimezone().strftime("%m-%d %H:%M"))
+            # 【本源这一批的 hash 一次查完】RSS 一轮的条目绝大多数是上一轮就见过的，
+            # 逐条各开一个 session 去查等于把 100 次数据库往返摊在采集主链路上
+            # （本地 SQLite 约 42ms/100 条；远程 MySQL 是每轮 0.4~2 秒的裸阻塞）。
+            # 预取是在【本源开抓之前】做的，所以本轮里前一个源刚入库的 hash 已经在里面了
+            # （每个源各预取一次）。缺口只有一个：同一个 feed 里出现【重复条目】——
+            # 那条 hash 预取时不存在、第一次处理后才存在，不补进集合的话第二条会再走一遍
+            # 识别与入库（唯一约束会挡下写入，但 bgm 请求已经白打出去了）。
+            # 所以处理完就补进集合：无论它是被入库还是被过滤掉，同一轮里再见到都该是同样的结局。
+            known = engine.existing_hashes(
+                AnimeTorrent, [getattr(i, "info_hash", "") for i in items])
+            # (r39 I8) 别的源先收过、行上优先级比本源低的待下种子：提到本源的优先级（见 anime.promote_known）。
+            # 本源没设优先级（0）时不查库。items 已按本组字幕组/标题过滤过，提的只是本组真会收的那些。
+            promote = anime.promotable_hashes([getattr(i, "info_hash", "") for i in items],
+                                              getattr(source, "priority", 0) or 0)
+            new = 0
+            for item in items:
+                try:
+                    if getattr(item, "info_hash", "") in promote:
+                        anime.promote_known(item)
+                    if await process_item(item, known_hashes=known, qb_alive=qb_alive):
+                        new += 1
+                except db.DatabaseBusy:
+                    # 【整轮早退，不要逐条记】(R22) 维护一开，后面每一条的 get_session() 都会一样失败。
+                    # 逐条落成 ERROR 的量是致命的：一轮 feed 几十到几千条（真实 Mikan 番组 feed 4193 条），
+                    # 而 /logs 的环形缓冲只有 200 条 —— 一次切库就把实时视图整块冲掉，
+                    # 同一时间段里真正的错误全被挤出去。冒到 run_worker 的 loop_error，整轮只留一行 INFO。
+                    raise
+                except Exception as e:
+                    loop_error(f"处理 {getattr(item, 'anime_title', '?')}", e)
+                    # 业务库连不上：这一条没入库，本组的 seen 不能推进到抓取时刻（见下）。
+                    # 判据与 pages/layout.py 的页面兜底同口径：锁竞争、表结构这类不算"库停了"。
+                    if isinstance(e, (OperationalError, InterfaceError)) and db.looks_like_connection_error(e):
+                        broke_urls.add(_key)
+                finally:
+                    health.touch()
+                    if getattr(item, "info_hash", ""):
+                        known.add(item.info_hash)   # 同一 feed 内的重复条目不再重复识别（理由见上）
+            # 【seen 推进到哪】(r39 A13) seen 的意思是"这之前的发布都处理过了"，下一轮拿它判断有没有断档。
+            # 早先抓到就写成抓取时刻：条目撞上业务库连接错误被 loop_error 吞掉，seen 照样推进 ——
+            # 库停得久一点、那几条滚出 feed，下一轮判不出断档，就是静默漏集。
+            # · 没撞上连接错误 → 推进到抓取时刻 _t（与以前相同）；
+            # · 撞上了 → 只推进到 max(本轮开头的 seen, 本轮 feed 最老一条)：本轮已报过的断档下一轮不重报；
+            #   失败的条目要是在下一轮之前滚出了 feed，[本轮最老, 下一轮最老] 会作为新断档报出来；
+            #   最老一条早于原 seen 时等于原地不动，下一轮整组重来。
+            # · 同一个 URL 被两组共用时，本轮只要有一组撞上，后面的组也按这条写（否则后一组的 _t 会把它盖掉）。
+            # · 本轮 feed 一条带时间的都没有（关键词搜索 / 单番 feed 合法地为空）→ 清掉 seen，不记抓取时刻：
+            #   记了的话，下一轮出现的第一条只要比这一轮晚 10 分钟以上发布，就被当成断档误报。光"不推进"不够——
+            #   "有 → 空 → 再出现第一条"时会拿更老的 seen 去比，误报更大。代价是漏报方向的：feed 空着时停机，
+            #   恢复后那一轮对它不报断档。
+            # · DatabaseBusy / existing_hashes 抛出、整轮早退时，抛出的那一组走不到这里；前面各组已写的 seen
+            #   由循环外的 except 还原成轮前的样子（空 feed 清掉的除外），下一轮整轮重算断档。
+            if _oldest is None:
+                health.forget_seen(_key)
+            elif _key in broke_urls:
+                health.mark_seen(_key, max((t for t in (round_prev[_key], _oldest) if t is not None),
+                                           default=None))
+            else:
+                health.mark_seen(_key, _t)
+            round_stats.append((source.name, len(items), new))
+    except BaseException:
+        _cur = health._load_seen()
+        _emptied = set(_seen_snap) - set(_cur)
+        _cur.clear()
+        _cur.update({k: v for k, v in _seen_snap.items() if k not in _emptied})
+        raise
+
+    # 没抓到的源不进这一行（失败行按连续失败轮数限频，见上面 fail_streak 那段；没有失败行的轮次
+    # 只能从"N 个源"看出少了谁）；整轮早退（DatabaseBusy 等）走不到这里，不记。
+    if round_stats:
+        log.info("本轮采集：%d 个源共 %d 条，新增 %d｜%s", len(round_stats),
+                 sum(c for _, c, _ in round_stats), sum(n for _, _, n in round_stats),
+                 "、".join(f"{name} {c}(+{n})" if n else f"{name} {c}" for name, c, n in round_stats))
 
     try:
         n = await flush_ready_downloads(qb_alive=qb_alive)
@@ -283,7 +318,9 @@ async def poll_once() -> None:
     if new_gaps:
         # 一次性事件、绕开普通限流桶：恢复那一轮的交付通知很可能把每小时的额度打满，而这条比它们都要紧
         await notify_event("feed_gap", "RSS 断档，这段时间的发布可能漏了：" + "；".join(
-            health.gap_text(g) for g in new_gaps) + "。去番剧表看缺集提示，用『补齐该源』补", bypass_rate=True)
+            health.gap_text(g) for g in new_gaps) + "。去番剧表看缺集提示，用『自动补齐』补；"
+            "缺集提示要等余量过了或下一集入库才出现，可以先到这段时间有更新的番的详情页点『自动补齐』",
+            bypass_rate=True)
     if fetched_any:
         await _heartbeat()
 
@@ -304,19 +341,21 @@ async def _heartbeat() -> None:
         log.warning("外部心跳没发出去：%s: %s", type(e).__name__, fetch.redact(e)[:120])
 
 
-# 【本进程是否还欠一次"启动复位"】只有 main.py 在【启动时业务库就不可用】的那一支会置 True：
-# 那时 init_business_state 被跳过，而库从进程启动起就一直 down、所有后台循环都按 is_data_down() 空转，
+# 【本进程是否还欠一次"启动复位"】只有进程启动时会置 True，main.py 两支都会：
+# 库可用那一支由 init_business_state()（sweep_leftovers 默认 True）记账，run_sweep 一起来就消费；
+# 【启动时业务库就不可用】的那一支直接置 True —— 那时 init_business_state 被跳过，
+# 而库从进程启动起就一直 down、所有后台循环都按 is_data_down() 空转，
 # 所以此刻库里的 downloading 必定是【上个进程】留下的残骸，复位它们是安全且必须的。
 # 『欠着一次交付残骸清扫』。默认 False：运行中掉线再恢复、以及切库，都可能有交付协程正卡在
 # await（取种最长 180s），把它的 downloading 占位打回去会当场解除集去重 → 同一集被两个源各下一份
-# 到同一目录。只有"进程启动时库就不可用、现在才首次可用"那一种情形才欠着（那时所有后台循环都空转过，
+# 到同一目录。只有"进程启动"那一次才欠着（启动时库就不可用的，要等到首次可用才清，那时所有后台循环都空转过，
 # 绝不可能有协程在半途）。清扫本身见 engine.sweep_stale_delivering —— 它要 await 问 qB，
 # 所以不能在 init_business_state（同步、还跑在线程里）里做，改由下面的 sweep_leftovers_if_pending 消费。
 _stale_sweep_pending = False
 
 
 def init_business_state(sweep_leftovers: bool = True) -> None:
-    """业务库可用之后必做的初始化。三个操作都幂等，重复调用无害。**同步**，调用方常把它丢线程。
+    """业务库可用之后必做的初始化。各项操作都幂等，重复调用无害。**同步**，调用方常把它丢线程。
 
     sweep_leftovers 的取值规则见上面 _stale_sweep_pending 的说明。它在这里只**记账**、不动数据：
     真正的清扫要先问 qB（E-57），而那是个 await —— 由 `sweep_leftovers_if_pending()` 在协程里做。
@@ -404,6 +443,10 @@ async def run_db_watch() -> None:
                     log.error("补读配置失败（下次探测再试）: %s", e)
             if not now_down:              # 库停摆时那边有自己的告警，采集健康不用再判
                 await _check_poll_health()
+                try:                      # 每日摘要：没到点只读内存配置；单独兜住，坏了不拖累下面的恢复补跑
+                    await digest.tick()
+                except Exception as e:
+                    loop_error("每日摘要", e)
             if was_down and not now_down:
                 # 补跑停摆期间漏掉的初始化。是否清扫遗留的 downloading 看本进程欠不欠那一次：
                 # 【启动时就停摆】→ 欠（main.py 跳过了初始化，且此刻不可能有交付协程在跑）；
@@ -548,8 +591,8 @@ async def archive_round() -> None:
 async def sweep_round() -> None:
     """跑一轮完结/断更/积压巡检（含交付残骸清扫），全程持 `_sweep_lock`。
 
-    【四段各自 try】它们互不相干：sweep_finished 抛一次异常不该让断更提醒与
-    失败/停滞/积压告警整轮不跑——而后两者恰恰是"出事了要有人知道"的那一类。
+    【各段各自 try】交付残骸清扫、下齐判定、断更提醒、积压告警、锁源落后提醒、缺集提醒、缺集自动补互不相干：
+    sweep_finished 抛一次异常不该让断更提醒与失败/停滞/积压告警整轮不跑——而后两者恰恰是"出事了要有人知道"的那一类。
 
     【交付残骸的清扫挂在这里】(R24) `status=downloading` 但本进程并没有协程在管的行
     是交付途中库抖了一下留下的残骸：sync 显式跳过它、集去重认定该集已有一份、
@@ -557,8 +600,9 @@ async def sweep_round() -> None:
     而它还会把设置页的切库/迁移永久拒死。放在巡检轮上：有界、周期性、不碰在途的那些。
 
     【锁盖整轮】(R27) 完结判定与断更提醒都是"拿着 Anime.id 去 await 通知、
-    回来按同一个主键写回"，锁只盖住其中一段等于没盖。整轮持锁的代价是维护要多等一轮巡检
-    （默认 3 小时一轮、一轮几十秒），而闸只挡"开始维护"、不打断已经在跑的，用户重试即可。
+    回来按同一个主键写回"，锁只盖住其中一段等于没盖。整轮持锁的代价是这期间切库/迁移被拒（默认 3 小时一轮）：
+    前几段一轮几十秒；缺集自动补那一段要跨种子站搜索和逐集交付（每集取种最长 180 秒），最多 3 部番各缺几集时
+    可能持续到分钟级。闸只挡"开始维护"、不打断已经在跑的，用户等这一轮过去重试即可。
     """
     async with _sweep_lock:
         for name, fn in (("交付残骸清扫", engine.sweep_stale_delivering),
@@ -569,10 +613,20 @@ async def sweep_round() -> None:
                          ("缺集提醒", anime.sweep_gaps)):
             try:
                 r = fn()
-                if asyncio.iscoroutine(r):    # 清扫是同步的（一条 SQL），其余三段是协程
+                # 各段现在都是协程（清扫自 E-57 起也要 await 问 qB）
+                if asyncio.iscoroutine(r):
                     await r
             except Exception as e:
                 loop_error(f"巡检·{name} ", e, exc_info=True)
+        # 缺集自动补放在缺集提醒之后：提醒照常先推，补回来的再另推一条。qB 没开或连不上时搜到了也下不了，
+        # 而入库就算"见过这一集"、缺集提示会消失，所以干脆不搜。采集暂停时先挡掉、不探 qB：
+        # 暂停期间别的后台线都不探，探了会在 qB 关着时推『连不上』、恢复时再推一条
+        try:
+            if (config.ANIME_GAP_AUTOFILL_DAYS > 0 and config.ANIME_POLL_ENABLED and config.QB_ENABLED
+                    and await anime.qb_precheck()):
+                await anime.autofill_gaps()
+        except Exception as e:
+            loop_error("巡检·缺集自动补 ", e, exc_info=True)
 
 
 async def run_sweep() -> None:
@@ -589,10 +643,11 @@ async def run_sweep() -> None:
     # 又占着 HAVE_STATUSES（集去重认定该集已有一份），等 3 小时才清是不行的 —— 以前这件事是
     # init_business_state 里的 reset_downloading（同步、问不了 qB），现在统一走 sweep_stale_delivering。
     # 完结判定/断更提醒仍然先睡后做（避免"每次重启都立刻重判一遍"），只有清扫提前。
-    # 【要包 try】(R36 体检) 这是七条后台协程里唯一一个不在 try 里的非 sleep await。它每次正常启动都真的
+    # 【要包 try】(R36 体检) 这是后台协程里唯一一个不在 try 里的非 sleep await。它每次正常启动都真的
     # 会对两张种子表发 SELECT（MySQL 上可以抛 gone away / read_timeout），抛一次整条巡检协程就死掉 ——
     # 且**零日志**：main.background_tasks 持强引用，Task.__del__ 永不执行，asyncio 那句
-    # "exception was never retrieved" 也永远不打。死掉之后失去的是巡检全部四段（残骸清扫 / 完结 / 断更 / 积压）。
+    # "exception was never retrieved" 也永远不打。死掉之后失去的是巡检的每一段
+    # （残骸清扫 / 完结 / 断更 / 积压 / 锁源落后 / 缺集）。
     # 失败也无妨：欠账（_stale_sweep_pending）留着不清，长睡之后的 sweep_round 每轮都会再跑一次残骸清扫
     # （那一段自带 try）—— 残骸最终会清掉，只是这个标志位不会被清；它唯一的后续影响是下一次"运行中掉线
     # 又回来"的恢复边沿会多跑一次清扫，而"打断真在途的交付"已被 _delivering 登记挡住。（核实意见）
@@ -611,7 +666,7 @@ async def run_sweep() -> None:
             # [10800, 30, 10800, 10800]：库在 3 小时时恢复，第一次巡检落在 6 小时。
             await asyncio.sleep(30)
             continue
-        await sweep_round()          # 一轮的内容与"为什么四段各自 try"写在它的 docstring 里
+        await sweep_round()          # 一轮的内容与"为什么各段各自 try"写在它的 docstring 里
         await asyncio.sleep(max(300, config.SWEEP_INTERVAL_MIN * 60))   # 做完再睡到下一轮
 
 

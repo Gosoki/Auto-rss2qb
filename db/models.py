@@ -4,7 +4,7 @@ TV 番剧与剧场版/OVA 彻底分表、互不相干（各自独立的表 + 独
 
 Setting     —— 键值配置覆盖（设置页写、运行时读、即时生效）。
 SourceGroup —— 订阅的字幕组/源组（feed/策略/优先级/白名单）——只喂 TV 周更番。
-Anime       —— 一部 TV 番剧（唯一）。身份 = bangumi_id。含 bgm 元数据。下不下 = confirmed 且未 rejected。
+Anime       —— 一部 TV 番剧（唯一）。身份 = bangumi_id。含 bgm 元数据。下不下 = confirmed 且未 rejected（开了 ANIME_FINISH_UNSUB 时还要未判完结，判据见 core.anime.subscribed_where）。
 AnimeAlias  —— 番名对照：(标题, 季) → 哪部 TV 番。命中即知是谁，不必再查 bgm。
 AnimeTorrent     —— 一条 TV 种子，按 info_hash 唯一；anime_id 关联到 TV 番。含 qB 实时态镜像（qb_*）。
 Movie       —— 一部剧场版/OVA（唯一）。来源仅 Mikan 季度剧场版/OVA 桶，识别用 bgm。与 Anime 无关。
@@ -38,7 +38,7 @@ class AlertAck(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("ident", name="uq_alert_ack_ident"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    kind: str = Field(default="")       # dup | mva | wrb，见 core/alerts.KINDS
+    kind: str = Field(default="")       # dup | mva | wrb | ign | rer，见 core/alerts.KINDS
     # 身份：这一条**具体的发现**。变了＝另一条发现，本来就该重新显示。
     ident: str = Field()
     # 事实指纹：`k=v;k=v` 的人话串，与当前事实逐字不等就复活（并能逐字段讲出变了什么）
@@ -89,15 +89,16 @@ class Anime(SQLModel, table=True):
     cast: str | None = Field(default=None)            # 主角声优：'角色：声优 / …'
     # ---- 下载控制 ----
     confirmed: bool = Field(default=True)             # 确认状态（待确认源默认 False，等人工确认）；确认即自动下
-    rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『拒绝』页恢复）
+    rejected: bool = Field(default=False)             # 人工拒绝（移出主列表 + 停下载，可在『已忽略』页恢复）
     # 注：『开始使用日超期忽略』复用此二字段编码为 (rejected=True, confirmed=False)——人工拒绝必是 confirmed=True，
     # 故该组合唯一表示"超期忽略"，随开始日可逆、不与人工拒绝混淆，无需额外字段。见 core.anime.apply_start_date_filter
-    # 进『待确认』的原因（键见 core.anime.CONFIRM_REASONS），只给待确认页显示用、不参与任何判定。
+    # 进『待确认』的原因（键见 core.anime.CONFIRM_REASONS），主要给待确认页显示用；
+    # 例外是 'movie'：deliver_single_works 把它当"人看过了"的记号，用户确认过的不再被打回待确认。
     # 离开待确认时不清，下次被打回时覆写；空=本列上线前就进了待确认，原因没记下。
     confirm_reason: str | None = Field(default=None)
     pref_source: str | None = Field(default=None)     # 锁定下载源（精确匹配 torrent.source：锁哪个组只下哪个；联合发布如"喵萌&LoliHouse"视作独立源、要单独锁，入库照收）；空=按优先级多源兜底
     pref_keyword: str | None = Field(default=None)    # 版本关键词（大小写不敏感子串命中 raw_title，如 繁日/简日/1080p）：与锁定源叠加、只下命中的版本；空=不限
-    enrich_tries: int = Field(default=0)              # bgm 未识别番的后台重试次数（满 REENRICH_MAX_TRIES 停自动重试，留手动；手动重识别清零）
+    enrich_tries: int = Field(default=0)              # bgm 未识别番的后台重试次数（满 REENRICH_MAX_TRIES 就停，来了新集号再试一次；手动重识别清零）
     # 跨源集号偏移：某些源用【全系列绝对集号】（第二季第 4 集写成 16），另一些用【季内集号】（写 04）。
     # 集去重键是 (anime_id, episode)，两种写法会被当成两集、各下一份到同一目录。
     # 值＝绝对号 - 季内号，从标题里的双编号写法 '16(88)' 自动推出（见 sources.parse.extract_episode_abs）；
@@ -156,7 +157,7 @@ class AnimeTorrent(SQLModel, table=True):
     #   · 能不能自动下：`>= 0`（0 是正片序列上的一集）；
     #   · 算不算"已下 N 集"/完结覆盖：`>= 1`（bgm 的 total_episodes 从 1 数起，
     #     把 0 计进去会让分子比分母多）。
-    # flush 的 have_eps **不设阈值**（按 HAVE 状态整批取），所以 0 也参与集去重、不会重复下。
+    # flush 的 have_eps **不设阈值**（按『该集有着落』判据 core.anime._COVERED_SQL 整批取），所以 0 也参与集去重、不会重复下。
     episode: float = Field(default=-2)
     quarter: str = Field(default="")                  # 入库时的解析快照，【不权威】：
     # 决定实际保存目录的是 Anime.quarter（同名但语义不同）；这里只在番还没识别出来时
@@ -181,8 +182,6 @@ class AnimeTorrent(SQLModel, table=True):
     qb_state: str = Field(default="")           # qB 原始态：downloading/stalledUP/pausedDL/error…（空=qB 未跟踪）
     qb_progress: float = Field(default=0.0)     # 完成度 0..1
     qb_dlspeed: int = Field(default=0)          # 下载速度 B/s
-    # 种子总大小(字节)。sync 每轮采，但**目前没有任何界面读它**（R32 死代码普查记过一次）。
-    # 留着不删：删列要开 revision，而它是 qB 现成回传的字段，将来详情页/列表要显示体积就在这儿。
     # 种子总大小(字节)。sync 每轮采，但**目前没有任何界面读它**（R32 死代码普查记过一次）。
     # 留着不删：删列要开 revision，而它是 qB 现成回传的字段，将来详情页/列表要显示体积就在这儿。
     qb_size: int = Field(default=0)

@@ -3,6 +3,7 @@
 刷新面板定义在 page 函数内部（每个浏览器连接各自一份），避免模块级
 单例 refreshable 在多页面/多客户端下互相串。
 """
+from collections import Counter
 from urllib.parse import quote
 
 from nicegui import ui
@@ -12,14 +13,14 @@ from db.models import AnimeTorrent
 from core import alerts, anime, engine
 import config
 from .anime_detail import maybe_relocate_anime, render_anime_detail, restore_anime_gated, subscribe_gated
-from .layout import (busy_action, confirm, cover_box, cover_title, ep_ranges_text, finished_tip,
+from .layout import (SEVERITY_COLOR, busy_action, confirm, cover_box, cover_title, ep_ranges_text, finished_tip,
                      require_bind_confirm,
                      ep_label,
                      expand_collapse_bar,
                      frame, group_by_quarter,
                      human_size, kpi_cards, live_status, name_of, paginate, parse_bgm_id,
                      platform_spec, rating_spec, recent_table, season_label, source_options, sources_spec,
-                     warn_banner, poll_time_text, poll_stale, page_visibility)
+                     torrent_status_cn, warn_banner, poll_time_text, poll_stale, page_visibility)
 from .sources import render_sources
 
 
@@ -40,6 +41,47 @@ def _state_rank(a):
     if a.rejected:
         return 2
     return 1 if not a.confirmed else 0
+
+
+# 『新入库』里"不用管"的徽标色（备用项 / 已忽略 / 已下齐…）。只在【不是已到手的状态】时才算数，见 _fold_recent。
+_NEUTRAL_BADGE = ("blue-grey", "grey", "teal")
+
+
+def _fold_recent(rows) -> list[dict]:
+    """『新入库』表按「番+集」并行：同一集的灰行并进这一集的领头行，彩色行一条不少。
+
+    rows 的每行带两个临时键（返回前去掉）：
+      · `_key` —— (anime_id, episode)；未知集/特别篇（集号 < 0）、集号为空、没挂番的为 None，永不并；
+      · `_quiet` —— 灰且不是已到手的状态。
+    领头行 = 同 _key 里第一条非 _quiet 的，没有就取第一条；其余 _quiet 行并进领头行的 `more`
+    （『另 2 个版本：桜都字幕组 备用项 ×2』，带来源）。同一集两条彩色行（已完成 + 失败、两个源各下一份）
+    各占一行——不许把红/绿压成灰字。顺序不重排：输出是输入的子序列。
+
+    【_quiet 不能只看徽标色】关了 qB 状态跟踪时，已下的行也是灰色『已下』，只按颜色判会把刚下好的集并掉。
+    【只并行、不默认隐藏】这张表是唯一把原始标题和规范番名按时间并排列出来的地方，
+    错挂到别的番名下、标着『备用项』的种子要在这里被看见。
+    """
+    lead: dict = {}
+    for i, r in enumerate(rows):
+        k = r["_key"]
+        if k is not None and (k not in lead or (rows[lead[k]]["_quiet"] and not r["_quiet"])):
+            lead[k] = i
+    keep, merged = [], {}
+    for i, r in enumerate(rows):
+        k = r["_key"]
+        if k is None or not r["_quiet"] or lead[k] == i:
+            keep.append(i)
+        else:
+            merged.setdefault(lead[k], []).append(r)
+    out = []
+    for i in keep:
+        row = {k: v for k, v in rows[i].items() if k not in ("_key", "_quiet")}
+        if i in merged:
+            cnt = Counter(f'{m["src"] or ""} {m["status"]}'.strip() for m in merged[i])
+            row["more"] = (f"另 {len(merged[i])} 个版本："
+                           + "、".join(lb + (f" ×{n}" if n > 1 else "") for lb, n in cnt.items()))
+        out.append(row)
+    return out
 
 
 # 本页的 tab：{键: 显示名}。设置页『默认标签页』下拉直接用它，页面侧的合法键集合由它派生——
@@ -152,15 +194,15 @@ def anime_page(t: str = ""):
 
             # ── qB 未启用提醒 ──
             if not ov["config"]["qb"]:
-                warn_banner("qB 未启用：只采集元数据、不实际下载（设置页开启 QB_ENABLED 后生效）")
+                warn_banner("qB 未启用：只采集元数据、不实际下载（设置页开启『发送种子到 qB』后生效）")
 
         @ui.refreshable
         def alerts_panel():
-            # ── 三类『只报不改』的巡检发现 ──
-            # 判据在 core/anime 的三个 suspect_*，身份/事实指纹、文案、已读过滤在 core/alerts。
+            # ── 『只报不改』的巡检发现 ──
+            # 判据在 core/anime 的各个 suspect_*，身份/事实指纹、文案、已读过滤在 core/alerts。
             # 【文案为什么不在这里】它要被用在三个地方：这条横幅、『已读的提示』列表里的存档、
             # 以及巡检推送。留在页面里的话另外两处就得各抄一遍（第①号缺陷形状）。
-            # 三类各自"为什么只报不改"的长注释跟着搬到了 core/alerts 的 _dup/_mva/_wrb 上方。
+            # dup/mva/wrb 三类各自"为什么只报不改"的长说明写在 core/anime 对应 suspect_* 的 docstring 里。
             # 【单独一个面板、不跟 30 秒定时器】(r37 #21) 它占仪表盘每轮一半的数据量（约 0.9 MB），
             # 而这些发现只在入库/绑定之后才会变：只在建页、用户操作（refresh_all）、点『知道了』时刷。
             _al = alerts.view()
@@ -186,14 +228,21 @@ def anime_page(t: str = ""):
                     _chg = "；".join(f"{k} {o} → {n}" for k, o, n in _a["revived"]["changed"])
                     _pre = (f"【你在 {_a['revived']['at'].strftime('%m-%d %H:%M')} 标过已读，"
                             f"之后：{_chg}】")
-                warn_banner(_pre + _a["text"], action=("知道了", "inbox", _ack_alert(_a)))
+                # 横幅叫人"去详情页核对 / 到番剧表打开这一条"：就地给入口（详情是本页的弹窗，不离站，
+                # 所以图标不用 open_in_new）。打开详情不算已读；在详情里处理完关掉，refresh_all 会连横幅一起刷。
+                # dup 有两条要核对，按钮上写 #id，与正文里的 (#a…) (#b…) 对得上。
+                _ids = _a.get("open") or []
+                _acts = [("打开详情" if len(_ids) == 1 else f"打开 #{i}", "info",
+                          lambda i=i: open_detail(i)) for i in _ids]
+                warn_banner(_pre + _a["text"], action=_acts + [("知道了", "inbox", _ack_alert(_a))])
 
-            if _al["acked"]:
-                _gone = sum(1 for r in _al["acked"] if r["state"] == "gone")
+            # 【首屏只数仍成立的】已不成立的已读记录不需要任何动作，常年挂在首屏只是噪音；
+            # 但也不自动删（理由见 core/alerts.drop_gone：ign/rer 这类发现会消失又回来，留着的记录挡住横幅复活）。
+            # 一条仍成立的都没有时整行不出；全部记录仍在『查看』对话框里（那时没有可取消的已读）。
+            _fresh = sum(1 for r in _al["acked"] if r["state"] == "fresh")
+            if _fresh:
                 with ui.row().classes("items-center gap-2 pl-1"):
-                    ui.label(f"已读的提示 {len(_al['acked'])} 条"
-                             + (f"（其中 {_gone} 条现在已经不成立了）" if _gone else "")
-                             ).classes("text-sm text-gray-400")
+                    ui.label(f"已读的提示 {_fresh} 条").classes("text-sm text-gray-400")
                     ui.button("查看", icon="inbox", on_click=_open_acked).props(
                         "flat dense").classes("btn-sm")
 
@@ -274,6 +323,9 @@ def anime_page(t: str = ""):
                         # 图例显示【全名】、不截断：环图与图例按像素排（环心 100px，图例从 205px 起），
                         # 宽屏下最长的组名（"豌豆字幕组&风之圣殿字幕组&LoliHouse" 约 220px）也是一行；放不下的源照旧翻页。
                         # 图表本身不足 480px 宽（窄屏、两列堆叠时）走 media：环图按比例放、长名换行而不是截断。
+                        # 图例文字从画布 50%+35px 处起画：画布窄于 350px（手机）时可用宽已不足 140，换行宽度再收到 100
+                        # （360px 宽的手机画布 276px、可用约 103px）。ECharts 按顺序合并命中的 media，后一档覆盖前一档。
+                        # 不直接把 140 改小：350~480px 的画布（桌面两列堆叠）放得下一行的长组名会被提前折行。
                         ui.echart({
                             "baseOption": {
                                 # Tailwind -400 十色（sRGB hex；ECharts canvas 不吃 oklch）
@@ -303,6 +355,9 @@ def anime_page(t: str = ""):
                                     "legend": {"left": "50%", "textStyle": {"width": 140}},
                                     "series": [{"center": ["25%", "50%"]}],
                                 },
+                            }, {
+                                "query": {"maxWidth": 350},
+                                "option": {"legend": {"textStyle": {"width": 100}}},
                             }],
                         }).classes("w-full").style("height:220px").on(
                             "chart:legendselectchanged", _remember_legend, args=["selected"])
@@ -321,7 +376,7 @@ def anime_page(t: str = ""):
                 _dla.set_enabled(config.QB_ENABLED)
                 _dla.tooltip("订阅中所有待下集立即下" if config.QB_ENABLED
                              else "qB 未启用，去设置页开启后可下载")
-            # 待下拆 将下载/备用/待确认/未知集/特别篇（库态『下载中』恒≈0、与 qB 实时态重复不单列）；失败、种子总数一并列出，与 KPI 卡呼应
+            # 待下拆 将下载/备用/锁源缺集/待确认/已下齐·停订/未知集/特别篇（库态『下载中』恒≈0、与 qB 实时态重复，不常驻，只在非零时露出，见下方循环）；失败、种子总数一并列出，与 KPI 卡呼应
             chips = [
                 # sent = 已发给 qB（含仍在下的）；真正下完的数在下方 qB 实时区的『已完成』
                 ("已交付", ov["status"]["sent"], "green",
@@ -331,6 +386,7 @@ def anime_page(t: str = ""):
                 # 被锁定源挡住、这一集一份都没有的（r37 #2）：以前混在『备用项』里，说法正好相反
                 *([("锁源缺集", ps["locked"], "orange",
                     "番锁了下载源，这些是别的组发的、锁定源还没跟上的集——这一集一份都没下。"
+                    "或被版本关键词挡住：有种子、但没有一条命中你设的『版本』（去详情页看是不是字幕组改了标签写法）。"
                     "点开看是哪几部，去详情页『只补这几集』或把下载源改回按优先级", _open_locked)]
                   if ps.get("locked") else []),
                 ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
@@ -461,7 +517,7 @@ def anime_page(t: str = ""):
                                lambda v, q=q: confirm_page["open"].__setitem__(q, v))
 
         def _quarter_group(label, opened, build, remember):
-            """一个季度折叠块，里面是封面卡片网格。番剧表/待确认/已忽略三处共用。
+            """一个季度折叠块，里面是封面卡片网格。番剧表/待确认/已忽略三个 tab 与 KPI 弹窗（_render_pop）共用。
             · 懒建：收着的季度先不建卡片，第一次展开时才建（build() 在网格里建卡片）；
             · remember(开/合)：用户手动开合时调用，面板重建后照此恢复（不想记就传个空函数）。"""
             # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
@@ -495,6 +551,9 @@ def anime_page(t: str = ""):
                     _card_title(a).classes("cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
                     _rs, _rd = anime.confirm_reason_text(a.confirm_reason)
                     ui.label("原因: " + _rs).classes("text-xs text-orange-400").tooltip(_rd)
+                    # 来源组是点不点确认的关键信息（人工审核的后备源什么组都可能进来），不截断：
+                    # 『喵萌奶茶屋&LoliHouse』截掉后半就没意义了；多源时自然折行，操作区靠 mt-auto 仍压在卡底
+                    ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
                     with ui.column().classes("w-full gap-2 mt-auto pt-1"):
                         # 预填当前锁定源：这个番可能是【补齐/绑定 bgm 打回来的】、本来就设过锁，
                         # 下拉恒空会让用户点一下『确认下载』就把锁静默解掉（选中值会被写回）。
@@ -620,8 +679,12 @@ def anime_page(t: str = ""):
                     sl = season_label(a)
                     if sl:
                         ui.badge(sl).props("color=purple")
+                    # 这枚徽标读的是 a.confirmed（不是源组策略）；手动绑定一律把番放回待确认（_bind_anime_bgm_inner）
                     ui.badge("待确认" if not a.confirmed else "自动").props(
-                        f"color={'orange' if not a.confirmed else 'blue-grey'}")
+                        f"color={'orange' if not a.confirmed else 'blue-grey'}").tooltip(
+                        "还没确认：后台不会下它。识别或绑定成功后进『待确认』，点确认下载才开始追"
+                        if not a.confirmed else
+                        "已确认在追：没绑 bgm 也照常自动下新集。点『绑定』会把它放回『待确认』，要再点一次确认下载")
                     ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
                     ui.link("去 bgm 搜", f"https://bgm.tv/subject_search/{quote(a.title)}?cat=2").props(
                         "target=_blank").classes("text-xs")
@@ -654,15 +717,16 @@ def anime_page(t: str = ""):
                         # 徽标永远钉在右侧，不会被挤到下一行左边去
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1 no-wrap").style(
                                 "border-bottom:1px solid rgba(255,255,255,.08)"):
+                            # overflow-wrap:anywhere 而不是 break-all：后者把英文番名从词中间拆开（同 .cover-card-title）
                             ui.label(f'{r["name"]}  {ep_label(r["episode"], r["anime_id"] in sw)}').classes(
-                                "grow break-all min-w-0")
+                                "grow min-w-0").style("overflow-wrap:anywhere")
                             ui.badge(text).props(f"color={color}").classes("shrink-0")
 
         @ui.refreshable
         def recent_panel():
             ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
             raw = anime.recent_anime_rows(50)
-            # 待下/失败行标『将下载/备用』：只给『已确认』的番批量算 download_plan（每番一查）；
+            # 待下/失败行标『将下载/备用』：只给『已确认』的番批量算 download_plan；
             # 未确认（待确认）的番不算、显示『待确认』——它要点确认才会下，标将下载是假的。
             pend_aids = {r["anime_id"] for r in raw
                          if r["status"] in engine.DOWNLOADABLE_STATUSES and r["anime_id"]}
@@ -699,8 +763,12 @@ def anime_page(t: str = ""):
                     "raw": r["raw"] or "—",
                     "status": text,
                     "status_color": color,
+                    # 折行用的两个临时键，判据见 _fold_recent（_fold_recent 返回前去掉）
+                    "_key": ((r["anime_id"], r["episode"]) if r["anime_id"] and r["episode"] is not None
+                             and r["episode"] >= 0 else None),
+                    "_quiet": r["status"] not in engine.HAVE_STATUSES and color in _NEUTRAL_BADGE,
                 })
-            recent_table(rows, "番剧",
+            recent_table(_fold_recent(rows), "番剧",
                          on_row_click=lambda row: row.get("detail_id") and open_detail(row["detail_id"]))
 
         @ui.refreshable
@@ -741,7 +809,11 @@ def anime_page(t: str = ""):
                             # 而这里这个数在仪表盘 KPI 上就叫『已交付』—— 同一个数两个名字。
                             # 「已下」留给"真到手"那两个口径。
                             ui.label(f"已交付 {b['done']}")
-                            ui.label(f"待下 {b['pending']}")
+                            # 【叫『未下』不叫『待下』】GLOSSARY 里番剧侧『待下』＝后台到点会自动下；这个合计是
+                            # pending+error 的条数，绝大多数是同一集的其它版本（备用项），不会下。
+                            ui.label(f"未下 {b['pending']}").tooltip(
+                                "这一季还没下的种子条数（待下 + 失败，按条不按集）。多数是同一集的其它版本（备用项），"
+                                "不会自动下；真正排队要下的看仪表盘『将下载』")
                             ui.label(f"种子 {b['torrents']}")
 
             # 面板设置：追番中恒显示；待确认/已拒绝各自按开关决定带不带上
@@ -762,6 +834,7 @@ def anime_page(t: str = ""):
             src_map = anime.source_map()
             # 已下/可下 + 缺集提示（按开播日推算应播、库里却没见过的集）：共用一次分集统计
             prog_map, gap_map = anime.progress_and_gaps(animes)
+            bad_map = _bad_map()
             yrs = max(1, config.ANIME_PAGE_YEARS)  # 防 0（每页 0 季会除零）
             groups, total_pages, page = paginate(group_by_quarter(animes), manage_page["n"], yrs * 4)
             manage_page["n"] = page
@@ -788,7 +861,8 @@ def anime_page(t: str = ""):
                     remember = lambda v, q=q: manage_page["open"].__setitem__(q, v)   # noqa: E731
                 _quarter_group(f"{engine.quarter_label(q)}   ·   {len(items)} 部", opened,
                                lambda qi=items: [_anime_card(a, src_map.get(a.id), prog_map.get(a.id),
-                                                             gap_map.get(a.id)) for a in qi],
+                                                             gap_map.get(a.id), bad_map.get(a.id, 0))
+                                                 for a in qi],
                                remember)
 
         def _refresh_overview(charts):
@@ -913,20 +987,23 @@ def anime_page(t: str = ""):
                 render_anime_detail(anime_id, refresh_outer=_mark_outer_stale, on_close=detail_dlg.close)
             detail_dlg.open()
 
-        # KPI 卡点开：列出对应种子（未知集/失败），点番名进详情页处理。详情弹窗叠在本弹窗之上、
+        # KPI 卡点开：列出对应明细（未知集/缺集/特别篇/失败…），点番名进详情页处理。详情弹窗叠在本弹窗之上、
         # 不关掉它——关了详情仍回到这层列表，一层一层来。
         list_dlg = ui.dialog()
 
-        _LIST_PAGE_SIZE = 50   # 弹窗每页条数：挂机久了这两类可能上百条，一次建几百个元素会明显卡
+        _LIST_PAGE_SIZE = 50   # 弹窗每页条数：挂机久了这几类可能上百条，一次建几百个元素会明显卡
         _list_view: dict = {"fn": None}   # list_dlg 当前显示的是哪个列表：refresh_all 据此就地重建 (r39 U12)
 
         def _open_torrent_list(title, desc, fetch, page: int = 1):
-            """未知集 / 特别篇 / 失败异常 的明细弹窗。分页而不是一次全渲染——总数照实显示在标题里。"""
+            """未知集 / 缺集 / 锁源缺集 / 特别篇 / 失败异常 的明细弹窗。分页而不是一次全渲染——总数照实显示在标题里。"""
             # 迟绑定：page 在下面被 paginate 夹回合法页码，重建时用的是夹过之后的那一页
             _list_view["fn"] = lambda: _open_torrent_list(title, desc, fetch, page)
             list_dlg.clear()
             rows = fetch()
             shown, pages, page = paginate(rows, page, _LIST_PAGE_SIZE)
+            # 同一部番常出现两行（第 6 集失败、第 3 集停滞）：每行要凭可见文字就分得清——集号、失败/停滞徽标、原因。
+            # 取值一律 .get：锁源缺集等列表的行不带集号/状态，缺了就什么都不追加。
+            sw = anime.single_work_ids() if shown else set()
             with list_dlg, ui.card().classes("w-full").style("max-width:720px"):
                 ui.label(f"{title} · {len(rows)}").classes("text-base font-bold")
                 if desc:
@@ -936,9 +1013,18 @@ def anime_page(t: str = ""):
                 for r in shown:
                     with ui.column().classes("gap-0 w-full py-1").style(
                             "border-bottom:1px solid rgba(255,255,255,.08)"):
-                        ui.label(r["name"]).classes(
-                            "text-sm text-blue-400 cursor-pointer hover:underline").on(
-                            "click", lambda aid=r["anime_id"]: open_detail(aid))  # 不关本弹窗，详情叠上面
+                        with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                            _ep = (f'  {ep_label(r["episode"], r["anime_id"] in sw)}'
+                                   if r.get("episode") is not None else "")
+                            ui.label(r["name"] + _ep).classes(
+                                "text-sm text-blue-400 cursor-pointer hover:underline grow min-w-0").on(
+                                "click", lambda aid=r["anime_id"]: open_detail(aid))  # 不关本弹窗，详情叠上面
+                            # 只有 error / stalled 出徽标（与仪表盘『失败数』『停滞』同源的文案与配色）；未知集/特别篇清单不出
+                            if r.get("status") in SEVERITY_COLOR:
+                                ui.badge(torrent_status_cn(r["status"])).props(
+                                    f'color={SEVERITY_COLOR[r["status"]]}').classes("shrink-0")
+                        if r.get("fail_reason"):
+                            ui.label(r["fail_reason"]).classes("text-xs text-gray-400 break-all")
                         ui.label(r["raw"] or "—").classes("text-xs text-gray-500 break-all")
                 with ui.row().classes("items-center gap-3 w-full mt-1"):
                     if pages > 1:
@@ -972,7 +1058,8 @@ def anime_page(t: str = ""):
                 "锁源缺集", "这些番锁了下载源，锁定的组停更或远远落后，别的组已经发了后面的集，"
                 + (f"锁定组停更满 {config.ANIME_LOCK_FALLBACK_DAYS} 天、核对无误的会自动用别的组补一份，其余被锁挡着不下。"
                    if config.ANIME_LOCK_FALLBACK_DAYS > 0 else "但因为锁了源一集都不会下。")
-                + "点番名进详情页：『只补这几集』用别的组补上（不改锁），或把下载源改回按优先级。",
+                + "点番名进详情页：『只补这几集』用别的组补上（不改锁），或把下载源改回按优先级。"
+                "也列出被版本关键词挡住的番：进详情页改『版本』关键词，或对准想要的那条点『下载』。",
                 anime.locked_out_rows)
 
         def _open_special():
@@ -1004,14 +1091,18 @@ def anime_page(t: str = ""):
             【必须是对话框，不能是就地展开】仪表盘的 overview_head 每 30 秒被
             `ui.timer` 重建一次（见本文件底部）。放一个 ui.expansion 在里面的话，
             用户展开去点『取消已读』，最多 30 秒就被合上 —— R27 已经为完全同构的
-            bug 付过一次学费（见 manage_panel 那段 docstring）。对话框活在
+            bug 付过一次学费（见 _refresh_live 那段 docstring）。对话框活在
             client.layout 上，不受面板重建影响。
             """
             _list_view["fn"] = _open_acked
             list_dlg.clear()
-            rows = alerts.view()["acked"]
+            # 仍成立的排前面（稳定排序，组内仍按标记时间倒序）；标题分开数，与首屏『已读的提示 N 条』（只数仍成立的）对得上
+            rows = sorted(alerts.view()["acked"], key=lambda r: r["state"] != "fresh")
+            _n_fresh = sum(1 for r in rows if r["state"] == "fresh")
+            _n_gone = len(rows) - _n_fresh
             with list_dlg, ui.card().classes("w-full").style("max-width:720px"):
-                ui.label(f"已读的提示 · {len(rows)}").classes("text-base font-bold")
+                ui.label(f"已读的提示 · 仍成立 {_n_fresh} 条"
+                         + (f" · 已不成立 {_n_gone} 条" if _n_gone else "")).classes("text-base font-bold")
                 ui.label("这些是你点过『知道了』的巡检发现。它们的关键事实变了会自己回到上面 —— "
                          "比如那条番从『超期忽略』变成『追番中』、改了 bgm 绑定、或者出问题的集号变了。"
                          ).classes("text-xs text-gray-400")
@@ -1111,7 +1202,9 @@ def anime_page(t: str = ""):
                     return
                 if kind == "track":
                     prog, gaps = anime.progress_and_gaps(items)
-                    card = lambda a: _anime_card(a, smap.get(a.id), prog.get(a.id), gaps.get(a.id))   # noqa: E731
+                    bad = _bad_map()      # 同一张卡在弹窗里别长得和番剧表不一样
+                    card = lambda a: _anime_card(a, smap.get(a.id), prog.get(a.id), gaps.get(a.id),   # noqa: E731
+                                                 bad.get(a.id, 0))
                 elif kind == "confirm":
                     card = lambda a: _confirm_card(a, smap.get(a.id, []))   # noqa: E731
                 else:
@@ -1250,7 +1343,7 @@ def anime_page(t: str = ""):
             return h
 
         async def _download_all(e):
-            # 【补下全部要防重入】它可能跑几十秒，而同文件 758 行的『重新识别』早就有现成写法。
+            # 【补下全部要防重入】它可能跑几十秒，而同文件 `_reident`（『刷新资料』）早就有现成写法。
             # 连点会叠出多轮并发补下：同一集被多轮各挑一次候选，qB 侧靠 409 兜着，
             # 但日志与"已触发 N 集"的数字会变得没法解释。
             async def _go():
@@ -1320,13 +1413,13 @@ def anime_page(t: str = ""):
             with ui.row().classes("justify-end w-full"):
                 ui.button("取消", on_click=reident_dlg.close).props("flat")
 
-        def _card_cover(a, *, dim: bool = False, status=None, sources=None, prog=None, missing=None):
+        def _card_cover(a, *, dim: bool = False, status=None, sources=None, prog=None, missing=None, bad=0):
             """番剧卡片的封面区（番剧表/待确认/已忽略共用），四角徽标的摆法与剧场版同一份（layout.cover_box）：
               · 左上：状态 status=(文案, 颜色, 悬停说明或 None)，下面叠『已下齐』；
               · 右上：bgm 评分，下面叠季号；
               · 左下：多源/单源（悬停看来源）；
               · 右下：bgm 判定的非 TV 类型（WEB/剧场版/OVA…），下面是已下/可下
-                （只有番剧表给 prog；missing＝缺集，见下）。
+                （只有番剧表给 prog；missing＝缺集，见下；bad＝失败/停滞的种子条数，只改悬停说明）。
             dim：封面置灰（番剧表里的已忽略番）。返回容器，调用方可再挂点击。"""
             fin = None
             if a.finished_at:
@@ -1366,7 +1459,7 @@ def anime_page(t: str = ""):
                             + ((f"——其中第 {ep_ranges_text(_free)} 集" if _held else "——")
                                + "按 bgm 开播日推算早该播了，库里却一条种子都没有。"
                                "采集停过一阵（RSS 只留最近几天）或锁定的源中途断更都会这样；"
-                               "进详情页把『下载源』换成还在更新的组，再点『补齐该源』" if _free else "")
+                               "进详情页点『自动补齐』（当前下载源搜不到时会列出别的组有哪些集，挑一个就能补）" if _free else "")
                             + ((f"{'；' if _free else '——'}第 {ep_ranges_text(_held)} 集的槽位被别的季的旧种子占着，"
                                 "补齐也下不了：进详情页把占槽的旧种子标为『不属于本季』（文件不动）") if _held else ""))
                 else:
@@ -1375,7 +1468,9 @@ def anime_page(t: str = ""):
                             + ("。集号超出 bgm 记载——多半有别的季的正片挂到了这条记录下面，"
                                "进详情页看『各源的集号范围』" if _over else
                                ("。还有集号没到手：可能是锁定源锁太死、版本关键词没匹配上，"
-                                "或还在缓冲窗口里" if _have < _seen else "。都到手了")))
+                                "或还在缓冲窗口里" if _have < _seen else
+                                # 进度分子按 HAVE_STATUSES 数、含 stalled：停滞的集算"交给 qB 了"，不能说都到手了
+                                ("。都到手了" if not bad else "。集号都交给 qB 了，但其中有失败/停滞的，见左上角"))))
                 progress = (f"{_have}/{_den}", _c, _tip)
             return cover_box(a.cover_url, dim=dim,
                              top_left=[status, fin],
@@ -1387,18 +1482,28 @@ def anime_page(t: str = ""):
             """番剧卡片上的番名（layout.cover_title）。struck：灰色删除线（已忽略）。"""
             return cover_title(name_of(a), struck)
 
-        def _anime_card(a, sources=None, prog=None, missing=None):
+        def _bad_map():
+            """{anime_id: 失败/停滞的种子条数}。判据就是 KPI『失败/异常』与 _open_failed 用的那一个
+            （failed_rows：status ∈ error/stalled），不另写谓词、不排除退避中的行——否则又是『卡上 0、点开 N 条』。"""
+            return Counter(r["anime_id"] for r in anime.failed_rows())
+
+        def _anime_card(a, sources=None, prog=None, missing=None, bad=0):
             # 一部番一张卡：封面（四角徽标）+ 番名。整张卡可点进详情（徽标的 tooltip 照常悬停可看）。
             # 与详情页、已忽略页同一套词（r37 #18）：超期忽略(rejected 且未确认，按开始使用日自动判) / 已忽略(人工)；
             # 还没识别出 bgm 的叫『待识别』（与剧场版卡片同色），不是『待确认』
             status = ((("超期忽略", "grey", "开播早于『开始使用日』，自动判的忽略。改开始使用日或点『恢复订阅』都能放回来")
                        if not a.confirmed else ("已忽略", "grey", None)) if a.rejected else
                       ("待识别", "red", "bgm 没匹配上，去『待识别』手动绑定") if a.bangumi_id is None else
-                      ("待确认", "orange", None) if not a.confirmed else None)
+                      ("待确认", "orange", None) if not a.confirmed else
+                      # 在追的番左上角本来是空的：有失败/停滞时标出来，否则它与等缓冲窗口的橙色 5/6、
+                      # 甚至蓝色 6/6（停滞算进了分子）分不开
+                      (f"失败/停滞 {bad}", "red", "有下载失败或长期停滞的种子（与仪表盘『失败/异常』同一批）。"
+                                                  "进详情页重下，或换一个版本") if bad else None)
             with ui.card().tight().classes("cover-card cursor-pointer w-full").props("tabindex=0").on(
                     "click", lambda aid=a.id: open_detail(aid)).on(
                     "keydown.enter", lambda aid=a.id: open_detail(aid)):
-                _card_cover(a, dim=a.rejected, status=status, sources=sources, prog=prog, missing=missing)
+                _card_cover(a, dim=a.rejected, status=status, sources=sources, prog=prog, missing=missing,
+                            bad=bad)
                 with ui.column().classes("px-3 py-2 gap-1.5 w-full"):
                     _card_title(a, struck=a.rejected)
 
@@ -1409,8 +1514,10 @@ def anime_page(t: str = ""):
         # 懒加载：首屏只构建当前 tab 的内容；切到别的 tab 首次才建（6 个面板 → 1 个，砍首屏构建/推送）。
         # 面板都是 @ui.refreshable，未构建过的 .refresh() 是安全 no-op，所以刷新逻辑无需改动。
         _builders = {
-            "overview": lambda: (_ov_snap.clear(), overview_head(), alerts_panel(), charts_panel(),
-                                 overview_tail(), inflight_panel(), recent_panel(),
+            # 定高的在前、变长的在后：KPI → 横幅 → 种子/下载/采集状态（健康信号，生产没配推送时页面是唯一渠道，
+            # 不许落到变长列表之后）→ 正在下载 → 新入库 → 订阅源组与两张统计图（不回答"正常吗/刚下了什么"，放页尾）
+            "overview": lambda: (_ov_snap.clear(), overview_head(), alerts_panel(), overview_tail(),
+                                 inflight_panel(), recent_panel(), charts_panel(),
                                  _ov_snap.clear()),
             "manage": _build_manage_tab, "confirm": confirm_panel,
             "fail": fail_panel, "reject": reject_panel, "sources": render_sources,

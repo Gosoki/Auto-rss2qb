@@ -75,15 +75,14 @@ async def _capped(client, method: str, url: str, **kw) -> tuple[int, bytes]:
 async def _retryable(make_request):
     """执行一次 HTTP 请求；遇瞬时错误(超时/连接/读)按 config.ENRICH_RETRY_TIMES 重试(指数退避)。
 
-    make_request：无参 async，返回 httpx.Response。重试用尽后把最后一次异常抛出（交由各调用点的
+    make_request：无参 async，返回 `_capped` 的 (status_code, 封顶后的响应体)。重试用尽后把最后一次异常抛出（交由各调用点的
     try/except httpx.HTTPError 收成 None/{}）。非瞬时错误（如 404 正常返回）不在此重试。
     """
     times = max(1, config.ENRICH_RETRY_TIMES)
     for i in range(times):
         try:
             # 【总超时】httpx 的 timeout 是每次读的、逐块重置，服务端涓流发送就能永久挂住，
-            # 而这是常驻的识别协程。给每次尝试套一个硬上限，和 sources/ 那边同一思路
-            # （那边走 services.fetch；这里调用方要的是 Response 对象，只补总超时即可）。
+            # 而这是常驻的识别协程。给每次尝试套一个硬上限，和 sources/ 那边同一思路。
             async with asyncio.timeout(_ATTEMPT_TIMEOUT):
                 return await make_request()
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
@@ -312,7 +311,9 @@ def _clean_summary(s: str | None) -> str | None:
     s = (s or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not s:
         return None
-    s = re.sub(r"[ \t　]+(?=\n)", "", s)   # 去每行尾部空白（含全角空格）
+    # 去每行尾部空白（含全角空格）。不用 `[ \t　]+(?=\n)`：一长串空白后面不是换行时它平方回溯
+    # （4 万个空格 9 秒，跑在事件循环上）。前面已 strip()，末行没有尾随空白，与正则写法逐字等价。
+    s = "\n".join(ln.rstrip(" \t　") for ln in s.split("\n"))
     s = re.sub(r"\n{3,}", "\n\n", s)           # 连续 2 行以上空白 → 压成 1 行
     return s
 

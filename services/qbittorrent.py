@@ -24,7 +24,7 @@ _SESSION_TTL = 1800   # 复用已登录 client 的秒数；取小于 qB 默认 c
 # 【登录失败的负缓存】qB 自带失败登录封禁（默认 5 次失败 → 封该 IP 3600 秒）。
 # 而本程序的两条后台线（anime + movies 的状态同步）每 QB_SYNC_INTERVAL（默认 30s）各要一次会话，
 # 用户改了密码或 qB 重启后，约 75 秒就能凑够 5 次失败把自己封进去——之后即使把密码改对，
-# 设置页的连接探测也会失败，还会顺手把『发送到 qB』开关自动关掉，看起来像"密码明明是对的却连不上"。
+# 设置页的连接探测也会失败，看起来像"密码明明是对的却连不上"。
 # 凭据类失败退避得久（改密码是人工动作，不必抢），网络类失败退避得短（qB 重启很快回来）。
 _LOGIN_COOLDOWN_AUTH = 300    # 200 'Fails.'（账号密码错）/ 403（已被封）
 _LOGIN_COOLDOWN_NET = 30      # 连不上/超时
@@ -250,8 +250,7 @@ class QBittorrent:
             return None
         if _add_accepted(resp):
             return True
-        # 被拒最常见的成因是『该 hash 已在 qB』(重复提交/跨表同种；新版回 409 Conflict)，调用方
-        # engine.add_to_qb 会据 info_hash 兜底判为已交付——故 200 按 warning 记，别当 error 惊扰。
+        # 被拒最常见的成因是『该 hash 已在 qB』(重复提交/跨表同种；新版回 409 Conflict)。
         # 响应体留 200 字：新版失败时的 failure_reasons 才不会被截掉（那是唯一的失败原因线索）。
         # 附上 save_path：远程 qB 若因路径不可写而拒，这行是另一条线索。
         # 200('Fails.') 与 409(Conflict) 都是"该 hash 已在 qB"的正常表达（新旧版本各一种），

@@ -3,7 +3,7 @@
 【为什么单独一个模块】它有两个使用口径，而两者要给到不同层：
   · block_internal_request —— 【每一跳都判】。用在取种上：download_url 完全来自 RSS 正文，
     是攻击者可控的字符串，没有"用户自填所以可信"这回事。
-    开了代理也照判字面内网 IP，只跳过 DNS 解析与钉 IP（那两步在代理模式下确实无意义）。
+    开了代理也照判内网地址（主机名照样解析，E-40），只跳过钉 IP（那一步在代理模式下确实无意义）。
   · guard_redirect_request —— 【首跳放行、重定向后的每一跳都判】。用在其余全部出站上，
     由 config.http_client_kwargs 默认装上，所以【新写一处抓取不需要记得加】。
     首跳放行是有意的：feed 地址、webhook 地址、qB 地址都是用户自己在设置页填的，
@@ -124,7 +124,7 @@ async def block_internal_request(request: httpx.Request) -> None:
     证书校验与虚拟主机都照常工作（实测 http/https 均 200）。
     本钩子对每一跳重定向都会跑，所以每跳各自钉各自的，不必自己重写重定向循环。
 
-    【代理模式下只跳过"解析+钉IP"，不跳过整条守卫】旧写法是 `if config.PROXY: return`，
+    【代理模式下只跳过"钉IP"，不跳过整条守卫】旧写法是 `if config.PROXY: return`，
     理由写的是"目标由代理侧解析、本地判定既无意义又会误伤"——那句话**只对域名成立**。
     URL 里写死的字面私网/环回 IP 是谁解析都一样的地址，不存在误伤，跳过它是零收益。
     而代价很大：本项目要抓 nyaa/bgm，「开着本机 clash/v2ray」几乎是默认姿势，
@@ -195,3 +195,17 @@ async def guard_redirect_request(request: httpx.Request) -> None:
         # 端口取的是 URL 里【显式写的】那个，http/https 的默认端口两边都是 None，故协议升级能过。
         return
     await block_internal_request(request)
+
+
+async def drop_redirect_body_encoding(response: httpx.Response) -> None:
+    """响应级钩子：重定向那一跳摘掉 Content-Encoding，让 httpx 按线上原始字节读它的包体。config 默认给所有客户端装上。
+
+    httpx 在跟随重定向前会 `await response.aread()`，aread 走 aiter_bytes —— 按 Content-Encoding 解压、
+    没有任何上限；services/fetch 的封顶只看得到最终响应。实测一跳 302 线上 1 MB 的 gzip 包体
+    就能在内存里解出 2 GB。中间跳的包体没人看，不解压不丢任何东西。
+    【判据必须带 has_redirect_location】写成"所有响应都摘"时最终响应也不解压了：gzip_ok 的 feed
+    拿到的是压缩字节，整个源抓不到；不跟随重定向的客户端（qB）拿到的 3xx 也只是少了一个它不读的头。
+    这只去掉解压放大，中间跳仍不封顶（E-41：3 跳 × 带宽 × 总超时）。
+    """
+    if response.has_redirect_location and "content-encoding" in response.headers:
+        del response.headers["content-encoding"]

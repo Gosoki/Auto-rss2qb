@@ -47,6 +47,8 @@ _INTENTIONAL = {
     "verify": "db/backup.py 是『这份备份打得开吗』(bool,str)；db/transfer.py 是『迁完行数对得上吗』(list)",
     "_parse_date": ("两份【接受的格式与返回类型都不同】：core/anime 收 YYYY-MM / YYYY 残缺日期、返回 date；"
                     "services/enrich 拒绝残缺日期、另收 MM/DD/YYYY、返回 datetime。见 GLOSSARY.md"),
+    # ---- 后台心跳入口：各模块自己的"到点就做一次"，调用方恒带模块名（ipfilter.tick / digest.tick）----
+    "tick": "core/ipfilter 更新屏蔽列表、core/digest 发每日摘要，两件互不相干的事，没有共用的判据",
 }
 
 _SKIP_DIRS = ("tests", ".venv", "alembic", "__pycache__", "docs", "data")

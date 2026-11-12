@@ -38,6 +38,7 @@ EVENTS: dict[str, tuple[str, str]] = {
     "gap": ("缺集", "🧩"),               # r38：在追的番按开播日早该播了、库里一条种子都没有的集（core.anime.episode_gaps）
     # r39：锁定源停更满 N 天、用别的组补了几集 / 锁定组补发后又下了它的版本（core.anime.deliver_lock_fallback）
     "lock_fallback": ("锁定源兜底", "🛟"),
+    "digest": ("每日摘要", "📋"),          # 每天一条：下了什么 / 等你处理什么 / 系统是否正常（core/digest.py）
 }
 
 # (事件, key) → 上次发送时刻（monotonic）。进程内，重启即忘。
@@ -74,6 +75,12 @@ _FAIL_MUTE_AFTER = 5           # 连续失败几条后闭嘴
 _FAIL_MUTE_SECONDS = 300       # 闭嘴多久
 _fail_streak = 0
 _muted_until = 0.0
+# 【已保存地址】上连续没发出去的条数与最近一次原因（已脱敏），只给 problem() 挂横幅用。
+# 不复用 _fail_streak：那个会被『发送测试通知』的 clear_mute 清掉，点一下按钮横幅就没了，
+# 而地址其实还是坏的；测试按钮试的又可能是另一个还没保存的地址，它的成败不该算到已保存的头上。
+_chan_fails = 0
+_chan_reason = ""
+_last_error = ""               # _send_once 写：刚才那一次为什么没发出去（已脱敏）
 
 
 def _safe_host(url: str = "") -> str:
@@ -129,7 +136,7 @@ async def notify(message: str, *, url_override: str = "") -> bool:
     · 连续失败到 _FAIL_MUTE_AFTER 条就【熔断】，静默期内连网络都不碰、立刻返回 False：
       推送地址变成黑洞时，"每条白等一个超时"会一路拖慢交付主链路（见 _muted_until 处的说明）。
     """
-    global _fail_streak, _muted_until, _dropped
+    global _fail_streak, _muted_until, _dropped, _chan_fails, _chan_reason, _last_error
     # 【url_override 给"只想试一下这个地址"用】设置页的『发送测试通知』原本是把
     # config._v["NOTIFY_URL"] 临时换掉、await 完再换回来——那段窗口最长有 NOTIFY_TIMEOUT，
     # 期间任何后台协程发出的通知（delivered / qb_down / 巡检告警）都会被送到那个
@@ -143,7 +150,10 @@ async def notify(message: str, *, url_override: str = "") -> bool:
         # 看到"有几条没送到"，唯一痕迹是日志里那一行 warning——而通知本来就是给不看日志的人用的。
         _dropped += 1
         return False                      # 熔断中：不发起请求，主链路一秒都不等
+    _last_error = ""
     ok = await _send_once(message, base)
+    if base == config.NOTIFY_URL:
+        _chan_fails, _chan_reason = (0, "") if ok else (_chan_fails + 1, _last_error or "原因见运行日志")
     if ok:
         if _fail_streak >= _FAIL_MUTE_AFTER:
             log.info("通知已恢复（%s）", _safe_host())
@@ -159,9 +169,18 @@ async def notify(message: str, *, url_override: str = "") -> bool:
 
 
 async def _send_once(message: str, base: str = "") -> bool:
-    """真正发一条。旁枝处理的理由全写在 notify() 的 docstring 里，这里只放实现。"""
+    """真正发一条。旁枝处理的理由全写在 notify() 的 docstring 里，这里只放实现。
+
+    地址里写了 {msg}（ntfy 的 ?message=、Telegram 的 &text= 这类拿 query 传正文的服务）就把每一处
+    原位换成编码后的正文、路径后不再追加；没写就按 Bark 的习惯接在地址后面。
+    """
+    global _last_error
     base = base or config.NOTIFY_URL
-    url = f"{base}/💡{quote(message, safe='')}"  # safe='' 连 '/' 也编码，防可控番名注入额外路径段
+    # safe='' 连 '/' '&' '?' '#' 也编码：番名是外部可控的，不编码就能注入额外的路径段或 query 参数
+    if "{msg}" in base:
+        url = base.replace("{msg}", quote(message, safe=""))
+    else:
+        url = f"{base}/💡{quote(message, safe='')}"
     timeout = max(1, config.NOTIFY_TIMEOUT)
     try:
         # 走 config.http_client_kwargs：这里曾是全仓唯一【绕过代理设置】的出站请求。
@@ -179,15 +198,20 @@ async def _send_once(message: str, base: str = "") -> bool:
         # 推送密钥放在 URL【路径】里——原样记下去就落进 data/autorss.log 与 /logs 页，
         # 用户用一键下载把日志贴进 issue 时密钥就公开了。
         if e.response.status_code >= 400:
-            log.warning("通知发送失败：HTTP %s（%s）", e.response.status_code, _safe_host(base))
+            _last_error = f"HTTP {e.response.status_code}"
+            log.warning("通知发送失败：%s（%s）", _last_error, _safe_host(base))
             return False
         return True   # 3xx：有些推送服务受理后就是 302 到状态页，那也是送到了
     except Exception as e:
         # 【str(e) 要脱敏再截断】上面 HTTPStatusError 那一支的注释写着"原样记下去密钥就公开了"，
         # 而这条兜底以前是裸 str(e)[:80]：services/fetch.py 造的异常消息正是以完整 URL 结尾，
         # 而 notify 的 url 含 Bark/Server酱 的路径密钥。截断也救不了——22 位密钥能塞进 80 字符。
-        log.warning("通知发送失败：%s: %s（%s）", type(e).__name__,
-                    fetch.redact(e)[:120], _safe_host(base))
+        # InvalidURL 不用异常串：fetch.redact 只认成形的 http(s):// 子串，而 httpx 解析失败时会把 URL 片段
+        # 原样引出来（口令里带 # 时报 "Invalid port: 'hunter2'"）。
+        # 超时类异常的 str 是空串，只留类名，免得横幅里出现 "TimeoutError: 。"。
+        text = "地址格式不对" if isinstance(e, httpx.InvalidURL) else fetch.redact(e)[:120].rstrip("。. ")
+        _last_error = f"{type(e).__name__}: {text}" if text else type(e).__name__
+        log.warning("通知发送失败：%s（%s）", _last_error, _safe_host(base))
         return False
 
 
@@ -268,7 +292,7 @@ def cooldown_active(kind: str, key: str, cooldown: int) -> bool:
     再判完结"，第二次就会被 7 天冷却挡住，于是 `finished_at` **永远落不下来**、每轮重判一次。
     （② 早先已经单独处理了，③ 是第 20 轮的审计端到端跑出来的。）
 
-    不把 event 改成返回四态：那会动到它全部 8 个调用点，而只有 sweep_finished 需要区分。
+    不把 event 改成返回四态：那会动到它的全部调用点，而只有 sweep_finished 与 sweep_alerts 的『绑定可疑』那一支需要区分。
     """
     if cooldown <= 0:
         return False
@@ -375,8 +399,8 @@ async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "", *,
     _state_suppressed.pop(kind, None)         # 桶松开了：下次再被挡住时重新记一行
     # （令牌在下面【送达之后】才扣，见 _state_rate_commit 调用点）
     # 【先占位再发】边沿判定（上面那个 prev）与写回之间隔着 await（最长 NOTIFY_TIMEOUT）。
-    # qB 掉线时两条路径会同时进来（qB 同步轮 与 flush 的 qb_precheck，分属不同锁；
-    # 或页面『补下全部』被双击——它没有防重入），两个协程都读到同一个 prev、都判成翻转，
+    # qB 掉线时两条路径会同时进来（qB 同步轮 与 flush 的 qb_precheck，分属不同锁），
+    # 两个协程都读到同一个 prev、都判成翻转，
     # 于是同一次翻转推【两条】、占两枚令牌。对称交错还能把一次真实掉线告警吞掉一轮。
     # 占位之后失败再还原，"没发出去就不落记忆"这条性质保持不变。
     _state_now[kind] = bad
@@ -417,7 +441,8 @@ async def state(kind: str, bad: bool, bad_msg: str, ok_msg: str = "", *,
 def reset_state() -> None:
     """用户改了通知设置后调它：清掉【会挡住下一条通知】的那几样，别的一律留着。
 
-    【清什么】冷却窗口（改完开关就该立刻看得到效果）与熔断（改完 NOTIFY_URL 就该立刻重试）。
+    【清什么】冷却窗口（改完开关就该立刻看得到效果）、熔断（改完 NOTIFY_URL 就该立刻重试）
+    与通道失败计数（problem() 的横幅）。
 
     【不清什么，以及为什么】
     · _state_now（状态型的当前认知）——清了它，"坏→好"那一次翻转就退化成"None→好"，
@@ -431,8 +456,26 @@ def reset_state() -> None:
       改大改小【立刻】生效，不需要清账本；清了反而等于"保存一次设置＝额度清零重来"，
       连点几次保存就能绕过用户自己设的上限。
     """
+    global _chan_fails, _chan_reason
     _last_sent.clear()
     clear_mute()
+    _chan_fails, _chan_reason = 0, ""     # 地址刚改过：旧地址的失败不该再挂在横幅上
+
+
+def problem() -> str | None:
+    """推送通道自己坏了的人话描述（全站横幅用）；没问题返回 None。
+
+    门槛与熔断同一个数（_FAIL_MUTE_AFTER）：偶尔抖一两条不值得挂横幅，连到熔断那一刻才说。
+    没配地址时恒 None —— 那是"没开"，不是"坏了"，横幅尾巴另有一句说它。
+    """
+    if not config.NOTIFY_URL or _chan_fails < _FAIL_MUTE_AFTER:
+        return None
+    return f"推送已连续 {_chan_fails} 次没发出去：{_chan_reason}。到设置页点『发送测试通知』看看"
+
+
+def muted() -> bool:
+    """推送是否正处在连续失败熔断期。"""
+    return time.monotonic() < _muted_until
 
 
 def clear_mute() -> None:

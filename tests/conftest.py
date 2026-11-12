@@ -18,8 +18,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 _TMP_ROOT = os.path.realpath(tempfile.gettempdir())   # 钉死在 import 时，见 _assert_throwaway
 _TMP_DB = Path(tempfile.mkdtemp(prefix="autorss-test-")) / "test.db"
 os.environ["DB_PATH"] = str(_TMP_DB)
+# 每次会话一个目录，不清的话系统临时目录里会一直攒下去；被 SIGKILL / 超时杀掉的会话不跑 atexit，只能留着
+import atexit, shutil  # noqa: E401,E402
+atexit.register(shutil.rmtree, _TMP_DB.parent, ignore_errors=True)
 
 import config  # noqa: E402
+
+# 备份目录、日志文件、IP 过滤缓存都是各自模块 import 时由 DATA_DIR 派生的：先把它挪进一次性目录，
+# 忘了打补丁的用例就写不进仓库的 data/（backup_now 会按保留份数 prune 整个备份目录，删掉的是真备份）。
+# 与 DB_PATH 一样依赖导入顺序 —— 必须在任何生产模块 import 之前；守卫见 test_r40_fix_tests。
+config.DATA_DIR = _TMP_DB.parent
 
 
 @pytest.fixture
@@ -170,6 +178,17 @@ def _restore_config_after_each_test():
 
 
 @pytest.fixture(autouse=True)
+def _reset_digest_backoff():
+    """每日摘要的退避计数是模块级的：一条用例里送达失败留下的退避，会让下一条用例的 tick 静默不发。"""
+    yield
+    try:
+        from core import digest as _d
+    except Exception:
+        return
+    _d._fails, _d._retry_at = 0, None
+
+
+@pytest.fixture(autouse=True)
 def _guard_every_session(monkeypatch):
     """把"测试不许碰非一次性库"这条约束装到【所有会话入口】上，而不只是 clean_tables。
 
@@ -198,7 +217,8 @@ def _guard_every_session(monkeypatch):
     monkeypatch.setattr(_db, "get_session", _s)
     monkeypatch.setattr(_db, "get_meta_session", _m)
     # 生产模块在 import 时就 `from db import get_session` 绑过去了，得逐个换掉
-    for mod in ("core.anime", "core.movies", "core.engine", "core.worker", "core.manual"):
+    # 漏登记的模块会绑着原函数绕过闸（收集期就被 import 的尤其如此）：守卫见 test_r40_fix_tests
+    for mod in ("core.anime", "core.movies", "core.engine", "core.worker", "core.manual", "core.alerts"):
         try:
             m = __import__(mod, fromlist=["*"])
         except Exception:
@@ -209,18 +229,117 @@ def _guard_every_session(monkeypatch):
             monkeypatch.setattr(m, "get_meta_session", _m)
 
 
+@pytest.fixture(autouse=True)
+def _reset_banner_state(monkeypatch):
+    """全站横幅读的两份进程内状态（推送通道连续失败、已退出的后台协程）每条用例都从空开始：
+    前一条用例攒下的失败 / 退出会让后一条渲染出多余的横幅，断言"没有横幅"的用例就会随顺序红绿。"""
+    from core import health
+    from services import notify
+    monkeypatch.setattr(health, "_dead", set())
+    # 源连续失败计数同理：前一条用例记下的失败会让兜底预览判成"有源在失败"、横幅换成被挡的说法
+    monkeypatch.setattr(health, "_fail", {})
+    monkeypatch.setattr(health, "_alive", set())
+    monkeypatch.setattr(notify, "_chan_fails", 0)
+    monkeypatch.setattr(notify, "_chan_reason", "")
+
+
+def reset_process_state():
+    """把进程内的模块级状态复位成刚 import 的样子（下面的 autouse 夹具每条用例之前调它；守卫也直接调它）。
+
+    都是"上一条用例做过的事会让下一条走上另一条分支"的来源：按节点挑着跑、文件内调序时，
+    _wb_notified / _build_skipped 已实测把别的用例打红。health._dead/_fail/_alive 与推送通道失败计数
+    由 _reset_banner_state 复位，这里不重复。
+    用 sys.modules.get：纯函数用例没 import 的模块不为它多 import 一次。"""
+    g = sys.modules.get
+    A, E, H, Wk, Mv, N = (g("core.anime"), g("core.engine"), g("core.health"), g("core.worker"),
+                          g("core.movies"), g("services.notify"))
+    if A is not None:
+        A._wb_notified = set()
+        A._qb_down_rounds = 0
+        A._meta_due.clear()
+    if E is not None:
+        E._path_miss.clear()
+        E._sync_locks.clear()        # 里面的 asyncio.Lock 是上一条用例的事件循环里建的
+        E.qb_kick.clear()
+    if H is not None:
+        H._seen = None               # 让它按本条用例的 SOURCE_FEED_SEEN 重新装载
+    if Wk is not None:
+        Wk._build_skipped.clear()
+        Wk._stale_sweep_pending = False
+    if Mv is not None:
+        Mv._scan_fail_streak, Mv._scan_retry_at = 0, None
+    if N is not None:
+        for d in (N._last_sent, N._state_now, N._state_members, N._state_times, N._state_suppressed):
+            d.clear()
+        N._sent_times.clear()
+        N._dropped = N._fail_streak = 0
+        N._muted_until = 0.0
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_state():
+    """每条用例之前复位模块级状态（见 reset_process_state）；跑完还原根日志器级别。"""
+    import logging
+    reset_process_state()
+    root_level = logging.getLogger().level
+    yield
+    logging.getLogger().setLevel(root_level)
+
+
+@pytest.fixture(autouse=True)
+def _reset_log_once_state():
+    """sources.base 的"番名解析为空只记一次"表是进程级的：不清的话前一条用例解析过的标题，
+    后一条用例再解析就不出日志，断言日志的用例会随执行顺序红绿。"""
+    from sources import base as _base
+    _base._EMPTY_NAME_LOGGED.clear()
+    yield
+    _base._EMPTY_NAME_LOGGED.clear()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _session_backup_dir(tmp_path_factory):
+    """备份目录在整个会话里都指到临时目录。升级前自动备份挂在所有建库夹具都走的 schema.upgrade 上，
+    判据一旦写松，临时库的快照会写进仓库的 data/backups，并按用例里的保留份数对【整个目录】跑 prune
+    （用户的真备份会被删）。必须是 session 级 autouse：testdb 是 session 级夹具，
+    它的 init_db 跑在任何函数级夹具之前。"""
+    from db import backup as _B
+    real, d = _B.BACKUP_DIR, tmp_path_factory.mktemp("backups")
+    _B.BACKUP_DIR = d
+    yield d
+    _B.BACKUP_DIR = real
+
+
+@pytest.fixture(autouse=True)
+def _reset_pre_upgrade_done():
+    """本进程"已备过"的升级前备份记录每条用例清空，免得前一条的结果让后一条走上另一条分支。"""
+    from db import schema as _S
+    _S._pre_upgrade_done.clear()
+    yield
+    _S._pre_upgrade_done.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_autofill_tried():
+    """后台缺集自动补的"24 小时内试过"记账是模块级的，前一条用例试过的番会让后一条用例直接跳过。"""
+    from core import anime as _A
+    _A._autofill_tried.clear()
+    yield
+    _A._autofill_tried.clear()
+
+
 @pytest.fixture
 def clean_tables(testdb):
     """每个用例前清空业务表与内部标记，用例之间互不干扰。"""
     from sqlmodel import delete
     from db.models import (AlertAck, Anime, AnimeTorrent, AnimeAlias, Movie, MovieTorrent,
-                           Setting)
+                           Setting, SourceGroup)
     _assert_throwaway(testdb.engine, "clean_tables（会 DELETE 七张业务表）")
     _assert_throwaway(testdb.meta_engine, "clean_tables 的 meta 侧")
     with testdb.get_session() as s:
         # 【alert_ack 必须一起清】它是"用户说这条别再显示"的记录：留一行脏的，
         # 下一个用例里那条告警就静默消失，而断言"告警在"的用例会**假绿**。
-        for m in (AnimeTorrent, AnimeAlias, Anime, MovieTorrent, Movie, AlertAck):
+        # 源组表也清：上一条用例留下的『坏配置的组』会被下一条的采集轮当成失败的源
+        for m in (AnimeTorrent, AnimeAlias, Anime, MovieTorrent, Movie, AlertAck, SourceGroup):
             s.exec(delete(m))
         s.commit()
     with testdb.get_meta_session() as s:

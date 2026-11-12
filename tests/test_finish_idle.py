@@ -371,9 +371,18 @@ async def test_finished_anime_is_not_idle(clean_tables, make, cfg):
     assert await A.sweep_idle() == 0
 
 
-async def test_idle_disabled(clean_tables, make, cfg):
+async def test_idle_disabled(clean_tables, make, cfg, monkeypatch):
+    """库里得真有一部该提醒的番：空库时 sweep_idle 本来就返回 0，ANIME_IDLE_DAYS 读没读设置都看不出来。"""
+    monkeypatch.setattr(A, "notify_event", lambda k, m, **kw: _async(True))
+    make(12, [(1, "sent")])
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent)).one()
+        t.created_at = datetime.now() - timedelta(days=30)
+        s.commit()
     cfg(ANIME_IDLE_DAYS=0)
     assert await A.sweep_idle() == 0
+    cfg(ANIME_IDLE_DAYS=14)
+    assert await A.sweep_idle() == 1, "同一份数据开着时会提醒 —— 上面的 0 才不是因为库里没东西"
 
 
 def _async(v=True):

@@ -7,7 +7,8 @@
 用 POST 而非 GET：GET 会被任意网页的 <img>/<script> 无声触发（CSRF），把在下种子伪造成『已下』；
 POST 无法这样触发。qB 的 run-external-program 支持 curl -X POST，故合法回调不受影响。
 
-不配也行——只是慢速下完后被 qB 删（remove-on-complete）的种子会被标 error（详见设置页说明）。
+不配也行——只是慢速下完后被 qB 删（remove-on-complete）的种子会被标 stalled
+（E-3：消失前没同步到任何进度的才标 error；详见设置页说明）。
 接口只认我们自己表里已交付的 hash、校验 40hex。**但不设 token 时的免鉴权分支靠的是三条"这不是浏览器/
 不是反代"的判据（见下），只是纵深防御，不等于鉴权**——qB 与本程序不同机、或本机跑着不受信的浏览器时，
 请到设置页设一个 token（页面上那条 curl 会自动带 &t=）。
@@ -62,7 +63,7 @@ async def qb_done(request: Request, hash: str = "", t: str = "") -> dict:
         #   · 转发头判据：nginx/caddy 的最小反代配置【不会】主动加 X-Forwarded-For（要写 proxy_set_header
         #     才有），于是"带了转发头才算反代"在最常见的那份配置下恒为假。
         # 补一条【肯定式】判据收口：浏览器发起的跨源请求必带 Origin，同源与跨源都必带 Sec-Fetch-Site
-        # （Chrome/Firefox/Safari 现行版本均有），而 qB 的 `curl -X POST` 三个头一个都不带。
+        # （Chrome/Firefox/Safari 现行版本均有），而 qB 的 `curl -X POST` 下面判的这四个头一个都不带。
         # 于是"是不是浏览器发来的"变成了正向可判定的事实，不再依赖对方没做什么。
         if (request.headers.get("origin") or request.headers.get("referer")
                 or request.headers.get("sec-fetch-site") or request.headers.get("sec-fetch-mode")):

@@ -9,10 +9,13 @@
 （32MB 上限 + asyncio.timeout(180) 流式读），这里把同一套范式抽出来给 feed/HTML 复用。
 """
 import asyncio
+import logging
 import re
 import zlib
 
 import httpx
+
+log = logging.getLogger("autorss")
 
 FEED_CAP = 16 * 1024 * 1024     # 单个 feed / HTML 页的上限。实际 RSS 通常几十 KB，16MB 已极宽松
 TOTAL_TIMEOUT = 120             # 整个传输的总时长上限（秒），与 httpx 的逐块超时是两回事
@@ -23,9 +26,15 @@ TOTAL_TIMEOUT = 120             # 整个传输的总时长上限（秒），与 
 # 两道闸：① 请求时要求 identity（大多数服务端会照做，那就根本没有解压这回事）；
 #        ② 仍然收到压缩响应时，走 aiter_raw() 按【线上原始字节】封顶，并用 decompressobj 的
 #           max_length 限制每次解出的量——这样压缩比再高也撑不爆内存。
-_IDENTITY = {"Accept-Encoding": "identity"}
+# 【feed / HTML 这条路不走闸①】(E-61，r40) 订阅 feed 每 20 分钟抓一次，四个真 feed 实测
+# identity 78~95 KB、gzip 10~14 KB —— 每天 37 MB 对 5 MB。调用方传 gzip_ok=True 时改发
+# `Accept-Encoding: gzip, deflate`，安全性全靠闸②（它本来就是为"服务端不照做"准备的，完整实现着）。
+# 取种（.torrent 是二进制，压不动）、推送、心跳、bgm 接口仍然要求 identity。
 # zlib 能增量解的两种（增量 = 能在解出 cap 字节时立刻停手，压缩炸弹撑不爆内存）。
 _ZLIB_WBITS = {"gzip": 16 + zlib.MAX_WBITS, "deflate": zlib.MAX_WBITS, "x-gzip": 16 + zlib.MAX_WBITS}
+# gzip_ok 时发的值。【只列上面那张表解得了的】不能交给 httpx 的默认值：装了 brotli / zstandard 的环境里
+# httpx 会自己加上 br / zstd，服务端照发的话就落进下面那条没有增量解压的回退路径。
+_ACCEPT_GZIP = "gzip, deflate"
 
 
 def _httpx_decoders() -> frozenset:
@@ -44,15 +53,16 @@ def _httpx_decoders() -> frozenset:
 _HTTPX_DECODERS = _httpx_decoders()
 
 
-def _with_identity(kw: dict) -> None:
-    """就地把 Accept-Encoding: identity 塞进 kw['headers']，调用方已给的同名头优先。
+def _with_accept_encoding(kw: dict, gzip_ok: bool = False) -> None:
+    """就地把 Accept-Encoding 塞进 kw['headers']：默认 identity，gzip_ok 时是 gzip, deflate。
+    调用方已给的同名头优先。
 
     走 httpx.Headers 而不是 dict 合并：httpx 允许 headers 是 dict / 二元组列表 / Headers，
     直接 `{**kw["headers"]}` 遇到列表就 TypeError，遇到小写键还会发出两条 Accept-Encoding。
     """
     hdrs = httpx.Headers(kw.get("headers") or {})
     if "accept-encoding" not in hdrs:
-        hdrs["Accept-Encoding"] = "identity"
+        hdrs["Accept-Encoding"] = _ACCEPT_GZIP if gzip_ok else "identity"
     kw["headers"] = hdrs
 
 
@@ -118,7 +128,7 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
             f"响应用了多重压缩编码 {'+'.join(codings)}（正常服务端不会这么发）：{safe_url(url)}")
     wbits = _ZLIB_WBITS.get(codings[0])
     if wbits is None:
-        # 多重编码 / 我们不认识的单一编码：交回 httpx 解，但先确认它【真的解得开】。
+        # 我们不认识的单一编码：交回 httpx 解，但先确认它【真的解得开】。
         # 【httpx 对装不上解码器的编码是静默放行的】——SUPPORTED_DECODERS 里没有 br/zstd 时
         # （brotli/zstandard 不是本项目的依赖），它会原样把【压缩字节】交给我们，
         # 于是 feedparser 拿到一堆二进制垃圾，抛出一个与编码毫无关系的解析错误。
@@ -126,7 +136,7 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
         if any(c not in _HTTPX_DECODERS for c in codings):
             bad = [c for c in codings if c not in _HTTPX_DECODERS]
             raise httpx.DecodingError(
-                f"响应用了本程序解不开的压缩编码 {'+'.join(bad)}（已请求 identity 但服务端未照做）：{safe_url(url)}")
+                f"响应用了本程序解不开的压缩编码 {'+'.join(bad)}（我们没有请求这种编码，是服务端自己发的）：{safe_url(url)}")
         # 回退路径也【必须有原始字节闸】——不该是一个没有防护的洞。
         # num_bytes_downloaded 是 httpx 自己记的线上字节数。
         buf = bytearray()
@@ -157,6 +167,13 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
             else:
                 raise httpx.DecodingError(f"解压失败：{e}") from e
         out += piece
+        if dec.eof and dec.unused_data[:2] == b"\x1f\x8b":
+            # 【多成员 gzip 不能当成功返回】decompressobj 解完第一段就停，后面一段整个进 unused_data：
+            # feed 只剩前半截，还被记成抓取成功。报错 → get_bytes / get_text 退回 identity 重取。
+            # 放在循环里、第二段一露头就停：eof 之后每块都被整段拼进 unused_data，读完整串再判是 O(n²)。
+            # 也不把后续成员解出来：每段都要把剩余字节整段复制一次，极小成员串同样能卡死事件循环。
+            # 只认 gzip 魔数：尾部填充（零字节 / 垃圾）照旧放行，不为它多出抓取失败。
+            raise httpx.DecodingError(f"响应是多成员 gzip，只解得出第一段：{safe_url(url)}")
         if len(out) > cap:
             raise TooLarge(f"解压后超过 {cap} 字节上限（疑似压缩炸弹）：{safe_url(url)}")
     try:
@@ -183,46 +200,66 @@ async def request_capped(client: httpx.AsyncClient, method: str, url: str, *,
 
     POST 也走这里：bgm 的搜索接口是 POST，而它同样是第三方响应。
     """
-    _with_identity(kw)
+    _with_accept_encoding(kw)
     async with asyncio.timeout(timeout):
         async with client.stream(method, url, **kw) as resp:
             return resp.status_code, await _read_capped(resp, cap, url)
 
 
-async def get_bytes(client: httpx.AsyncClient, url: str, *,
-                    cap: int = FEED_CAP, timeout: int = TOTAL_TIMEOUT, **kw) -> bytes:
-    """流式取回并封顶。超限抛 TooLarge，超时抛 TimeoutError，HTTP 错误照常抛。"""
-    _with_identity(kw)
+async def _get_capped(client: httpx.AsyncClient, url: str, cap: int, timeout: int, gzip_ok: bool,
+                      kw: dict) -> tuple[bytes, str]:
+    """get_bytes / get_text 共用的取回：回 (封顶后的响应体, 响应头声明的字符集，没有则 utf-8)。
+
+    【gzip_ok 时压缩路解不开就用 identity 再取一次】放开压缩后多了 identity 时代没有的失败：多成员 gzip、
+    中间盒子把编码标错、压缩体被改写——不退的话这条 feed 每轮都判抓取失败，而不压缩本来取得到。
+    只对 DecodingError 退；TooLarge（压缩炸弹）与 HTTP 错误不退。两次共用同一个总超时。
+    """
     async with asyncio.timeout(timeout):
-        async with client.stream("GET", url, **kw) as resp:
-            resp.raise_for_status()
-            return await _read_capped(resp, cap, url)
+        for gz in ((True, False) if gzip_ok else (False,)):
+            k = dict(kw)
+            _with_accept_encoding(k, gz)
+            try:
+                async with client.stream("GET", url, **k) as resp:
+                    resp.raise_for_status()
+                    return await _read_capped(resp, cap, url), resp.charset_encoding or "utf-8"
+            except httpx.DecodingError as e:
+                if not gz:
+                    raise
+                # 记一行：否则一条 feed 永久"每轮取两次"没人知道
+                log.info("压缩响应解不开（%s），改用不压缩的方式重取一次：%s", redact(e), safe_url(url))
+
+
+async def get_bytes(client: httpx.AsyncClient, url: str, *,
+                    cap: int = FEED_CAP, timeout: int = TOTAL_TIMEOUT, gzip_ok: bool = False,
+                    **kw) -> bytes:
+    """流式取回并封顶。超限抛 TooLarge，超时抛 TimeoutError，HTTP 错误照常抛。
+
+    gzip_ok=True：允许服务端用 gzip/deflate 压缩（只给 feed / HTML 用，理由见文件头 E-61 那段）；
+    压缩体解不开时自动用 identity 重取一次（见 _get_capped）。
+    cap 对线上原始字节与解压后字节【各自】生效，开不开压缩都一样。"""
+    return (await _get_capped(client, url, cap, timeout, gzip_ok, kw))[0]
 
 
 async def get_text(client: httpx.AsyncClient, url: str, *,
-                   cap: int = FEED_CAP, timeout: int = TOTAL_TIMEOUT, **kw) -> str:
+                   cap: int = FEED_CAP, timeout: int = TOTAL_TIMEOUT, gzip_ok: bool = False,
+                   **kw) -> str:
     """同 get_bytes，按响应头声明的字符集解码（取不到则 utf-8，坏字节替换而不是抛）。
 
     用 charset_encoding（响应头里的）而不是 httpx 的 resp.encoding：后者在流式模式下
     可能要读完整个 body 做字符集嗅探，正好绕开我们要设的上限。
     """
-    _with_identity(kw)
-    async with asyncio.timeout(timeout):
-        async with client.stream("GET", url, **kw) as resp:
-            resp.raise_for_status()
-            enc = resp.charset_encoding or "utf-8"
-            data = await _read_capped(resp, cap, url)
-            try:
-                return data.decode(enc, "replace")
-            except (LookupError, UnicodeError):
-                # 字符集名来自第三方响应头（Content-Type: charset=xxx），是不可信输入：
-                # 编造一个不存在的编码名就能让 decode 抛 LookupError——它不属 httpx 异常族，
-                # 会从各调用点的 except httpx.HTTPError 里漏出去打断整轮采集。回落 utf-8 照常解。
-                # 【只接 LookupError 不够】它盖住的是"编码名不存在"和"是二进制编解码器"
-                # （bz2_codec / hex_codec 这一族，Python 明确抛 LookupError: not a text encoding）。
-                # 还有一类是【存在、也是文本编码、但拒绝 errors='replace'】：
-                #   b"…".decode("idna", "replace")     → UnicodeError: Unsupported error handling
-                #   b"…".decode("punycode", "replace") → UnicodeDecodeError（内部 ascii 解码，无视 errors）
-                # 两者都不是 LookupError，照样能从这里逃出去打断整轮采集。
-                # UnicodeDecodeError 是 UnicodeError 的子类，一并盖住。
-                return data.decode("utf-8", "replace")
+    data, enc = await _get_capped(client, url, cap, timeout, gzip_ok, kw)
+    try:
+        return data.decode(enc, "replace")
+    except (LookupError, UnicodeError):
+        # 字符集名来自第三方响应头（Content-Type: charset=xxx），是不可信输入：
+        # 编造一个不存在的编码名就能让 decode 抛 LookupError——它不属 httpx 异常族，
+        # 会从各调用点的 except httpx.HTTPError 里漏出去打断整轮采集。回落 utf-8 照常解。
+        # 【只接 LookupError 不够】它盖住的是"编码名不存在"和"是二进制编解码器"
+        # （bz2_codec / hex_codec 这一族，Python 明确抛 LookupError: not a text encoding）。
+        # 还有一类是【存在、也是文本编码、但拒绝 errors='replace'】：
+        #   b"…".decode("idna", "replace")     → UnicodeError: Unsupported error handling
+        #   b"…".decode("punycode", "replace") → UnicodeDecodeError（内部 ascii 解码，无视 errors）
+        # 两者都不是 LookupError，照样能从这里逃出去打断整轮采集。
+        # UnicodeDecodeError 是 UnicodeError 的子类，一并盖住。
+        return data.decode("utf-8", "replace")

@@ -7,7 +7,7 @@
 
 【双引擎】两个引擎各自独立地跑同一条版本链，各有各的版本表（见 alembic/env.py）：
     role="meta" → 本地 SQLite，只管 setting
-    role="data" → 业务库（SQLite 或 MySQL），管其余 6 张表
+    role="data" → 业务库（SQLite 或 MySQL），管其余全部表
 
 【本项目不做向后迁移】切到 Alembic 那天起老库一律重建，故基线就是起点、没有 downgrade。
 以后改表结构：改完模型后跑
@@ -141,6 +141,48 @@ def _known_revision(rev: str) -> bool:
         return False
 
 
+# 本进程已做过升级前备份的库（db.data_identity 口径）。启动序列里 meta 链与 data 链先后各升一次同一个文件，
+# 只在第一次——两条链都还停在旧版本的那一刻——备：晚一步拍下的快照里 alembic_version_meta 已是新版本，
+# 旧版程序拿它一启动就被"库比代码新"拒绝。也挡住看守协程反复重试失败的迁移时每次再备一份。
+# 上界＝配置库文件数（恒为 1）；用例之间由 conftest 复位。
+_pre_upgrade_done: set = set()
+
+
+def _backup_before_upgrade(engine, cur: str, want: str) -> None:
+    """存量库真要跑迁移之前先备一份：本项目没有 downgrade，迁移出事或要退回旧版程序时只能靠它。
+
+    只备【要升级的就是本地配置库那个文件、且业务数据也在这个文件里】的情形：backup_now 恒对
+    meta_engine 的文件做快照，业务库在 MySQL 或另一个 SQLite 文件上时，备出来的不是要升级的那一份。
+    meta 链那次在 load_from_db 之前、config 还是默认值：业务库指向直接从库里读（是 MySQL 就不备）；
+    保留份数传 0（不清理）——拿默认的 7 去清会把用户设的 30 份删到 7 份，留给下一次日常备份按真设置清。
+    失败只记 WARNING、不拦升级：拦下就是整站停摆，而备不成（满盘之类）并不让迁移本身更危险。
+    """
+    try:
+        import config
+        import db
+        from . import backup     # 函数内导入：db 包在加载期不引 schema，这里也不在加载期回头引 db，不成环
+        ident = db.data_identity(engine)
+        if ident != db.data_identity(db.meta_engine) or ident in _pre_upgrade_done:
+            return
+        if config.loaded_from_db:
+            keep = config.BACKUP_KEEP
+        elif backup._peek(backup._sqlite_path(engine)).get("backend") == "mysql":
+            return
+        else:
+            keep = 0
+        res = backup.backup_now(keep=keep, pre_upgrade=True)
+        # 无人值守的一份，做完就验（verify 的约定：做完/恢复前都该验）；验不过只告警、不删不拦
+        ok, why = backup.verify(res["path"])
+        if not ok:
+            log.warning("升级前自动备份做完了但自检未通过（照常升级，版本 %s → %s）：%s —— %s",
+                        cur, want, res["path"], why)
+            return
+        _pre_upgrade_done.add(ident)
+        log.info("升级前自动备份：%s（数据库版本 %s → %s）", Path(res["path"]).name, cur, want)
+    except Exception as e:
+        log.warning("升级前自动备份失败（照常升级，版本 %s → %s）：%s: %s", cur, want, type(e).__name__, e)
+
+
 def upgrade(engine, role: str, target: str = "head") -> None:
     """把 engine 升到 target（默认最新；已经在那一版则什么都不做）。全新库会一路建过去。
 
@@ -151,7 +193,8 @@ def upgrade(engine, role: str, target: str = "head") -> None:
     """
     with _LOCK:      # 连"检查当前版本"一起包住：否则两个线程可能都读到旧版本再各跑一遍
         cur = current_revision(engine, role)
-        if cur == (head_revision() if target == "head" else target):
+        want = head_revision() if target == "head" else target
+        if cur == want:
             return
         # 【库比代码新】(r37 #13) 这个库被更新版本的程序升级过（比如在别的机器上跑了新版、或回滚了代码）。
         # alembic 自己的报错是 "Can't locate revision identified by 'xxxx'"，用户看不懂、也不知道该干什么。
@@ -159,6 +202,8 @@ def upgrade(engine, role: str, target: str = "head") -> None:
             raise RuntimeError(
                 f"数据库[{role}]的版本 {cur} 比当前程序新——它被更新版本的 Auto-rss2qb 升级过。"
                 "请把程序更新到最新版（git pull 后重新部署）再启动；不要用旧版本连这个库。")
+        if cur is not None:
+            _backup_before_upgrade(engine, cur, want)
         with _ddl_engine(engine) as ddl:
             command.upgrade(_config(engine, role, ddl), target)
         log.info("数据库版本升级[%s]：%s → %s", role, cur or "空库", current_revision(engine, role))

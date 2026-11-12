@@ -274,15 +274,17 @@ def test_busy_action_handlers_take_the_event_positionally():
     `async def h(e=None)` 会被 handler() 不带参调用，e 恒为 None，busy_action 拿到 btn=None，
     loading 那一支整段跳过 —— 8 个 120~240 秒级的按钮按下去全都毫无反应。
     """
-    bad = []
+    bad, seen = [], 0
     FN = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
     for rel in sorted((ROOT / "pages").glob("*.py")):
         tree = ast.parse(rel.read_text(encoding="utf-8"))
         parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
         for c in ast.walk(tree):
-            if not (isinstance(c, ast.Call) and getattr(c.func, "id", "") == "busy_action"
+            if not (isinstance(c, ast.Call)
+                    and (c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, "id", "")) == "busy_action"
                     and c.args and "sender" in ast.unparse(c.args[0])):
                 continue
+            seen += 1
             fn = parents.get(c)                      # 最近的那一层函数才是 NiceGUI 真正调用的处理器
             while fn is not None and not isinstance(fn, FN):
                 fn = parents.get(fn)
@@ -295,6 +297,7 @@ def test_busy_action_handlers_take_the_event_positionally():
             if required < 1:
                 name = getattr(fn, "name", "<lambda>")
                 bad.append(f"pages/{rel.name}:{fn.lineno} {name}({ast.unparse(a)})")
+    assert seen, "一处 busy_action(e.sender, …) 都没扫到 —— 调用形态变了，判据已经失效"
     assert not bad, "这些处理器会被 NiceGUI 不带参调用，e 恒为 None、loading 永远不亮：\n" + "\n".join(bad)
 
 

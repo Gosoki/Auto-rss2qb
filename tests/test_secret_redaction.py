@@ -319,7 +319,7 @@ def test_the_non_log_exits_redact_explicitly():
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
-    offenders = []
+    offenders, n_persist = [], 0
     for mod in ("core/manual.py", "core/anime.py", "core/movies.py"):
         tree = ast.parse((root / mod).read_text(encoding="utf-8"))
         for h in ast.walk(tree):
@@ -330,6 +330,7 @@ def test_the_non_log_exits_redact_explicitly():
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
                         and n.func.id in ("_fail", "_retry"):
                     expr = ast.dump(n)
+                    n_persist += 1
                 # ② 直接 return 出去（manual 那条路的返回值会被页面弹成红字）
                 elif isinstance(n, ast.Return) and n.value is not None:
                     expr = ast.dump(n.value)
@@ -342,6 +343,7 @@ def test_the_non_log_exits_redact_explicitly():
                     and "redact" in ast.dump(h)
                 if uses_exc and "redact" not in expr and not via_var:
                     offenders.append(f"{mod}:{n.lineno}")
+    assert n_persist, "except 块里一处 _fail/_retry 都没扫到 —— 持久化出口改名了，判据已经失效"
     assert not offenders, (
         "这些出口把未脱敏的异常写进了库或返回给了页面（日志过滤器盖不到它们）：\n  "
         + "\n  ".join(offenders))

@@ -83,7 +83,7 @@ def _season_toggle_btn(key: str, name: str, selected: set) -> None:
 
 
 def _notify_relocate_movie(rep):
-    """把 relocate_movie 结果转成用户提示（对齐番剧 _notify_relocate）。"""
+    """把 relocate_movie 结果转成用户提示（对齐番剧 notify_relocate_anime）。"""
     if rep.get("error"):
         ui.notify(f"移动失败：{rep['error']}", type="negative")
         return
@@ -272,7 +272,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     "flat dense color=grey").classes("btn-sm")
         ui.label(f"版本（{len(ts)}）").classes("text-sm font-bold mt-2")
         if not ts:
-            ui.label("（还没有种子）").classes("text-gray-500")
+            ui.label("（还没有版本）").classes("text-gray-500")
             return
         for t in ts:
             with ui.column().classes("w-full gap-1 py-1").style(
@@ -282,6 +282,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                     ui.label(t.raw_title or t.source).classes("grow break-all")
                 with ui.row().classes("items-center gap-2 flex-wrap"):   # 状态标签 + 下载：统一左下
                     live = qb_live_text(t)
+                    _why_line = ""   # 出过事的行把原因印出来：气泡要逐行悬停，手机上基本按不出来
                     if live:  # 完成(做种/100%)才绿，下载中用蓝
                         _done = (t.qb_progress or 0) >= 1
                         ui.badge(live).props(f"color={'green' if _done else 'blue'}").tooltip(
@@ -301,31 +302,43 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                         if t.status == "stalled":
                             # (E-3) 停滞的原因也在 fail_reason 里，但它不是"上次失败"：盘上有半成品，
                             # 且有意不自动重发。颜色留 SEVERITY_COLOR 的 deep-orange，别改成失败的 orange。
+                            if t.fail_reason:
+                                _why_line = f"停滞原因：{t.fail_reason}"
                             _b.props(f"color={SEVERITY_COLOR['stalled']}").tooltip(
                                 (f"{t.fail_reason}；" if t.fail_reason else "")
                                 + "半成品文件在下载目录里；要重试点右边『下载』，要放弃点『删除』")
                         elif t.fail_reason:
+                            _why_line = f"上次失败：{t.fail_reason}（不自动重发）"
                             _b.props("color=orange").tooltip(
                                 f"上次失败：{t.fail_reason}（剧场版不自动重发，要重试就点右边『下载』）")
+                    # 已在 qB 里：core/movies._download_movie_torrent_inner 开头同一道幂等短路，点了也不会下 → 置灰不隐藏（位置不动）
+                    _in_qb = t.status == "downloading" or (t.status in engine.TRACKED_STATUSES and not t.archived_at)
                     _vdl = ui.button("下载", icon="download", on_click=_force(t.id, t.archived_at)).props(
                         "flat dense").classes("btn-sm")
-                    _vdl.set_enabled(config.QB_ENABLED)
-                    _vdl.tooltip("强制下这一版本到文件夹" if config.QB_ENABLED
-                                 else "qB 未启用，去设置页开启后可下载")
+                    _vdl.set_enabled(config.QB_ENABLED and not _in_qb)
+                    _vdl.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
+                                 else "已经在下载或已经下好了，不用再点" if _in_qb
+                                 else "已归档：文件还在盘上，点这里把这一版重新交回 qB" if t.archived_at
+                                 else "强制下这一版本到文件夹")
                     # 交付中的占位行不给删除按钮，理由同番剧详情页（E-49 后占位段不清归档标记）
                     if t.status in engine.HAVE_STATUSES and t.status != "downloading":
                         ui.button(icon="delete_forever",
-                                  on_click=_del(t.id, t.archived_at, t.save_path)).props(
+                                  on_click=_del(t.id, t.archived_at, t.save_path, raw=t.raw_title or "")).props(
                             "flat dense color=negative").classes("btn-sm").tooltip(
                             "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
                             else "删除这一版本的文件（qB+硬盘，不可撤销）")
                     if t.status in engine.DOWNLOADABLE_STATUSES:   # 未下载的可直接排除
                         ui.button("排除", icon="block", on_click=_exclude(t.id)).props(
                             "flat dense color=grey").classes("btn-sm").tooltip(
-                            "不想要这版本：从可下排除（不删文件，只改状态；可恢复）")
+                            "不想要这版本：从可下载排除（不删文件，只改状态；可恢复）")
                     if t.status == "excluded":   # 已排除：给『恢复』放回可下
                         ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
-                            "flat dense color=primary").classes("btn-sm").tooltip("放回可下")
+                            "flat dense color=primary").classes("btn-sm").tooltip("放回可下载")
+                if _why_line:
+                    ui.label(_why_line).classes("text-gray-400 break-all text-xs")
+        if on_close:   # 手机上版本多时 X 在最顶：看完就地能关（桌面不出）
+            with ui.row().classes("w-full justify-end sm:hidden"):
+                ui.button("关闭", on_click=on_close).props("flat")
 
     def _after():
         body.refresh()
@@ -420,7 +433,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
             if ok:
                 ui.notify("已强制下载到文件夹", type="positive")
             elif not config.QB_ENABLED:
-                ui.notify("未启用 qB（QB_ENABLED=false），无法真正下载", type="warning")
+                ui.notify("未启用 qB（设置页『发送种子到 qB』关着），无法真正下载", type="warning")
             elif not archived and mov.torrent_status(mt_id) in engine.TRACKED_STATUSES:
                 # 幂等短路（连点、或另一个标签页已经点过）：这一版已经在下 / 已下，不是失败。
                 # 已归档的版本是『重新交回 qB』，失败会原样还原成 sent —— 那是真失败
@@ -429,23 +442,25 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.notify("下载失败，看日志", type="negative")
         return h
 
-    def _del(mt_id, archived=None, save_path=""):
+    def _del(mt_id, archived=None, save_path="", raw=""):
         async def h():
+            # 剧场版的版本只有原名能区分：放正文首行，确认框说清删的是哪一版（删除图标小、行又多，点偏一行就删错）
+            _head = (raw + "\n") if raw else ""
             if archived:   # 已归档：种子早已移出 qB，删不到文件 → 明确告知路径，让用户自己清理
                 if not await confirm(
                         "这一版本已归档，只能标记已删",
-                        f"它已从 qB 移除，本工具删不到文件。确认后仅标记为『已删』。\n\n"
+                        _head + f"它已从 qB 移除，本工具删不到文件。确认后仅标记为『已删』。\n\n"
                         f"⚠️ 文件仍在（需你手动删）：{save_path or '（未记录路径，请到下载目录自行查找）'}\n\n"
                         f"想连文件一起删：先点『下载』把它重新挂回 qB，再删。",
                         ok_label="标记已删", ok_icon="delete_forever"):
                     return
             elif not await confirm("删除这一版本的文件？",
-                                   "通过 qB 连同硬盘文件一起删除，不可撤销。",
+                                   _head + "通过 qB 连同硬盘文件一起删除，不可撤销。",
                                    ok_label="删除文件", ok_icon="delete_forever"):
                 return
             ok = await mov.delete_movie_torrent(mt_id)
             _after()
-            if ok and archived:
+            if ok and (archived or ok == "gone"):   # "gone"：qB 里早已没有这条，什么都没删到
                 ui.notify(f"已标记为已删；文件仍在 {save_path or '下载目录'}，需手动清理", type="warning")
             else:
                 ui.notify("已删除该版本文件" if ok else "没删成（qB 未连上或无文件）",
@@ -455,7 +470,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
     def _exclude(mt_id):
         async def h():
             if not await confirm("排除这一版本？",
-                                 "从可下里排除：不再显示为可下、RSS 再遇到同种子也不重收；可随时点『恢复』放回。",
+                                 "从可下载里排除：不再显示为可下载、RSS 再遇到同种子也不重收；可随时点『恢复』放回。",
                                  ok_label="排除", ok_icon="block", ok_color="primary"):
                 return
             ok = mov.exclude_torrent(mt_id)
@@ -468,7 +483,7 @@ def render_movie_detail(movie_id: int, refresh_outer=None, on_close=None) -> Non
         def h():
             mov.unexclude_torrent(mt_id)
             _after()
-            ui.notify("已恢复到可下", type="positive")
+            ui.notify("已恢复到可下载", type="positive")
         return h
 
     async def _bind():
@@ -525,7 +540,7 @@ def movies_page(t: str = ""):
     """t = 当前 tab（写在 URL ?t= 里），刷新后停在同一 tab。
     默认空串：顶栏导航进来（无 ?t=）时留给下面按 MOVIE_DEFAULT_TAB 决定默认停哪个 tab。"""
     with frame("movies"):
-        list_page = {"n": 1, "expand": None}  # 剧场版列表：分页页码 + 一键展开/收起意图（None=默认全开）
+        list_page = {"n": 1, "expand": None}  # 剧场版列表：分页页码 + 一键展开/收起意图（None=默认仅最新年展开）
         # 用户手动开合过的折叠块 {年份键/底部折叠键: 开/合}。详情弹窗里的操作会整体重建面板，不记的话
         # 重建后一律回到默认（只开最新年、底部折叠全收）。点『全部展开/收起』时清空。与番剧页同口径。
         list_page["open"] = {}
@@ -561,17 +576,24 @@ def movies_page(t: str = ""):
             list_dlg.clear()
             rows = mov.failed_rows()
             with list_dlg, ui.card().classes("w-full").style("max-width:720px"):
-                ui.label(f"失败 · {len(rows)}").classes("text-base font-bold")
-                ui.label("下载失败过的版本（取种/发送失败）。点片名进详情页补下重试 / 忽略。").classes(
+                ui.label(f"失败 / 异常 · {len(rows)}").classes("text-base font-bold")   # 清单里有停滞，KPI 也叫『失败/异常』
+                ui.label("下载失败过（取种/发送失败）或长期停滞无进展的版本。点片名进详情页补下重试 / 忽略。").classes(
                     "text-xs text-gray-400")
                 if not rows:
                     ui.label("（空）").classes("text-gray-500 p-2")
                 for r in rows:
                     with ui.column().classes("gap-0 w-full py-1").style(
                             "border-bottom:1px solid rgba(255,255,255,.08)"):
-                        ui.label(r["name"]).classes(
-                            "text-sm text-blue-400 cursor-pointer hover:underline").on(
-                            "click", lambda mid=r["movie_id"]: open_detail(mid))  # 不关本弹窗，详情叠上面
+                        # 同番剧侧 _open_torrent_list：失败/停滞徽标 + 原因，取值一律 .get
+                        with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                            ui.label(r["name"]).classes(
+                                "text-sm text-blue-400 cursor-pointer hover:underline grow min-w-0").on(
+                                "click", lambda mid=r["movie_id"]: open_detail(mid))  # 不关本弹窗，详情叠上面
+                            if r.get("status") in SEVERITY_COLOR:
+                                ui.badge(torrent_status_cn(r["status"])).props(
+                                    f'color={SEVERITY_COLOR[r["status"]]}').classes("shrink-0")
+                        if r.get("fail_reason"):
+                            ui.label(r["fail_reason"]).classes("text-xs text-gray-400 break-all")
                         ui.label(r["raw"] or "—").classes("text-xs text-gray-500 break-all")
                 ui.button("关闭", on_click=list_dlg.close).props("flat")
             list_dlg.open()
@@ -586,22 +608,28 @@ def movies_page(t: str = ""):
             ui.notify(f"扫描 {yr} 年 {len(letters)} 个季度的剧场版/OVA…（走 Mikan+bgm，请稍候）", type="info")
             # 走 worker 那把 _scan_lock 而不是页面自己的标志：一次全年扫描是几分钟的 Mikan+bgm 串行请求，
             # 而页面级防抖只在【本浏览器标签】里有效——挡不住后台自动扫描那一轮，也挡不住第二个标签页。
-            # 并发跑两轮不只是请求翻倍：_upsert_movie 是"先查后插"、mikan_id 上没有唯一约束，
-            # 两轮交错时未识别的番组会留下两行重复 Movie。
+            # 并发跑两轮不只是请求翻倍：_upsert_movie 是"先查后插"，当时 mikan_id 上还没有唯一约束，
+            # 两轮交错时未识别的番组会留下两行重复 Movie（唯一索引是之后 D-12 补的）。
             res = await worker.scan_movies_now(yr, letters)
             if res is None:
                 ui.notify("已有一轮剧场版扫描在跑（后台自动扫描或另一处触发），本次跳过", type="warning")
                 return
             refresh_all()
+            # 『稍后自动重试』只在真排了重试时说（当年四季 + 开了自动扫描），否则如实让用户自己再扫。
+            # 不报具体时刻：退避会一直翻倍到 MOVIE_SCAN_INTERVAL，只给时分会误导。
+            _later = ("稍后自动重试" if res.get("retry_at") and config.MOVIE_SCAN_ENABLED
+                      else "稍后再扫一次")
             tail = f"，{res['errors']} 个出错" if res["errors"] else ""
+            if res.get("failed") and not res.get("bgm_down"):   # bgm_down 那句已经说了重试，别说两遍
+                tail += f"；{_later}"
+            # 颜色按 core 给的 failed（整轮失败）判：别把其实什么都没扫到显示成绿色的成功；个别出错不算。
+            # bgm_down 也算 failed，但那一轮源站是扫到了的（只是 bgm 没问成），仍叫"扫描完成"，下一句单说 bgm。
+            prefix = "扫描失败" if res.get("failed") and not res.get("bgm_down") else "扫描完成"
             ui.notify(
-                f"扫描完成：命中 {res['seen']} 部，新增 {res['movies']}，种子 {res['torrents']}{tail}",
-                type="positive")
+                f"{prefix}：命中 {res['seen']} 部，新增 {res['movies']}，版本 {res['torrents']}{tail}",
+                type="warning" if res.get("failed") else "positive")
             if res.get("bgm_down"):
                 # (r39 M8) 判据是『一部都没问成』（连接失败/限流/5xx），bgm 答『没有』(404) 不算，所以这句不会误报。
-                # 『稍后自动重试』只在真排了重试时说（当年四季 + 开了自动扫描），否则如实让用户自己再扫。
-                _later = ("稍后自动重试" if res.get("retry_at") and config.MOVIE_SCAN_ENABLED
-                          else "稍后再扫一次")
                 ui.notify(f"bgm 连接失败（一部都没问成），新片暂留待识别，{_later}", type="warning")
 
         def _reject(movie_id):
@@ -630,7 +658,7 @@ def movies_page(t: str = ""):
             def h():   # 取消排除：把 excluded 放回可下
                 mov.unexclude_torrent(mt_id)
                 refresh_all()
-                ui.notify("已恢复到可下", type="positive")
+                ui.notify("已恢复到可下载", type="positive")
             return h
 
         def _bind_from_input(movie_id, inp):
@@ -703,7 +731,7 @@ def movies_page(t: str = ""):
 
         def _movie_card(m, ts):
             # 一部片一张封面卡，四角位置与番剧卡片同一份（layout.cover_box）：
-            #   左上 待识别 · 右上 类型（Mikan 判定的剧场版/OVA）· 左下 多源/单源 · 右下 已下/版本数。
+            #   左上 待识别 · 右上 bgm 评分 · 左下 多源/单源 · 右下 类型（Mikan 判定的剧场版/OVA）+ 已下/版本数。
             # 封面/片名点开详情；整张卡不可点——卡里有按钮，点它们会冒泡成"打开详情"。
             # "已下" = 这部片有几个版本已经落到盘上（含停滞的半成品）——与同页搬迁框的
             # "{n} 个版本已下"、详情页"删除文件"按钮的门槛同集合，三者可互相校验。
@@ -725,8 +753,11 @@ def movies_page(t: str = ""):
                     cover_title(name_of(m)).classes("cursor-pointer").on(
                         "click", lambda mid=m.id: open_detail(mid))
                     ui.label(f"放送 {m.air_date or '—'}").classes("text-xs text-gray-400")
-                    # no-wrap + 不带图标：卡片窄，带图标的『下载』会把『忽略』挤到下一行
-                    with ui.row().classes("w-full gap-2 items-center no-wrap mt-auto pt-1"):
+                    # 不带图标：带图标的『挑版本』更宽，常见卡宽下也会把『忽略』挤到下一行。
+                    # 【别加 no-wrap】两个按钮并排要 142px，卡内不够时（手机两列约 100px；桌面卡宽 <168px 的那几段
+                    # 窗口宽度）不许换行只会各自折字——手机上是一字一行。放开换行＝放得下就并排、放不下『忽略』落第二行，
+                    # 与番剧『待确认』卡片同一个样子。
+                    with ui.row().classes("w-full gap-2 items-center mt-auto pt-1"):
                         # 【叫『挑版本』不叫『下载』】(r37 #19) 它只是打开详情、自己挑一个版本下 ——
                         # 叫『下载』会让人以为点了就开始下，而触屏上看不到解释它的 tooltip
                         ui.button("挑版本",
@@ -754,7 +785,7 @@ def movies_page(t: str = ""):
                        ("失败/异常", ov["status"]["error"] + ov["status"]["stalled"], "red", _open_failed),
                        ("版本", k["versions"], "", None)])
             if not ov["config"]["qb"]:
-                warn_banner("qB 未启用：剧场版也只采集不下载（设置页开 QB_ENABLED 后生效）")
+                warn_banner("qB 未启用：剧场版也只采集不下载（设置页开启『发送种子到 qB』后生效）")
 
             # ── 各年份（剧场版数）──(R31) 剧场版按【年】归档（E-30），季母对它没有意义：
             # 按季度分会把同一年劈成最多 4 根柱，而新入库的片一律落进 `<yy>A`。
@@ -776,7 +807,7 @@ def movies_page(t: str = ""):
                  "已发送给 qB 的版本数（含仍在下的）。真正下完的看下方『已完成』"),
                 ("可下载", ov["status"]["pending"], "blue", "还没下的版本，进详情逐条下"),
                 ("跳过数", ov["status"]["skipped"], "blue-grey",
-                 "已忽略剧场版留下的种子；恢复时若一版都没下过会放回可下载"),
+                 "已忽略剧场版留下的版本；恢复时若一版都没下过会放回可下载"),
                 ("失败数", ov["status"]["error"], "red", "下载出错的版本"),
             ]
             # 少见状态只在非零时露出（与番剧侧同口径）：保证各 chip 之和 == 种子数，又不让全新库挂一排 0
@@ -812,10 +843,10 @@ def movies_page(t: str = ""):
                     "qB 报告进度已满的版本数（真正下完的）")
                 ui.badge(f"下载中 {q['downloading']}").props("color=blue").tooltip("qB 里此刻正在下的版本数")
                 ui.badge(f"已跟踪 {q['tracked']}").props("color=blue").tooltip(
-                    "qB 里正在跟踪的种子数（已交付给 qB 的）")
+                    "qB 里正在跟踪的版本数（已交付给 qB 的）")
                 if q["dlspeed"]:
                     ui.badge(f"↓ {human_size(q['dlspeed'])}/s").props("color=blue")
-                ui.badge(f"完成率 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").tooltip("已交付种子的平均完成度")
+                ui.badge(f"完成率 {q['avg_progress'] * 100:.0f}%").props("color=blue-grey").tooltip("已交付版本的平均完成度")
 
             # ── 采集状态 ──（剧场版=Mikan 季度扫描；开关/间隔在『订阅源』tab 调）
             with ui.row().classes("items-center gap-2 mt-3 pl-1 flex-wrap"):
@@ -852,7 +883,8 @@ def movies_page(t: str = ""):
                         # 同番剧侧：no-wrap + 标题 grow/min-w-0 + 徽标 shrink-0，徽标恒在右
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1 no-wrap").style(
                                 "border-bottom:1px solid rgba(255,255,255,.08)"):
-                            ui.label(r["name"]).classes("grow break-all min-w-0")
+                            # overflow-wrap:anywhere 而不是 break-all：后者把英文片名从词中间拆开（同 .cover-card-title）
+                            ui.label(r["name"]).classes("grow min-w-0").style("overflow-wrap:anywhere")
                             ui.badge(text).props(f"color={color}").classes("shrink-0")
 
         @ui.refreshable
@@ -921,7 +953,7 @@ def movies_page(t: str = ""):
                     ui.pagination(1, total_pages, direction_links=True, value=page,
                                   on_change=_list_goto)
                     ui.label(f"共 {total_pages} 页 · 每页 {yrs} 年").classes("text-xs text-gray-500")
-            exp = list_page["expand"]  # None=默认仅最新年展开(年内季度全铺开)；True/False=一键全展开/收起(跨页一致)
+            exp = list_page["expand"]  # None=默认仅最新年展开(年内卡片全铺开)；True/False=一键全展开/收起(跨页一致)
             tmap = mov.torrents_by_movie(
                 [m.id for _, qs in shown for _, grp in qs for m in grp])  # 本页种子一次查齐
             for i, (year, quarters) in enumerate(shown):
@@ -931,7 +963,7 @@ def movies_page(t: str = ""):
                 # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
                 year_exp = ui.expansion(f"{_yt}   ·   {year_total} 部",
                                         value=year_open).classes("w-full").props(remove="dense")
-                # 懒加载在『年』这级：年展开才建内容。二级『季度』不折叠——小标题 + 卡直接全铺开。
+                # 懒加载在『年』这级：年展开才建内容。年内不分二级，卡直接全铺开。
                 _fl = {"built": False}
 
                 def _fill(qs=quarters, box=year_exp, fl=_fl):
@@ -1014,7 +1046,7 @@ def movies_page(t: str = ""):
 
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（与番剧侧对称）
             if dels:
-                with ui.expansion(f"已删除的种子（{len(dels)}）", icon="delete_outline",
+                with ui.expansion(f"已删除的版本（{len(dels)}）", icon="delete_outline",
                                   value=rej_open.get("deleted", False)).on_value_change(
                         lambda e: rej_open.__setitem__("deleted", e.value)).classes(
                         "w-full mt-2"):
@@ -1036,11 +1068,11 @@ def movies_page(t: str = ""):
 
             # 已排除的种子：独立折叠，可『恢复』放回可下（与番剧侧对称）
             if excls:
-                with ui.expansion(f"已排除的种子（{len(excls)}）", icon="block",
+                with ui.expansion(f"已排除的版本（{len(excls)}）", icon="block",
                                   value=rej_open.get("excluded", False)).on_value_change(
                         lambda e: rej_open.__setitem__("excluded", e.value)).classes(
                         "w-full mt-2"):
-                    ui.label("你从可下里主动排除的剧场版版本（不显示为可下、RSS 再遇到也不重收）。点『恢复』放回。").classes(
+                    ui.label("你从可下载里主动排除的剧场版版本（不显示为可下载、RSS 再遇到也不重收）。点『恢复』放回。").classes(
                         "text-xs text-gray-500 p-1")
                     for x in excls:
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1").style(
@@ -1051,7 +1083,7 @@ def movies_page(t: str = ""):
                             ui.label(x["raw"]).classes("text-gray-500 text-xs break-all min-w-0 grow")
                             ui.button("恢复", icon="undo", on_click=_unexclude_mv(x["id"])).props(
                                 "flat dense color=primary").classes("btn-sm").tooltip(
-                                "放回可下")
+                                "放回可下载")
 
         # 手动扫描表单的暂存：本面板会被『保存自动扫描设置』整块 refresh，而那个表单就在同一面板里。
         # 不暂存的话，用户刚填好的年份/季度会被静默清回默认值——同文件里的另一处注释
@@ -1139,7 +1171,7 @@ def movies_page(t: str = ""):
 
             【走 busy_action】(R36 体检 ux-2) 这个按钮被按下的典型时机恰恰是"我觉得 qB 那边不对劲"，
             也就是最可能走满 `_QB_TOTAL_TIMEOUT`（45 秒）的那一次 —— 以前从头到尾没碰过按钮元素，
-            同一行另外两个按钮都有反馈，只有它是 45 秒死键。异常也交给 busy_action 兜（fail=同步失败）。
+            按下去就是 45 秒死键。异常也交给 busy_action 兜（fail=同步失败）。
             """
             if not config.QB_ENABLED:
                 ui.notify("qB 未启用（去设置页开启『发送种子到 qB』）", type="warning")
@@ -1161,7 +1193,7 @@ def movies_page(t: str = ""):
                     ui.notify(f"已同步 {n} 个版本的进度" if n else "没有正在下载的版本",
                               type="positive")
             # 先一句 toast 再转圈（核实意见）：这个按钮所在的面板每 30 秒被定时器重建，loading 只活到下一个
-            # tick；能盖住整段 45 秒的是 toast —— 与同页『刷新资料』的写法一致。
+            # tick；能盖住整段 45 秒的是 toast —— 与番剧页『刷新资料』的写法一致。
             ui.notify("正在向 qB 拉最新进度…（qB 不通时最长约 45 秒）", type="info")
             await busy_action(e.sender, "qb-sync-movie", _go, fail="同步失败")
 

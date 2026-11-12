@@ -3,6 +3,7 @@
 运行： python main.py    然后浏览器打开 http://<host>:2333
 """
 import asyncio
+import gc
 import logging
 import sys
 
@@ -42,7 +43,7 @@ background_tasks: list = []
 
 @app.on_startup
 async def _startup():
-    # 【这三步必须整体兜住】它们裸调时，任一抛异常都会让下面七个 create_task 一个都建不起来，
+    # 【这三步必须整体兜住】它们裸调时，任一抛异常都会让下面这几个 create_task 一个都建不起来，
     # 而 NiceGUI 只是把异常记一行、Web 服务照常起：页面能开、看着一切正常，实则采集/下载/
     # qB 同步/重识别【全部没在跑】，用户只会觉得"好几天没更新了"。宁可明确停摆也不要假装正常。
     try:
@@ -69,7 +70,7 @@ async def _startup():
             init_business_state()
         except Exception:           # 记账/种源组失败不该连累后台协程的建立
             log.exception("业务初始化失败（采集仍会启动，遗留的 downloading 可能未清扫）")
-    # 协程照常建：它们各自都按 db.is_data_down() 把门，停摆期间空转短睡，库一恢复就自动接上。
+    # 协程照常建：碰业务库的那几条各自都按 db.is_data_down() 把门，停摆期间空转短睡，库一恢复就自动接上。
     # 【句柄必须存住】(R33) 两个理由：① asyncio 只对 task 持弱引用，官方文档明写
     #   "Save a reference to the result of this function, to avoid a task disappearing mid-execution"
     #   —— 这几条是长驻循环、实际一直被调度着，大概率没事，但那是靠运气不是靠设计；
@@ -88,6 +89,13 @@ async def _startup():
     ])
     for _t in background_tasks:
         _t.add_done_callback(log_task_exit)   # 任何一条意外退出都留一行 ERROR（见 core.worker.log_task_exit）
+    # 【冻结启动时的常驻对象，必须放在最后】导入 nicegui 与全部页面模块后，常驻的可回收对象约 16 万，
+    # 全代回收每次要把它们扫一遍、约 24 ms，随机落在仪表盘 / 采集的数据函数里；冻结后它们进永久代、不再被扫。
+    # 放在最后：前面建库 / 读配置 / 建后台协程留下的常驻对象要一并冻进去；而此刻还没有页面客户端连进来
+    # （_startup 体内没有 await：NiceGUI 把它排成任务后一步跑完，这时端口还没开始监听；冻结之前一旦加了 await，
+    # 这个前提就没了），冻住的不会混进某个页面的临时对象（冻住的对象日后成了环状垃圾也不再回收，混进去就是常驻泄漏）。
+    gc.collect()
+    gc.freeze()
 
 
 if __name__ in {"__main__", "__mp_main__"}:

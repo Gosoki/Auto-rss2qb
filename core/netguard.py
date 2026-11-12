@@ -111,7 +111,7 @@ def host_allowed(host_header: str, raw_hosts: str) -> bool:
 
 
 class SubnetGuard:
-    """ASGI 中间件：WEB_ALLOW_CIDRS 非空时，非白名单网段的 HTTP/WS 一律拒；空=放行一切。
+    """ASGI 中间件：WEB_ALLOW_CIDRS 非空时，非白名单网段的 HTTP/WS 一律拒；空=网段不设限（Host 头校验照做，见 host_allowed）。
 
     白名单配了但全解析失败 → nets 为空 → 只有回环能过（fail-closed，但本机仍能进去改回来）。
     配置整个没从库里读出来（建表/迁移失败）→ 同样只放行回环，理由见 __call__ 里的注释。

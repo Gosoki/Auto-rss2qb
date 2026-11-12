@@ -13,7 +13,7 @@
   3. 【标识符引用与参数占位符】SQLite 用 "x" 和 ?，MySQL 用 `x` 和 %s。迁移语句一律走
      preparer.quote() + SQLAlchemy 具名参数，别再手拼。
   4. 【partial index】`CREATE INDEX ... WHERE ...` 是 SQLite/PG 的特性，MySQL 不支持，
-     由调用方按方言跳过（见 db.__init__._migrate_inflight_indexes）。
+     由 alembic 基线按方言跳过（见 alembic/versions/20260727_41170d6a7ad4_baseline.py 的 _inflight_index_sql）。
 
 改模型时要注意的唯一一条：新加的 str 列如果要建索引/唯一约束，长度会自动按 _KEYED_LEN 给；
 需要更长就往 _COL_LEN 里加一条，别在 MySQL 上撞 3072 字节的索引键上限

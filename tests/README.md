@@ -3,7 +3,7 @@
 **已入库**（原本按要求不上传，第 6 轮起改为入库——理由见 `docs/DECISIONS.md` 的 D-28）。跑法：
 
 ```bash
-.venv/bin/python -m pytest          # 全量，约 10 秒
+.venv/bin/python -m pytest          # 全量，约 1 分钟（第 40 轮量的）
 .venv/bin/python -m pytest tests/test_parse.py -v
 ```
 
@@ -20,17 +20,19 @@
 
 ## 覆盖
 
+下面只列最要紧的几组，不是全部文件。
+
 | 文件 | 守住什么 |
 | --- | --- |
-| `test_parse.py` (47) | 标题解析：集号/季号/组名/番名，含全括号命名的回退捕获。解析错 = 下错文件或整部番进"待识别" |
-| `test_dedup.py` (25) | 集去重键与绝对号折算的不变量。错了 = 漏整季，或同一集下两份进同一目录 |
-| `test_paths.py` (42) | 保存路径：越界穿越、跨平台分隔符、按字节截断、季度模板容错 |
-| `test_select.py` (14) | 下载候选的挑选顺序与每集分组。错了 = 某集永久停滞，或同一集下两份 |
-| `test_qb_sync.py` (10) | qB 实时态同步的状态机（何时才允许判死一条种子）。错了 = 整批种子被误标失败 → 自动重复下载 |
-| `test_netguard.py` (29) | 网段白名单。放宽 = 无鉴权面板暴露给内网；收紧 = 用户被挡在自己的面板外 |
-| `test_engine_lifecycle.py` (25) | 完成回调、归档前置条件、跨表同 hash |
-| `test_status_tables.py` (26) | 状态词表的分层与一致性。本项目自己立过「同一份知识记两处会漂移」的规矩，这组把它变成可执行断言 |
-| `test_qb_client.py` (11) | qB 客户端的三态返回（受理/被拒/连不上）。揉成两态会让 qB 掉线时整批种子被打成 error |
+| `test_parse.py` | 标题解析：集号/季号/组名/番名，含全括号命名的回退捕获。解析错 = 下错文件或整部番进"待识别" |
+| `test_dedup.py` | 集去重键与绝对号折算的不变量。错了 = 漏整季，或同一集下两份进同一目录 |
+| `test_paths.py` | 保存路径：越界穿越、跨平台分隔符、按字节截断、季度模板容错 |
+| `test_select.py` | 下载候选的挑选顺序与每集分组。错了 = 某集永久停滞，或同一集下两份 |
+| `test_qb_sync.py` | qB 实时态同步的状态机（何时才允许判死一条种子）。错了 = 整批种子被误标失败 → 自动重复下载 |
+| `test_netguard.py` | 网段白名单。放宽 = 无鉴权面板暴露给内网；收紧 = 用户被挡在自己的面板外 |
+| `test_engine_lifecycle.py` | 完成回调、归档前置条件、跨表同 hash |
+| `test_status_tables.py` | 状态词表的分层与一致性。本项目自己立过「同一份知识记两处会漂移」的规矩，这组把它变成可执行断言 |
+| `test_qb_client.py` | qB 客户端的三态返回（受理/被拒/连不上）。揉成两态会让 qB 掉线时整批种子被打成 error |
 | `test_plan_equivalence.py` | 批量/逐番/合并三种计划口径必须逐字相等；含一条把「confirmed 闸在调用方」这个**契约**写死的用例 |
 | `test_poll_dedup.py` | 采集轮的批量查重（预取集合的盲区：预取之后才入库的 hash） |
 | `test_backup.py` | 备份：WAL 快照、自检、保留策略、并发、残骸清理 |
@@ -40,10 +42,11 @@
 | `test_finish_idle.py` | 完结判定与断更提醒。完结判据的失败方向不对称：误判 = 最后一集永远下不下来且不报错 |
 | `test_enrich_refund.py` | 退避阶梯与「bgm 不可达退款」。退款判据写错会把整个阶梯废掉 |
 | `test_movies_scan.py` / `test_movies_identity.py` | 剧场版入库守卫与身份归并（合并会**删行**且不可逆） |
-| `test_dashboard_invariants.py` | 仪表盘拆桶：五者之和 = 待下总数 |
+| `test_dashboard_invariants.py` | 仪表盘拆桶：七者之和 = 待下总数 |
 | `test_qb_precheck.py` | 三个交付入口共用的 qB 预检 |
 
-共 **425+** 条。
+共 **1800+** 条（第 40 轮数的，只会越来越多；精确数看 `pytest --collect-only -q`）。
 
-**没覆盖**（有意）：真实网络抓取、真实 qB、NiceGUI 页面渲染、Alembic 迁移、MySQL 后端。
-这些要么依赖外部环境，要么值得单独一套集成测试。
+**没覆盖**（有意）：真实网络抓取、真实 qB、真实 MySQL 服务、真浏览器。
+这些都依赖外部环境。页面构建（`test_pages_render.py`，NiceGUI 的 `User` 夹具）、存量库升级（`test_upgrade_path.py`）、
+MySQL 方言（`test_mysql_compat.py`，只测方言无关的正确性）是有用例的。

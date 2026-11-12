@@ -31,7 +31,6 @@ qB 的 IP 过滤只认【qB 那台机器上的】本地文件路径，WebAPI 也
 """
 import asyncio
 import fnmatch
-import gzip
 import hashlib
 import io
 import ipaddress
@@ -40,6 +39,7 @@ import logging
 import re
 import socket
 import time
+import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -249,7 +249,14 @@ def _p_cloud(name: str, body: bytes, ccs: set) -> dict:
 def _p_dat(body: bytes) -> dict:
     """eMule .dat：001.000.192.000 - 001.000.255.255 , 000 , 说明。地址带前导零，Python 的 ipaddress 不收，先去掉。"""
     if body[:2] == b"\x1f\x8b":
-        body = gzip.decompress(body)
+        # 这个 .gz 是文件本身、不是 Content-Encoding，取回那层的封顶管不到解压后：线上 261 KB 解析时内存峰值 1.5 GB。
+        # 解压后也封在 _CAP（真实文件 2.4 MB → 18 MB）。eof / unused_data 两项不能省：decompressobj 对
+        # 截断的流不报错、对多成员只解第一段，都会把一份更薄的名单静默换上去（模块头第 4 条）；
+        # 抛出去 → 这个源记"解析失败"→ 本次不更新、旧规则照用。
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        body = d.decompress(body, _CAP)
+        if not d.eof or d.unused_data:
+            raise ValueError(f"解压后超过 {_CAP >> 20} MB，或压缩流不完整 / 不止一段")
     out = []
     for ln in _lines(body):
         try:
@@ -263,8 +270,13 @@ def _p_dat(body: bytes) -> dict:
 
 def merge(ranges: list, version: int, gap: int) -> list:
     """合成【最少条数】的区间列表：重叠、紧邻、或缝 ≤ gap 的都并成一段（v4 才填缝；v6 地址空间太大，不做）。
-    返回 [(起, 止), …]。"""
-    rs = sorted((s, e) for v, s, e in ranges if v == version)
+    返回 [(起, 止), …]。
+
+    越界（负数、超出该版本地址空间）与起点大于终点的区间直接丢掉。六个解析器的输出都汇到这里，
+    任何一个源写坏一行（RIR 个数写成 99999999999 或负数、CSV 起止颠倒、v4 起 v6 止），不丢的话
+    要么到 render 才抛错、此后每次生成都失败，要么渲染出起点大于终点的规则行。"""
+    top = (1 << (32 if version == 4 else 128)) - 1
+    rs = sorted((s, e) for v, s, e in ranges if v == version and 0 <= s <= e <= top)
     if not rs:
         return []
     gap = max(0, gap) if version == 4 else 0
@@ -322,7 +334,7 @@ async def _get(client, url: str) -> tuple[int, bytes]:
 
 
 async def generate(ccs: list | None = None, gap: int | None = None, antip2p: bool | None = None) -> dict:
-    """取全部数据源并生成规则。返回 {text, v4, v6, counts, failed, countries}。
+    """取全部数据源并生成规则。返回 {text, v4, v6, per, counts, failed, countries}。
     failed 非空时 text 照样给（命令行 --force 用）；程序里的自动更新有失败就不换文件（见 update）。"""
     ccs = ccs or countries()
     gap = config.IPFILTER_GAP_FILL if gap is None else gap
@@ -430,7 +442,8 @@ def build_torrent(data: bytes, name: str, url: str) -> tuple[bytes, str]:
 def run_state() -> dict:
     """运行时状态（存在 IPFILTER_STATE 一个键里）：
     last 上次交给 qB 的时刻 / tried 上次尝试生成的时刻 / pending 还没下完的种子 hash /
-    serving 当前提供下载的 "摘要/文件名" / summary 规则概要 / status 给设置页看的一句话。"""
+    serving 当前提供下载的 "摘要/文件名" / summary 规则概要 / target 交给 qB 时记下的文件路径 /
+    status 给设置页看的一句话。"""
     try:
         v = json.loads(config.IPFILTER_STATE or "{}")
         return v if isinstance(v, dict) else {}

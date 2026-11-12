@@ -6,7 +6,7 @@
 
 ② 季度剧场版/OVA：周更番走 RSS，剧场版/OVA 不适合，改用 Mikan 季度浏览页发现：
    /Home/BangumiCoverFlowByDayOfWeek?year=..&seasonStr=..  按放送星期分块 + 末尾『剧场版/OVA』桶。
-   拿到番组 id → 详情页取 bgm.tv/subject/<id> + 字幕组 → /RSS/Bangumi?bangumiId=<id> 取全部种子。
+   拿到番组 id → 详情页取 bgm.tv/subject/<id> → /RSS/Bangumi?bangumiId=<id> 取全部种子。
    季度/规范名一律由 bgm 定（识别用 bgm）；Mikan 只负责『发现有哪些』+『提供种子』。
 """
 import html
@@ -47,7 +47,10 @@ _DOW_SPLIT_RE = re.compile(r'<div class="sk-bangumi" data-dayofweek="\d+">')
 # 改成"正则只找起点、`str.find` 找收尾"：两步都是线性，且捕获内容与旧写法**逐字相同**
 # （包括内层标签那种），行为零变化。
 _ROW_START_RE = re.compile(r'id="data-row-\d+"[^>]*>')
-_BANGUMI_RE = re.compile(r'/Home/Bangumi/(\d+)"[^>]*?title="([^"]*)"')
+# 【href 到 title 之间限 512 个字符】写成 `[^>]*?` 时与上面是同一个形状：一串没有 > 也没有 title= 的
+# `/Home/Bangumi/1" `，每个起点都扫到块尾才失败，平方增长（400 KB 卡 31 秒）。512 是结构上限不是业务阈值：
+# 真实页 href 与 title 相隔 33 个字符，整个 <a> 标签最长 399 个；超过的那一条会取不到。
+_BANGUMI_RE = re.compile(r'/Home/Bangumi/(\d+)"[^>]{0,512}?title="([^"]*)"')
 _BGM_RE = re.compile(r'bgm\.tv/subject/(\d+)')
 _HASH_FROM_LINK_RE = re.compile(r'/Home/Episode/([0-9a-f]{40})')
 _HEX40_RE = _BASE_HEX40      # 复用 sources/base 里那一份，别各自留一个拷贝   # info_hash 校验（每条种子热路径，预编译）
@@ -74,7 +77,7 @@ def _enclosure(entry) -> str:
 # ---------------- ① 全站 RSS 发现源 ----------------
 
 class MikanSource(RssSource):
-    """Mikan 的 RSS 源。除了下面这三样，全部逻辑在 RssSource 里（见那里的说明）。"""
+    """Mikan 的 RSS 源。除了下面这几样，全部逻辑在 RssSource 里（见那里的说明）。"""
 
     site = "mikan"
     # Mikan 的 pubDate 【不带时区】（实为北京时间 UTC+8），而 feedparser 一律按 GMT 解释。
@@ -160,13 +163,13 @@ async def discover_movie_bucket(client, year: int, season_letter: str) -> list[t
         return []
     url = (f"{config.MIKAN_BASE}/Home/BangumiCoverFlowByDayOfWeek"
            f"?year={year}&seasonStr={quote(scn)}")
-    htm = await fetch.get_text(client, url)
+    htm = await fetch.get_text(client, url, gzip_ok=True)
     return _parse_movie_bucket(htm)
 
 
 async def fetch_detail(client, mikan_id: str) -> int | None:
     """Mikan 番组详情页 → bgm_id（取不到返回 None）。剧场版只需 bgm 精确联动键，不接字幕组白名单。"""
-    htm = await fetch.get_text(client, f"{config.MIKAN_BASE}/Home/Bangumi/{mikan_id}")
+    htm = await fetch.get_text(client, f"{config.MIKAN_BASE}/Home/Bangumi/{mikan_id}", gzip_ok=True)
     bm = _BGM_RE.search(htm)
     return int(bm.group(1)) if bm else None
 
@@ -177,7 +180,7 @@ async def fetch_bangumi_torrents(client, mikan_id: str) -> list[ParsedItem]:
     剧场版/OVA 常无规范集号，episode 允许 -1/-2；不做批量/字幕组过滤（剧场版逐版本人工挑着下）。
     """
     url = f"{config.MIKAN_BASE}/RSS/Bangumi?bangumiId={mikan_id}"
-    content = await fetch.get_bytes(client, url)   # 带上限+总超时，理由同 RssSource.fetch
+    content = await fetch.get_bytes(client, url, gzip_ok=True)   # 带上限+总超时，理由同 RssSource.fetch
     # 【解析丢线程，同 RssSource.fetch】Mikan 的 /RSS/Bangumi 返回该番组【全部历史种子】，
     # 长寿番组实测 3.2MB / 4193 条：feedparser + 逐条 parse_title 是纯 CPU 的同步代码，
     # 连续占住事件循环好几秒（980KB/4000 条这个量级实测就已经 1.45 秒）。

@@ -1,6 +1,6 @@
 """仪表盘拆桶的不变量。
 
-`pending_breakdown` 的 docstring 承诺"六者之和 = 待下总数"。这类"卡片数字加起来要对得上"的
+`pending_breakdown` 的 docstring 承诺"七者之和 = 待下总数"。这类"卡片数字加起来要对得上"的
 承诺最容易在加桶时被破坏，而破坏之后没有任何报错——只是某一类种子从此在面板上消失。
 本项目已经出过一次：特别篇曾掉进『备用项』，而那张卡的说明是"同集已有更优版本"。
 """
@@ -178,7 +178,7 @@ def test_internal_marker_names_actually_exist_in_production_code():
     """
     import pathlib
 
-    from tests.conftest import _INTERNAL_MARKERS
+    from conftest import _INTERNAL_MARKERS
 
     root = pathlib.Path(__file__).resolve().parent.parent
     src = "\n".join((root / d).read_text(encoding="utf-8")
@@ -265,7 +265,7 @@ def test_every_quarter_ordering_uses_the_year_not_the_string():
     纯字符串比较下 '99D' > '26C'，1999 年首播的长番会排到当季前面。
     修的时候第一遍只改了 pages/layout.group_by_quarter（番剧/剧场版列表），
     结果打开首页看到的仍是 99D 在最前——因为默认标签页是【仪表盘】，
-    它的季度分布条走的是 core.anime.quarter_overview / core.movies 里另外两处
+    它的季度分布条走的是 core.anime.overview / core.movies 里另外两处
     各自独立的 `sorted(..., reverse=True)`。三处必须同时成立。
     """
     from core import anime as A, movies as M

@@ -1030,6 +1030,8 @@ _STRADDLERS = {
         "_retire_old_versions":           "lock:_poll_lock",     # 修正版：新版下完删旧版
         # (r39 E-74) 锁定源停更兜底：读计划 → await 交付 → 当场重读锁/状态、按 id 写 lock_fallback 标记
         "deliver_lock_fallback":          "lock:_poll_lock",
+        # 缺集自动补：读缺集 → await 补齐 → 查补回了哪几集；函数体自己包在 engine.in_flight 里
+        "autofill_gaps":                  "in_flight",
     },
     "core/engine.py": {
         "archive_old_completed":          "lock:_archive_lock",

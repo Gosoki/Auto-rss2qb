@@ -118,7 +118,7 @@ def test_every_config_writer_checks_loaded_from_db():
 
     这是本项目第②种缺陷形状：约束的作用域比它保护的东西小。
     用 AST 查：pages/ 里每个含 `config.set_many(` 的函数，函数体里必须也出现
-    `_require_config_loaded()` 或 `config.loaded_from_db`。
+    `require_config_loaded()` 或 `config.loaded_from_db`。
     """
     import ast
     import pathlib
@@ -130,7 +130,7 @@ def test_every_config_writer_checks_loaded_from_db():
     }
 
     root = pathlib.Path(__file__).resolve().parent.parent
-    offenders = []
+    offenders, n_writers = [], 0
     for path in sorted((root / "pages").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf8"))
         fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
@@ -144,11 +144,13 @@ def test_every_config_writer_checks_loaded_from_db():
                 own = own.replace(ast.dump(m), "")
             if "attr='set_many'" not in own and 'attr="set_many"' not in own:
                 continue
+            n_writers += 1
             if node.name in _EXEMPT:
                 continue
             if "require_config_loaded" in own or "loaded_from_db" in own:
                 continue
             offenders.append(f"{path.name}:{node.lineno} {node.name}()")
+    assert n_writers, "pages/ 里一个 config.set_many 调用都没扫到 —— 写入口改名了，判据已经失效"
     assert not offenders, (
         "这些处理器会把表单值写回配置，却没过 loaded_from_db 那道闸——"
         "库读不出来时它们会把用户原有的设置整体覆盖成默认值：\n  " + "\n  ".join(offenders)
@@ -199,7 +201,7 @@ def test_every_periodic_timer_skips_while_the_db_is_down():
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
-    offenders = []
+    offenders, n_timers = [], 0
     for path in sorted((root / "pages").glob("*.py")):
         src = path.read_text(encoding="utf8")
         tree = ast.parse(src)
@@ -211,9 +213,14 @@ def test_every_periodic_timer_skips_while_the_db_is_down():
                     and n.func.value.id == "ui"):
                 continue
             iv = n.args[0] if n.args else None
-            if not (isinstance(iv, ast.Constant) and isinstance(iv.value, (int, float))
-                    and iv.value >= 10):
-                continue        # 只管周期性的长间隔定时器；一次性/短间隔的另有用途
+            if any(k.arg == "once" and getattr(k.value, "value", None) is True for k in n.keywords):
+                continue        # 一次性的不是周期刷新
+            if not (isinstance(iv, ast.Constant) and isinstance(iv.value, (int, float))):
+                offenders.append(f"{path.name}:{n.lineno} 间隔不是字面量，看不了")
+                continue
+            if iv.value < 10:
+                continue        # 只管长间隔的；短间隔的另有用途
+            n_timers += 1
             cb = n.args[1] if len(n.args) > 1 else None
             name = cb.id if isinstance(cb, ast.Name) else None
             fn = funcs.get(name)
@@ -222,6 +229,7 @@ def test_every_periodic_timer_skips_while_the_db_is_down():
                 continue
             if "is_data_down" not in ast.dump(fn):
                 offenders.append(f"{path.name}:{n.lineno} {name}() 没有停摆闸")
+    assert n_timers, "一个周期性 ui.timer 都没扫到 —— 写法变了，判据已经失效"
     assert not offenders, ("这些周期性定时器会在库停摆/维护时照撞不误：\n  "
                            + "\n  ".join(offenders))
 

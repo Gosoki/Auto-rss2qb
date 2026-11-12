@@ -13,6 +13,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 import config
 import db
 from core import engine, health, worker
+from services import notify
 from sources.parse import quarter_sort_key
 
 log = logging.getLogger("autorss")
@@ -118,6 +119,7 @@ ui.button.default_props("no-caps")
 #     ↑ 这一项曾经三个叫法：术语表写「未识别」、tab 与 KPI 用「待识别」、番剧卡片写「未匹配」。
 #       统一取「待识别」——tab、KPI、空状态文案、以及各处 tooltip 里的"去『待识别』手动绑定"都是它。
 #   episode=-2（集号没解析出来）→ 「未知集」（不要写成"未识别"，那是 bgm 那一档的词）
+#   最容易被读成同义的状态词（订阅中/在追、已交付/已完成/已下 等）见 docs/GLOSSARY.md §二十二
 NAV = [("manage", "番剧", "/"), ("movies", "剧场版", "/movies"),
        ("parse", "解析测试", "/parse"), ("manual", "手动下载", "/manual"),
        ("logs", "运行日志", "/logs"), ("settings", "全局设置", "/settings")]
@@ -190,7 +192,7 @@ def group_by_quarter(items):
 
 
 def barline(label, value, maxv, color="oklch(70.7% 0.165 254.624)", lw="w-32", text=None) -> None:
-    """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认取 value）。番剧/剧场版共用。"""
+    """一行『标签 + 比例条 + 数值』。比例条按 value 长；text 可自定义右侧文案（默认取 value）。"""
     pct = (value / maxv * 100) if maxv else 0
     with ui.row().classes("items-center gap-3 w-full text-sm py-0.5 min-w-0"):
         ui.label(str(label)).classes(f"{lw} shrink-0 truncate").tooltip(str(label))
@@ -206,7 +208,8 @@ def kpi_cards(cards) -> None:
     """一排 KPI 数字卡：cards=[(标签, 数值, 高亮色或'') / (…, on_click), ...]；
     给了 on_click 的卡可点（手型光标+悬浮高亮）。数字染色需值非零且给了高亮色；标签一律 gray-400
     （曾有第 5 元素"标签色"用来分组，全站没有一个调用点传过，R36 体检删掉 —— 分组只靠 "|"）。
-    列表里放字符串 "|" 会把左右拆成两组：每组内卡等宽铺满、左右平衡（仿番剧列表 flex:1），够宽时并排，窄了整组换行成上下布局。"""
+    列表里放字符串 "|" 会把左右拆成两组：每组内卡等宽铺满、左右平衡（仿番剧列表 flex:1），够宽时并排，窄了整组换行成上下布局；
+    组内窄了折成 2×2，手机上（<600px）5 张一组的排成 3 列两行。"""
     groups: list[list] = [[]]
     for card in cards:
         if card == "|":
@@ -241,15 +244,17 @@ def kpi_cards(cards) -> None:
             # tabindex + 回车：键盘也能点（r37：可点的 KPI 卡以前是键盘够不着的 div）
             c.props("tabindex=0").on("click", on_click).on("keydown.enter", on_click)
 
-    if len(groups) == 1:                   # 单组（如剧场版页）：维持原来的自由换行、左对齐
+    if len(groups) == 1:                   # 单组：维持原来的自由换行、左对齐
         with ui.row().classes("gap-3 flex-wrap p-1"):
             for card in groups[0]:
                 _card(card, grow=False)
     else:                                  # 多组：每组一个 grid，够宽 n 列一排、窄了折成 2×2、再窄整组换行；绝不裁掉右边
         with ui.row().classes("w-full gap-4 flex-wrap items-stretch p-1"):
             for group in groups:
+                # --kpi-m：手机档的列数。5 张 + 第一张跨两列 = 6 格，排 3 列正好两行；4 张仍是 2×2。
+                # 全站只有 5:5 与 4:4 两种分组；以后某组加到 6 张，tests/test_r40_ui_dash.py 会逼你决定手机上怎么排。
                 with ui.element("div").classes("kpi-group items-stretch").style(
-                        f"flex:1 1 200px;--kpi-n:{len(group)}"):
+                        f"flex:1 1 200px;--kpi-n:{len(group)};--kpi-m:{3 if len(group) == 5 else 2}"):
                     for card in group:
                         _card(card, grow=True)
 
@@ -324,8 +329,8 @@ def warn_banner(text: str, action: tuple | list | None = None) -> None:
 
     `action=(按钮文字, 图标, 回调)`：给"只报不改"那一类横幅配一个就地的处置入口；要两个就传一个列表
     （锁定源落后：『只补这几集』『改回按优先级』）。
-    不给就是原来的样子（另外 9 个调用点一个字都不用改）。**别再造第二个带按钮的横幅** ——
-    全站 10 处用的是同一个块，再抄一份就是"改了样式只改一处"的温床。
+    不给就是原来的样子（不带按钮的调用点一个字都不用改）。**别再造第二个带按钮的横幅** ——
+    全站各处用的是同一个块，再抄一份就是"改了样式只改一处"的温床。
 
     【灰度只有两档，别再加第三档】（E-37，用户 2026-09-01 拍板"只剩下 2 种灰色就行"）
       · text-gray-400 —— 说明文、字段名、次要标签。默认用它。
@@ -336,32 +341,52 @@ def warn_banner(text: str, action: tuple | list | None = None) -> None:
       · hover 态用 hover:text-white，不要用更亮的灰——那会变相引入第三档。
     tests/test_ui_badge_style.py 里有守卫钉着这条。
     多行长文（如设置页那两条）图标顶部对齐、只有文字缩进换行。
+    <640px 时按钮落到文字下面；文案里的 \\n 会真换行。
     """
+    _acts = [action] if isinstance(action, tuple) else (action or [])
     with ui.row().classes("items-start gap-2 p-2 rounded w-full no-wrap").style(
             tint("amber")):
         # 图标压到与 text-sm 同高(20px)并锁行高，才能跟首行文字齐平、也不被长文挤掉
         ui.icon("warning").classes("text-amber-400 shrink-0").style(
             "font-size:20px;line-height:20px")
-        # grow：把 action 按钮推到右端。不带 action 的调用点只是让文字块占满剩余宽度，外观不变。
-        ui.label(text).classes("text-sm text-amber-400 min-w-0 grow")
-        for _lab, _icon, _cb in ([action] if isinstance(action, tuple) else (action or [])):
-            ui.button(_lab, icon=_icon, on_click=_cb).props(
-                "flat dense color=amber").classes("btn-sm shrink-0 self-start")
+        # whitespace-pre-line：文案里写的 \n 要真换行（『集号超出』那条分四段写），否则糊成一段
+        if not _acts:
+            ui.label(text).classes("text-sm text-amber-400 min-w-0 grow whitespace-pre-line")
+            return
+        # 【按钮不能与文字同排硬挤】外层是 no-wrap、按钮 shrink-0，宽度只能由文字让：手机上两个按钮
+        # 就把文字压成一两个字一行、整条横幅一屏高。所以文字+按钮再包一层：<640px 竖排（按钮落到文字下面），
+        # ≥640px 左右排。这组响应式类与 meta_card 同一组；别换成 Quasar 的 `flex` 类，它自带 flex-wrap:wrap，
+        # 会在桌面上把按钮挤到下一行。
+        with ui.row().classes("grow min-w-0 gap-2 items-start flex-col sm:flex-row sm:flex-nowrap"):
+            ui.label(text).classes("text-sm text-amber-400 min-w-0 grow whitespace-pre-line")
+            # gap-2：与外层横幅行的间距一致（桌面上双按钮横幅外观不变）。
+            # ≥2 个按钮时挂 .warn-acts：桌面上按钮组宽度封顶（见 _HEAD_BASE_CSS），多了自己折行，正文至少留一半。
+            with ui.row().classes("gap-2 shrink-0 justify-end flex-wrap"
+                                  + (" warn-acts" if len(_acts) > 1 else "")):
+                for _lab, _icon, _cb in _acts:
+                    ui.button(_lab, icon=_icon, on_click=_cb).props(
+                        "flat dense color=amber").classes("btn-sm")
 
 
 def recent_table(rows, name_label: str, on_row_click=None) -> None:
-    """『新入库』表：rows 已构造好(id/time/name/src/raw/status/status_color)，name_label 为番名列标题；
-    番名下再压一行灰色原始种子名（长名换行、完整显示）；状态列渲染成彩色徽标（含 qB 实时态）。
+    """『新入库』表：rows 已构造好(id/time/name/src/raw/status/status_color，可选 more)，name_label 为番名列标题；
+    番名下再压一行灰色原始种子名（长名换行、完整显示）；<1024px 换成『时间 · 来源 + 状态徽标』那一行；
+    状态列渲染成彩色徽标（含 qB 实时态）。行带 more 时再加一行灰字（番剧侧并进这一行的同集其它版本）。
     番剧表与剧场版共用。on_row_click(row) 非空时，番名可点开详情（传回整行 dict）。"""
     tbl = ui.table(
         columns=[
-            {"name": "time", "label": "时间", "field": "time", "align": "left"},
+            # 窄屏隐去时间/来源/状态三列，只留番名列。【用 Quasar 的 gt-sm，不用 hidden md:table-cell】(r37) Quasar 的
+            # .hidden 带 !important，会压过 Tailwind 的响应式类，用它的话这一列在任何宽度下都不显示。
+            # gt-sm 在 <1024px 时 display:none；断点取 1024 而不是 600：700 宽时番名列会被另两列挤到一百来像素。
+            # 【两个断点必须互补】<1024 隐列，番名格里那行 lt-md（<1024 才出）把时间·来源·状态补回来；
+            # 改了一边不改另一边，就是某个宽度区间里状态哪儿都看不到（tests/test_r40_ui_dash.py 钉着）。
+            {"name": "time", "label": "时间", "field": "time", "align": "left",
+             "classes": "gt-sm", "headerClasses": "gt-sm"},
             {"name": "name", "label": name_label, "field": "name", "align": "left"},
-            # 窄屏隐去次要列。【用 Quasar 的 gt-xs，不用 hidden sm:table-cell】(r37) Quasar 的 .hidden 带
-            # !important，压过了 sm:table-cell —— 这一列以前在任何宽度下都不显示。gt-xs 只在 <600px 时 display:none。
             {"name": "src", "label": "来源", "field": "src", "align": "left",
-             "classes": "gt-xs", "headerClasses": "gt-xs"},
-            {"name": "status", "label": "状态", "field": "status", "align": "left"},
+             "classes": "gt-sm", "headerClasses": "gt-sm"},
+            {"name": "status", "label": "状态", "field": "status", "align": "left",
+             "classes": "gt-sm", "headerClasses": "gt-sm"},
         ],
         rows=rows, row_key="id",
     ).classes("w-full")
@@ -373,9 +398,12 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
         </div>
     """)
     # 番名：可点则染蓝加手型、点击 $emit 回传整行给 Python；不可点则纯文本。原始名恒为灰色小字。
-    name_top = ('<div class="cursor-pointer text-blue-400" '
+    # 【番名必须能换行】q-td 继承 Quasar 的 white-space:nowrap，最长的番名会把整列撑到六百多像素、
+    # 把状态列推出屏幕。overflow-wrap:anywhere 只在一个词本身放不下时才断（同 .cover-card-title）。
+    _wrap = "white-space:normal;overflow-wrap:anywhere"
+    name_top = (f'<div class="cursor-pointer text-blue-400" style="{_wrap}" '
                 "@click=\"() => $parent.$emit('opendetail', props.row)\">{{ props.row.name }}</div>"
-                ) if on_row_click else "<div>{{ props.row.name }}</div>"
+                ) if on_row_click else f'<div style="{_wrap}">{{{{ props.row.name }}}}</div>'
     tbl.add_slot("body-cell-name", f'''
         <q-td :props="props">
             {name_top}
@@ -384,10 +412,18 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
                  text-xs(12px)/gray-500 —— 按钮、徽标、分页、输入框的尺寸刚被逐条收成
                  "只在一处定"，唯独这一处漏在 Vue 插槽字符串里、谁也扫不到。
                  warn_banner 的注释也把"原始种子标题"明确列在 gray-500 那一档。 -->
-            <div class="text-xs text-gray-500"
+            <div class="gt-sm text-xs text-gray-500"
                  style="white-space:normal;word-break:break-all">
                 {{{{ props.row.raw }}}}
             </div>
+            <!-- <1024px：被 gt-sm 隐去的时间/来源/状态三列补在这一行，徽标钉在右边。
+                 时间与详情页同一字段同一档灰（gray-400）。<1024 时看不到原始标题，点番名进详情仍有。 -->
+            <div class="lt-md row items-center no-wrap" style="gap:8px;margin-top:2px">
+                <div class="col text-xs text-gray-400" style="white-space:normal;min-width:0">{{{{ (props.row.time || '').slice(5) }}}} · {{{{ props.row.src }}}}</div>
+                <q-badge :color="props.row.status_color || 'blue-grey'" :label="props.row.status" />
+            </div>
+            <!-- 同集并进来的其它版本。white-space:normal 不能省：q-td 是 nowrap，长串会把表格撑出屏幕 -->
+            <div v-if="props.row.more" class="text-xs text-gray-400" style="white-space:normal">{{{{ props.row.more }}}}</div>
         </q-td>
     ''')
     if on_row_click:
@@ -433,7 +469,7 @@ def finished_tip(a, resub_hint: str) -> str:
 
 
 def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
-    """详情元信息卡：封面 + bgm 链接（图下） + 两列 kv 网格 + 右上角豆瓣式评分（分+评价） + 简介。
+    """详情元信息卡：封面 + 两列 kv 网格 + bgm 链接（贴中列底部） + 右上角豆瓣式评分（分+评价） + 简介。
     番剧/剧场版详情共用，kv_pairs=[(标签, 值)...] 各页自备（字段集略不同）。"""
     with ui.card().classes("w-full"):
         with ui.row().classes("gap-4 items-start w-full flex-col sm:flex-row sm:flex-nowrap"):   # 窄屏竖排；宽屏三列不换行(长标题在中列内换行、不把评分挤下去)
@@ -472,7 +508,11 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                         ui.label(_lab).classes("text-xs text-gray-400")
         if summary:
             ui.separator()
-            ui.label(summary).classes("text-sm whitespace-pre-wrap")   # 简介是正文，不着灰
+            # 简介是正文，不着灰。默认收成 3 行（中日两份全文会把下载控制行和分集表推出首屏），点一下展开 / 收起。
+            # 不设长度阈值：短简介本来不到 3 行。body.refresh() 之后回到收起状态
+            _sum = ui.label(summary).classes("text-sm whitespace-pre-wrap line-clamp-3 cursor-pointer")
+            _sum.tooltip("点一下展开 / 收起全文")
+            _sum.on("click", lambda: _sum.classes(toggle="line-clamp-3"))
 
 
 def name_of(a) -> str:
@@ -609,7 +649,7 @@ def ep_label(e, single_work: bool = False) -> str:
 
 # qB 原始态 → 中文：词表（分类 + 中文名）统一在 core.engine._QB_STATES，本层只负责翻译，
 # 不再自建一份——历史上两边各记一份导致 moving/checkingResumeData 只有 UI 认识、
-# engine 集合漏收，进而『已完成』长期少记（见 AUDIT.md B2/B3）。
+# engine 集合漏收，进而『已完成』长期少记。
 # 下载完成后的各种做种/暂停态一律显示『已完成』，不再对用户区分做种（B6）。
 
 
@@ -671,7 +711,7 @@ def live_status(status, qb_state="", qb_progress=0, qb_synced_at=None,
     in_plan=None 表示不区分首选/备用（剧场版没有集去重，用这个）。
     confirmed=False：番未确认（待确认），其待下不显示将下载/备用（那要点确认才会下），而显示『待确认』。
     single_work：番是单部作品，其 -2 按『特别篇』而不是『未知集』显示（判据见 engine.is_special_ep）。
-    locked_out：这条被锁定源挡住、这一集一份都没有 → 『锁源缺集』，不是『备用项』（判据见 core.anime.locked_out_torrent_ids）。
+    locked_out：这条被锁定源 / 版本关键词挡住、这一集一份都没有 → 『锁源缺集』，不是『备用项』（判据见 core.anime.locked_out_torrent_ids）。
     dropped：这条落在"该集已删"那一集上 → 『该集已删·不自动下』（判据见 core.anime.dropped_torrent_ids，E-73）。"""
     # 同 qb_live_text：人工终态与停滞的 qB 残留态是陈旧的，别拿它盖住真实 status
     if status in engine.MANUAL_TERMINAL_STATUSES or status == "stalled":
@@ -934,18 +974,41 @@ _HEAD_BASE_CSS = (
     # 【这里不再列 .q-table .q-badge】徽标字号由下面 _HEAD_BADGE_CSS 里那条 !important 一处定，
     # 留在这里只会变成"同一件事写在两处"——两处一旦漂开，表格里的徽标会和别处不一样大。
     ".q-table tbody td,.q-table thead th{font-size:14px}"
-    # KPI 每组：窄屏 2 列（2×2 不裁右边），≥860px 时按卡数 n 列一排
+    # KPI 每组：窄屏 2 列（2×2 不裁右边；<600px 且一组 5 张时 3 列，见下面的手机档），≥860px 时按卡数 n 列一排
     ".kpi-group{display:grid;gap:.75rem;grid-template-columns:repeat(2,minmax(0,1fr))}"
     # 窄屏两列时，一组是奇数张（番剧仪表盘 5:5）就让【第一张】横跨整行，别让落单的只占半行留个空洞。
     # 每组第一张是总量（订阅中 / 已交付），放大它比放大排在最后的那张顺眼
     "@media(max-width:859px){.kpi-group>:first-child:nth-last-child(odd){grid-column:span 2}}"
     "@media(min-width:860px){.kpi-group{grid-template-columns:repeat(var(--kpi-n,4),minmax(0,1fr))}}"
+    # 【手机档，全站只开这一个 599 的块】断点与 Quasar 的 xs（gt-xs / lt-sm）对齐。
+    # 它必须排在上面那条 .kpi-group{…repeat(2,…)} 之后：同特异性，靠先后顺序压过去。
+    # · --nicegui-default-padding 同时管 .nicegui-content / .nicegui-tab-panel / .nicegui-card /
+    #   .nicegui-expansion-content 四层，16→8px 后手机上每侧留白 60→36px（390 宽屏的卡片 127→151px）。
+    #   必须留在这个不属任何 @layer 的 <style> 里：nicegui.css 走 layer(nicegui)，未分层的规则才压得过。
+    # · <600px 且一组 5 张时 3 列（--kpi-m 由 kpi_cards 给）：5 张 + 第一张跨两列 = 6 格，排两行；
+    #   不限定在 <600px 的话，620px 宽时两组并排、单卡被压到 78px。卡内间距收紧，卡高 82→70px。
+    # · tab 左右内边距 16→4px：六个三字 tab 各 42+8=50px、共 300px，360px 宽的屏（tab 条 312px）也放得下；
+    #   放得下时 Quasar 会把 tab 均分铺满，内边距只决定"多窄还放得下"。再加第七个 tab 就放不下了，
+    #   那时给 ui.tabs() 加 mobile-arrows（tests/test_r40_ui_dash.py 按 _TABS_DEF 算着这笔账）。
+    "@media(max-width:599px){"
+    ":root{--nicegui-default-padding:.5rem}"
+    ".kpi-group{grid-template-columns:repeat(var(--kpi-m,2),minmax(0,1fr))}.kpi-group>.q-card{gap:.25rem}"
+    ".q-tab{padding:0 4px}"
+    "}"
+    # warn_banner 的多按钮组：≥640px（Tailwind sm，与它那组 sm:flex-row 同一断点）左右排时封顶宽度，
+    # 按钮多了在组内折行。用 min(22rem,50%)：只写 22rem 的话 640~760px 的窗口里正文会被压到两百像素以下。
+    # <640px 时按钮已经落到文字下面，不需要封顶。
+    "@media(min-width:640px){.warn-acts{max-width:min(22rem,50%)}}"
     # 数字输入：隐去浏览器原生上下箭头，统一成纯输入框
     "input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button"
     "{-webkit-appearance:none;margin:0}input[type=number]{-moz-appearance:textfield}"
-    # 设置页数字项栅格：桌面每格 1/4 宽（4 列），窄屏落到 2 列；顶端对齐
+    # 设置页数字项栅格：桌面 4 列，窄屏 2 列，手机（<480px）1 列；顶端对齐。
+    # 手机上两列时标签被截掉的正好是单位和『0=关』，而浮起的标签没有别的办法看全。
+    # 手机那条的后半句不能省：『代理地址』挂着 col-span-2，单列栅格里它会撑出一条隐式第二列；
+    # 本段是裸 <style>、不属任何 layer，压得过 Tailwind 的 col-span-2。
     ".field-grid{display:grid;gap:.75rem 1.25rem;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}"
     "@media(min-width:760px){.field-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}"
+    "@media(max-width:479px){.field-grid{grid-template-columns:minmax(0,1fr)}.field-grid>*{grid-column:auto}}"
     # 顶栏品牌：只要汉堡在（<1024，与 lg:hidden 同断点）就绝对居中——汉堡在左、品牌居中、动作在右；
     # ≥1024 汉堡消失、内联导航接管居中位，品牌回到静态靠左跟导航同排。两个断点必须一致，否则会出现
     # 『汉堡在、品牌却还靠左』的错位。
@@ -1081,7 +1144,8 @@ _HEAD_BADGE_CSS = (
 
 
 def _health_notices() -> None:
-    """采集停摆 / 暂停太久 / 源连续失败 / RSS 断档：全站挂一条（判据见 core/health.py，r37 #1 #7）。
+    """采集停摆 / 暂停太久 / 源连续失败 / 后台协程退出 / 推送连续发不出去 / RSS 断档：全站挂一条
+    （判据见 core/health.py 与 services/notify.problem，r37 #1 #7）。
 
     以前这些只体现在仪表盘 tab 的『上次采集』徽标上，恢复后第一轮跑完就变回灰色；生产上推送地址又是空的，
     于是容器停了 15 天、回来之后漏了哪段，全程没有任何地方说过一个字。挂在 frame() 上，任何页面都看得见。"""
@@ -1090,20 +1154,26 @@ def _health_notices() -> None:
         lines.append(p)
     if (sp := health.sources_problem()):
         lines.append(sp)
+    if (tp := health.tasks_problem()):
+        lines.append(tp)
+    if (pp := notify.problem()):
+        lines.append(pp)
     gaps = health.gaps()
     if not (lines or gaps):
         return
     tail = "（没配推送地址，这些只在页面上看得见。）" if not config.NOTIFY_URL else ""
     with ui.column().classes("w-full max-w-7xl mx-auto px-2 pt-2 gap-1"):
         for ln in lines:
-            warn_banner(ln + tail)
+            # 协程退出没有对应的推送事件，配了地址也只在页面上：给它带尾巴等于暗示"配了推送就能收到"
+            warn_banner(ln if ln is tp else ln + tail)
         if gaps:
             def _ack():
                 health.clear_gaps()
                 ui.navigate.reload()
             warn_banner("RSS 断档：下面这段时间的发布在两轮采集之间滚出了 feed、没抓到或没入库，可能漏集——"
                         + "；".join(health.gap_text(g) for g in gaps)
-                        + "。去番剧表看缺集提示，用『补齐该源』补；补完点『知道了』。" + tail,
+                        + "。去番剧表看缺集提示，用『自动补齐』补；缺集提示要等余量过了或下一集入库才出现，"
+                        "可以先到这段时间有更新的番的详情页点『自动补齐』；补完点『知道了』。" + tail,
                         action=("知道了", "done", _ack))
 
 
@@ -1177,7 +1247,7 @@ async def _db_reconnect() -> None:
     # 而 run_db_watch 的恢复边沿最多要 30 秒后才轮到——那时它清的就是【正在交付】的行：
     # 动它的占位会当场解除集去重，同一集被两个源各下一份到同一目录（这正是 _stale_sweep_pending
     # 那段注释警告的事）。在这里补做，窗口从 30 秒缩到几毫秒；标记被消费掉之后，看守协程那次会以
-    # sweep_leftovers=False 跑，只剩三个幂等操作，无害。
+    # sweep_leftovers=False 跑，只剩那几个幂等操作，无害。
     try:
         await asyncio.to_thread(worker.init_business_state, worker._stale_sweep_pending)
         await worker.sweep_leftovers_if_pending()    # 清扫要 await 问 qB，不能在上面那个线程里做（E-57）
@@ -1189,12 +1259,12 @@ async def _db_reconnect() -> None:
     ui.navigate.reload()
 
 
-# 长操作的按钮状态：全站的【默认写法】，16 个调用点。
+# 长操作的按钮状态：全站的【默认写法】。
 # 【"唯一一份"是句假话，别再这么写】此前这里写的是"全站唯一一份"，而实际另有几种并存，
 # 每种都有自己的理由，但对用户呈现的是"有的按钮会转圈、有的不会"：
 #   · settings『立刻备份』——手写 btn.props("loading") + try/finally（它要在 finally 里
 #     刷新备份列表，且成功/失败的 toast 文案各不相同，收编进来反而绕）；
-#   · settings『重新激活全部任务』/ anime『重新识别(批量)』/ anime_detail『补齐』——
+#   · settings『重新激活全部任务』/ anime_detail『补齐』——
 #     各自一个模块级 busy 字典/集合，去重粒度是【按对象】（按番、按源）而不是按按钮，
 #     busy_action 的单一 key 表达不了；
 #   · movies『立即扫描』——真正的并发保险在服务端 worker._scan_lock（页面级防抖挡不住
@@ -1281,7 +1351,7 @@ def frame(active: str = ""):
                             mi.classes("text-blue-400 font-semibold")
                     for _name, _url in _jump_targets():   # 跳转到：外链新标签打开（qB后台/Nyaa/Mikan/Bangumi）
                         ui.menu_item(f"{_name} ↗", on_click=lambda u=_url: ui.navigate.to(u, new_tab=True))
-            # 品牌：手机绝对居中(.brand-center)，≥640 静态靠左跟导航同排
+            # 品牌：窄屏(<1024，汉堡在)绝对居中(.brand-center)，≥1024 静态靠左跟导航同排
             with ui.row().classes("items-center gap-2 mr-2 sm:mr-6 brand-center"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
                 ui.label(config.SITE_NAME or "AutoRSS").classes("text-lg font-bold max-sm:hidden").style(

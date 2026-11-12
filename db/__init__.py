@@ -1,7 +1,7 @@
 """数据库：SQLModel 之上的【双引擎】——配置永远在本地 SQLite，业务数据可切到 MySQL。
 
     meta 引擎（恒为本地 SQLite，DB_PATH）  ── setting 表
-    data 引擎（SQLite 或 MySQL，可热切换）  ── 其余 6 张业务表
+    data 引擎（SQLite 或 MySQL，可热切换）  ── 其余全部业务表（见 transfer.TABLE_ORDER）
 
 为什么要拆：数据库连接信息本身得存在某个数据库里。如果它跟业务数据一起搬去 MySQL，
 那 MySQL 连不上时就再也读不到"该怎么连 MySQL"——先有鸡还是先有蛋。把 setting 钉死在本地
@@ -99,7 +99,8 @@ def make_mysql_engine(url: str, query_timeout: bool = True):
     于是整站冻结而 db_down 通知一条都发不出去。
 
     query_timeout=False 给【迁移】那条路径用：整库复制的单条 chunk 写入可能远超 15 秒，
-    而那正是"已清空目标、写到一半"最不能被打断的地方。别的调用点一律用默认值。
+    而那正是"已清空目标、写到一半"最不能被打断的地方。跑 DDL 的 `schema._ddl_engine` 同理也传 False
+    （理由见那里）。别的调用点一律用默认值。
     """
     args = {"connect_timeout": MYSQL_CONNECT_TIMEOUT}
     if query_timeout:
@@ -128,7 +129,8 @@ engine = meta_engine                          # 业务库：默认与配置同�
 # 想用本地库必须去设置页手动切（那是明确的意思表示，切完 _data_down 自然清空）。
 _data_down = ""
 # 【自愈不了的停摆】与"连不上"分开记：探测通了也不解除，必须人工介入（改配置 / 切库 / 修好再重启）。
-# 目前有两个来源：① 配置参数不全，压根没有正确的库可指；② 启动初始化就失败（建表/迁移抛异常）。
+# 目前有三个来源：① 配置参数不全，压根没有正确的库可指；② 启动初始化就失败（建表/迁移抛异常）；
+# ③ 设置页切回本地 SQLite 时迁移仍失败（见 switch_data_engine）。
 # 踩过的坑：参数不全时只标 _data_down，而 engine 此时仍是本地 SQLite（没有别的地方可指），
 # 看守协程 30 秒后拿这个引擎探一次 SELECT 1——探的是本地库，必然成功——于是停摆被自动解除，
 # 系统就在【错误的库】上继续跑，正是本文件极力要避免的那种静默回退。
@@ -565,10 +567,10 @@ def switch_data_engine(url: str | None) -> None:
       · `run.io_bound(db.switch_data_engine / transfer.migrate_data / ...)`（设置页）—— 写，
         但这几条都要用户点按钮才发生，且它们本身就是"把整个库换掉"的操作，
         与"交付路径的读改写"并发本来就没有正确解，靠的是用户不会一边迁移一边下载
-      · `asyncio.to_thread(worker.init_business_state, ...)`（页面『立即重连』）—— **写**。
-        它里面的 `reset_downloading()` 会无条件把 downloading 打回 pending，
-        与事件循环里正在交付的行有一个窗口（见 pages/layout.py `_db_reconnect` 的说明：
-        窗口从看守协程的 30 秒缩到了几毫秒，但不是零）。
+      · `asyncio.to_thread(worker.init_business_state, ...)`（看守协程的恢复边沿 + 页面『立即重连』）—— **写**。
+        它写的是几项幂等 / 一次性的初始化与存量补数。交付残骸（downloading 占位）的复位已不在它里面：
+        E-57（R35）起这件事它只记账（`worker._stale_sweep_pending`），清扫由
+        `worker.sweep_leftovers_if_pending()` 回到事件循环上做，并跳过 `engine._delivering` 登记的在途行。
     所以这段话准确的说法是：**交付路径的原子性只在事件循环内部成立**，
     上面第四条是已知且已缩到最小的例外。
 
