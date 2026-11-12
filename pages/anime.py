@@ -1514,10 +1514,10 @@ def anime_page(t: str = ""):
         # 懒加载：首屏只构建当前 tab 的内容；切到别的 tab 首次才建（6 个面板 → 1 个，砍首屏构建/推送）。
         # 面板都是 @ui.refreshable，未构建过的 .refresh() 是安全 no-op，所以刷新逻辑无需改动。
         _builders = {
-            # 定高的在前、变长的在后：KPI → 横幅 → 种子/下载/采集状态（健康信号，生产没配推送时页面是唯一渠道，
-            # 不许落到变长列表之后）→ 正在下载 → 新入库 → 订阅源组与两张统计图（不回答"正常吗/刚下了什么"，放页尾）
-            "overview": lambda: (_ov_snap.clear(), overview_head(), alerts_panel(), overview_tail(),
-                                 inflight_panel(), recent_panel(), charts_panel(),
+            # KPI → 横幅 → 订阅源组与两张统计图（用户要的位置）→ 种子/下载/采集状态（健康信号，
+            # 生产没配推送时页面是唯一渠道，不许落到变长列表之后）→ 正在下载 → 新入库
+            "overview": lambda: (_ov_snap.clear(), overview_head(), alerts_panel(), charts_panel(),
+                                 overview_tail(), inflight_panel(), recent_panel(),
                                  _ov_snap.clear()),
             "manage": _build_manage_tab, "confirm": confirm_panel,
             "fail": fail_panel, "reject": reject_panel, "sources": render_sources,
