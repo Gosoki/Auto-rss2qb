@@ -163,3 +163,24 @@ def test_lock_fallback_touches_in_both_steps(cfg, monkeypatch, touches, step, ok
     monkeypatch.setattr(A, "notify_event", notify)
     assert asyncio.run(A.deliver_lock_fallback(qb_alive=True)) == (1 if ok else 0)
     assert len(touches) == 1
+
+
+def test_end_mark_prefilter_is_case_insensitive_like_mysql_bin(clean_tables, monkeypatch):
+    """MySQL 上 raw_title 是 utf8mb4_bin、LIKE 分大小写：SQL 预筛只写死几种写法时 [End]/[FIN] 到不了正则。
+    这里用 SQLite 的 case_sensitive_like 在独立引擎上模拟那种排序规则（不污染共享连接池）。"""
+    from sqlalchemy import create_engine, event
+    from sqlmodel import Session
+    import db as _db
+    with _db.get_session() as s:
+        aid = _anime(s)
+        for ep, tag in ((10, " [End]"), (11, "")):
+            _row(s, aid, "G", ep, raw_title=f"[G] 某番 - {ep:02d}{tag}")
+        bid = _anime(s, title="另番", display_name="另番", bangumi_id=2)
+        _row(s, bid, "G", 12, raw_title="[G] 另番 - 12 [FIN]")
+    eng = create_engine(_db.engine.url)
+    event.listen(eng, "connect", lambda c, _r: c.execute("PRAGMA case_sensitive_like=ON"))
+    monkeypatch.setattr(A, "get_session", lambda: Session(eng))
+    try:
+        assert A._end_marked_episodes([aid, bid]) == {aid: 10, bid: 12}
+    finally:
+        eng.dispose()

@@ -118,20 +118,19 @@ class QBittorrent:
                     log.info("qBittorrent 连上了（之前连续 %d 次连不上）", self._net_fails)
                 self._net_fails = 0
                 return client
-            # 凭据错 / 已被封 → 长冷却。再撞下去只会把封禁时间续上，且用户改对密码后仍连不上。
-            self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_AUTH
-            log.error("qBittorrent 登录失败: %s %s（%d 秒内不再重试；改完账号密码点『保存』可立即重试）",
-                      resp.status_code, resp.text[:80], _LOGIN_COOLDOWN_AUTH)
+            if resp.status_code == 403 or (resp.status_code == 200
+                                           and resp.text.strip().lower().startswith("fails")):
+                # 凭据错 / 已被封 → 长冷却。再撞下去只会把封禁时间续上，且用户改对密码后仍连不上。
+                self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_AUTH
+                log.error("qBittorrent 登录失败: %s %s（%d 秒内不再重试；改完账号密码点『保存』可立即重试）",
+                          resp.status_code, resp.text[:80], _LOGIN_COOLDOWN_AUTH)
+                return None
+            # 其余状态不是 qB 自己的凭据判定：qB 前有反代时，qB 重启期间反代回 502/503，
+            # 当成凭据错会冷却 5 分钟、还在日志里叫用户去改密码。按连不上处理。
+            self._note_net_fail(f"HTTP {resp.status_code} {resp.text[:80]}")
             return None
         except httpx.HTTPError as e:
-            self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_NET   # 网络类：短冷却，qB 重启很快回来
-            # 【连续失败只在第一次记 ERROR】(r37) 10-14 断网那 30 小时里这一行记了 250 次，
-            # 把 200 条的日志缓冲整个冲掉了。之后每 12 次（约 4 小时）记一行 INFO，恢复时再记一行。
-            self._net_fails += 1
-            if self._net_fails == 1:
-                log.error("qBittorrent 登录请求失败: %s", e)
-            elif self._net_fails % 12 == 0:
-                log.info("qBittorrent 仍然连不上（连续 %d 次）: %s", self._net_fails, e)
+            self._note_net_fail(e)
             return None
         except Exception as e:                 # 非 HTTP 类异常(socket/URL 等)也别逃逸；CancelledError 是
             self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_NET
@@ -140,6 +139,16 @@ class QBittorrent:
         finally:
             if not ok:
                 await client.aclose()
+
+    def _note_net_fail(self, e) -> None:
+        self._fail_until = time.monotonic() + _LOGIN_COOLDOWN_NET   # 网络类：短冷却，qB 重启很快回来
+        # 【连续失败只在第一次记 ERROR】(r37) 10-14 断网那 30 小时里这一行记了 250 次，
+        # 把 200 条的日志缓冲整个冲掉了。之后每 12 次（约 4 小时）记一行 INFO，恢复时再记一行。
+        self._net_fails += 1
+        if self._net_fails == 1:
+            log.error("qBittorrent 登录请求失败: %s", e)
+        elif self._net_fails % 12 == 0:
+            log.info("qBittorrent 仍然连不上（连续 %d 次）: %s", self._net_fails, e)
 
     async def _close(self) -> None:
         if self._client is not None:

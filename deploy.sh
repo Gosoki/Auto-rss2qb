@@ -45,7 +45,11 @@ if [ ! -x "$APP/.venv/bin/python" ] || ! "$APP/.venv/bin/python" -V 2>/dev/null 
   systemctl stop "$SVC" 2>/dev/null || true
   uv venv --clear --python "$PYVER"
 fi
-uv pip install -r requirements.txt
+# 按锁文件装：只给下限的 requirements.txt 在重建 venv 时会拉当天最新、没测过的版本。
+# 用 install 不用 sync：sync 只装清单里的包，不补 greenlet 这类开发机(macOS arm64)没装、
+# 而 Linux 上 SQLAlchemy 需要的平台依赖；也不删用户手动装进 .venv 的东西。
+[ -f "$APP/requirements.lock" ] || { echo "❌ $APP 下没有 requirements.lock"; exit 1; }
+uv pip install -r requirements.lock
 
 PY="$APP/.venv/bin/python"
 [ -x "$PY" ] || { echo "❌ 虚拟环境没建出来：$PY"; exit 1; }
@@ -84,10 +88,27 @@ EOF
 
 systemctl daemon-reload
 systemctl enable "$SVC" >/dev/null 2>&1 || true
+# 【不能只看 is-active】main.py 把启动初始化（建表/迁移/读配置）的异常接住转成停摆，Web 照常起、进程活着，
+# 以前这里照样打「✅ 部署完成」，而采集/下载其实全停了。所以按本次启动之后的日志判：
+#   · 失败：main.py 启动时的两条停摆日志（初始化抛异常 / 业务库停摆中），或进程已退出；
+#   · 就绪：「自动备份协程启动」—— 后台协程只在 _startup 跑完后才建，它出现时停摆日志若有必然已先写出。
+#     不用 NiceGUI 的 "ready to go"：那行在本项目 _startup 之前就打了，证明不了初始化成功。
+# 这些文案改了要同步这里（tests/test_ops_r41.py 核它们仍在源码里）。
+T0="$(date +%s)"
 systemctl restart "$SVC"
-sleep 3
+STATE=timeout
+for _ in $(seq 30); do
+  sleep 2
+  LOG="$(journalctl -u "$SVC" --since "@$T0" --no-pager 2>/dev/null || true)"
+  if grep -qF -e '启动初始化失败，系统停摆' -e '业务数据库停摆中' <<<"$LOG" || ! systemctl is-active --quiet "$SVC"; then
+    STATE=fail; break
+  fi
+  if grep -qF '自动备份协程启动' <<<"$LOG"; then
+    STATE=ok; break
+  fi
+done
 
-if systemctl is-active --quiet "$SVC"; then
+if [ "$STATE" = ok ]; then
   # 探一下本机所在网段，只是把上面那条警告里的例子换成用户真实的网段（不自动写进配置：
   # 推错了会把用户挡在自己的面板外，这个决定留给人做）。
   # 【必须带 || true】grep 无匹配退出 1，而 set -euo pipefail 会让这条赋值直接掐死脚本——
@@ -116,8 +137,11 @@ if systemctl is-active --quiet "$SVC"; then
   echo
   echo "   日志: journalctl -u ${SVC} -f     重启: systemctl restart ${SVC}"
   echo "   升级: git pull && bash deploy.sh"
-else
-  echo "❌ 启动失败，最近日志："
+elif [ "$STATE" = fail ]; then
+  echo "❌ 启动失败（或启动后停摆），最近日志："
   journalctl -u "$SVC" -n 30 --no-pager
+  exit 1
+else
+  echo "⚠ 等了 60 秒没看到启动完成的日志，不能确认部署成功。看日志：journalctl -u ${SVC} -n 50 --no-pager"
   exit 1
 fi

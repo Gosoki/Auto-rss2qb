@@ -1156,6 +1156,8 @@ def _health_notices() -> None:
         lines.append(sp)
     if (tp := health.tasks_problem()):
         lines.append(tp)
+    if (bp := health.backup_problem()):
+        lines.append(bp)
     if (pp := notify.problem()):
         lines.append(pp)
     gaps = health.gaps()
@@ -1164,11 +1166,11 @@ def _health_notices() -> None:
     tail = "（没配推送地址，这些只在页面上看得见。）" if not config.NOTIFY_URL else ""
     with ui.column().classes("w-full max-w-7xl mx-auto px-2 pt-2 gap-1"):
         for ln in lines:
-            # 协程退出没有对应的推送事件，配了地址也只在页面上：给它带尾巴等于暗示"配了推送就能收到"
-            warn_banner(ln if ln is tp else ln + tail)
+            # 协程退出、备份超期都没有对应的推送事件，配了地址也只在页面上：给它带尾巴等于暗示"配了推送就能收到"
+            warn_banner(ln if ln is tp or ln is bp else ln + tail)
         if gaps:
             def _ack():
-                health.clear_gaps()
+                health.clear_gaps(gaps)
                 ui.navigate.reload()
             warn_banner("RSS 断档：下面这段时间的发布在两轮采集之间滚出了 feed、没抓到或没入库，可能漏集——"
                         + "；".join(health.gap_text(g) for g in gaps)

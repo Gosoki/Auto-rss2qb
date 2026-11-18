@@ -334,6 +334,22 @@ def verify(path: str) -> tuple[bool, str]:
     return True, f"可用（{describe_content(path)}）"
 
 
+# 自动备份连续失败次数（进程内；重启从 0 数起）。用来给日志限频，判据同 r37 源抓取失败：
+# 失败后每 10 分钟心跳重试一次，满盘/目录不可写这类故障每次都失败，逐次记 ERROR 一天 144 行，
+# 会把 /logs 的 100 条 ERROR 环形缓冲冲得别的错一条不剩。持续失败由全站横幅提示（core.health.backup_problem）。
+_auto_fail_streak = 0
+_AUTO_FAIL_LOG_EVERY = 36        # 连续失败时每 36 次（约 6 小时）再记一行，证明还在试、还在败
+
+
+def _auto_failed(msg: str, *args) -> None:
+    global _auto_fail_streak
+    _auto_fail_streak += 1
+    if _auto_fail_streak == 1:
+        log.error(msg, *args)
+    elif _auto_fail_streak % _AUTO_FAIL_LOG_EVERY == 0:
+        log.warning("自动备份仍在失败（连续 %d 次）：" + msg, _auto_fail_streak, *args)
+
+
 def auto_tick() -> bool:
     """后台心跳调用：开了自动备份且距上次 ≥ BACKUP_INTERVAL_HOURS 就备一次。备了返回 True。
 
@@ -355,14 +371,14 @@ def auto_tick() -> bool:
     try:
         res = backup_now(keep=config.BACKUP_KEEP)
     except Exception as e:
-        log.error("自动备份失败：%s: %s", type(e).__name__, e)
+        _auto_failed("自动备份失败：%s: %s", type(e).__name__, e)
         return False
     # 【做完就验一次】verify 的 docstring 说的就是"做完/恢复前都该验"，而自动这条路径是
     # 唯一没人盯着的：验不过还记下 BACKUP_LAST，就会安静地等满一个间隔再做下一份，
     # 中间这段时间用户手里的"最新备份"其实打不开。
     ok, why = verify(res["path"])
     if not ok:
-        log.error("自动备份做完了但自检未通过（不记时间，下次心跳重做）：%s —— %s", res["path"], why)
+        _auto_failed("自动备份做完了但自检未通过（不记时间，下次心跳重做）：%s —— %s", res["path"], why)
         try:
             Path(res["path"]).unlink(missing_ok=True)   # 可疑文件比没有更危险
         except OSError:
@@ -370,5 +386,9 @@ def auto_tick() -> bool:
         return False
     # 【只有成功才记时间】失败不记 → 下次心跳还会再试，而不是等满一个间隔
     config.set_many({"BACKUP_LAST": datetime.now().isoformat(timespec="seconds")})
+    global _auto_fail_streak
+    if _auto_fail_streak:
+        log.info("自动备份恢复了（之前连续 %d 次失败）", _auto_fail_streak)
+        _auto_fail_streak = 0
     log.info("自动备份：%s", res["note"])
     return True

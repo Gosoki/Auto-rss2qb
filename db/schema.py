@@ -77,11 +77,34 @@ def _ddl_engine(engine):
     这里要的只是**握手有上界**：连不上就快点失败，别把整站拖进维护态。
     （"DDL 被 MySQL 的元数据锁挡住"是另一件事：E-50 给它设了 lock_wait_timeout 上界，见下面的 connect 事件。）
 
-    SQLite 直接用调用方的引擎：本地文件，没有握手这回事，而它的 busy_timeout
-    已经在 `_sqlite_engine` 里设过了。
+    【SQLite 也要另建，为的是事务而不是握手】pysqlite 只在 DML 前隐式 BEGIN，DDL 一律自动提交：
+    alembic 对 SQLite 是每条 revision 各开一个事务，那个事务对 ADD COLUMN / batch 的 _alembic_tmp_ 表形同虚设。
+    一条 revision 中途失败时，已执行的 DDL 落了盘、alembic_version 却没推进 →
+    下次启动重跑同一条撞 duplicate column → mark_data_fatal，永久停摆。
+    按 SQLAlchemy 文档的 pysqlite 写法：关掉驱动的隐式事务、由 begin 事件自己发 BEGIN，
+    每条 revision（含 DDL 与版本号）才真是一个事务。不能直接改调用方的引擎：业务连接池也在用它。
+    走 db._sqlite_engine 建，WAL / busy_timeout 照样挂上。
+    内存库（:memory:）另建就是另一个库，只能照旧复用。
     """
     if engine.url.get_backend_name() != "mysql":
-        yield engine
+        if engine.url.database in (None, "", ":memory:"):
+            yield engine
+            return
+        from . import _sqlite_engine
+        eng = _sqlite_engine(engine.url.render_as_string(hide_password=False))
+
+        @sa.event.listens_for(eng, "connect")
+        def _no_implicit_tx(dbapi_conn, _record):
+            dbapi_conn.isolation_level = None
+
+        @sa.event.listens_for(eng, "begin")
+        def _explicit_begin(conn):
+            conn.exec_driver_sql("BEGIN")
+
+        try:
+            yield eng
+        finally:
+            eng.dispose()
         return
     from . import MYSQL_DDL_LOCK_WAIT_TIMEOUT, make_mysql_engine
     eng = make_mysql_engine(engine.url.render_as_string(hide_password=False),

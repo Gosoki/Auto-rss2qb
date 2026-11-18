@@ -694,6 +694,9 @@ async def fetch_torrent_bytes(url: str, strict: bool = True) -> bytes:
     # 只换 request 钩子：整个覆写 event_hooks 会把默认的 response 钩子（摘中间跳的压缩编码）一起丢掉
     kwargs["event_hooks"]["request"] = [
         ssrf.block_internal_request if strict else ssrf.guard_redirect_request]
+    # 钉了 IP 的跳建连失败时换下一个已校验地址（理由见 block_internal_request）；
+    # 没钉 IP 的请求原样透传，走代理的请求根本不经过它
+    kwargs["transport"] = ssrf.PinnedRetryTransport()
     async with httpx.AsyncClient(**kwargs) as client:
         # 复用 services.fetch 的封顶实现，别再手写一份：那份已经处理了"上限只作用在解压后"
         # 这个坑（一个几百 KB 的 gzip 压缩体能在单个块里解出几十 MB，等发现超限内存早就上去了）。

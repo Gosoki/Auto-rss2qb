@@ -9,6 +9,7 @@ import functools
 import logging
 import re
 from collections import Counter
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from typing import NamedTuple
 
@@ -539,6 +540,27 @@ def _top_priority() -> int:
 
 # ---------------- 管线 ----------------
 
+# 【本轮 bgm 熔断】bgm 连接被吞（被墙/挂死）时 enrich.resolve 每部都要等满整体预算（120s），
+# 季初几十部新番 → 一轮拖一两小时，下载放行与外部心跳全被堵在后面。
+# 连续 BGM_ROUND_BREAKER 部都因"没问成"没识别成，本轮剩下的新番就不再去问，走与识别失败
+# 完全相同的路径（进『待识别』、种子照常入库），由 retry_unmatched 在后台按退避重来。
+# 状态只活在一轮里：poll_once 开头 bgm_round_start() 重置；没开轮的调用方（默认 None）不熔断。
+# 用 ContextVar 而不是模块变量：与 enrich 的失败记账同理，别的协程的调用不该吃到采集轮的熔断。
+_bgm_round: ContextVar[dict | None] = ContextVar("autorss_bgm_round", default=None)
+
+
+def bgm_round_start() -> None:
+    """采集轮开头调：清零本轮的连续失败计数与跳过数。"""
+    _bgm_round.set({"streak": 0, "skipped": 0})
+
+
+def bgm_round_end() -> None:
+    """采集轮正常跑完时调：本轮有跳过的就记一行。"""
+    st = _bgm_round.get()
+    if st and st["skipped"]:
+        log.warning("本轮 bgm 连不上，剩下 %d 部跳过识别（进『待识别』，后台重试）", st["skipped"])
+
+
 async def _resolve_anime(item) -> int:
     """把一条种子映射到唯一的 Anime，返回 anime_id。
 
@@ -553,7 +575,18 @@ async def _resolve_anime(item) -> int:
             return alias.anime_id
 
     # 未命中：富集定身份（尽力而为，拿不到就当独立新番）
-    info = await enrich.resolve(item.search_names, item.release_time, item.episode, item.info_hash)
+    rnd = _bgm_round.get()
+    th = config.BGM_ROUND_BREAKER
+    if rnd is not None and th > 0 and rnd["streak"] >= th:
+        rnd["skipped"] += 1
+        info = None
+    else:
+        before = (enrich.net_failures(), enrich.budget_timeouts())
+        info = await enrich.resolve(item.search_names, item.release_time, item.episode, item.info_hash)
+        if rnd is not None:
+            # 只有"没识别成且这次确实没问成 bgm"才累计；查无 / 识别成都说明 bgm 通着，清零
+            unreached = info is None and (enrich.net_failures(), enrich.budget_timeouts()) != before
+            rnd["streak"] = rnd["streak"] + 1 if unreached else 0
 
     with get_session() as s:
         alias = s.exec(select(AnimeAlias).where(  # 重入保护：再查一次
@@ -2290,8 +2323,9 @@ def _end_marked_episodes(anime_ids) -> dict:
     with get_session() as s:
         rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.raw_title).where(
             AnimeTorrent.anime_id.in_(ids), AnimeTorrent.episode >= 1,
-            or_(AnimeTorrent.raw_title.contains("END"), AnimeTorrent.raw_title.contains("end"),
-                AnimeTorrent.raw_title.contains("Fin"), AnimeTorrent.raw_title.contains("完")))))
+            # 预筛先转小写：MySQL 上 raw_title 是 utf8mb4_bin、LIKE 分大小写，写死几种写法会把 [End]/[FIN] 漏在正则之前
+            or_(func.lower(AnimeTorrent.raw_title).contains("end"), func.lower(AnimeTorrent.raw_title).contains("fin"),
+                AnimeTorrent.raw_title.contains("完")))))
     out: dict = {}
     for aid, ep, raw in rows:
         if _END_MARK_RE.search(raw or "") and float(ep).is_integer():
@@ -3995,6 +4029,7 @@ async def enrich_anime(anime_id: int, freeze_empty_path: bool = False,
         #
         # 留下的两条同 bgm_id 记录由 suspect_duplicate_anime 报到仪表盘，
         # 用户到详情页走绑定那条路合并（那条带回显）。
+        dup_note = None
         if a.bangumi_id is not None:
             dup = list(s.exec(select(Anime).where(
                 Anime.bangumi_id == a.bangumi_id, Anime.id != a.id)))
@@ -4004,10 +4039,10 @@ async def enrich_anime(anime_id: int, freeze_empty_path: bool = False,
                             "本路径不合并、不删行（合并只在『绑定 bgm』那条带回显的路上做），"
                             "请到仪表盘按提示人工核对",
                             f"#{a.id}「{display_of(a)}」", a.bangumi_id, names)
-                await notify_event(
-                    "backlog", f"{display_of(a)} 与 {names} 绑到了同一个 bgm，"
-                               "识别没有合并（合并会删记录）。去仪表盘核对一下",
-                    key=f"dup:{a.bangumi_id}", cooldown=24 * 3600)
+                dup_note = (f"{display_of(a)} 与 {names} 绑到了同一个 bgm，"
+                            "识别没有合并（合并会删记录）。去仪表盘核对一下", f"dup:{a.bangumi_id}")    # 通知在会话外发：推送最长要等 NOTIFY_TIMEOUT，会话跨 await 开着会在 MySQL 上白占一条连接
+    if dup_note is not None:
+        await notify_event("backlog", dup_note[0], key=dup_note[1], cooldown=24 * 3600)
     return bool(info)
 
 

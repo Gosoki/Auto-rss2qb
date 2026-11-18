@@ -459,11 +459,18 @@ def test_the_ddl_engine_bounds_metadata_lock_waits(monkeypatch):
     assert ours == [f"SET SESSION lock_wait_timeout = {D.MYSQL_DDL_LOCK_WAIT_TIMEOUT}"], sent
 
 
-def test_sqlite_reuses_the_callers_engine(tmp_path):
-    """SQLite 不另建：本地文件没有握手这回事，busy_timeout 已经在 `_sqlite_engine` 里设过。"""
+def test_sqlite_ddl_engine_is_separate_but_keeps_the_pragmas(tmp_path):
+    """SQLite 也另建 DDL 引擎（为了真事务，见 test_migration_atomic.py），但 WAL / busy_timeout 照样挂上；
+    内存库另建就是另一个库，只能照旧复用。"""
     from db import schema as S
 
     eng = sa.create_engine(f"sqlite:///{tmp_path / 'x.db'}")
     with S._ddl_engine(eng) as e:
-        assert e is eng
+        assert e is not eng
+        with e.connect() as c:
+            assert c.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
+            assert c.exec_driver_sql("PRAGMA busy_timeout").scalar() == 5000
     eng.dispose()
+    mem = sa.create_engine("sqlite://")
+    with S._ddl_engine(mem) as e:
+        assert e is mem

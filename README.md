@@ -12,7 +12,7 @@
 ## 运行（本地开发）
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.lock   # 与生产同一组固定版本；requirements.txt 只是直接依赖清单
 cp .env.example .env      # 可选：只放 Web 端口等结构项
 python main.py            # 浏览器打开 http://127.0.0.1:2333（启动横幅会打印确切地址）
 ```
@@ -46,6 +46,18 @@ Debian 11 的 3.9 也无所谓）→ 建 `.venv` 装依赖 → 写 `.env`（`WEB
 ```bash
 journalctl -u autorss -f          # 看日志
 systemctl restart autorss         # 重启
+```
+
+### 依赖与升级
+
+`deploy.sh` 按 `requirements.lock`（固定版本、不含 hash，跨 macOS/Linux 通用）安装，不读 `requirements.txt`。
+升级依赖 = 改 `requirements.txt` → 本地升级并跑测试 → 重新生成锁文件，三者一次显式提交：
+
+```bash
+.venv/bin/python -m pip install -U -r requirements.txt
+.venv/bin/python -m pytest -q
+.venv/bin/python -m pip freeze --exclude-editable > requirements.lock
+# 再删掉不在 requirements.txt 依赖树里的开发工具行（如 pyflakes），并保留文件头注释
 ```
 
 > ⚠️ **本工具没有鉴权**，设置页还存着 qB 密码。绑 `0.0.0.0` 后请进设置页把 `WEB_ALLOW_CIDRS`

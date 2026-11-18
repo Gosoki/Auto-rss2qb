@@ -137,6 +137,18 @@ def net_failures() -> int:
     return _bgm_fail_ctx.get()
 
 
+# 【整体预算超时单独记一个数，不并进上面那个】预算超时不一定是 bgm 的锅（Mikan 桥也在预算里），
+# 并进 net_failures 会让退避阶梯被错误退款（理由见 resolve 的 except TimeoutError）。
+# 消费者是采集轮的 bgm 熔断（core.anime._resolve_anime）：它关心的是"这一部是不是白等了一整个预算"，
+# 不管是谁拖的。同样按任务分账。
+_budget_timeout_ctx: ContextVar[int] = ContextVar("autorss_resolve_budget_timeout", default=0)
+
+
+def budget_timeouts() -> int:
+    """**当前任务**里 resolve 撞上整体预算超时的累计次数。用法同 net_failures（取前后差值）。"""
+    return _budget_timeout_ctx.get()
+
+
 _MIKAN_BANGUMI_RE = re.compile(r"/Home/Bangumi/(\d+)")
 _BGM_SUBJECT_RE = re.compile(r"bgm\.tv/subject/(\d+)")
 _CJK_RE = re.compile(r"[一-鿿぀-ヿ]")
@@ -488,7 +500,8 @@ async def resolve(names, release_time=None, episode=None, info_hash=None) -> dic
         # 'Mikan 打不开' 被判成 'bgm 整体不可达'，把退避阶梯无限退款"。
         # 无条件记的话，Mikan 涓流就能让每一轮都退款：enrich_tries 永远回到 0、
         # 每个检查节拍重打一遍 bgm，而 bgm 从头到尾都是 200。实测复现过。
-        # 内层已经在每个真实的 bgm 失败点各记了一笔，这里【什么都不做】才是准确的。
+        # 内层已经在每个真实的 bgm 失败点各记了一笔，这里【不记 bgm 的账】才是准确的。
+        _budget_timeout_ctx.set(_budget_timeout_ctx.get() + 1)
         log.warning("富集超时（整体 %ds），按未识别处理：%s",
                     _RESOLVE_BUDGET, (names[0] if names else info_hash or "")[:40])
         return None

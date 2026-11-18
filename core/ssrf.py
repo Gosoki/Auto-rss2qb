@@ -78,6 +78,16 @@ async def safe_ip_for(host: str, allow_fake_ip: bool = False) -> str | None:
     里对 DNS 重绑定的说明。字面 IP 原样返回（校验通过的话），域名取第一个解析结果。
     解析失败/无结果保守视作内网（反正也连不上）。
     """
+    ips = await safe_ips_for(host, allow_fake_ip)
+    return ips[0] if ips else None
+
+
+async def safe_ips_for(host: str, allow_fake_ip: bool = False) -> list[str] | None:
+    """同 safe_ip_for，但按 getaddrinfo 的顺序返回【全部】校验过的地址（去重）——给取种换地址重试用。
+
+    判据与 safe_ip_for 是同一份（后者就是取这里的第一个）：任何一个地址落在内网就整体 None，
+    不是"挑出公网的那几个用"——混着内网地址的应答本身就是重绑定的征兆。
+    """
     def _bad(ip, resolved: bool) -> bool:
         # 【豁免只对【解析出来的】地址成立】(R21 收紧) fake-ip 的立论是"只有当本机解析器
         # 就是 fake-ip 代理时才会返回这一段"——那是关于 **DNS 解析结果** 的论断。
@@ -91,7 +101,7 @@ async def safe_ip_for(host: str, allow_fake_ip: bool = False) -> str | None:
 
     host = (host or "").strip("[]")            # 去 IPv6 字面量方括号
     try:
-        return None if _bad(ipaddress.ip_address(host), resolved=False) else host
+        return None if _bad(ipaddress.ip_address(host), resolved=False) else [host]
     except ValueError:
         pass
     try:
@@ -101,7 +111,7 @@ async def safe_ip_for(host: str, allow_fake_ip: bool = False) -> str | None:
         return None
     if not infos:
         return None
-    first = None
+    ips: list[str] = []
     for info in infos:
         try:
             addr = ipaddress.ip_address(info[4][0])
@@ -109,9 +119,9 @@ async def safe_ip_for(host: str, allow_fake_ip: bool = False) -> str | None:
             return None                        # 解析出无法识别的地址形态 → 保守拒
         if _bad(addr, resolved=True):
             return None                        # 只要有一个内网地址就整体拒（别给轮询解析留缝）
-        if first is None:
-            first = info[4][0]
-    return first
+        if info[4][0] not in ips:
+            ips.append(info[4][0])
+    return ips
 
 
 async def block_internal_request(request: httpx.Request) -> None:
@@ -132,6 +142,8 @@ async def block_internal_request(request: httpx.Request) -> None:
     的 feed，在最常见的配置下能让后台 flush 协程替它去打同机 qB。实测复现过。
     """
     host = request.url.host or ""
+    # extensions 会顺着重定向链浅拷贝下去：上一跳的候选地址不能被这一跳（字面 IP / 代理模式）误用
+    request.extensions.pop(_PIN_KEY, None)
     if config.PROXY:
         # 【代理模式下也要解析主机名，只是不钉 IP】(E-40，2026-09-01 拍板)
         # 旧写法的判据是"ipaddress 解析得出来的才判"，而那既不是"是不是字面 IP"、
@@ -153,16 +165,18 @@ async def block_internal_request(request: httpx.Request) -> None:
         if await safe_ip_for(host, allow_fake_ip=True) is None:
             raise ValueError(f"拒绝请求内网/环回地址（防 SSRF）：{host}")
         return
-    ip = await safe_ip_for(host)
-    if ip is None:
+    ips = await safe_ips_for(host)
+    if not ips:
         raise ValueError(f"拒绝请求内网/环回地址（防 SSRF）：{host}")
-    # 【已知取舍】钉住单个地址 = 放弃 httpx/anyio 的 happy-eyeballs 多地址回退（RFC 6555）：
-    # 域名解析出多个地址时，原先连不通第一个会自动试下一个，现在只连我们选中的那个。
-    # 接受它的理由：多地址回退只在"第一个地址不通、其余通"时才有价值，而那对本工具的场景
-    # （固定几个种子站、走同一条家宽）很罕见；而不钉就等于把 DNS 重绑定的洞留着。
-    # 真要两者兼得，得在这条关键下载路径上加一层"逐个候选地址重试"的循环——
-    # 那条路径一旦写错就是【所有下载全挂】，代价不对等，故不做。
+    ip = ips[0]
+    # 【钉 IP 会丢掉 happy-eyeballs 多地址回退，所以补一层有限的换地址重试】
+    # 只钉第一个地址时，"有全局 IPv6、上游 v6 不通"（LXC/家宽常见）且 AAAA 排前的站会让
+    # 取种全挂，而抓 feed 不钉 IP、照常成功——症状是 ~40h 后整批落 error 漏集。
+    # 候选地址全部来自【同一次】解析、且整组已过内网判定（混着内网地址的应答整体拒），
+    # 重试由 PinnedRetryTransport 做：只在建连失败时换下一个，最多 _PIN_MAX 个，
+    # 总时长仍受调用方的总超时约束；Host 头与 SNI 不随换地址改变。
     if ip != host:                     # 域名 → 钉到刚校验过的地址；字面 IP 无需改写
+        request.extensions[_PIN_KEY] = ips[:_PIN_MAX]
         # 【Host 头要带端口】request.url.host 不含端口，直接拿它当 Host 会把
         # 'example.com:8443' 写成 'example.com' —— 非默认端口的私站取种恒失败，
         # 而浏览器/curl 一切正常，排查方向会被完全带偏。netloc 是"主机[:端口]"的原样。
@@ -172,6 +186,40 @@ async def block_internal_request(request: httpx.Request) -> None:
         request.headers["Host"] = netloc
         if request.url.scheme == "https":
             request.extensions["sni_hostname"] = host
+
+
+_PIN_KEY = "autorss_pin_ips"
+_PIN_MAX = 3
+
+
+class PinnedRetryTransport(httpx.AsyncBaseTransport):
+    """取种用：被 block_internal_request 钉了 IP 的请求，建连失败时按解析顺序换下一个候选地址。
+
+    【只认建连失败】ConnectError/ConnectTimeout 意味着请求一个字节都没发出去，换地址重发不会重复副作用；
+    HTTP 状态、读超时、SSRF 拒绝都不重试——那些换地址也不会变好，或者请求已经发出去了。
+    【候选只从钩子写的那份取】这里不解析、不判定，所以不会多出一条绕开内网判定的路；
+    并要求当前主机正是候选里的第一个，防上一跳留下的候选被一个没钉 IP 的跳误用。
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport | None = None):
+        self._inner = inner or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        ips = request.extensions.get(_PIN_KEY) or []
+        if len(ips) < 2 or request.url.host != ips[0]:
+            return await self._inner.handle_async_request(request)
+        first_err = None
+        for ip in ips:
+            request.url = request.url.copy_with(host=ip)
+            try:
+                return await self._inner.handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                first_err = first_err or e
+        raise first_err
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
 
 async def guard_redirect_request(request: httpx.Request) -> None:
     """请求级钩子：**首跳放行，重定向后的每一跳强制内网判定**。config 默认给所有客户端装上。

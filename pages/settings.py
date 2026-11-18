@@ -35,7 +35,7 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "ANIME_BACKFILL_EXTRA_EPS", "ANIME_LOCK_SYNC_DAYS", "ANIME_IDLE_WINDOW_X",
             "ANIME_IGNORED_AIRING_DAYS", "ALERT_REPEAT_HOURS", "ALERT_REPEAT_DAYS",
             "ANIME_LOCK_FALLBACK_DAYS", "ANIME_REPLACE_MAX_GAP_DAYS", "ANIME_GAP_AUTOFILL_DAYS",
-            "NOTIFY_DIGEST_HOURS", "NOTIFY_DIGEST_AT"}
+            "NOTIFY_DIGEST_HOURS", "NOTIFY_DIGEST_AT", "BGM_ROUND_BREAKER"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
@@ -964,7 +964,7 @@ def settings():
             _text("IPFILTER_DIR", "qB 那台上的存放目录", config.IPFILTER_DIR,
                   f"空=工作目录下的 IPBlocker（{ipfilter.default_dir() or '工作目录还没填'}）")
             _text("IPFILTER_SEED_URL", "qB 访问本程序的地址", config.IPFILTER_SEED_URL,
-                  f"空=自动（{ipfilter.auto_seed_base()}）")
+                  f"空=自动（{ipfilter.auto_seed_base() or '按 qB 地址的主机名解析出的本机地址'}）")
 
             @ui.refreshable
             def _ipf_status():
@@ -1357,12 +1357,17 @@ def settings():
                      "后台查到 bgm：自动源发现的直接转『订阅中』开始自动下（绑定看着不对、绑到只有 1 集的条目、像剧场版、"
                      "早于开始使用日、已经下过、另有一条番绑着同一个 bgm 的留在『待确认』）；人工审核源发现的进『待确认』。\n"
                      "已绑好的番每收录 N 集（按不同集号数）自动刷一次 bgm 资料：评分、总集数、封面跟着播出更新。"
-                     "只刷资料、不改绑定，也不改已下番的归档目录。")
+                     "只刷资料、不改绑定，也不改已下番的归档目录。\n"
+                     "一轮采集里接连几部新番都因为 bgm 连不上（超时、断线、限流）没认出来，这一轮剩下的新番就先不去认、"
+                     "直接进『待识别』交给后台重试，种子照常入库——免得 bgm 挂着时每部都干等两分钟、一轮拖上一两个小时。"
+                     "bgm 明确回答『查不到这部番』不算连不上。填 0 关掉，每部都照常去认。")
             with ui.element("div").classes("field-grid w-full"):
                 _num("ENRICH_RETRY_TIMES", "bgm 请求最多尝试几次（含首次；超时/连接错时）", config.ENRICH_RETRY_TIMES)
                 _num("REENRICH_RETRY_BASE", "延迟重试基准等待（分钟，失败后翻倍）", config.REENRICH_RETRY_BASE)
                 _num("REENRICH_RETRY_MAX", "延迟重试等待上限（分钟，翻倍封顶）", config.REENRICH_RETRY_MAX)
                 _num("REENRICH_MAX_TRIES", "每番最多重试几次", config.REENRICH_MAX_TRIES)
+                _num("BGM_ROUND_BREAKER", "接连几部连不上 bgm 就本轮停认（0=关）", config.BGM_ROUND_BREAKER,
+                     *config._RANGE["BGM_ROUND_BREAKER"])
                 _num("ANIME_META_REFRESH_EPS", "每几集刷新 bgm 资料（0=关）",
                      config.ANIME_META_REFRESH_EPS, 0, 100)
 

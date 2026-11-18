@@ -37,12 +37,17 @@ _fail: dict[str, tuple[int, str]] = {}
 _alive: set = set()                   # 上一轮启用着的源组名（forget_sources 时记下，判"全挂了"要用分母）
 # 一看就是"这台机器连不上网"的失败原因（DNS 解析不了、连接被拒/超时、路由不可达）
 _NET_HINTS = ("name resolution", "Name or service not known", "nodename nor servname",
-              "ConnectError", "ConnectTimeout", "Network is unreachable", "No route to host")
+              "ConnectError", "ConnectTimeout", "Network is unreachable", "No route to host",
+              # 开代理时宿主机断网：https 走 CONNECT，代理连不上上游回 502/503/504，httpx 抛 ProxyError
+              # 而不是 ConnectError。407 是代理认证没配对，不是断网，不收。
+              "ProxyError: 502", "ProxyError: 503", "ProxyError: 504")
 # feed 键 → seen：这之前的发布都已处理过（正常等于上次抓取时刻；UTC ISO）。
 # 持久化在运行时配置 SOURCE_FEED_SEEN 里（重启之后正要用它）。
 _seen: dict | None = None
 _GAP_MIN = timedelta(minutes=10)      # 小于这个的"断档"只是两边时钟差，不报
 _GAPS_KEEP = 10
+# 进程启动时刻：从没备份成功过（BACKUP_LAST 空）时，自动备份超期按它算，免得刚启动就误报。
+_started: datetime = datetime.now()
 # 已经退出的后台协程名（worker.log_task_exit 记）。上界就是 main.py 建的那几条；协程不会自己复活，只有重启能清。
 _dead: set[str] = set()
 
@@ -196,8 +201,14 @@ def gaps_with(new: list[dict]) -> str:
     return json.dumps((gaps() + new)[-_GAPS_KEEP:], ensure_ascii=False)
 
 
-def clear_gaps() -> None:
-    config.set_many({"FEED_GAPS": ""})
+def clear_gaps(seen: list[dict] | None = None) -> None:
+    """seen：横幅渲染时用户看到的那几条。只删这些——页面开着期间后台新记的断档用户还没看过，
+    而 FEED_GAPS 同时是锁源兜底（E-74）和缺集自动补的断档闸，一并清掉会让它们漏判。不传 = 全清（旧行为）。"""
+    if seen is None:
+        config.set_many({"FEED_GAPS": ""})
+        return
+    keep = [g for g in gaps() if g not in seen]
+    config.set_many({"FEED_GAPS": json.dumps(keep, ensure_ascii=False) if keep else ""})
 
 
 def gap_text(g: dict) -> str:
@@ -248,3 +259,21 @@ def poll_problem(now: datetime | None = None) -> str | None:
     tail = f"，上一轮结束于 {last:%m-%d %H:%M}" if last else ""
     return (f"采集开着，但已经 {_ago(idle)} 没有任何动静{tail}。多半是某一轮卡住了或后台协程退出了，"
             "去 /logs 看最近的 ERROR；重启服务可以恢复。")
+
+
+def backup_problem(now: datetime | None = None) -> str | None:
+    """自动备份超期的人话描述（横幅用）；没问题返回 None。
+
+    失败只写日志的话，满盘 / 目录不可写这类故障会每 10 分钟重试、每次都败，而日志限了频（见 backup._auto_failed），
+    用户不去 /logs 就永远不知道手里没有新备份。超过 2 个备份间隔还没成功一次才挂：偶尔失败一两次下次心跳自己会补上。
+    """
+    if not config.BACKUP_ENABLED:
+        return None
+    now = now or datetime.now()
+    hours = max(1, config.BACKUP_INTERVAL_HOURS)
+    last = _parse_local(config.BACKUP_LAST)
+    if now - (last or _started) < timedelta(hours=2 * hours):
+        return None
+    since = f"上次成功是 {last:%m-%d %H:%M}" if last else f"本次启动（{_started:%m-%d %H:%M}）以来一次都没成功"
+    return (f"自动备份已经 {_ago(now - (last or _started))} 没有成功了（{since}，设定每 {hours} 小时一次）。"
+            "去 /logs 看『自动备份失败』那一行，常见是磁盘满或备份目录不可写。")

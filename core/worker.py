@@ -123,6 +123,7 @@ async def poll_once() -> None:
     # 别去白取种（详见 anime.process_item 的 qb_alive 说明）。探测本身就是 flush 前那一次，
     # 顺带把状态型通知的翻转也发了，所以不额外增加请求。
     qb_alive = await anime.qb_precheck()
+    anime.bgm_round_start()          # bgm 熔断按轮计（见 anime._resolve_anime）
     # 【本轮内同 URL 的 feed 只抓一次】(R36 体检，见 RssSource.fetch) 真库两对源组同 URL。
     # 缓存的字节只活到"后面再没有源要用这个 URL"为止就弹掉：一轮可能跑几个小时（D-06），
     # 别让 4 个 feed 的字节整轮挂着。键是 feed URL —— Mikan『我的番组』把 token 放在 query 里，
@@ -266,6 +267,7 @@ async def poll_once() -> None:
         _cur.clear()
         _cur.update({k: v for k, v in _seen_snap.items() if k not in _emptied})
         raise
+    anime.bgm_round_end()
 
     # 没抓到的源不进这一行（失败行按连续失败轮数限频，见上面 fail_streak 那段；没有失败行的轮次
     # 只能从"N 个源"看出少了谁）；整轮早退（DatabaseBusy 等）走不到这里，不记。

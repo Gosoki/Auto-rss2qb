@@ -188,6 +188,10 @@ _SPEC = {
     "REENRICH_RETRY_BASE": (int, 30),        # 『待识别』番延迟重试基准等待（分钟），每失败一次翻倍（默认 30 分钟）
     "REENRICH_RETRY_MAX": (int, 1440),       # 延迟重试等待上限（分钟），翻倍到此封顶（默认 1440=24 小时）
     "REENRICH_MAX_TRIES": (int, 5),          # 每部『待识别』番最多自动重试几次（满则停；之后每来一个新集号再试一次，也可手动重新识别）
+    # 一轮采集里连续这么多部新番都因 bgm 没问成（连接失败/限流/整体超时，不含查无）而没识别成，
+    # 本轮剩下的新番跳过识别、直接进『待识别』交给后台重试（0=关）。bgm 被墙/挂死时每部要等满识别预算，
+    # 季初几十部新番会把一轮拖上一两小时，下载放行与外部心跳都被堵住（见 core.anime._resolve_anime）
+    "BGM_ROUND_BREAKER": (int, 2),
     "ANIME_META_REFRESH_EPS": (int, 4),      # 已绑 bgm 的番每收录这么多集（不同集号）自动刷一次 bgm 资料（评分/总集数等，0=关）
     # 下面三项只在首次建库种默认源组时读（core.anime.seed_source_groups）；之后在订阅源页改，没有设置页入口
     "ANI_RSS_URL": (str, "https://nyaa.si/?page=rss&u=ANiTorrent"),
@@ -241,6 +245,7 @@ _RANGE: dict[str, tuple[int, int]] = {
     "NOTIFY_DIGEST_HOURS": (0, 720),
     "NOTIFY_DIGEST_AT": (0, 23),
     "ANIME_GAP_AUTOFILL_DAYS": (0, 60),
+    "BGM_ROUND_BREAKER": (0, 50),
 }
 
 # 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集

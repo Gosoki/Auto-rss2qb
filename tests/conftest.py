@@ -268,6 +268,8 @@ def reset_process_state():
         Wk._stale_sweep_pending = False
     if Mv is not None:
         Mv._scan_fail_streak, Mv._scan_retry_at = 0, None
+    if (Bk := g("db.backup")) is not None:
+        Bk._auto_fail_streak = 0
     if N is not None:
         for d in (N._last_sent, N._state_now, N._state_members, N._state_times, N._state_suppressed):
             d.clear()

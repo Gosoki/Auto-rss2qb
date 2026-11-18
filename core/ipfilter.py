@@ -396,23 +396,44 @@ def qb_file_path() -> str:
     return engine._path_module(d).join(d, NAME) if d else ""
 
 
-def seed_base() -> str:
-    """qB 来下文件时用的本程序地址：IPFILTER_SEED_URL，空＝自动（auto_seed_base）。"""
-    return config.IPFILTER_SEED_URL.strip().rstrip("/") or auto_seed_base()
+async def seed_base() -> str:
+    """qB 来下文件时用的本程序地址：IPFILTER_SEED_URL，空＝自动（resolve_seed_base）。"""
+    return config.IPFILTER_SEED_URL.strip().rstrip("/") or await resolve_seed_base()
+
+
+def _seed_base_via(ip: str) -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((ip, 9))                # UDP connect 不发包，只让系统选出走哪块网卡
+            return f"http://{s.getsockname()[0]}:{config.WEB_PORT}"
+    except OSError:
+        return f"http://127.0.0.1:{config.WEB_PORT}"
 
 
 def auto_seed_base() -> str:
-    """本机连 qB 时走的那个 IP + Web 端口。"""
+    """本机连 qB 时走的那个 IP + Web 端口；QB_URL 是主机名时返回空串。
+    设置页渲染走这里（同步、在事件循环上）：主机名要 DNS，慢起来会卡住整个页面服务，所以不现算。"""
     host = urlsplit(config.QB_URL or "").hostname or "127.0.0.1"
-    ip = "127.0.0.1"
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect((host, 9))          # UDP connect 不发包，只让系统选出走哪块网卡
-                ip = s.getsockname()[0]
-        except OSError:
-            pass
-    return f"http://{ip}:{config.WEB_PORT}"
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return f"http://127.0.0.1:{config.WEB_PORT}"
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return ""
+    return _seed_base_via(host)
+
+
+async def resolve_seed_base() -> str:
+    """同 auto_seed_base，主机名用事件循环的异步解析（带超时）先换成 IP；解析不了按 127.0.0.1。"""
+    if base := auto_seed_base():
+        return base
+    host = urlsplit(config.QB_URL or "").hostname
+    try:
+        infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(
+            host, 9, family=socket.AF_INET, type=socket.SOCK_DGRAM), timeout=5)
+        return _seed_base_via(infos[0][4][0])
+    except (OSError, asyncio.TimeoutError, IndexError):
+        return f"http://127.0.0.1:{config.WEB_PORT}"
 
 
 def _bencode(v) -> bytes:
@@ -496,7 +517,7 @@ async def update() -> str:
     digest = hashlib.sha1(data).hexdigest()[:16]
     if run_state().get("pending"):     # 上一次的种子还在 qB 里（没下完）：先摘掉，只留一个
         await qb.delete([run_state()["pending"]], delete_files=False)
-    torrent, h = build_torrent(data, NAME, f"{seed_base()}/api/ipfilter/{digest}/{NAME}")
+    torrent, h = build_torrent(data, NAME, f"{await seed_base()}/api/ipfilter/{digest}/{NAME}")
     _save(serving=f"{digest}/{NAME}", pending="")
     # 原始布局：qB 若设了『创建子文件夹』，单文件种子会落进 IPBlocker/ipfilter/ 下面，与要让 qB 指向的路径对不上
     ok = await qb.add_torrent(torrent, target_dir(), "", _TAG, content_layout="Original")
@@ -541,7 +562,7 @@ async def finish_pending() -> str | None:
             # 一直下不完（qB 连不上本程序、目录不可写…）：摘掉这个种子、清掉待办，按失败的节奏过 6 小时再试，
             # 别让它永远挂在 qB 里、自动更新也永远停着（due() 见到待办就不开新的一轮）
             await qb.delete([h], delete_files=False)
-            return _status(f"qB 一个小时都没下完，已撤下这次的种子，6 小时后再试。确认 qB 那台能打开 {seed_base()}"
+            return _status(f"qB 一个小时都没下完，已撤下这次的种子，6 小时后再试。确认 qB 那台能打开 {await seed_base()}"
                            "（不通就在设置里填『qB 访问本程序的地址』，设了允许访问的网段要把 qB 那台放进去）",
                            pending="", last="")      # 清掉"上次更新"：按失败的节奏 6 小时后重试，而不是等满 30 天
         return None

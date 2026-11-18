@@ -128,7 +128,10 @@ async def test_torrent_fetch_redirect_hop_is_not_decompressed_unbounded(monkeypa
     real = httpx.AsyncClient
 
     def fake_client(**kw):
-        return real(transport=httpx.MockTransport(_hop_handler(bomb, b"d4:infod4:name1:xee")), **kw)
+        # 保留取种自带的换地址重试层，只把最底下的传输换成假的
+        kw["transport"] = engine.ssrf.PinnedRetryTransport(
+            httpx.MockTransport(_hop_handler(bomb, b"d4:infod4:name1:xee")))
+        return real(**kw)
     monkeypatch.setattr(engine.httpx, "AsyncClient", fake_client)
 
     peak, out = await _peak(lambda: engine.fetch_torrent_bytes("http://93.184.216.34/hop"))
