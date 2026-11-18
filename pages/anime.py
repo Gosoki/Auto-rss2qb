@@ -12,7 +12,8 @@ import db
 from db.models import AnimeTorrent
 from core import alerts, anime, engine
 import config
-from .anime_detail import maybe_relocate_anime, render_anime_detail, restore_anime_gated, subscribe_gated
+from .anime_detail import (lock_two_numbering, maybe_relocate_anime, render_anime_detail, restore_anime_gated,
+                           subscribe_gated)
 from .layout import (SEVERITY_COLOR, busy_action, confirm, cover_box, cover_title, ep_ranges_text, finished_tip,
                      require_bind_confirm,
                      ep_label,
@@ -220,8 +221,30 @@ def anime_page(t: str = ""):
                 for f in _odd:
                     _txt += f["text"]
                 warn_banner(_txt, action=("知道了", "inbox", _ack_alerts(_ign)))
+            # 『两套集号同时在下』：生产上一次就命中 5 部，每部一整条长横幅会把仪表盘（手机上尤其）淹掉。
+            # 两部以上时合成一张卡：说明只在卡头讲一次，每部番一行短句 + 自己的按钮；已读仍按条记。
+            _two = [f for f in _al["live"] if f["kind"] == "two"]
+            if len(_two) >= 2:
+                warn_banner(f"{len(_two)} 部番两套集号同时在下：一个组用全系列编号、一个组用季内编号，"
+                            "同一集各下了一份到同一个目录。锁定其中一个组，以后每集就只下一份；已经下了的不动。",
+                            action=("全部知道了", "inbox", _ack_alerts(_two)))
+                with ui.column().classes("w-full gap-1 pl-8 -mt-1"):
+                    for _a in _two:
+                        with ui.row().classes("w-full items-center gap-x-2 gap-y-1 flex-wrap"):
+                            ui.label(_a["brief"]).classes("text-sm min-w-0 grow")
+                            _i = _a["open"][0]
+                            _lk = _a["lock"]
+                            with ui.row().classes("gap-1 shrink-0 flex-wrap"):
+                                ui.button("详情", icon="info", on_click=lambda i=_i: open_detail(i)).props(
+                                    "flat dense").classes("btn-sm")
+                                for j, src in enumerate(_lk):
+                                    ui.button(f"只下 {src}", icon="lock",
+                                              on_click=_lock_two(_i, src, _lk[1 - j])).props(
+                                        "flat dense").classes("btn-sm")
+                                ui.button(icon="inbox", on_click=_ack_alert(_a)).props(
+                                    "flat dense").classes("btn-sm").tooltip("知道了")
             for _a in _al["live"]:
-                if _a["kind"] == "ign":
+                if _a["kind"] == "ign" or (_a["kind"] == "two" and len(_two) >= 2):
                     continue
                 _pre = ""
                 if _a["revived"]:
@@ -234,6 +257,10 @@ def anime_page(t: str = ""):
                 _ids = _a.get("open") or []
                 _acts = [("打开详情" if len(_ids) == 1 else f"打开 #{i}", "info",
                           lambda i=i: open_detail(i)) for i in _ids]
+                # 两套集号同时在下（U1-1）：两个组各给一个『只下 X』，锁哪个由人挑（确认框里说后果）
+                _lk = _a.get("lock") or []
+                _acts += [(f"只下 {src}", "lock", _lock_two(_ids[0], src, _lk[1 - j]))
+                          for j, src in enumerate(_lk)]
                 warn_banner(_pre + _a["text"], action=_acts + [("知道了", "inbox", _ack_alert(_a))])
 
             # 【首屏只数仍成立的】已不成立的已读记录不需要任何动作，常年挂在首屏只是噪音；
@@ -1074,6 +1101,13 @@ def anime_page(t: str = ""):
                 alerts.ack(f["ident"], f["kind"], f["fact"], f["text"])
                 ui.notify("已收进『已读的提示』")     # 只说已经发生的事，不预告"以后不会再看到"
                 alerts_panel.refresh()
+            return h
+
+        def _lock_two(anime_id, src, other):
+            async def h():
+                if await lock_two_numbering(anime_id, src, other):
+                    alerts_panel.refresh()       # 锁了源这条就不成立了，横幅随之消失
+                    refresh_all()
             return h
 
         def _ack_alerts(fs):

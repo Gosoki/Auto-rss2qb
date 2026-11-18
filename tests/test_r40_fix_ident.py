@@ -120,6 +120,36 @@ def test_never_clicked_movie_like_work_still_bounces(clean_tables, cfg, monkeypa
     assert _state(clean_tables, aid) == (False, False, "movie")
 
 
+@pytest.mark.parametrize("how", ["confirm", "restore"])
+def test_unbound_wrong_season_confirmed_with_movie_hash_is_not_retried(clean_tables, cfg, monkeypatch, how):
+    """疑似别季（没绑 bgm、后台重试次数故意打满）且种子剧场版表也收了：人点确认 / 恢复后原因不能被改成 movie——
+    后台『新集号再排一次识别』只认 wrong_season 才拦，改掉就会再识别、可能又绑回那个错的条目。"""
+    from core import anime as A
+    from db.models import Anime, AnimeTorrent, Movie, MovieTorrent
+    cfg(REENRICH_MAX_TRIES=5)
+    h = f"{7:040x}"
+    with clean_tables.get_session() as s:
+        a = Anime(title="某番", season=4, quarter="26D", confirmed=False, rejected=(how == "restore"),
+                  confirm_reason="wrong_season", bangumi_id=None, enrich_tries=5)
+        m = Movie(bangumi_id=9, title="某片")
+        s.add(a)
+        s.add(m)
+        s.commit()
+        s.add(AnimeTorrent(anime_id=a.id, info_hash=h, episode=85, raw_title="x - 85", status="pending"))
+        s.add(MovieTorrent(info_hash=h, movie_id=m.id, status="pending"))
+        s.commit()
+        aid = a.id
+    (A.confirm_anime if how == "confirm" else A.restore_anime)(aid)
+    assert _state(clean_tables, aid)[2] == "wrong_season"
+    with clean_tables.get_session() as s:
+        t = AnimeTorrent(anime_id=aid, info_hash=f"{8:040x}", episode=86, raw_title="x - 86", status="pending")
+        s.add(t)
+        s.commit()
+        A._rearm_enrich_on_new_episode(s, s.get(Anime, aid), 86, t.id)
+    with clean_tables.get_session() as s:
+        assert s.get(Anime, aid).enrich_tries == 5, "后台又排了一次识别"
+
+
 # ---------------- 采集轮的 seen 记账 ----------------
 def _sec(d):
     return d.replace(microsecond=0)

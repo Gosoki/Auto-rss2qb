@@ -977,9 +977,12 @@ async def recheck_stalled() -> int:
         if p >= 1.0 - 1e-9 and st in _QB_SEEDING and st not in _QB_TRANSIENT:
             if was == "error":
                 # mark_done_by_hash 不认 error；按主键重读，await 期间被人删 / 排除 / 补下过的就不动
+                qb_sp = d.get("save_path") or ""
                 with get_session() as s:
                     t = s.get(model_cls, tid)
-                    if t is not None and t.status == "error":
+                    # 番剧与剧场版偶有同 hash：qB 里那份可能是另一张表交付、下在另一个目录的，
+                    # 认回就成了"这一集已有"而文件根本不在番剧目录 → 漏集。qB 报的目录对不上就不认；没报照旧。
+                    if t is not None and t.status == "error" and (not qb_sp or same_dir(qb_sp, t.save_path)):
                         t.status, t.qb_progress, t.qb_state, t.qb_synced_at, t.fail_reason = "sent", 1.0, "", now, ""
                         s.add(t)
                         s.commit()

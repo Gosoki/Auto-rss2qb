@@ -147,10 +147,14 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
         return bytes(buf)
     dec = zlib.decompressobj(wbits)
     raw_seen, out = 0, bytearray()
+    tail_only = False
     async for chunk in resp.aiter_raw():
         raw_seen += len(chunk)
         if raw_seen > cap:                  # 线上原始字节也封顶：压缩体本身就不该有这么大
             raise TooLarge(f"压缩响应超过 {cap} 字节上限：{safe_url(url)}")
+        if tail_only:
+            # 已确认是尾部填充：再交给 zlib 会被整段拼进 unused_data，每块复制一遍 → O(n²)。只计数（上面照样封顶）。
+            continue
         # max_length 让每次最多解出"还能再收多少"，多出来的留在 unconsumed_tail 里不占额外内存
         try:
             piece = dec.decompress(chunk, max_length=cap - len(out) + 1)
@@ -174,6 +178,9 @@ async def _read_capped(resp: httpx.Response, cap: int, url: str) -> bytes:
             # 也不把后续成员解出来：每段都要把剩余字节整段复制一次，极小成员串同样能卡死事件循环。
             # 只认 gzip 魔数：尾部填充（零字节 / 垃圾）照旧放行，不为它多出抓取失败。
             raise httpx.DecodingError(f"响应是多成员 gzip，只解得出第一段：{safe_url(url)}")
+        if dec.eof and len(dec.unused_data) >= 2:
+            # 尾巴前两字节已看清不是 gzip 魔数：后面不可能再冒出一段成员，不必再喂解压器
+            tail_only = True
         if len(out) > cap:
             raise TooLarge(f"解压后超过 {cap} 字节上限（疑似压缩炸弹）：{safe_url(url)}")
     try:

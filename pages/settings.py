@@ -6,6 +6,8 @@
 import ipaddress
 import json
 import logging
+import os
+import shlex
 
 from nicegui import context, run, ui
 
@@ -35,7 +37,8 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "ANIME_BACKFILL_EXTRA_EPS", "ANIME_LOCK_SYNC_DAYS", "ANIME_IDLE_WINDOW_X",
             "ANIME_IGNORED_AIRING_DAYS", "ALERT_REPEAT_HOURS", "ALERT_REPEAT_DAYS",
             "ANIME_LOCK_FALLBACK_DAYS", "ANIME_REPLACE_MAX_GAP_DAYS", "ANIME_GAP_AUTOFILL_DAYS",
-            "NOTIFY_DIGEST_HOURS", "NOTIFY_DIGEST_AT", "BGM_ROUND_BREAKER"}
+            "NOTIFY_DIGEST_HOURS", "NOTIFY_DIGEST_AT", "BGM_ROUND_BREAKER",
+            "ANIME_TWO_NUMBERING_DAYS", "ANIME_TWO_NUMBERING_PAIRS"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
@@ -255,6 +258,18 @@ def _pw_into(f: dict, key: str, label: str) -> None:
     f[key] = ui.input(label, value="", password=True).classes("w-full")
 
 
+def restore_commands() -> tuple[str, str]:
+    """恢复步骤第 2、3 步的命令行（改名留底 / 拷回备份）。
+
+    用绝对路径而不是 `cd data`：DB_PATH 可被 .env 改到别处，备份目录却恒在 data/backups，
+    相对写法在两者不同处或人不在程序目录敲时会挪错文件、甚至挪空。shlex.quote 防目录名带空格。"""
+    db_path = os.path.abspath(config.DB_PATH)
+    files = " ".join(shlex.quote(db_path + sfx) for sfx in ("", "-wal", "-shm"))
+    step2 = f"for x in {files}; do [ -e \"$x\" ] && mv \"$x\" \"$x.before-restore\"; done"
+    step3 = f"cp {shlex.quote(os.path.abspath(backup.BACKUP_DIR))}/<选中的那份> {shlex.quote(db_path)}"
+    return step2, step3
+
+
 def _backup_panel(f: dict) -> None:
     """『备份』分栏：开关/间隔/保留份数 + 立刻备份 + 现有备份列表。
 
@@ -328,6 +343,7 @@ def _backup_panel(f: dict) -> None:
         finally:
             btn.props(remove="loading")
 
+    step2, step3 = restore_commands()
     with ui.row().classes("gap-2 items-center mt-2"):
         btn = ui.button("立刻备份", icon="backup", on_click=_now).props("unelevated color=primary")
         _help("恢复步骤（顺序不能乱）：\n"
@@ -341,10 +357,9 @@ def _backup_panel(f: dict) -> None:
               "『当前业务数据库』是不是你要的那个。\n"
               "1. systemctl stop autorss\n"
               "2. 现役库【改名留底】，连 -wal/-shm 一起（不是删）：\n"
-              "   cd data && for x in autorss.db autorss.db-wal autorss.db-shm; do "
-              "[ -e \"$x\" ] && mv \"$x\" \"$x.before-restore\"; done\n"
-              "3. 接上一步，仍在 data/ 里：\n"
-              "   cp backups/<选中的那份> autorss.db\n"
+              f"   {step2}\n"
+              "3. 把选中的那份拷成现役库（<选中的那份> 换成列表里的文件名）：\n"
+              f"   {step3}\n"
               "4. systemctl start autorss —— 打开首页确认番剧数目对，再删那几个 .before-restore\n\n"
               "第 2 步为什么必须连 -wal 一起挪走：本库开着 WAL，最近的写入躺在 -wal 里。"
               "只覆盖主文件的话，SQLite 启动时会把【事故现场那份 -wal】重放到你刚恢复的库上——"
@@ -1161,11 +1176,18 @@ def settings():
             _section("其它提示（只报不改）",
                      "同号新集：在追的番新来的种子，集号与已经下好的那一集相同、发布却晚了这么多周以上，就在仪表盘提示（只报不改；0=关）。"
                      "多半是新一季沿用季内编号、标题又没写第几季，被当成『这一集已有』而不会下；也可能只是很晚的重发版（如 BD 版）。\n"
-                     "超期忽略·仍在更新：被自动判成超期忽略的番，最近这么多天里还收到正片新集，就在仪表盘提示（只报不改）。")
+                     "超期忽略·仍在更新：被自动判成超期忽略的番，最近这么多天里还收到正片新集，就在仪表盘提示（只报不改）。\n"
+                     "两套集号同时在下：在追、没锁下载源的番，一个组用全系列编号（集号全部超过总集数）、另一个组用季内编号，"
+                     "两边都已经在下，同一集各下了一份。季内组第 k 集和全系列组对应那一集发布相差不超过这么多天算对上，"
+                     "至少对上这么多集才提醒（只提醒，锁哪个组由你点）。调大天数、调小集数更容易提醒，也更容易说错。")
             with ui.element("div").classes("field-grid w-full"):
                 _num("ANIME_RERELEASE_WEEKS", "同号新集晚几周算可疑（0=关）", config.ANIME_RERELEASE_WEEKS, 0, 520)
                 _num("ANIME_IGNORED_AIRING_DAYS", "超期忽略·仍在更新（天）", config.ANIME_IGNORED_AIRING_DAYS,
                      *config._RANGE["ANIME_IGNORED_AIRING_DAYS"])
+                _num("ANIME_TWO_NUMBERING_DAYS", "两套集号：发布相差几天内算对上", config.ANIME_TWO_NUMBERING_DAYS,
+                     *config._RANGE["ANIME_TWO_NUMBERING_DAYS"])
+                _num("ANIME_TWO_NUMBERING_PAIRS", "两套集号：至少对上几集", config.ANIME_TWO_NUMBERING_PAIRS,
+                     *config._RANGE["ANIME_TWO_NUMBERING_PAIRS"])
 
             ui.separator()
             _section("采集健康",
@@ -1558,7 +1580,7 @@ def settings():
                     log.warning("关跟踪前数在途失败，这次不问", exc_info=True)
                     n = 0
                 if n and not await confirm(
-                        "关闭 qB 状态跟踪？",
+                        "关闭『读取 qB 实时状态』？",
                         f"现在有 {n} 条种子还在下载。关掉之后它们会直接记成『已下完』，不再跟踪进度；"
                         "之后卡住或失败都不会再提醒，重新打开也不会恢复。\n"
                         "只是 qB 临时维护的话，关上面那个『发送种子到 qB』就够了，它不改已有种子的状态。",

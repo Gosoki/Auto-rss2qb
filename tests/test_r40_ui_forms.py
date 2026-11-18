@@ -210,7 +210,7 @@ async def test_turning_off_qb_sync_with_inflight_asks_first(user: User, page, cf
     await user.open("/settings")
     _sync_switch(user).value = False
     _click(user, _button(user, "保存"))
-    await user.should_see("关闭 qB 状态跟踪？")
+    await user.should_see("关闭『读取 qB 实时状态』？")   # 与开关上的字一致，用户认得出是哪一个
     await user.should_see("现在有 1 条种子还在下载")
     _click(user, _button(user, "取消"))
     await _until(lambda: not [b for b in _live(user, ui.button) if b.text == "关闭并记为已下完"])

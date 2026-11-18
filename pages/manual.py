@@ -44,7 +44,7 @@ def manual_page():
             @ui.refreshable
             def upbox():
                 async def _on_upload(e):
-                    # 【NiceGUI 3.16 的事件对象是 slots dataclass，只有 sender/client/file】
+                    # 【NiceGUI 3.x（现装 3.14.0）的事件对象是 slots dataclass，只有 sender/client/file】
                     # 早先这里写的是 e.content.read() / e.name（旧版 API），在当前依赖上必抛
                     # AttributeError——整条"上传 .torrent 文件"的入口是坏的：点了没反应，
                     # 只有日志里一行异常。新 API 是 e.file.name / await e.file.read() / e.file.size()。

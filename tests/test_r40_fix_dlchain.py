@@ -215,6 +215,32 @@ def test_error_rows_that_must_be_left_alone(clean_tables, cfg, monkeypatch, save
         assert not asked, "从没交付过的失败行不该去问 qB"
 
 
+@pytest.mark.parametrize("qb_sp, taken", [
+    ("/dl/26C/x", True),                 # 同目录：就是这一行交付的那份
+    ("/dl/26C/x/", True),                # 写法不同的同一目录（same_dir 口径）
+    ("/dl/movies/某片", False),          # 同 hash 的剧场版下在剧场版目录：不是这集
+    (None, True),                        # qB 没报路径：保持原行为
+])
+def test_error_row_is_taken_back_only_if_qb_copy_is_in_its_own_dir(clean_tables, cfg, monkeypatch, qb_sp, taken):
+    _stall_cfg(cfg)
+    tid = _dead_seed(clean_tables)
+    with clean_tables.get_session() as s:
+        t = s.get(AnimeTorrent, tid)
+        t.status, t.fail_reason = "error", "原因"
+        s.add(t)
+        s.commit()
+
+    async def info(hs):
+        d = {"state": "stalledUP", "progress": 1.0, "dlspeed": 0, "size": 1}
+        if qb_sp is not None:
+            d["save_path"] = qb_sp
+        return {f"{1:040x}": d}
+    monkeypatch.setattr(ce.qb, "torrents_info", info)
+    assert asyncio.run(ce.recheck_stalled()) == int(taken)
+    got = _get(clean_tables, AnimeTorrent, tid)
+    assert got.status == ("sent" if taken else "error"), qb_sp
+
+
 @pytest.mark.parametrize("to", ["deleted", "excluded", "pending"])
 def test_error_row_changed_during_the_await_is_not_written_back(clean_tables, cfg, monkeypatch, to):
     """torrents_info 的 await 期间这一行被人删了 / 排除了 / 点『补下』清回待下：写回前按主键重读，不覆盖成 sent。"""

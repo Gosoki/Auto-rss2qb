@@ -30,50 +30,45 @@ def _read(rel: str) -> str:
 
 # ---------- 设置页『备份』的恢复步骤（DOC-1） ----------
 
-def _restore_help() -> str:
-    """_backup_panel 里那段『恢复步骤』的原文（按源码取，测的就是页面上显示的那一份）。"""
-    tree = ast.parse(_read("pages/settings.py"))
-    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_backup_panel")
-    for node in ast.walk(fn):
-        if (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_help" and node.args
-                and isinstance(node.args[0], ast.Constant) and str(node.args[0].value).startswith("恢复步骤")):
-            return node.args[0].value
-    raise AssertionError("前提：_backup_panel 里没找到『恢复步骤』那段 _help")
-
-
-def _restore_commands() -> tuple[str, str]:
-    lines = _restore_help().split("\n")
-    i2 = next(i for i, ln in enumerate(lines) if ln.startswith("2. "))
-    step2 = lines[i2 + 1].strip()
-    i3 = next(i for i, ln in enumerate(lines) if ln.startswith("3. "))
-    step3 = lines[i3 + 1].strip()                 # 整行原文，用户复制的就是它
-    assert step2.startswith("cd ") and step3.startswith("cp "), (step2, step3)
-    return step2, step3
+def _restore_commands(monkeypatch, db_path, backup_dir) -> tuple[str, str]:
+    """页面上显示的第 2、3 步就是 restore_commands() 的返回值；按给定的 DB_PATH / 备份目录生成。"""
+    from db import backup
+    from pages import settings as P
+    monkeypatch.setattr(config, "DB_PATH", str(db_path))
+    monkeypatch.setattr(backup, "BACKUP_DIR", backup_dir)
+    src = _read("pages/settings.py")
+    assert "f\"   {step2}\\n\"" in src and "f\"   {step3}\\n\"" in src, "前提：恢复步骤里显示的就是这两条"
+    return P.restore_commands()
 
 
 @pytest.mark.skipif(shutil.which("sh") is None, reason="no sh")
 @pytest.mark.parametrize("with_sidecars", [True, False], ids=["有-wal-shm", "无-wal-shm"])
-def test_restore_steps_run_as_written(tmp_path, with_sidecars):
-    """照页面上的第 2、3 步在程序目录里敲一遍：库换成选中的备份、原库改名留底、-wal 被挪走。
+@pytest.mark.parametrize("db_elsewhere", [False, True], ids=["库在data", "DB_PATH改到别处"])
+def test_restore_steps_run_as_written(tmp_path, monkeypatch, with_sidecars, db_elsewhere):
+    """照页面上的第 2、3 步原样敲一遍（在一个无关目录里敲）：库换成选中的备份、原库改名留底、-wal 被挪走。
     第 2 步的 for 在没有 -shm 时退出码本来就是 1，只看第 3 步的退出码。"""
     app = tmp_path / "app dir"                     # 目录名带空格
     (app / "data" / "backups").mkdir(parents=True)
-    live = app / "data" / "autorss.db"
+    live_dir = (tmp_path / "other db") if db_elsewhere else (app / "data")
+    live_dir.mkdir(exist_ok=True)
+    live = live_dir / "autorss.db"
     live.write_bytes(b"LIVE")
     if with_sidecars:
-        (app / "data" / "autorss.db-wal").write_bytes(b"WAL")
-        (app / "data" / "autorss.db-shm").write_bytes(b"SHM")
+        (live_dir / "autorss.db-wal").write_bytes(b"WAL")
+        (live_dir / "autorss.db-shm").write_bytes(b"SHM")
     (app / "data" / "backups" / "autorss-full-20261101-090000.db").write_bytes(b"BACKUP")
-    step2, step3 = _restore_commands()
+    step2, step3 = _restore_commands(monkeypatch, live, app / "data" / "backups")
     step3 = step3.replace("<选中的那份>", "autorss-full-20261101-090000.db")
     script = f"{step2}\n{step3}\n"                 # 同一个 shell 里接着敲
-    r = subprocess.run(["sh", "-c", script], cwd=app, capture_output=True, text=True)
+    cwd = tmp_path / "somewhere"
+    cwd.mkdir()
+    r = subprocess.run(["sh", "-c", script], cwd=cwd, capture_output=True, text=True)
     assert r.returncode == 0, (script, r.stderr)
     assert live.read_bytes() == b"BACKUP"
-    assert (app / "data" / "autorss.db.before-restore").read_bytes() == b"LIVE"
-    assert not (app / "data" / "autorss.db-wal").exists()
+    assert (live_dir / "autorss.db.before-restore").read_bytes() == b"LIVE"
+    assert not (live_dir / "autorss.db-wal").exists()
     if with_sidecars:
-        assert (app / "data" / "autorss.db-wal.before-restore").read_bytes() == b"WAL"
+        assert (live_dir / "autorss.db-wal.before-restore").read_bytes() == b"WAL"
 
 
 # ---------- 设置页说明背后的行为（DOC-5） ----------

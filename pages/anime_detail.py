@@ -75,6 +75,22 @@ def notify_relocate_anime(rep):
     ui.notify(msg, type="warning" if warn else "positive")
 
 
+async def lock_two_numbering(anime_id: int, src: str, other: str) -> bool:
+    """『两套集号同时在下』横幅上的『只下 X』（仪表盘与详情页共用一份确认文案）。先确认，再走既有的
+    set_pref_source；横幅本身只提醒，锁不锁、锁哪个组由人定。返回是否真的锁了。"""
+    if not await confirm(
+            f"只下『{src}』？",
+            f"锁定后这部番只自动下『{src}』的种子，『{other}』和别的组的新集都不再自动下，以后每集只下一份。\n"
+            "已经下了的文件不动、不删；同一集多出来的那份要清理，到详情页逐条删。\n"
+            f"『{src}』要是停更，别的组的集不会自动补上（两套编号对不上，换源兜底不替它补），要自己来点下载。\n"
+            "想改回去：详情页『下载源』选回『按优先级』。",
+            ok_label=f"只下 {src}", ok_icon="lock", ok_color="primary"):
+        return False
+    anime.set_pref_source(anime_id, src)
+    ui.notify(f"已锁定：之后只下 {src}", type="positive")
+    return True
+
+
 async def subscribe_gated(anime_id: int, action: str, pref_source: str | None = None) -> int | None:
     """让一部番【进入订阅并立刻补下】的唯一入口：先过 E-52 的闸，再做动作、再补下。
 
@@ -290,7 +306,18 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 跨源集号体系不一致的兜底提示：能从 '16(88)' 双编号推出偏移的番已在入库时自动折算，
         # 这里剩下的是推不出、必须人工判断的（同一集会被当成两集，各下一份到同一目录）。
         _conf = anime.episode_numbering_conflict(anime_id)
-        if _conf:
+        # (U1-1) 判据坐实了两套编号【已经各下了一份】：下结论、给锁源按钮，替掉下面那条"请你自己判断"的通用提示。
+        # 判据只在在追、没锁源时成立，所以这里不会和下面"已锁定"那一支同时出现
+        _two = anime.two_numberings([anime_id]).get(anime_id) if _conf else None
+        if _two:
+            warn_banner(
+                f"两套集号同时在下：{_two['abs_src']} 用全系列编号（第 {ep_ranges_text(_two['abs_eps'])} 集），"
+                f"{_two['in_src']} 用季内编号（第 {ep_ranges_text(_two['in_eps'])} 集）；按发布时间对，"
+                f"季内第 k 集就是全系列第 k+{_two['offset']} 集，同一集各下了一份到同一个目录。\n"
+                "锁定其中一个组，以后每集就只下一份；已经下了的不动。",
+                action=[(f"只下 {src}", "lock", _lock_two(src, other))
+                        for src, other in ((_two["abs_src"], _two["in_src"]), (_two["in_src"], _two["abs_src"]))])
+        elif _conf:
             # 【只陈述事实，不下"这是两套编号"的结论】原文案断言"多半是某个源用绝对集号、
             # 另一个用季内集号，同一集会被下两份"——真库实测它 8 次命中里只有 2 次成立
             # （#6/#60/#25/#47/#23 都是【一个源】用跨季连续编号数过了总集数，每集只有一个号）。
@@ -1001,6 +1028,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         _after()
         ui.notify(f"已下发 {n} 集" if n else "一集都没放行——多半是 qB 此刻连不上，去 /logs 看最近的 WARNING",
                   type="positive" if n else "warning")
+
+    def _lock_two(src, other):
+        async def h():
+            if await lock_two_numbering(anime_id, src, other):
+                _after()
+        return h
 
     def _unlock_source():
         anime.set_pref_source(anime_id, "")

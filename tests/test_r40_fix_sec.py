@@ -434,6 +434,46 @@ async def test_multi_member_gzip_stops_reading_at_the_second_member():
     assert len(pulled) <= 2, f"报错前读了 {len(pulled)} 块（共 {len(body) // 4096 + 1} 块）"
 
 
+class _CountingDec:
+    """包一层 decompressobj，数 decompress 调用次数：尾巴每块都喂给 zlib 就是 O(n²) 的根。"""
+    calls = 0
+
+    def __init__(self, real):
+        self._r = real
+
+    def decompress(self, *a, **k):
+        _CountingDec.calls += 1
+        return self._r.decompress(*a, **k)
+
+    def __getattr__(self, n):
+        return getattr(self._r, n)
+
+
+async def test_long_trailing_padding_is_not_fed_to_zlib(monkeypatch):
+    """第一段解完、尾巴确认不是 gzip 头后，后续字节只计数不再喂解压器（16 MB 尾巴按 4 KB 一块曾要几秒）。"""
+    real = fetch.zlib.decompressobj
+    _CountingDec.calls = 0
+    monkeypatch.setattr(fetch.zlib, "decompressobj", lambda *a: _CountingDec(real(*a)))
+    body = gzip.compress(_A + _B) + b"\0" * (4 << 20)
+
+    def h(req):
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_Stream(body, 4096))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as c:
+        assert await fetch.get_bytes(c, "http://x/", gzip_ok=True) == _A + _B
+    # 只数调用次数、不卡绝对耗时：文件头约定，硬预算在满负载全量跑时会假红
+    assert _CountingDec.calls <= 3, f"尾巴共 {len(body) // 4096} 块，喂了 zlib {_CountingDec.calls} 次"
+
+
+async def test_long_trailing_padding_still_counts_toward_the_raw_cap():
+    body = gzip.compress(_A + _B) + b"\0" * (2 << 20)
+
+    def h(req):
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_Stream(body, 4096))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as c:
+        with pytest.raises(fetch.TooLarge):
+            await fetch.get_bytes(c, "http://x/", cap=1 << 20, gzip_ok=True)
+
+
 # ══ SEC-6：Mikan 剧场版块的 _BANGUMI_RE ═════════════════════════════════
 
 _OLD_BANGUMI_RE = re.compile(r'/Home/Bangumi/(\d+)"[^>]*?title="([^"]*)"')

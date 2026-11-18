@@ -3672,6 +3672,75 @@ def episode_ranges_by_source(anime_id: int) -> list[tuple]:
                   key=lambda x: (x[1], x[0]))
 
 
+def two_numberings(anime_ids=None) -> dict:
+    """在追、没锁源的番里，【已经各下了一份】的两套集号：{anime_id: {abs_src, abs_eps, in_src, in_eps, offset, pairs}}。
+    只读、只报不改；横幅上给『只下 X』让人自己锁源。anime_ids=None 查全部在追的番。
+
+    【为什么能写成判据了】episode_ranges_by_source 的 docstring 记着四种判据在真库上都有误报，
+    它们看的是"全部种子的集号分布"。这里只认三件事同时成立（U1-1，2026-11-19 生产副本回放 5 中 5、零误报）：
+      ① 只看已交付（sent/downloading/stalled）、非别季、整数集号、有发布时间的行 —— "同时在下"本身就是证据；
+      ② 一个组的这些集【全部】超出总集数 T、另一个组【全部】在 1..T 内（一个源从 1 连续数过 T 的不算两组）；
+      ③ 存在一个偏移 d ≥ T，使至少 ANIME_TWO_NUMBERING_PAIRS 集满足"季内组的第 k 集与绝对组的第 k+d 集
+         发布时间相差不超过 ANIME_TWO_NUMBERING_DAYS 天"。
+    d ≥ T 与 D1 同口径（O ≥ T 时两套取值域才不相交）：字幕组同号落后几周的偏移远小于 T，挡在这里；
+    O < T 的歧义段（如杀手旅店第二季 O=13/T=15）有意不报，那一段本来就按源各下一份。
+    上一季的旧集整批补发，发布时间对不上绝对组的周更，挡在 ③。"""
+    days = config.ANIME_TWO_NUMBERING_DAYS
+    need = config.ANIME_TWO_NUMBERING_PAIRS
+    with get_session() as s:
+        q = select(Anime.id, Anime.total_episodes).where(
+            *subscribed_where(), Anime.total_episodes > 0,
+            or_(Anime.pref_source.is_(None), Anime.pref_source == ""))
+        if anime_ids is not None:
+            q = q.where(Anime.id.in_(list(anime_ids)))
+        tot = dict(s.exec(q).all())
+        if not tot:
+            return {}
+        rows = s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.source, AnimeTorrent.episode,
+                             AnimeTorrent.release_time).where(
+            AnimeTorrent.anime_id.in_(list(tot)), AnimeTorrent.episode >= 1,
+            AnimeTorrent.status.in_(HAVE_STATUSES), AnimeTorrent.release_time.is_not(None),
+            AnimeTorrent.foreign_season == False)).all()   # noqa: E712
+    by: dict = {}
+    for aid, src, ep, rt in rows:
+        if not float(ep).is_integer():
+            continue
+        d = by.setdefault(aid, {}).setdefault(src or "", {})
+        e = int(ep)
+        if e not in d or rt < d[e]:
+            d[e] = rt
+    win = timedelta(days=days)
+    out: dict = {}
+    for aid, srcs in by.items():
+        t = tot[aid]
+        best = None
+        for a_src, ea in srcs.items():
+            if min(ea) <= t:
+                continue
+            for b_src, eb in srcs.items():
+                if b_src == a_src or max(eb) > t:
+                    continue
+                for off in sorted({x - y for x in ea for y in eb if x - y >= t}):
+                    n = sum(1 for k, tk in eb.items() if k + off in ea and abs(ea[k + off] - tk) <= win)
+                    if n >= need and (best is None or n > best["pairs"]):
+                        best = {"abs_src": a_src, "abs_eps": sorted(ea), "in_src": b_src,
+                                "in_eps": sorted(eb), "offset": off, "pairs": n}
+        if best:
+            out[aid] = best
+    return out
+
+
+def suspect_two_numberings() -> list[dict]:
+    """仪表盘横幅用：two_numberings 的命中加上番名与身份。返回 [{id, born, name, **命中}]。"""
+    hits = two_numberings()
+    if not hits:
+        return []
+    with get_session() as s:
+        animes = {a.id: a for a in s.exec(select(Anime).options(_NO_SUMMARY).where(Anime.id.in_(list(hits))))}
+    return [{"id": aid, "born": animes[aid].created_at, "name": display_of(animes[aid]), **h}
+            for aid, h in sorted(hits.items()) if aid in animes]
+
+
 def list_episodes(anime_id: int) -> list[AnimeTorrent]:
     """某番剧的全部种子（按集数、再按入库时间倒序），供详细页展示分集/来源。"""
     with get_session() as s:
@@ -3730,7 +3799,9 @@ def confirm_anime(anime_id: int, pref_source: str | None = None) -> None:
             # 像剧场版的番被人点了确认：原因记成 movie，deliver_single_works 认它当"人看过了"，
             # 不然卡片上原因是别的（人工审核源发现 / 当时没识别出 / 绑定…）时下一轮又被打回待确认。
             # 只对像剧场版的写：普通番写上 movie，以后被打回待确认时卡片会说它"像是剧场版"。
-            if _movie_like(s, a):
+            # 没绑 bgm 的疑似别季不改：_rearm_enrich_on_new_episode 只认 wrong_season 才不重试，
+            # 改成 movie 后台就会再识别、可能又绑回那个错的条目；没绑 bgm 也进不了 deliver_single_works，留着无碍。
+            if _movie_like(s, a) and not (a.confirm_reason == "wrong_season" and a.bangumi_id is None):
                 a.confirm_reason = "movie"
             s.add(a)
             s.commit()
@@ -3805,8 +3876,8 @@ def restore_anime(anime_id: int) -> None:
             return
         a.rejected = False
         a.confirmed = True   # 恢复=确认，confirmed=True → 改开始日不会再把它判超期忽略（超期忽略需 confirmed=False）
-        if _movie_like(s, a):
-            a.confirm_reason = "movie"   # 同 confirm_anime：人点过了，deliver_single_works 别再打回待确认
+        if _movie_like(s, a) and not (a.confirm_reason == "wrong_season" and a.bangumi_id is None):
+            a.confirm_reason = "movie"   # 同 confirm_anime：人点过了，deliver_single_works 别再打回待确认（疑似别季的例外也同）
         s.add(a)
         all_rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
         # 【键必须是 dedup_key，不能是裸 episode】这是 dedup_key 的第六条消费路径——

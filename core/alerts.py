@@ -50,7 +50,7 @@ log = logging.getLogger("autorss")
 # 各类的键与人话名。加一类要同时在 `_BUILD` 里给出判据与构造式（产出 ident/fact/text），
 # 下面 `scan()` 的断言会逼着你补齐。
 KINDS = {"dup": "同一部番被拆成两条", "mva": "番剧与剧场版重号", "wrb": "绑定看着不对",
-         "ign": "超期忽略但还在更新", "rer": "同号新集被当成旧集"}
+         "ign": "超期忽略但还在更新", "rer": "同号新集被当成旧集", "two": "两套集号同时在下"}
 
 
 def _tag(row_id, created_at) -> str:
@@ -179,24 +179,44 @@ def _rer(g: dict) -> dict:
     }
 
 
+def _two(g: dict) -> dict:
+    abs_r = _anime.ep_ranges(g["abs_eps"])
+    in_r = _anime.ep_ranges(g["in_eps"])
+    return {
+        "kind": "two",
+        "ident": f"two:{_tag(g['id'], g['born'])}",
+        # 进指纹的是哪两个组：每周各来一集是常态，不该让人重新点『知道了』；换了一对组才是新事实
+        "fact": "pair=" + "|".join(x.replace(";", ",").replace("=", "-") for x in (g["abs_src"], g["in_src"])),
+        "text": (f"『{g['name']}』(#{g['id']}) 两套集号同时在下：{g['abs_src']} 用全系列编号（第 {abs_r} 集），"
+                 f"{g['in_src']} 用季内编号（第 {in_r} 集）；按发布时间对，季内第 k 集就是全系列第 k+{g['offset']} 集，"
+                 "同一集各下了一份到同一个目录。锁定其中一个组，以后每集就只下一份；已经下了的不动。"),
+        "open": [g["id"]],
+        "lock": [g["abs_src"], g["in_src"]],
+        # 仪表盘上多部同时命中时合成一张卡、每部一行，行里只放这句短的（长说明在卡头说一次）
+        "brief": (f"『{g['name']}』(#{g['id']})　{g['abs_src']} 第 {abs_r} 集 ／ "
+                  f"{g['in_src']} 第 {in_r} 集（季内第 k 集＝全系列第 k+{g['offset']} 集）"),
+    }
+
+
 _BUILD = {"dup": (_anime.suspect_duplicate_anime, _dup),
           "mva": (_anime.suspect_movie_as_anime, _mva),
           "wrb": (_anime.suspect_wrong_binding, _wrb),
           "ign": (_anime.suspect_ignored_airing, _ign),
-          "rer": (_anime.suspect_rerelease_collision, _rer)}
+          "rer": (_anime.suspect_rerelease_collision, _rer),
+          "two": (_anime.suspect_two_numberings, _two)}
 
 
 def scan() -> list[dict]:
     """跑各类判据，返回统一形状的发现列表（**不**过滤已读）。只读。
 
-    每条：{kind, ident, fact, text}（ign 另带 `impossible`；其余四类另带 `open`：横幅上
+    每条：{kind, ident, fact, text}（ign 另带 `impossible`；two 另带 `lock`：横幅上『只下 X』的两个组；其余各类另带 `open`：横幅上
     『打开详情』按钮要打开的番剧 id 列表，每个 id 都以 `#id` 出现在自己的 text 里）。
     `open` 不进 ident / fact，已读记录不受它影响。顺序固定（dup → mva → wrb → ign → rer），
     前三类与横幅原来的顺序一致。
     """
     assert set(_BUILD) == set(KINDS), "加了一类却没给全 判据/构造式/人话名"
     out = []
-    for kind in ("dup", "mva", "wrb", "ign", "rer"):
+    for kind in ("dup", "mva", "wrb", "ign", "rer", "two"):
         find, build = _BUILD[kind]
         for raw in find():
             out.append(build(raw))
@@ -258,7 +278,7 @@ def view() -> dict:
 FACT_LABEL = {"abgm": "左边那条绑的 bgm", "bbgm": "右边那条绑的 bgm",
               "ast": "左边那条的订阅状态", "bst": "右边那条的订阅状态",
               "bgm": "绑的 bgm", "season": "季号", "eps": "出问题的集号", "st": "订阅状态",
-              "imp": "是不是别的季的集被分到了这条"}
+              "imp": "是不是别的季的集被分到了这条", "pair": "两套编号的组"}
 _BITS_CN = {"00": "待确认", "01": "超期忽略", "10": "追番中", "11": "已忽略"}
 
 

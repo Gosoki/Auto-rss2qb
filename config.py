@@ -171,6 +171,10 @@ _SPEC = {
     "ANIME_GAP_AUTOFILL_DAYS": (int, 2),    # 缺集出现满这么多天，后台按原来那个组搜回这几集（只收缺的集、发布时间对得上的；0=关，只提醒）
     "ANIME_RERELEASE_WEEKS": (int, 20),     # 同号新集：新来的种子比这一集已下的那份晚这么多周以上就提醒（多半是新一季用季内编号；0=关）
     "ANIME_LOCK_LAG_DAYS": (int, 7),        # 锁定源落后提醒：别的组已有后续集、锁定源过了这么多天还没跟上才提醒（0=关）；版本关键词挡住新集的提醒共用这个天数
+    # 两套集号同时在下（U1-1，见 core.anime.two_numberings）：季内组第 k 集与绝对组第 k+偏移 集发布相差不超过这么多天算对上；
+    # 至少对上这么多集才提醒。2026-11-19 生产副本上 1~30 天 × 1~5 集全是同样 5 部真命中，范围再收窄一档留余量
+    "ANIME_TWO_NUMBERING_DAYS": (int, 7),
+    "ANIME_TWO_NUMBERING_PAIRS": (int, 3),
     "ANIME_LOCK_SYNC_DAYS": (int, 2),       # 锁定组在别组发某集前后这么多天内也在发（且集号差得远）→ 当两套编号同步在发，不算落后（只影响提醒；版本关键词挡住提醒对命中关键词的行用同一个窗口）
     # 锁定源停更兜底（E-74）：锁定组满这么多天没新东西、编号/发布时间核对无误的缺集，用别的组补一份（0=关）。
     # 判据见 core.anime.lock_fallback_plan。应不小于 ANIME_LOCK_LAG_DAYS：提醒先到，人才来得及介入
@@ -246,6 +250,9 @@ _RANGE: dict[str, tuple[int, int]] = {
     "NOTIFY_DIGEST_AT": (0, 23),
     "ANIME_GAP_AUTOFILL_DAYS": (0, 60),
     "BGM_ROUND_BREAKER": (0, 50),
+    # 压力回放（去掉锁源/忽略闸、待下行也算）在 30 天 × 1 集时多出一部旧集整批补发的误报，14 天 × 2 集仍干净
+    "ANIME_TWO_NUMBERING_DAYS": (1, 14),
+    "ANIME_TWO_NUMBERING_PAIRS": (3, 12),
 }
 
 # 全新库首启时这些键种成 false（而非其 _SPEC 默认）：配置还没弄好，先别自动采集
