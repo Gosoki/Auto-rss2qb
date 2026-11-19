@@ -38,7 +38,7 @@ _NUMERIC = {"BACKUP_INTERVAL_HOURS", "BACKUP_KEEP",
             "ANIME_IGNORED_AIRING_DAYS", "ALERT_REPEAT_HOURS", "ALERT_REPEAT_DAYS",
             "ANIME_LOCK_FALLBACK_DAYS", "ANIME_REPLACE_MAX_GAP_DAYS", "ANIME_GAP_AUTOFILL_DAYS",
             "NOTIFY_DIGEST_HOURS", "NOTIFY_DIGEST_AT", "BGM_ROUND_BREAKER",
-            "ANIME_TWO_NUMBERING_DAYS", "ANIME_TWO_NUMBERING_PAIRS"}
+            "ANIME_TWO_NUMBERING_DAYS", "ANIME_TWO_NUMBERING_PAIRS", "ANIME_LOCK_LAG_EPS"}
 _PASSWORD = {"QB_PASSWORD", "PROXY_PASS", "DB_MYSQL_PASSWORD"}
 # 绑监听地址/端口：仍走 .env、改了要重启；其余设置都进 DB 即时生效
 _RESTART_ONLY = {"WEB_HOST", "WEB_PORT"}
@@ -1168,6 +1168,8 @@ def settings():
                      "建议不小于『锁定源落后提醒』的天数，好让提醒先到、你来得及介入。")
             with ui.element("div").classes("field-grid w-full"):
                 _num("ANIME_LOCK_LAG_DAYS", "锁定源落后 / 版本关键词挡住提醒（天，0=关）", config.ANIME_LOCK_LAG_DAYS, 0, 90)
+                _num("ANIME_LOCK_LAG_EPS", "锁定源落后几集才提醒", config.ANIME_LOCK_LAG_EPS,
+                     *config._RANGE["ANIME_LOCK_LAG_EPS"])
                 _num("ANIME_LOCK_SYNC_DAYS", "锁定源同步窗口（天）", config.ANIME_LOCK_SYNC_DAYS,
                      *config._RANGE["ANIME_LOCK_SYNC_DAYS"])
                 _num("ANIME_LOCK_FALLBACK_DAYS", "锁定源停更兜底（天，0=关）", config.ANIME_LOCK_FALLBACK_DAYS,

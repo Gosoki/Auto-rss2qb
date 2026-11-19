@@ -3346,6 +3346,13 @@ async def sweep_idle() -> int:
 _wb_notified: set = set()
 
 
+def _lag_worth_alert(lagging: dict) -> dict:
+    """推送和仪表盘只报被挡住至少 ANIME_LOCK_LAG_EPS 集的番：字幕组晚一集是常态，报了就是误报。
+    详情页横幅、停更兜底（E-74）不经过这里 —— 卡在一集的终集照样由兜底补，用户点进去也看得到。"""
+    need = config.ANIME_LOCK_LAG_EPS
+    return {k: v for k, v in lagging.items() if len(v["eps"]) >= need}
+
+
 async def sweep_lock_lag() -> int:
     """巡检：锁定源落后（判据见 locked_out_episodes）→ 推送 lock_lag。返回推出去几条。(r37 #2)
     同一部番、同一个"被挡到第几集"只推一次（冷却 7 天，进程内）；锁定源后面又被甩开一集就是新的一条。
@@ -3354,7 +3361,7 @@ async def sweep_lock_lag() -> int:
         return 0
     with get_session() as s:
         animes = list(s.exec(select(Anime).where(Anime.pref_source.is_not(None), Anime.pref_source != "")))
-    lagging = locked_out_episodes(animes)
+    lagging = _lag_worth_alert(locked_out_episodes(animes))
     fb_days = config.ANIME_LOCK_FALLBACK_DAYS
     # 只为取 kw_missed（版本关键词是兜底的硬条件，没有这个版本的集不补、继续靠这条提醒）与被哪道闸挡住。在 await 之前算好
     fb_plan, fb_blocked = lock_fallback_preview() if (fb_days > 0 and lagging) else ({}, {})
@@ -3390,7 +3397,7 @@ def suspect_lock_lag() -> list[dict]:
     with get_session() as s:
         animes = list(s.exec(select(Anime).options(_NO_SUMMARY).where(
             Anime.pref_source.is_not(None), Anime.pref_source != "")))
-    lagging = locked_out_episodes(animes)
+    lagging = _lag_worth_alert(locked_out_episodes(animes))
     if not lagging:
         return []
     blocked = lock_fallback_preview()[1] if config.ANIME_LOCK_FALLBACK_DAYS > 0 else {}

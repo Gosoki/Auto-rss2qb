@@ -175,6 +175,9 @@ _SPEC = {
     # 至少对上这么多集才提醒。2026-11-19 生产副本上 1~30 天 × 1~5 集全是同样 5 部真命中，范围再收窄一档留余量
     "ANIME_TWO_NUMBERING_DAYS": (int, 7),
     "ANIME_TWO_NUMBERING_PAIRS": (int, 3),
+    # 锁定源落后提醒（推送与仪表盘）：被挡住的集至少这么多集才提醒。落后一集多半是字幕组还在做；
+    # 只管提醒，详情页横幅和停更兜底照旧按一集算
+    "ANIME_LOCK_LAG_EPS": (int, 2),
     "ANIME_LOCK_SYNC_DAYS": (int, 2),       # 锁定组在别组发某集前后这么多天内也在发（且集号差得远）→ 当两套编号同步在发，不算落后（只影响提醒；版本关键词挡住提醒对命中关键词的行用同一个窗口）
     # 锁定源停更兜底（E-74）：锁定组满这么多天没新东西、编号/发布时间核对无误的缺集，用别的组补一份（0=关）。
     # 判据见 core.anime.lock_fallback_plan。应不小于 ANIME_LOCK_LAG_DAYS：提醒先到，人才来得及介入
@@ -238,6 +241,7 @@ _SPEC = {
 # 设置页保存时越界直接拒收。raw() 仍返回存储值。
 _RANGE: dict[str, tuple[int, int]] = {
     "ANIME_LOCK_SYNC_DAYS": (0, 14),
+    "ANIME_LOCK_LAG_EPS": (1, 12),
     "ANIME_LOCK_FALLBACK_DAYS": (0, 90),
     "ANIME_IDLE_WINDOW_X": (2, 52),
     "ANIME_IGNORED_AIRING_DAYS": (1, 365),
