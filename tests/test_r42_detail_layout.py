@@ -2,7 +2,7 @@
 
 钉的是：
 · 每条种子行右侧是固定三格（.ep-acts）：『下载』恒在，🗑 / 排除 / 恢复 与它同在一个容器里，空格也占位；
-· 『别季』（标为不属于本季）/『撤销』常驻在第三格，不收菜单（用户：不要单纯收起来）；
+· 『非本季』（标为不属于本季）/『撤销』常驻在第一格，不收菜单（用户：不要单纯收起来）；『下载』在最后一格贴行尾；
 · 详情页里没有任何菜单：顶部管理行 = 主操作 + 重新识别 / 编辑季度 / 忽略本番，都常驻；
 · 下载区（下载源、版本、下载该源 / 自动补齐 / 补齐该源）在元信息卡下面、分集列表上面；
 · 『重新识别』跑一百多秒，转圈挂在它自己身上；
@@ -91,14 +91,14 @@ async def test_every_seed_row_has_the_fixed_three_slot_actions(user, clean_table
         acts = _acts_of(b)
         assert acts is not None, "『下载』不在 .ep-acts 里"
         kids = _slots(acts)
-        assert len(kids) == 3 and kids[1] is b, "三格：处置 / 下载 / 别季，空格也要占位"
+        assert len(kids) == 3 and kids[2] is b, "三格：非本季 / 处置 / 下载，下载贴行尾，空格也要占位"
         assert _row_of(acts) is _row_of(b)
     for text, icon in (("排除", None), ("恢复", None), ("", "delete_forever")):
         bs = _btns(user, text, icon) if icon is None else _btns(user, icon=icon)
         assert bs, (text, icon)
         for b in bs:
             acts = _acts_of(b)
-            assert acts is not None and _slots(acts)[0] is b, f"{text or icon} 不在处置格"
+            assert acts is not None and _slots(acts)[1] is b, f"{text or icon} 不在处置格"
 
 
 @pytest.mark.nicegui_main_file(_MAIN)
@@ -110,7 +110,7 @@ async def test_foreign_season_actions_sit_in_the_third_slot(user, clean_tables, 
     assert len(undo) == 1
     assert not _in_menu(undo[0]), "『撤销』又收回菜单里了"
     acts = _acts_of(undo[0])
-    assert acts is not None and _slots(acts)[2] is undo[0], "『撤销』应常驻在第三格"
+    assert acts is not None and _slots(acts)[0] is undo[0], "『撤销』应常驻在第一格"
 
 
 @pytest.mark.nicegui_main_file(_MAIN)
@@ -123,7 +123,7 @@ async def test_foreign_suspect_button_sits_in_the_third_slot(user, clean_tables,
     bs = _btns(user, "非本季")
     assert len(bs) == 1 and not _in_menu(bs[0])
     acts = _acts_of(bs[0])
-    assert acts is not None and _slots(acts)[2] is bs[0], "『别季』应常驻在第三格"
+    assert acts is not None and _slots(acts)[0] is bs[0], "『非本季』应常驻在第一格"
 
 
 @pytest.mark.nicegui_main_file(_MAIN)

@@ -147,24 +147,50 @@ async def test_numbering_conflict_turns_grey_once_a_source_is_locked(user, clean
         assert "已锁定『A』" in ls[0].text and "别的组的不会自动下" in ls[0].text, ls[0].text
 
 
-# ---------------------------------------------------------------- U2-3 简介默认展开，开关收起（r43）
+# ---------------------------------------------------------------- U2-3 简介：中文 / 原文分开显示（r43）
 
 @pytest.mark.nicegui_main_file(_MAIN)
-async def test_summary_is_expanded_and_folds_by_toggle(user, clean_tables):
-    """简介默认全文展开；下面的『收起简介』开关收成 3 行、再点展开。点文字本身不收（选中复制时不误收），也不挂提示。"""
-    summary = "第一段简介。\n[简介原文]\n日本語のあらすじ。\n第四行\n第五行"
+async def test_summary_shows_chinese_and_original_by_toggle(user, clean_tables):
+    """bgm 的"中文 + [简介原文] + 日文"：默认只显示中文全文，『显示原文』开关展开原文、再点收回。不挂提示、点文字不触发。"""
+    summary = "第一段简介。\n第二段。\n\n[简介原文]\n日本語のあらすじ。\n二行目"
+    with clean_tables.get_session() as s:
+        aid = _anime(s, summary=summary).id
+    await user.open(f"/detail/{aid}")
+    cn = next(e for e in _live(user, ui.label) if e.text == "第一段简介。\n第二段。")
+    orig = next(e for e in user.client.layout.descendants()
+                if isinstance(e, ui.label) and e.text == "日本語のあらすじ。\n二行目")
+    assert "line-clamp-5" not in cn.classes and not orig.visible
+    assert not any(isinstance(c, ui.tooltip) for c in cn.default_slot.children)
+    assert not any(lis.type == "click" for lis in cn._event_listeners.values())
+    tg = next(b for b in _live(user, ui.button) if b.text == "显示原文")
+    _fire(user, tg, "click")
+    await _until(lambda: orig.visible and tg.text == "收起原文", "开关没有显示原文")
+    _fire(user, tg, "click")
+    await _until(lambda: not orig.visible and tg.text == "显示原文", "开关没有收起原文")
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_single_language_summary_is_clamped_and_expands(user, clean_tables):
+    """没有『[简介原文]』的简介：默认收成 5 行，『展开简介』开关展开全文、再点收回。"""
+    summary = "第一行\n第二行\n第三行\n第四行\n第五行\n第六行"
     with clean_tables.get_session() as s:
         aid = _anime(s, summary=summary).id
     await user.open(f"/detail/{aid}")
     lab = next(e for e in _live(user, ui.label) if e.text == summary)
-    assert "line-clamp-3" not in lab.classes, lab.classes
-    assert not any(isinstance(c, ui.tooltip) for c in lab.default_slot.children)
-    assert not any(lis.type == "click" for lis in lab._event_listeners.values()), "点文字不该收起"
-    tg = next(b for b in _live(user, ui.button) if b.text == "收起简介")
+    assert "line-clamp-5" in lab.classes, lab.classes
+    tg = next(b for b in _live(user, ui.button) if b.text == "展开简介")
     _fire(user, tg, "click")
-    await _until(lambda: "line-clamp-3" in lab.classes and tg.text == "展开简介", "开关没有收起")
+    await _until(lambda: "line-clamp-5" not in lab.classes and tg.text == "收起简介", "开关没有展开")
     _fire(user, tg, "click")
-    await _until(lambda: "line-clamp-3" not in lab.classes and tg.text == "收起简介", "开关没有展开")
+    await _until(lambda: "line-clamp-5" in lab.classes and tg.text == "展开简介", "开关没有收回")
+
+
+def test_split_summary():
+    from pages.layout import split_summary
+    assert split_summary("中文\n[简介原文]\n日文") == ("中文", "日文")
+    assert split_summary("只有一段") == ("只有一段", "")
+    assert split_summary("[简介原文]\n日文") == ("", "日文")
+    assert split_summary(None) == ("", "")
 
 
 # ---------------------------------------------------------------- U2-5 删除确认框说清是哪一行

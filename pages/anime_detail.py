@@ -689,8 +689,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         # 标题行：标题+第X季+状态徽章塞进左侧可换行容器（grow/min-w-0），窄屏先把它们挤下去换行；
         # 外层 no-wrap + X 用 shrink-0 → X 永远钉在右上角，不被挤走。items-start 让 X 贴顶。
         with ui.row().classes("items-start gap-2 w-full no-wrap"):
-            with ui.row().classes("items-center gap-2 flex-wrap grow min-w-0"):
-                ui.label(name_of(cur)).classes("text-2xl font-bold")
+            # 行内排版（不是 flex）：标题很长折行时，✎ 和徽标紧跟在最后一个字后面，不整块掉到下一行
+            with ui.element("div").classes("grow min-w-0 title-flow"):
+                ui.label(name_of(cur)).classes("text-2xl font-bold inline")
                 ui.button(icon="edit", on_click=_bind).props(
                     "flat round dense color=primary").classes("btn-sm").tooltip(
                     "认错了？手动绑定正确的 bgm（粘链接或 ID）")
@@ -1180,7 +1181,22 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                         ui.space()
                         # 别用 ui.column：测试按最近的 ui.column 认种子行。三格宽度固定（见 layout.py 的 .ep-acts），空格也要占位
                         with ui.element("div").classes("ep-acts"):
-                            # 格1「处置」：恢复 / 排除 / 🗑 三者按状态互斥，一格放得下
+                            # 格1「非本季」：『不属于本季』/『撤销』二选一常驻在这一格。放最左：这一格多数行是空的，空在中间不显眼，
+                            # 『下载』才能贴住行尾、跟上面的保存路径右缘对齐。手机上看不到气泡，标上之前确认框会说清是什么。
+                            # (E-77 C)『不属于本季』只由这里（和缺集横幅上的批量按钮）产生，后台永不自动打。
+                            # 只对看着像别季的正集给按钮（判据见 anime.foreign_season_suspect）。交付中的不给（set_foreign_season 也不改它）：等它落定。
+                            if t.foreign_season:
+                                ui.button("撤销", icon="undo", on_click=_set_foreign(t.id, False, t.episode)).props(
+                                    "flat dense color=primary").classes("btn-sm").tooltip(
+                                    "撤销『不属于本季』：这一条重新占用本季这一集的位置")
+                            elif t.status != "downloading" and anime.foreign_season_suspect(cur, t):
+                                ui.button("非本季", icon="playlist_remove",
+                                          on_click=_set_foreign(t.id, True, t.episode)).props(
+                                    "flat dense color=grey").classes("btn-sm").tooltip(
+                                    "不属于本季：这一条是别的季的（同集号的旧正片），标记后不再占用本季这一集的位置，文件不动，可撤销")
+                            else:
+                                ui.element("div")
+                            # 格2「处置」：恢复 / 排除 / 🗑 三者按状态互斥，一格放得下
                             if t.status == "excluded":  # 已排除：给『恢复』放回待下
                                 ui.button("恢复", icon="undo", on_click=_unexclude(t.id)).props(
                                     "flat dense color=primary").classes("btn-sm").tooltip(
@@ -1202,7 +1218,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                     else "删除这一集的文件（qB+硬盘，不可撤销）")
                             else:
                                 ui.element("div")
-                            # 格2「下载」：已在 qB 里（在下 / 已下且未归档）：core 对 force 也是幂等短路（逐字对应
+                            # 格3「下载」：已在 qB 里（在下 / 已下且未归档）：core 对 force 也是幂等短路（逐字对应
                             # _download_anime_torrent_inner 开头两道闸；交付中的占位行可能还挂着旧 archived_at，同样被拒）。
                             # 置灰不隐藏：各行『下载』要落在同一列
                             _in_qb = t.status == "downloading" or (t.status in engine.TRACKED_STATUSES and not t.archived_at)
@@ -1213,21 +1229,6 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                          else "已经在下载或已经下好了，不用再点" if _in_qb
                                          else "已归档：文件还在盘上，点这里把这一条重新交回 qB" if t.archived_at
                                          else "强制下这一条到文件夹（无视去重/优先级）")
-                            # 格3「别季」：『不属于本季』/『撤销』二选一常驻在这一格。格宽固定、没有时空格占位，
-                            # 徽标右缘照样对齐；字只写两个（同前两格的宽度），手机上看不到气泡，标上之前确认框会说清是什么。
-                            # (E-77 C)『不属于本季』只由这里（和缺集横幅上的批量按钮）产生，后台永不自动打。
-                            # 只对看着像别季的正集给按钮（判据见 anime.foreign_season_suspect）。交付中的不给（set_foreign_season 也不改它）：等它落定。
-                            if t.foreign_season:
-                                ui.button("撤销", icon="undo", on_click=_set_foreign(t.id, False, t.episode)).props(
-                                    "flat dense color=primary").classes("btn-sm").tooltip(
-                                    "撤销『不属于本季』：这一条重新占用本季这一集的位置")
-                            elif t.status != "downloading" and anime.foreign_season_suspect(cur, t):
-                                ui.button("非本季", icon="playlist_remove",
-                                          on_click=_set_foreign(t.id, True, t.episode)).props(
-                                    "flat dense color=grey").classes("btn-sm").tooltip(
-                                    "不属于本季：这一条是别的季的（同集号的旧正片），标记后不再占用本季这一集的位置，文件不动，可撤销")
-                            else:
-                                ui.element("div")
                 # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
                 with ui.row().classes("items-start gap-3 w-full text-sm no-wrap"):
                     ui.label(ep_txt).classes("shrink-0").style("visibility:hidden")

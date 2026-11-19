@@ -517,14 +517,41 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                         ui.label(_lab).classes("text-xs text-gray-400")
         if summary:
             ui.separator()
-            # 简介是正文，不着灰。默认全文展开；嫌长就点下面的开关收成 3 行。只认开关、不认点文字：
-            # 选中复制简介时不会误收起。body.refresh() 之后回到展开
-            _sum = ui.label(summary).classes("text-sm whitespace-pre-wrap")
+            # 简介是正文，不着灰。只认开关、不认点文字：选中复制简介时不会误收起。body.refresh() 之后回到默认
+            cn, orig = split_summary(summary)
+            if cn and orig:
+                # bgm 简介常是"中文 + [简介原文] + 日文"：默认只显示中文，原文按开关展开
+                ui.label(cn).classes("text-sm whitespace-pre-wrap")
+                _orig = ui.label(orig).classes("text-sm whitespace-pre-wrap")
+                _orig.set_visibility(False)
 
-            def _fold():
-                _sum.classes(toggle="line-clamp-3")
-                _tg.text = "展开简介" if "line-clamp-3" in _sum.classes else "收起简介"
-            _tg = ui.button("收起简介", on_click=_fold).props("flat dense color=primary").classes("btn-sm self-start")
+                def _flip():
+                    _orig.set_visibility(not _orig.visible)
+                    _tg.text = "收起原文" if _orig.visible else "显示原文"
+                _tg = ui.button("显示原文", on_click=_flip).props("flat dense color=primary").classes(
+                    "btn-sm self-start")
+            else:
+                # 只有一种语言：默认收成 5 行，开关展开全文 / 收回
+                _sum = ui.label(cn or orig).classes("text-sm whitespace-pre-wrap line-clamp-5")
+
+                def _fold():
+                    _sum.classes(toggle="line-clamp-5")
+                    _tg.text = "展开简介" if "line-clamp-5" in _sum.classes else "收起简介"
+                _tg = ui.button("展开简介", on_click=_fold).props("flat dense color=primary").classes(
+                    "btn-sm self-start")
+
+
+_ORIG_MARK = "[简介原文]"
+
+
+def split_summary(summary: str) -> tuple[str, str]:
+    """bgm 简介 → (中文, 原文)。bgm 编辑常把中文译文放前面、"[简介原文]" 之后接日文原文；
+    没有这个标记就整段当作一种语言放在第一项。只拆显示，库里照原样存。"""
+    text = summary or ""
+    if _ORIG_MARK not in text:
+        return text.strip(), ""
+    cn, orig = text.split(_ORIG_MARK, 1)
+    return cn.strip(), orig.strip()
 
 
 def name_of(a) -> str:
@@ -1027,6 +1054,8 @@ _HEAD_BASE_CSS = (
     "}"
     # 详情元信息卡：字段一对一行；封面桌面 20rem、手机 18.5rem（手机竖排时封面独占一行，太高会把下面推太远）
     ".kv-grid{display:grid;grid-template-columns:auto minmax(0,1fr)}"
+    # 详情页标题：标题文字与 ✎ / 徽标同在一段行内排版，徽标跟在最后一个字后面
+    ".title-flow>.q-btn,.title-flow>.q-badge{vertical-align:middle;margin-left:.5rem}"
     ".meta-cover{height:20rem}"
     # 订阅源页：白名单与关键词两个输入框，≥1024px 并排
     ".pair-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:.5rem 1rem}"
@@ -1038,9 +1067,9 @@ _HEAD_BASE_CSS = (
     # <640px 时按钮已经落到文字下面，不需要封顶。
     "@media(min-width:640px){.warn-acts{max-width:min(22rem,50%)}}"
     # 详情页种子行右侧的固定三格操作（处置 / 下载 / 别季）：格子宽度不随这一行有哪些按钮变，
-    # 各行『下载』与状态徽标的右缘才对得齐。前两格 3.75rem 放得下"图标 + 两个字"（约 57px），第三格 4.5rem 放"图标 + 非本季"。
+    # 各行『下载』与状态徽标的右缘才对得齐。第一格 4.5rem 放"图标 + 非本季"，后两格 3.75rem 放得下"图标 + 两个字"（约 57px）。
     # 手机档见上面 599 那块
-    ".ep-acts{display:grid;grid-template-columns:3.75rem 3.75rem 4.5rem;align-items:center;justify-items:end;"
+    ".ep-acts{display:grid;grid-template-columns:4.5rem 3.75rem 3.75rem;align-items:center;justify-items:end;"
     "column-gap:.25rem;flex:none}"
     # 详情页的两组常驻按钮（顶部管理行、下载区）：桌面按自然宽度排一行；手机档见上面 599 那块
     ".act-grid{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem}"
