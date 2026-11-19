@@ -49,7 +49,7 @@ def test_feed_gap_push_points_to_auto_backfill():
     seg = seg[:seg.index("bypass_rate=True")]
     assert "补齐该源" not in seg
     assert "自动补齐" in seg and "缺集提示要等余量过了或下一集入库才出现" in seg
-    assert "可以先到这段时间有更新的番的详情页点『自动补齐』" in seg
+    assert "去这段时间有更新的番的详情页点『自动补齐』" in seg
 
 
 def test_feed_gap_banner_points_to_auto_backfill():

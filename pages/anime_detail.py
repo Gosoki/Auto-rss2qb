@@ -1,12 +1,13 @@
 """番剧详情组件：render_anime_detail 渲染进列表页的悬浮框(dialog)，不再有独立页路由。"""
 import itertools
+import json
 
 from nicegui import ui
 
 from core import anime, engine
 import config
 from .layout import (SEVERITY_COLOR, WEEKDAY_CN, busy_action, confirm, require_bind_confirm,
-                     ep_label, ep_ranges_text, ep_str, finished_tip, meta_card,
+                     ep_label, human_size, ep_ranges_text, ep_str, finished_tip, meta_card,
                      name_of, page_dialog, parse_bgm_id, wait_dialog,
                      qb_live_text, season_label, source_options, torrent_status_cn,
                      warn_banner)
@@ -75,19 +76,354 @@ def notify_relocate_anime(rep):
     ui.notify(msg, type="warning" if warn else "positive")
 
 
+# 清理清单的两个框在手机上整屏显示（等同 Quasar 的 maximized，但只在窄屏生效；服务端拿不到视口宽度，只能交给 CSS）。
+# 卡片撑满后按钮落在最底下，清单在中间滚。
+_CLEANUP_DLG_CSS = """
+@media (max-width: 599.98px) {
+  .cleanup-dlg .q-dialog__inner--minimized { padding: 0; }
+  .cleanup-dlg .q-dialog__inner > .q-card { width: 100vw; max-width: 100vw !important; height: 100%;
+    max-height: 100% !important; border-radius: 0; }
+}
+"""
+ui.add_css(_CLEANUP_DLG_CSS, shared=True)
+
+
+def _ep_span_text(eps) -> str:
+    """『第 a–b 集』里的 a–b（只有一集时就是那一集）。"""
+    eps = sorted(e for e in eps if e is not None)
+    if not eps:
+        return "?"
+    a, b = ep_str(eps[0]), ep_str(eps[-1])
+    return a if a == b else f"{a}–{b}"
+
+
+def _cleanup_tail(kind: str, items: list) -> str:
+    """清理框末尾那段（C3 / C3f）。"""
+    if kind == "foreign":
+        return ("这些已经标了『不属于本季』，是别的季的正片，不占本季的集号；本季每一集照常下、照常补。"
+                "删掉后你盘上可能就没有那一季的这几集了。")
+    it = items[0]
+    return (f"删掉的是『{it['drop_src']}』的第 {_ep_span_text(i['drop_ep'] for i in items)} 集，"
+            f"这些内容在『{it['keep_src']}』里是第 {_ep_span_text(i['keep_ep'] for i in items)} 集，留着。"
+            f"以后『{it['drop_src']}』这几个号不再自动下；想要回某一份，在那一行点『下载』。")
+
+
+class _CleanupList:
+    """清理清单（勾选 / 删哪份 / 大小 / 留哪份），『看清单并清理』框与『只下 X』框共用这一个组件。
+
+    打开后 probe() 在后台查一次 qB：填大小、把留下那份核不过的锁成不可勾。查完之前与 qB 连不上时 ready=False，
+    调用方据此禁用删除按钮。on_change：勾选数或大小变了时回调（调用方用来改按钮文字）。"""
+
+    def __init__(self, kind: str, pv: dict, on_change=None):
+        self.kind, self.on_change = kind, on_change
+        self.items = [dict(it) for it in pv["items"]]
+        self.skipped = list(pv.get("skipped") or [])
+        self.on = {it["drop_id"]: bool(it["checked"]) for it in self.items}
+        self.qb = None          # None=还在查 / True / False=连不上
+        self.warn = list(pv.get("warn") or [])
+
+    @property
+    def ready(self) -> bool:
+        return self.qb is True
+
+    def picks(self) -> list:
+        return [(it["drop_id"], it["drop_hash"], it["keep_id"], it["keep_hash"]) for it in self.items
+                if self.on.get(it["drop_id"]) and not it.get("locked")]
+
+    def tail_text(self) -> str:
+        """C3 / C3f：『删掉的是第 a–b 集』按此刻勾着且没锁的那几份算（没勾时按全部），和真正要删的对得上。"""
+        ids = {p[0] for p in self.picks()}
+        return _cleanup_tail(self.kind, [it for it in self.items if it["drop_id"] in ids] or self.items)
+
+    def size_text(self, only_checked: bool = True) -> str:
+        sel = [it for it in self.items if not only_checked or (self.on.get(it["drop_id"]) and not it.get("locked"))]
+        if self.qb is not True:
+            return "大小待查"
+        known = [it["size"] for it in sel if it.get("size")]
+        return human_size(sum(known)) if known else "—"
+
+    def _changed(self):
+        self.summary.refresh()
+        if self.on_change:
+            self.on_change()
+
+    def _toggle(self, drop_id, v):
+        self.on[drop_id] = bool(v)
+        self._changed()
+
+    def _toggle_all(self, v):
+        for it in self.items:
+            if not it.get("locked"):
+                self.on[it["drop_id"]] = bool(v)
+        self.rows.refresh()
+        self._changed()
+
+    def render(self) -> None:
+        self.summary()
+        self.rows()
+        if self.skipped:
+            with ui.expansion(f"不删的 {len(self.skipped)} 份", icon="block").classes("w-full text-sm"):
+                for sk in self.skipped:
+                    ui.label(f"{sk['src'] or '—'} 第 {ep_str(sk['ep'])} 集：{sk['reason']}").classes(
+                        "text-xs text-gray-400 break-all")
+
+    @ui.refreshable_method
+    def summary(self) -> None:
+        n = len(self.picks())
+        free = [it for it in self.items if not it.get("locked")]
+        with ui.row().classes("items-center gap-2 w-full no-wrap"):
+            ui.checkbox("全选", value=bool(free) and n == len(free),
+                        on_change=lambda e: self._toggle_all(e.value)).props("dense")
+            ui.label(f"已勾 {n} 份 · 共 {self.size_text()}").classes("text-xs text-gray-400")
+            if self.qb is None:
+                ui.spinner(size="1em").classes("text-gray-400")
+        for w in self.warn:
+            ui.label(w).classes("text-xs text-amber-400")
+
+    @ui.refreshable_method
+    def rows(self) -> None:
+        # 超过 8 行时表格内部滚动，按钮留在底下看得见
+        box = ui.column().classes("w-full gap-0")
+        if len(self.items) > 8:
+            box.classes("overflow-y-auto").style("max-height:min(50vh,22rem)")
+        with box:
+            for it in self.items:
+                # 桌面一行四列（勾 / 删 / 大小 / 留）；手机两行：第一行勾+删+大小，第二行缩进写留哪份与提示
+                with ui.element("div").classes(
+                        "w-full flex flex-col sm:flex-row sm:flex-nowrap sm:items-start gap-x-3 py-1").style(
+                        "border-bottom:1px solid rgba(255,255,255,.08)"):
+                    with ui.row().classes("items-center gap-2 no-wrap min-w-0 sm:w-1/2"):
+                        cb = ui.checkbox(value=self.on.get(it["drop_id"]) and not it.get("locked"),
+                                         on_change=lambda e, i=it["drop_id"]: self._toggle(i, e.value)).props("dense")
+                        cb.set_enabled(not it.get("locked") and self.qb is not False)
+                        ui.label(f"删：{it['drop_src'] or '—'} 第 {ep_str(it['drop_ep'])} 集").classes(
+                            "text-sm grow min-w-0 break-all")
+                        ui.label(human_size(it["size"]) if it.get("size") else "—").classes(
+                            "text-xs text-gray-400 shrink-0 text-right").style("min-width:4.5rem")
+                    with ui.column().classes("gap-0 min-w-0 pl-8 sm:pl-0 sm:flex-1"):
+                        ui.label(f"留：{it['keep_src']} 第 {ep_str(it['keep_ep'])} 集" if it["keep_id"] is not None
+                                 else "别季，本季不受影响").classes("text-sm text-gray-400")
+                        if it.get("note"):
+                            ui.label(it["note"]).classes("text-xs text-amber-400")
+
+    async def probe(self) -> None:
+        r = await anime.cleanup_probe(self.items)
+        self.qb = r["qb"]
+        self.items = r["items"]
+        for it in self.items:
+            if it.get("locked"):
+                self.on[it["drop_id"]] = False
+        self.warn += r["warn"]
+        self.rows.refresh()
+        self._changed()
+
+
+def _cleanup_report(kind: str, res: dict) -> tuple[str, str]:
+    """执行结果 → (toast 文案, 类型)。qB 里早就没有的那几份不在这里说，由结果视图逐行列路径。"""
+    parts = []
+    if res["deleted"]:
+        parts.append(f"已删掉 {len(res['deleted'])} 份（{human_size(res['bytes'])}）。"
+                     + ("每一集都还留着一份。" if kind == "two" else ""))
+    by: dict = {}
+    for _, why in res["skipped"]:
+        by[why] = by.get(why, 0) + 1
+    parts += [f"{k} 份没删：{why}。" for why, k in by.items()]
+    qb_down = [x for x in res["failed"] if x[1] == "qB 连不上"]
+    if qb_down and len(qb_down) == len(res["failed"]) and not res["deleted"] and not res["gone"]:
+        parts.append("qB 连不上，一份都没删。")
+    elif res["failed"]:
+        parts.append(f"{len(res['failed'])} 份 qB 没删成，可以再点一次。")
+    bad = res["skipped"] or res["failed"]
+    return "".join(parts) or "一份都没删。", ("warning" if bad or not res["deleted"] else "positive")
+
+
+async def _copy_text(text: str) -> None:
+    """带回执的复制（非安全上下文里 navigator.clipboard 不存在，ui.clipboard.write 会静默失败，同设置页那一处）。"""
+    try:
+        ok = await ui.run_javascript(
+            "(async () => { try { await navigator.clipboard.writeText(" + json.dumps(text)
+            + "); return true } catch (e) { return false } })()", timeout=3.0)
+    except Exception:
+        ok = False
+    ui.notify("已复制路径" if ok else "浏览器不允许自动复制（局域网 http 属非安全上下文），请手动选中上面的路径复制",
+              type="positive" if ok else "warning")
+
+
+def _gone_view(gone: list, on_close) -> None:
+    """qB 里早就没有了的那几份：只改了记录，文件可能还在盘上 —— 逐行给路径，让人自己去删。"""
+    ui.label(f"另有 {len(gone)} 份 qB 里早就没有了，只改了记录，文件可能还在盘上：").classes("text-sm")
+    paths = "\n".join(p for _, p in gone)
+    ui.label(paths).classes("text-xs text-gray-400 select-all").style("white-space:pre-line;word-break:break-all")
+    with ui.row().classes("w-full justify-end gap-2 flex-col sm:flex-row"):
+        ui.button("复制路径", icon="content_copy", on_click=lambda: _copy_text(paths)).props(
+            "flat color=primary").classes("w-full sm:w-auto")
+        ui.button("关闭", on_click=on_close).props("flat").classes("w-full sm:w-auto")
+
+
+async def _show_gone(gone: list) -> None:
+    dlg = page_dialog()
+    if dlg is None:
+        return
+    with dlg, ui.card().classes("gap-2").style("max-width:min(92vw,46rem)"):
+        _gone_view(gone, lambda: dlg.submit(None))
+    try:
+        await wait_dialog(dlg)
+    finally:
+        dlg.delete()
+
+
+async def run_cleanup(anime_id: int, kind: str, picks: list) -> dict:
+    """执行 + 汇报（toast；有 qB 里早没了的另弹一个列路径的框）。『只下 X』框关掉之后用。"""
+    res = await anime.cleanup_execute(anime_id, kind, picks)
+    msg, typ = _cleanup_report(kind, res)
+    ui.notify(msg, type=typ)
+    if res["gone"]:
+        await _show_gone(res["gone"])
+    return res
+
+
+async def cleanup_dialog(anime_id: int, kind: str, keep_src: str | None = None, after=None) -> dict | None:
+    """详情页横幅『看清单并清理』：两套集号的重复份（kind="two"）/ 已标『不属于本季』的别季文件（kind="foreign"）。
+    打开先列预览，后台查 qB 填大小与留下那份的核实结果（查完之前删除按钮禁用）；执行中框不关、按钮转圈防连点；
+    qB 里早就没有的那几份换成结果视图列路径。after：执行过就调（刷新横幅与外层）。返回执行结果，没执行返回 None。"""
+    pv = anime.cleanup_preview(anime_id, kind, keep_src)
+    if not pv["items"]:
+        ui.notify("没有要清理的了（可能刚被处理过）", type="info")
+        return None
+    dlg = page_dialog()
+    if dlg is None:
+        return None
+    dlg.classes("cleanup-dlg")   # 手机上整屏（见 _CLEANUP_DLG_CSS），清单不被挤成一条缝
+    state: dict = {"res": None, "busy": False}
+    n_all = len(pv["items"])
+    with dlg, ui.card().classes("gap-2 w-full").style("max-width:min(92vw,46rem)") as card:
+        body = ui.column().classes("w-full gap-2 grow")
+        with body:
+            ui.label(f"删掉 {n_all} 份重复文件？" if kind == "two" else f"删掉 {n_all} 个别季文件？").classes(
+                "font-bold")
+            ui.label("通过 qB 连同硬盘文件一起删，不能撤销。"
+                     + ("每一份右边写着留下的那份。" if kind == "two" else "")).classes("text-xs text-gray-400")
+            lst = _CleanupList(kind, pv, on_change=lambda: _sync())
+            lst.render()
+            tail = ui.label(lst.tail_text()).classes("text-xs text-gray-400")
+        acts = ui.row().classes("w-full justify-end gap-2 flex-col sm:flex-row")
+        with acts:
+            cancel = ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat").classes("w-full sm:w-auto")
+            _c = "negative"
+            ok = ui.button("", icon="delete_forever").props(f"color={_c} unelevated").classes("w-full sm:w-auto")
+
+    def _sync():
+        n = len(lst.picks())
+        ok.text = f"删掉勾选的 {n} 份"
+        tail.text = lst.tail_text()
+        ok.set_enabled(n > 0 and lst.ready and not state["busy"])
+
+    async def _run():
+        if state["busy"]:
+            return
+        state["busy"] = True
+        ok.props("loading")
+        cancel.set_enabled(False)
+        dlg.props("persistent")
+        _sync()
+        try:
+            res = await anime.cleanup_execute(anime_id, kind, lst.picks())
+        finally:
+            ok.props(remove="loading")
+        state["res"] = res
+        if after:
+            after()
+        msg, typ = _cleanup_report(kind, res)
+        ui.notify(msg, type=typ)
+        if not res["gone"]:
+            dlg.submit(res)
+            return
+        # 框不关，换结果视图：qB 里早就没有的那几份逐行列路径
+        body.clear()
+        acts.delete()
+        with body:
+            _gone_view(res["gone"], lambda: dlg.submit(res))
+
+    ok.on_click(_run)
+    _sync()
+    with card:
+        ui.timer(0.05, lst.probe, once=True)
+    try:
+        await wait_dialog(dlg)
+    finally:
+        dlg.delete()
+    return state["res"]
+
+
+async def _lock_dialog(title: str, note: str, ok_label: str, pv: dict, src: str, other: str):
+    """『只下 X』确认框（有可顺便清理的重复份时）：确认文案 + 勾选项（默认不勾）+ 勾上后内嵌同一份清理清单。
+    返回 (是否确认, 要删的 picks)。没勾或 qB 没核实完时 picks 为空。"""
+    dlg = page_dialog()
+    if dlg is None:
+        return False, []
+    dlg.classes("cleanup-dlg")
+    with dlg, ui.card().classes("gap-2 w-full").style("max-width:min(92vw,46rem)") as card:
+        ui.label(title).classes("font-bold")
+        ui.label(note).classes("text-xs text-gray-400").style("white-space:pre-line;word-break:break-all")
+        n = len(pv["items"])
+        also = ui.checkbox("").props("dense")
+        box = ui.column().classes("w-full gap-2 pl-6")
+        with box:
+            lst = _CleanupList("two", pv, on_change=lambda: _sync())
+            lst.render()
+            tail = ui.label(lst.tail_text()).classes("text-xs text-gray-400")
+        ui.space()   # 手机整屏时把按钮顶到最底下
+        with ui.row().classes("w-full justify-end gap-2 flex-col sm:flex-row"):
+            ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat").classes("w-full sm:w-auto")
+            ok = ui.button(ok_label, icon="lock",
+                           on_click=lambda: dlg.submit(lst.picks() if also.value else [])).props(
+                "unelevated color=primary").classes("w-full sm:w-auto")
+
+    def _sync():
+        also.text = f"顺便删掉『{other}』已经下好的 {n} 份重复（{lst.size_text(only_checked=False)}）"
+        also.update()
+        box.set_visibility(bool(also.value))
+        tail.text = lst.tail_text()
+        k = len(lst.picks())
+        if also.value:
+            ok.text = f"只下 {src} 并删掉 {k} 份"
+            ok.set_enabled(k > 0 and lst.ready)
+        else:
+            ok.text = ok_label
+            ok.set_enabled(True)
+
+    also.on_value_change(lambda: _sync())
+    _sync()
+    with card:
+        ui.timer(0.05, lst.probe, once=True)
+    try:
+        picks = await wait_dialog(dlg)
+    finally:
+        dlg.delete()
+    return (picks is not None), (picks or [])
+
+
 async def lock_two_numbering(anime_id: int, src: str, other: str) -> bool:
     """『两套集号同时在下』横幅上的『只下 X』（仪表盘与详情页共用一份确认文案）。先确认，再走既有的
-    set_pref_source；横幅本身只提醒，锁不锁、锁哪个组由人定。返回是否真的锁了。"""
-    if not await confirm(
-            f"只下『{src}』？",
-            f"锁定后这部番只自动下『{src}』的种子，『{other}』和别的组的新集都不再自动下，以后每集只下一份。\n"
-            "已经下了的文件不动、不删；同一集多出来的那份要清理，到详情页逐条删。\n"
-            f"『{src}』要是停更，别的组的集不会自动补上（两套编号对不上，换源兜底不替它补），要自己来点下载。\n"
-            "想改回去：详情页『下载源』选回『按优先级』。",
-            ok_label=f"只下 {src}", ok_icon="lock", ok_color="primary"):
+    set_pref_source；横幅本身只提醒，锁不锁、锁哪个组由人定。返回是否真的锁了。
+    『{other}』已经下好、能对上『{src}』同一集的那几份，确认框里可以顺便勾上删掉（默认不勾）；删失败不回滚锁定。"""
+    pv = anime.cleanup_preview(anime_id, "two", keep_src=src)
+    title = f"只下『{src}』？"
+    note = (f"锁定后这部番只自动下『{src}』的种子，『{other}』和别的组的新集都不再自动下，以后每集只下一份。\n"
+            + (f"已经下了的文件这一步不动。下面可以顺便删掉『{other}』多出来的那几份——每一份都对得上『{src}』的同一集。\n"
+               if pv["items"] else "已经下了的文件这一步不动。\n")
+            + f"『{src}』要是停更，别的组的集不会自动补上（两套编号对不上，换源兜底不替它补），要自己来点下载。\n"
+            "想改回去：详情页『下载源』选回『按优先级』。")
+    if pv["items"]:
+        ok, picks = await _lock_dialog(title, note, f"只下 {src}", pv, src, other)
+    else:
+        ok, picks = await confirm(title, note, ok_label=f"只下 {src}", ok_icon="lock", ok_color="primary"), []
+    if not ok:
         return False
     anime.set_pref_source(anime_id, src)
     ui.notify(f"已锁定：之后只下 {src}", type="positive")
+    if picks:
+        await run_cleanup(anime_id, "two", picks)
     return True
 
 
@@ -344,6 +680,26 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     + ("\n本番两套编号的取值范围重叠，系统【不会】自动折算，需要合并请手动改集号。"
                        if (cur.ep_offset and cur.total_episodes and cur.ep_offset < cur.total_episodes)
                        else "\n若某个源的标题里带 “16(88)” 这类双编号，系统会自动学到偏移量并从此自行折算。"))
+        # 【清理入口】锁了源之后『两套集号同时在下』那条就不出了，已经各下了一份的重复文件靠这里兜底；
+        # 没锁源不给（先选只下哪个组）。已标『不属于本季』、还在盘上的别季文件同理给一个入口。删不删、删哪几份由人在清单里勾
+        if cur.pref_source:
+            _pv2 = anime.cleanup_preview(cur.id, "two")
+            if _pv2["items"]:
+                _it = _pv2["items"]
+                _b1 = (f"有 {len(_it)} 份是另一套编号的重复（『{_it[0]['drop_src']}』第 {_ep_span_text(i['drop_ep'] for i in _it)} 集"
+                       f" = 『{_it[0]['keep_src']}』第 {_ep_span_text(i['keep_ep'] for i in _it)} 集）。")
+                if any(i["checked"] for i in _it):
+                    warn_banner(_b1, action=("看清单并清理", "delete_sweep", _cleanup("two")))
+                else:
+                    # 全部超出时间窗、默认都不勾：拿不准是不是同一集，不占琥珀块，只留一个入口
+                    with ui.row().classes("items-center gap-2 w-full"):
+                        ui.label(_b1 + "两份发布时间对不上，可能不是同一集。").classes("text-xs text-gray-400")
+                        ui.button("看清单并清理", icon="delete_sweep", on_click=_cleanup("two")).props(
+                            "flat dense color=grey").classes("btn-sm")
+        _pvf = anime.cleanup_preview(cur.id, "foreign")
+        if _pvf["items"]:
+            warn_banner(f"有 {len(_pvf['items'])} 份已标『不属于本季』的别季文件还在这部番的目录里，它们不影响本季。",
+                        action=("看清单并清理", "delete_sweep", _cleanup("foreign")))
         # 【歧义段】前面各季共 O 集(ep_offset)、本季 T 集：绝对编号取值域 [O+1,O+T] 与季内编号
         # [1,T] 在 O<T 时于 [O+1,T] 上重叠，光看集号分辨不出是哪一套，系统一条都不折
         #（折一半会让同一个源的前后半季撞成同一个去重键、静默漏掉半季，见 core.anime._foldable）。
@@ -702,7 +1058,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                                     t.foreign_season,
                                                     label=f"{ep_txt}（{t.source or '—'}）",
                                                     raw=t.raw_title or "")).props(
-                            "flat dense color=negative").classes("btn-sm").tooltip(
+                            "flat dense color=negative").classes("btn-sm max-sm:mr-3").tooltip(   # 手机上与右边『下载』拉开距离
                             "已归档：不在 qB，只能标记已删，文件需你手动清理" if t.archived_at
                             else "删除这一集的文件（qB+硬盘，不可撤销）")
                     # 已在 qB 里（在下 / 已下且未归档）：core 对 force 也是幂等短路（逐字对应
@@ -719,8 +1075,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
                 with ui.row().classes("items-start gap-3 w-full text-sm no-wrap"):
                     ui.label(ep_txt).classes("shrink-0").style("visibility:hidden")
-                    ui.label(t.raw_title or "—").classes(
-                        "text-gray-500 break-all min-w-0 text-xs")
+                    # 原名默认只占一行（手机上 3 行 × 几十条种子把弹窗拉到 5000px+），点一下展开全文
+                    _raw = ui.label(t.raw_title or "—").classes(
+                        "text-gray-500 break-all min-w-0 text-xs line-clamp-1 cursor-pointer")
+                    _raw.tooltip(t.raw_title or "—")
+                    _raw.on("click", lambda _raw=_raw: _raw.classes(toggle="line-clamp-1"))
                 # 第三行（只给要处理的行）：原因印在行上——气泡要逐行悬停、手机上基本按不出来。
                 # gray-400 比原名亮一档；不用 amber：qB 掉线时一串行同时在重试中，整屏发黄
                 if _why_line:
@@ -1035,6 +1394,11 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 _after()
         return h
 
+    def _cleanup(kind):
+        async def h():
+            await cleanup_dialog(anime_id, kind, after=_after)
+        return h
+
     def _unlock_source():
         anime.set_pref_source(anime_id, "")
         _after()
@@ -1116,10 +1480,19 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             drops = anime.delete_drops_episode(torrent_id)
             _what = ("这是这一集仅剩的一份：删掉后后台不会再自动下这一集的其它版本（想换版本就在那一行点『下载』）。"
                      if drops else "同集还留着别的版本，只删这一份；留下那份以后若失败，后台照常会补。")
+            _alias_tail = ""
             if special:   # (r39 F17) 普通番的特别篇 / 未知集：彼此不是"同一集"，后台也本来就不自动下，上面两句都不对
                 _what = "特别篇 / 未知集后台本来就不自动下，只删这一份。"
             elif foreign:   # (E-77 C) 别季的行：删它不是"本季这一集不要了"（delete_drops_episode 对它恒 False），上面两句都不对
                 _what = "这一条标了『不属于本季』：只删这一份，不影响本季这一集（本季那一集照常自动下）。"
+            elif drops:
+                # 两套集号：按这个号它是最后一份（照旧标"该集已删"，E-73 不变），可内容在另一套编号里还留着一份 ——
+                # 只换说法，别吓人说"这一集仅剩的一份"
+                _ak = anime.alias_keeper(torrent_id)
+                if _ak:
+                    _what = (f"这一集另有一份留着：『{_ak['keep_src']}』第 {ep_str(_ak['keep_ep'])} 集（两套编号，内容相同）。"
+                             f"删掉后程序不再按「第 {ep_str(_ak['ep'])} 集」这个号补下别的版本。")
+                    _alias_tail = f"这一集还有『{_ak['keep_src']}』第 {ep_str(_ak['keep_ep'])} 集那份。"
             _head = (raw + "\n") if raw else ""
             if archived:   # 已归档：种子早已移出 qB，删不到文件 → 明确告知路径与后果，让用户自己清理
                 if not await confirm(
@@ -1136,7 +1509,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 return
             ok = await anime.delete_anime_torrent(torrent_id)
             _after()
-            _tail = "；同集其它版本不会再自动下" if ok and drops else ""
+            _tail = ("；" + _alias_tail) if ok and _alias_tail else "；同集其它版本不会再自动下" if ok and drops else ""
             if ok and (archived or ok == "gone"):
                 # 已归档的、或早就在 qB 里被手动移除的：本工具删不到文件，只标记了已删
                 ui.notify(f"这一集已经不在 qB 里，只标记为已删；文件仍在 {save_path or '下载目录'}，需手动清理{_tail}",
@@ -1235,11 +1608,55 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         finally:
             dlg.delete()
 
+    async def _ask_freed(title, note, cands):
+        """锁了源时标『不属于本季』的守卫：让出来的那几集没有锁定组的版本，标完不会自动下、也没有任何提示（静默漏集）。
+        确认框里写明，并每集给一个勾选项（默认勾那一集按自动挑版本排第一的那条），标完立刻下载勾着的。
+        返回 None=取消 / [种子 id…]=确认（可以是空：都不勾）。"""
+        dlg = page_dialog()
+        if dlg is None:
+            return None
+        pref = (getattr(anime.get_anime(anime_id), "pref_source", "") or "")
+        picks = {}
+        with dlg, ui.card().style("max-width:min(92vw,40rem)"):
+            ui.label(title).classes("font-bold")
+            ui.label(note).classes("text-xs text-gray-400").style("white-space:pre-line;word-break:break-all")
+            ui.label(f"这部番锁定了『{pref}』，标完后第 {ep_ranges_text(sorted(int(e) if float(e).is_integer() else e for e in cands))} 集没有锁定组的版本，不会自动下。"
+                     "下面勾着的会在标完后立刻下载；不勾就要你以后自己点『下载』。").classes(
+                "text-sm text-amber-400").style("white-space:pre-line")
+            for e, cs in cands.items():
+                first = cs[0]
+                picks[e] = ui.checkbox(f"第 {ep_str(e)} 集：{first['source'] or '—'}　{first['title']}",
+                                       value=True).props("dense").classes("text-sm break-all")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
+                ui.button("不属于本季", icon="playlist_remove",
+                          on_click=lambda: dlg.submit([cands[e][0]["id"] for e, cb in picks.items() if cb.value])).props(
+                    "unelevated color=primary")
+        try:
+            return await wait_dialog(dlg)
+        finally:
+            dlg.delete()
+
+    async def _download_freed(dl, base_msg):
+        """标完之后把勾着的那几条强制下（越过锁定，与在那一行点『下载』同一个入口）；结果并进同一条 toast。"""
+        if not dl:
+            ui.notify(base_msg, type="positive")
+            return
+        n = 0
+        for tid in dl:
+            if await anime.download_anime_torrent(tid, force=True):
+                n += 1
+        _after()
+        ui.notify(base_msg + (f"；顺带下载了 {n} 集" if n == len(dl) else
+                              f"；顺带下载 {n}/{len(dl)} 集，其余没下成（qB 没连上或种子取不到），在那一行点『下载』重试"),
+                  type="positive" if n == len(dl) else "warning")
+
     def _set_foreign(torrent_id, flag, episode):
         """(E-77 C) 那一条的『不属于本季』/『撤销』。标上要先确认（会放行本季那一集的自动下载），撤销直接做。
-        同集还有别的看着像别季的行时，确认框把它们列出来、由人选要不要一起标（名单以 core 当场查的为准）。"""
+        同集还有别的看着像别季的行时，确认框把它们列出来、由人选要不要一起标（名单以 core 当场查的为准）。
+        锁了源、让出来的这一集没有锁定组版本时，再问一次要不要顺带下（_ask_freed）。"""
         async def h():
-            also = []
+            also, dl, freed = [], [], {}
             if flag:
                 title = "这一条不属于本季？"
                 note = (f"标记后这一条不再占用本季第 {ep_str(episode)} 集的位置，本季那一集会照常自动下载；"
@@ -1249,15 +1666,21 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     also = await _ask_foreign_extra(title, note, sib, "只标这一条")
                     if also is None:
                         return
-                elif not await confirm(title, note, ok_label="不属于本季", ok_icon="playlist_remove",
-                                       ok_color="primary"):
+                freed = anime.locked_freed_candidates(anime_id, [torrent_id, *also])
+                if freed:
+                    dl = await _ask_freed(title, note.replace("本季那一集会照常自动下载；", ""), freed)
+                    if dl is None:
+                        return
+                elif not sib and not await confirm(title, note, ok_label="不属于本季", ok_icon="playlist_remove",
+                                                   ok_color="primary"):
                     return
             ok = anime.set_foreign_season(torrent_id, flag, also=also)
             _after()
-            if ok:
-                ui.notify(("已把这一条和同集一起选的几条标为『不属于本季』：本季这一集照常自动下" if also
-                           else "已标为『不属于本季』：本季这一集照常自动下") if flag
-                          else "已撤销：这一条重新占用本季这一集的位置", type="positive")
+            if ok and flag:
+                await _download_freed(dl, ("已把这一条和同集一起选的几条标为『不属于本季』" if also
+                                           else "已标为『不属于本季』") + ("" if freed else "：本季这一集照常自动下"))
+            elif ok:
+                ui.notify("已撤销：这一条重新占用本季这一集的位置", type="positive")
             else:
                 ui.notify("没改成（这一条正在交付中，或状态已经变了），刷新后再试", type="warning")
         return h
@@ -1270,18 +1693,28 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             note = ("这些是集号落在本季范围内、发布却比本季首播早得多的旧种子（多半是前一季的正片）。"
                     "标记后它们不再占用本季的集号，本季那几集会照常自动下载；文件不动、还在原目录；"
                     "它们不会被自动下载、替换或搬迁清状态；每一条都可以在下面单独撤销。")
-            also = []
+            also, dl = [], []
             left = anime.foreign_suspect_leftovers(anime_id)
             if left:
                 also = await _ask_foreign_extra(title, note, left, f"只标占槽的 {n} 条")
                 if also is None:
                     return
-            elif not await confirm(title, note, ok_label="全部标记", ok_icon="playlist_remove", ok_color="primary"):
+            _cur = anime.get_anime(anime_id)
+            _ids = [t.id for t in anime.list_episodes(anime_id) if _cur and anime._foreign_markable(_cur, t)]
+            freed = anime.locked_freed_candidates(anime_id, _ids + list(also))
+            if freed:
+                dl = await _ask_freed(title, note.replace("本季那几集会照常自动下载；", ""), freed)
+                if dl is None:
+                    return
+            elif not left and not await confirm(title, note, ok_label="全部标记", ok_icon="playlist_remove",
+                                                ok_color="primary"):
                 return
             k = anime.mark_slot_impostors_foreign(anime_id, also=also)
             _after()
-            ui.notify(f"已把 {k} 条旧种子标为『不属于本季』：本季那几集照常自动下" if k
-                      else "没有可标的了（可能已经标过，或正在交付中）", type="positive" if k else "info")
+            if k:
+                await _download_freed(dl, f"已把 {k} 条旧种子标为『不属于本季』" + ("" if freed else "：本季那几集照常自动下"))
+            else:
+                ui.notify("没有可标的了（可能已经标过，或正在交付中）", type="info")
         return h
 
     body()

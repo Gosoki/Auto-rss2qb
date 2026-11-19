@@ -156,11 +156,11 @@ async def test_summary_is_clamped_and_toggles_on_click(user, clean_tables):
         aid = _anime(s, summary=summary).id
     await user.open(f"/detail/{aid}")
     lab = next(e for e in _live(user, ui.label) if e.text == summary)
-    assert "line-clamp-3" in lab.classes, lab.classes
+    assert "line-clamp-2" in lab.classes, lab.classes
     _fire(user, lab, "click")
-    await _until(lambda: "line-clamp-3" not in lab.classes, "点一下没有展开")
+    await _until(lambda: "line-clamp-2" not in lab.classes, "点一下没有展开")
     _fire(user, lab, "click")
-    await _until(lambda: "line-clamp-3" in lab.classes, "再点一下没有收起")
+    await _until(lambda: "line-clamp-2" in lab.classes, "再点一下没有收起")
 
 
 # ---------------------------------------------------------------- U2-5 删除确认框说清是哪一行

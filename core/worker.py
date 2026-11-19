@@ -18,7 +18,8 @@ import db
 from db.models import AnimeTorrent
 from core.anime import flush_ready_downloads, list_source_groups, process_item
 from services import fetch
-from services.notify import event as notify_event, state as notify_state
+from services.notify import (QB_DOWN_TEXT, QB_UP_TEXT, event as notify_event,
+                             state as notify_state)
 from sources import SOURCES
 from sources.nyaa import nyaa_feed_url
 
@@ -320,8 +321,8 @@ async def poll_once() -> None:
     if new_gaps:
         # 一次性事件、绕开普通限流桶：恢复那一轮的交付通知很可能把每小时的额度打满，而这条比它们都要紧
         await notify_event("feed_gap", "RSS 断档，这段时间的发布可能漏了：" + "；".join(
-            health.gap_text(g) for g in new_gaps) + "。去番剧表看缺集提示，用『自动补齐』补；"
-            "缺集提示要等余量过了或下一集入库才出现，可以先到这段时间有更新的番的详情页点『自动补齐』",
+            health.gap_text(g) for g in new_gaps) + "。去这段时间有更新的番的详情页点『自动补齐』；"
+            "番剧表上的缺集提示要等余量过了或下一集入库才出现",
             bypass_rate=True)
     if fetched_any:
         await _heartbeat()
@@ -737,7 +738,7 @@ async def run_qb_sync() -> None:
             # 这个循环是唯一一条与采集开关无关、又必然要碰 qB 的路径。
             try:
                 await notify_state("qb_down", not await engine.qb.reachable(),
-                                   "qB 连不上，下载状态无法同步", "qB 恢复，继续同步")
+                                   QB_DOWN_TEXT, QB_UP_TEXT)
             except Exception as e:
                 loop_error("qB 可达性探测（忽略）", e)
         # 【归档不能只挂在"内层循环退出"这个事件上】(R22)

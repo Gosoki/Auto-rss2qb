@@ -32,7 +32,6 @@ log = logging.getLogger("autorss")
 _LINE_CAP = (140, 179, 179)            # 字数，合计加两个换行 ≤ 500
 _LINE_BYTES = (850, 1300, 850)         # 编码后字节，合计 ≤ 3000
 _NAMES = 3          # 第一行列几部番名
-_PEND_NAMES = 2     # 待确认列几部番名
 _BACKOFF_MAX = 3600  # 没送到时重试间隔的上限（秒）
 
 # 没送到时的退避：只靠 notify 的共享熔断不够——别的通知照常送达时连续失败计数一直被清零，
@@ -40,6 +39,21 @@ _BACKOFF_MAX = 3600  # 没送到时重试间隔的上限（秒）
 # 把交付通知一起丢掉。送达即清零；设置页改了推送设置也清零（reset_retry）。
 _fails = 0
 _retry_at: datetime | None = None
+
+
+# 摘要里的短名：第二行字数有封顶，用全名的话各类顶满会把末尾的项挤掉
+_ALERT_SHORT = {"dup": "拆成两条", "mva": "与剧场版重号", "wrb": "绑定可疑",
+                "ign": "忽略仍在更", "rer": "同号新集", "two": "两套集号"}
+
+
+def _alert_kinds(live: list) -> str:
+    """未读提示按种类拆开写：光写条数说不出是什么问题。最多列条数最多的 3 类。"""
+    c: dict = {}
+    for f in live:
+        k = _ALERT_SHORT.get(f["kind"], alerts.KINDS.get(f["kind"], f["kind"]))
+        c[k] = c.get(k, 0) + 1
+    top = sorted(c.items(), key=lambda kv: -kv[1])
+    return "（" + "、".join(f"{k} {n}" for k, n in top[:3]) + (" 等" if len(top) > 3 else "") + "）"
 
 
 def _clip(s: str, n: int) -> str:
@@ -95,16 +109,19 @@ def digest_text(since: datetime, now: datetime) -> str:
     gaps = health.gaps()                  # 全站横幅上那条『RSS 断档』，点了『知道了』才清
     todo = []
     if pend:
-        todo.append(f"待确认 {len(pend)} 部（" + "、".join(
-            f"{_clip(anime.display_of(a), 24)}·{anime.confirm_reason_text(a.confirm_reason)[0]}"
-            for a in pend[:_PEND_NAMES]) + (" 等" if len(pend) > _PEND_NAMES else "") + "）")
+        # 按原因合并：逐部写会把同一个标签重复很多遍，手机上只看得到前两行
+        by_reason: dict = {}
+        for a in pend:
+            r = anime.confirm_reason_text(a.confirm_reason)[0]
+            by_reason[r] = by_reason.get(r, 0) + 1
+        todo.append(f"待确认 {len(pend)} 部（" + "、".join(f"{r} {n}" for r, n in by_reason.items()) + "）")
     for label, n, unit in (("待识别", ov["kpi"]["fail"], "部"), ("缺集", ov["kpi"]["gaps"], "部"),
                            ("锁定源落后", len(lag), "部"),
                            ("失败/异常", ov["status"]["error"] + ov["status"]["stalled"], "条"),
                            ("未读提示", len(live), "条"), ("剧场版新版本", new_mv, "个"),
                            ("RSS 断档", len(gaps), "段")):
         if n:
-            todo.append(f"{label} {n} {unit}")
+            todo.append(f"{label} {n} {unit}" + (_alert_kinds(live) if label == "未读提示" else ""))
     line2 = ("等你处理：" + "、".join(todo)) if todo else "没有要你处理的事"
 
     # 别的模块后来加的健康判据（推送通道连续失败、后台协程退出）有就带上，没有就不提

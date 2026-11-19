@@ -15,6 +15,10 @@ import config
 from services import fetch
 from services.fetch import TooLarge, get_bytes
 
+# qB 掉线 / 恢复是同一个状态事件，几处调用方共用这一对文案：谁先触发就用谁的，说法必须一致。
+QB_DOWN_TEXT = "qB 连不上：暂停下载、状态不同步（种子留在待下）"
+QB_UP_TEXT = "qB 恢复，继续下载与同步"
+
 # 事件表：键 → (中文名, 图标)。
 # 【键是存进 settings 表的字面量，改名等于改用户配置】——要改名得同时写迁移，别顺手改。
 EVENTS: dict[str, tuple[str, str]] = {

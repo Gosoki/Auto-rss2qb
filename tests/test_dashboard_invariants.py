@@ -1,6 +1,6 @@
 """仪表盘拆桶的不变量。
 
-`pending_breakdown` 的 docstring 承诺"七者之和 = 待下总数"。这类"卡片数字加起来要对得上"的
+`pending_breakdown` 的 docstring 承诺"八者之和 = 待下总数"。这类"卡片数字加起来要对得上"的
 承诺最容易在加桶时被破坏，而破坏之后没有任何报错——只是某一类种子从此在面板上消失。
 本项目已经出过一次：特别篇曾掉进『备用项』，而那张卡的说明是"同集已有更优版本"。
 """
@@ -53,12 +53,12 @@ def _pending_total(db):
 
 @pytest.mark.parametrize("unsub", [False, True])
 def test_buckets_sum_to_pending_total(clean_tables, mixed_library, cfg, unsub):
-    """(R5) 七者之和必须等于待下总数——两种停订开关下都要成立。"""
+    """(R5) 八者之和必须等于待下总数——两种停订开关下都要成立。"""
     cfg(ANIME_FINISH_UNSUB=unsub)
     b = A.pending_breakdown()
     total = _pending_total(clean_tables)
     assert sum((b["will"], b["backup"], b["unconfirmed"], b["unknown"], b["special"],
-                b["finished"], b["locked"])) == total, b
+                b["finished"], b["locked"], b["ignored"])) == total, b
 
 
 def test_specials_and_unknown_get_their_own_buckets(clean_tables, mixed_library, cfg):
@@ -110,17 +110,17 @@ def test_finished_bucket_only_counts_when_unsub_is_on(clean_tables, mixed_librar
     assert A.pending_breakdown()["finished"] > 0
 
 
-def test_orphan_and_rejected_go_to_backup(clean_tables, mixed_library, cfg):
-    """番已忽略/孤儿的待下不会自动下，归『备用项』（而不是凭空消失）。"""
+def test_orphan_and_rejected_get_their_own_bucket(clean_tables, mixed_library, cfg):
+    """番已忽略/孤儿的待下不会自动下，单独归『已忽略番』(R41)：不凭空消失，也不混进说"同集已有更优版本"的『备用项』。"""
     cfg(ANIME_FINISH_UNSUB=False)
     b = A.pending_breakdown()
-    assert b["backup"] >= 3, "已忽略番的 2 条正集 + 1 条孤儿"
+    assert b["ignored"] == 3, "已忽略番的 2 条正集 + 1 条孤儿"
 
 
 def test_breakdown_keys_are_stable(clean_tables, mixed_library):
     """页面按键名取值。少一个键就是 KeyError（白屏），多一个键无害但要有人知道。"""
     assert set(A.pending_breakdown()) == {"will", "backup", "unconfirmed", "unknown", "special",
-                                          "finished", "locked"}
+                                          "finished", "locked", "ignored"}
 
 
 def test_auto_off_reasons_matches_pending_breakdown_wording(clean_tables, cfg):

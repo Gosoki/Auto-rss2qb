@@ -25,6 +25,21 @@ from .layout import (SEVERITY_COLOR, busy_action, confirm, cover_box, cover_titl
 from .sources import render_sources
 
 
+# 仪表盘提示上『知道了』的气泡：收起来不等于处理了
+_ACK_TIP = "先收起来；问题还在，处理完会自己消失"
+
+
+def _banner_with_ack_tip(text, action) -> None:
+    """warn_banner + 给它的『知道了』按钮挂气泡。warn_banner 不返回它建的按钮，只能建完在当前槽位里回头找。"""
+    kids = ui.context.slot.children
+    n0 = len(kids)
+    warn_banner(text, action=action)
+    for root in kids[n0:]:
+        for el in root.descendants():
+            if isinstance(el, ui.button) and el.text == "知道了":
+                el.tooltip(_ACK_TIP)
+
+
 def _kw_hit(a, kw: str) -> bool:
     """番剧表搜索框的匹配判据：大小写不敏感子串，命中中文名/解析名/日文名/bgm ID 任一。
 
@@ -168,9 +183,33 @@ def anime_page(t: str = ""):
                 _ov_snap["v"] = anime.overview()
             return _ov_snap["v"]
 
+        # 【30 秒定时器：数据没变就不重建】(R41 perf-1) 每轮照常取数，和各面板上一次建出来时用的那一份比，
+        # 相等就不 refresh —— 生产 20 分钟才采集一轮，绝大多数轮重建出来的和上一轮一字不差，
+        # 白白卡事件循环约 80ms、推约 38KB。比的是面板要显示的全部内容（含 qB 进度、"上次采集"这类
+        # 随时间变的文案），任何一处变了都照常重建。用户操作之后（refresh_all）不走这道比较，一律重建。
+        _live_sig: dict = {}    # {面板: 上一次建出来时用的数据}，面板自己建时写
+        _live_snap: dict = {}   # 定时器本轮已经取好的数据，面板重建时直接用、不再取一遍
+
+        def _take(key, fetch):
+            data = _live_snap.pop(key) if key in _live_snap else fetch()
+            _live_sig[key] = data
+            return data
+
+        def _changed(key, data) -> bool:
+            if key in _live_sig and _live_sig[key] == data:
+                return False
+            _live_snap[key] = data
+            return True
+
+        def _tail_sig(ov):
+            # overview_tail 除了 overview() 之外还读的东西：qB 开关、按此刻算的"上次采集"文案与是否超时
+            c = ov["config"]
+            return (ov, config.QB_ENABLED, poll_stale(c["poll_last"], c["poll"]),
+                    poll_time_text(c["poll_last"]), poll_time_text(c["poll_ok_last"]))
+
         @ui.refreshable
         def overview_head():   # KPI（计数，随定时器刷新，无交互态可丢）
-            ov = _overview()
+            ov = _take("head", _overview)
             k = ov["kpi"]
             ps = ov["pending_split"]
 
@@ -180,7 +219,7 @@ def anime_page(t: str = ""):
                        # 缺集：按开播日推算应播、库里一条都没见过的集（r37 后续）——点开列出是哪几部
                        ("缺集", k["gaps"], "orange", _open_gaps()),
                        ("待识别", k["fail"], "red", _open_pop("fail")),
-                       ("待确认", k["confirm"], "orange", _open_pop("confirm")),
+                       ("待确认(番)", k["confirm"], "orange", _open_pop("confirm")),
                        ("已忽略", k["rejected"], "", _open_pop("reject")),
                        "|",
                        ("已交付", k["done"], "green", None),
@@ -220,7 +259,7 @@ def anime_page(t: str = ""):
                              + "。要追就去『已忽略』页点『恢复订阅』。")
                 for f in _odd:
                     _txt += f["text"]
-                warn_banner(_txt, action=("知道了", "inbox", _ack_alerts(_ign)))
+                _banner_with_ack_tip(_txt, ("知道了", "inbox", _ack_alerts(_ign)))
             # 『两套集号同时在下』：生产上一次就命中 5 部，每部一整条长横幅会把仪表盘（手机上尤其）淹掉。
             # 两部以上时合成一张卡：说明只在卡头讲一次，每部番一行短句 + 自己的按钮；已读仍按条记。
             _two = [f for f in _al["live"] if f["kind"] == "two"]
@@ -242,7 +281,7 @@ def anime_page(t: str = ""):
                                               on_click=_lock_two(_i, src, _lk[1 - j])).props(
                                         "flat dense").classes("btn-sm")
                                 ui.button(icon="inbox", on_click=_ack_alert(_a)).props(
-                                    "flat dense").classes("btn-sm").tooltip("知道了")
+                                    "flat dense").classes("btn-sm").tooltip("知道了：" + _ACK_TIP)
             for _a in _al["live"]:
                 if _a["kind"] == "ign" or (_a["kind"] == "two" and len(_two) >= 2):
                     continue
@@ -261,7 +300,14 @@ def anime_page(t: str = ""):
                 _lk = _a.get("lock") or []
                 _acts += [(f"只下 {src}", "lock", _lock_two(_ids[0], src, _lk[1 - j]))
                           for j, src in enumerate(_lk)]
-                warn_banner(_pre + _a["text"], action=_acts + [("知道了", "inbox", _ack_alert(_a))])
+                _banner_with_ack_tip(_pre + _a["text"], _acts + [("知道了", "inbox", _ack_alert(_a))])
+                if _a["kind"] == "mva":
+                    # 两边各留一条的两种处置（D9：只忽略、不删文件，两边可能共用同一个种子）。手机上各占一行全宽
+                    with ui.row().classes("w-full gap-2 pl-8 -mt-1 flex-col sm:flex-row"):
+                        ui.button("留番剧，忽略剧场版", icon="movie", on_click=_mva_keep(_a, "anime")).props(
+                            "flat dense").classes("btn-sm w-full sm:w-auto")
+                        ui.button("留剧场版，忽略番剧", icon="tv_off", on_click=_mva_keep(_a, "movie")).props(
+                            "flat dense").classes("btn-sm w-full sm:w-auto")
 
             # 【首屏只数仍成立的】已不成立的已读记录不需要任何动作，常年挂在首屏只是噪音；
             # 但也不自动删（理由见 core/alerts.drop_gone：ign/rer 这类发现会消失又回来，留着的记录挡住横幅复活）。
@@ -305,8 +351,10 @@ def anime_page(t: str = ""):
                 for name, site, policy, priority, enabled in ov["groups"]:
                     pol = "自动下载" if policy == "auto" else "人工审核"
                     tail = "" if enabled else " · 停用"
+                    # outline：实心蓝是状态徽标和主按钮的颜色，源组是配置、不是状态也不可点；
+                    # 人工审核组（会让新番先进待确认）用琥珀描边区分
                     ui.badge(f"{name} · {site} · {pol} · P{priority}{tail}").props(
-                        f"color={'blue' if enabled else 'grey'}")   # 启用=蓝，停用=灰
+                        "outline color=" + ("grey" if not enabled else "amber" if policy != "auto" else "blue-grey"))
             # ── 下载番剧 / 种子来源（左右分开，窄屏自动堆叠）──
             with ui.row().classes("w-full gap-6 flex-wrap mt-3 pl-1"):   # pl-1 跟其他区块(订阅源组/种子状态)左对齐，别突出去
                 with ui.column().classes("gap-1 min-w-0").style("flex:1 1 320px"):
@@ -321,7 +369,7 @@ def anime_page(t: str = ""):
                                     ui.element("div").style(
                                         f"width:9px;height:9px;border-radius:2px;background:{_c}")
                                     ui.label(_lab)
-                    with ui.column().classes("w-full gap-0").style("max-height:200px;overflow-y:auto"):
+                    with ui.column().classes("w-full gap-0").style(f"max-height:{min(max(len(bqs), 8) * 24, 360)}px;overflow-y:auto"):
                         if not bqs:
                             ui.label("—").classes("text-gray-500 text-sm")
                         for q, sub, rev, ign in bqs:
@@ -378,20 +426,23 @@ def anime_page(t: str = ""):
                             },
                             "media": [{
                                 "query": {"maxWidth": 480},
+                                # 手机：图例挪到环图下面横排，不再挤在右边翻 4 页（环图高度见 layout 的 .src-donut）
                                 "option": {
-                                    "legend": {"left": "50%", "textStyle": {"width": 140}},
-                                    "series": [{"center": ["25%", "50%"]}],
+                                    "legend": {"type": "plain", "orient": "horizontal", "left": "center",
+                                               "top": "auto", "bottom": 0, "textStyle": {"width": 140}},
+                                    "series": [{"center": ["50%", "34%"], "radius": ["28%", "50%"]}],
                                 },
                             }, {
                                 "query": {"maxWidth": 350},
                                 "option": {"legend": {"textStyle": {"width": 100}}},
                             }],
-                        }).classes("w-full").style("height:220px").on(
+                        }).classes("w-full src-donut").on(      # 高度在 layout 的 .src-donut（手机上要多留一块放图例）
                             "chart:legendselectchanged", _remember_legend, args=["selected"])
 
         @ui.refreshable
         def overview_tail():   # 种子状态(含 qB 实时徽标) + 采集状态：随定时器刷新，qB 进度要 30s 更新
             ov = _overview()
+            _live_sig["tail"] = _tail_sig(ov)
             k = ov["kpi"]
             ps = ov["pending_split"]
             # ── 种子状态 ──
@@ -403,20 +454,24 @@ def anime_page(t: str = ""):
                 _dla.set_enabled(config.QB_ENABLED)
                 _dla.tooltip("订阅中所有待下集立即下" if config.QB_ENABLED
                              else "qB 未启用，去设置页开启后可下载")
-            # 待下拆 将下载/备用/锁源缺集/待确认/已下齐·停订/未知集/特别篇（库态『下载中』恒≈0、与 qB 实时态重复，不常驻，只在非零时露出，见下方循环）；失败、种子总数一并列出，与 KPI 卡呼应
+            # 待下拆 将下载/备用/已忽略番/锁源缺集/待确认/已下齐·停订/未知集/特别篇（库态『下载中』恒≈0、与 qB 实时态重复，不常驻，只在非零时露出，见下方循环）；失败、种子总数一并列出，与 KPI 卡呼应
             chips = [
                 # sent = 已发给 qB（含仍在下的）；真正下完的数在下方 qB 实时区的『已完成』
-                ("已交付", ov["status"]["sent"], "green",
+                ("已交付", ov["status"]["sent"], "blue-grey",   # 与上方 KPI 同数，降一档免得并排抢眼
                  "已发送给 qB 的种子数（含仍在下载的）。真正下完的看下方『已完成』"),
                 ("将下载", ps["will"], "blue", "已确认番·本集首选，会自动下（特别篇/未知集不在其列，需手动下）"),
                 ("备用项", ps["backup"], "blue-grey", "同集已有『将下载/已下』的更优版本，或该集已人工删除，或标了『不属于本季』，不会自动下"),
+                # 已忽略的番（或已删掉的番）留下的待下（R41）：以前算在『备用项』里，而那张卡的说法对它们不成立
+                *([("已忽略番", ps["ignored"], "blue-grey",
+                    "番已被忽略（或已从番剧表删掉）留下的待下种子，不会自动下。要追就去『已忽略』页点『恢复订阅』")]
+                  if ps.get("ignored") else []),
                 # 被锁定源挡住、这一集一份都没有的（r37 #2）：以前混在『备用项』里，说法正好相反
                 *([("锁源缺集", ps["locked"], "orange",
                     "番锁了下载源，这些是别的组发的、锁定源还没跟上的集——这一集一份都没下。"
                     "或被版本关键词挡住：有种子、但没有一条命中你设的『版本』（去详情页看是不是字幕组改了标签写法）。"
                     "点开看是哪几部，去详情页『只补这几集』或把下载源改回按优先级", _open_locked)]
                   if ps.get("locked") else []),
-                ("待确认", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
+                ("待确认种子", ps["unconfirmed"], "orange", "番还没确认，去『待确认』页点确认才会下"),
                 *([("已下齐·停订", ps["finished"], "teal",
                     "番已按 bgm 总集数下齐、且设置里开了『下齐后停止自动下新集』，所以这些不会自动下。"
                     "若那部番其实还没完（bgm 的总集数少记了），去详情页点『继续订阅』")]
@@ -448,7 +503,8 @@ def anime_page(t: str = ""):
             chips.append(("种子数", k["torrents"], "grey", "全部种子数（各状态之和）"))
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip, *click in chips:   # 可选第 5 项：点开明细的回调
-                    b = ui.badge(f"{label} {val}").props(f"color={color}")
+                    # 零值不上语义色（与 KPI 卡零值置灰同一规矩）：红块只该出现在真有失败的时候
+                    b = ui.badge(f"{label} {val}").props(f"color={color if val else 'grey'}")
                     if tip:
                         b.tooltip(tip)
                     if click:
@@ -497,8 +553,9 @@ def anime_page(t: str = ""):
                             "错误率 4.3%，而已有绑定的正确率是 98%。"
                             "要改某一部的绑定去它的详情页，那里有绑定回显。")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
+                # 暂停是设置页里的主动选择，不用红（红色留给真出错）
                 ui.badge("采集开启" if ov["config"]["poll_on"] else "采集暂停").props(
-                    f"color={'green' if ov['config']['poll_on'] else 'red'}").tooltip(
+                    f"color={'green' if ov['config']['poll_on'] else 'orange'}").tooltip(
                     "后台是否在抓取（在设置页『采集』开关切换）")
                 ui.badge(f"识别番数 {enr}/{tot}").props("color=blue").tooltip(
                     "已匹配到 bgm 的番 / 全部")
@@ -543,12 +600,14 @@ def anime_page(t: str = ""):
                                lambda qi=items: [_confirm_card(a, smap.get(a.id, [])) for a in qi],
                                lambda v, q=q: confirm_page["open"].__setitem__(q, v))
 
-        def _quarter_group(label, opened, build, remember):
+        def _quarter_group(label, opened, build, remember, dense=False):
             """一个季度折叠块，里面是封面卡片网格。番剧表/待确认/已忽略三个 tab 与 KPI 弹窗（_render_pop）共用。
             · 懒建：收着的季度先不建卡片，第一次展开时才建（build() 在网格里建卡片）；
             · remember(开/合)：用户手动开合时调用，面板重建后照此恢复（不想记就传个空函数）。"""
             # 主结构分组：退出紧凑档（理由见 pages/layout.py 的 ui.expansion 默认值）
-            box = ui.expansion(label, value=opened).classes("w-full").props(remove="dense")
+            # dense=True：已忽略页十来个只有几部的季度，行高不用撑满
+            box = ui.expansion(label, value=opened).classes("w-full").props(
+                remove="" if dense else "dense")
             built = {"v": False}
 
             def fill():
@@ -577,7 +636,7 @@ def anime_page(t: str = ""):
                 with ui.column().classes("px-3 py-2 gap-1.5 w-full grow"):
                     _card_title(a).classes("cursor-pointer").on("click", lambda aid=a.id: open_detail(aid))
                     _rs, _rd = anime.confirm_reason_text(a.confirm_reason)
-                    ui.label("原因: " + _rs).classes("text-xs text-orange-400").tooltip(_rd)
+                    ui.label("原因: " + _rs).classes("text-xs text-gray-400").tooltip(_rd)
                     # 来源组是点不点确认的关键信息（人工审核的后备源什么组都可能进来），不截断：
                     # 『喵萌奶茶屋&LoliHouse』截掉后半就没意义了；多源时自然折行，操作区靠 mt-auto 仍压在卡底
                     ui.label("来源: " + (" · ".join(srcs) or "—")).classes("text-xs text-gray-400")
@@ -612,7 +671,7 @@ def anime_page(t: str = ""):
                                reject_page["open"].get(q, i == 0 if exp is None else exp),
                                lambda qi=items: [_reject_card(a, smap.get(a.id, []), dlmap.get(a.id, 0))
                                                  for a in qi],
-                               lambda v, q=q: reject_page["open"].__setitem__(q, v))
+                               lambda v, q=q: reject_page["open"].__setitem__(q, v), dense=True)
 
             # 已删除的种子：本页最底的独立折叠，可『重新下载』找回（deleted 是终态、不会自动重下）
             if dels:
@@ -722,36 +781,43 @@ def anime_page(t: str = ""):
                     ui.button("重试识别", icon="refresh", on_click=_refail(a.id)).props("flat color=grey")
                     ui.button("忽略", on_click=_reject(a.id)).props("flat color=grey")
 
+        def _inflight_view():
+            """正在下载区要显示的全部内容：(总数, 显示条数, [(标题, 徽标文案, 徽标色)…])；第三项 None＝关了 qB 状态跟踪。
+            定时器拿它和上一轮比（见 _changed），所以面板只许从这里取数。"""
+            rows = anime.inflight_anime_rows()
+            total = engine.inflight_count(AnimeTorrent)
+            if not config.QB_SYNC_STATUS:
+                return total, len(rows), None
+            sw = anime.single_work_ids() if rows else set()
+            return total, len(rows), [
+                (f'{r["name"]}  {ep_label(r["episode"], r["anime_id"] in sw)}',
+                 *live_status(r["status"], r["qb_state"], r["qb_progress"], r["qb_synced_at"], r["qb_dlspeed"]))
+                for r in rows]
+
         @ui.refreshable
         def inflight_panel():
-            rows = anime.inflight_anime_rows()
-            _inflight_total = engine.inflight_count(AnimeTorrent)
-            ui.label(f"正在下载（{_inflight_total}{'，显示前 %d' % len(rows) if _inflight_total > len(rows) else ''}）").classes("text-sm font-bold mt-4 pl-1")
+            _inflight_total, _n, items = _take("inflight", _inflight_view)
+            ui.label(f"正在下载（{_inflight_total}{'，显示前 %d' % _n if _inflight_total > _n else ''}）").classes("text-sm font-bold mt-4 pl-1")
             with ui.card().classes("w-full"):
-                if not config.QB_SYNC_STATUS:
+                if items is None:
                     ui.label("已关闭 qB 状态跟踪：发送即视为『已下』，不跟踪下载进度（设置页可重新开启）。").classes(
                         "text-gray-500 text-sm")
                     return
-                if not rows:
+                if not items:
                     ui.label("暂无正在下载的种子").classes("text-gray-500 text-sm")
                     return
-                sw = anime.single_work_ids()
                 with ui.column().classes("w-full gap-0"):
-                    for r in rows:
-                        text, color = live_status(r["status"], r["qb_state"], r["qb_progress"],
-                                                  r["qb_synced_at"], r["qb_dlspeed"])
+                    for title, text, color in items:
                         # no-wrap + 标题 grow/min-w-0 + 徽标 shrink-0：长标题在自己那一格里换行，
                         # 徽标永远钉在右侧，不会被挤到下一行左边去
                         with ui.row().classes("items-center gap-3 w-full text-sm py-1 no-wrap").style(
                                 "border-bottom:1px solid rgba(255,255,255,.08)"):
                             # overflow-wrap:anywhere 而不是 break-all：后者把英文番名从词中间拆开（同 .cover-card-title）
-                            ui.label(f'{r["name"]}  {ep_label(r["episode"], r["anime_id"] in sw)}').classes(
-                                "grow min-w-0").style("overflow-wrap:anywhere")
+                            ui.label(title).classes("grow min-w-0").style("overflow-wrap:anywhere")
                             ui.badge(text).props(f"color={color}").classes("shrink-0")
 
-        @ui.refreshable
-        def recent_panel():
-            ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
+        def _recent_view():
+            """新入库表要显示的全部行（已折好）。定时器拿它和上一轮比，见 _changed。"""
             raw = anime.recent_anime_rows(50)
             # 待下/失败行标『将下载/备用』：只给『已确认』的番批量算 download_plan；
             # 未确认（待确认）的番不算、显示『待确认』——它要点确认才会下，标将下载是假的。
@@ -795,7 +861,12 @@ def anime_page(t: str = ""):
                              and r["episode"] >= 0 else None),
                     "_quiet": r["status"] not in engine.HAVE_STATUSES and color in _NEUTRAL_BADGE,
                 })
-            recent_table(_fold_recent(rows), "番剧",
+            return _fold_recent(rows)
+
+        @ui.refreshable
+        def recent_panel():
+            ui.label("新入库（最近 50 条种子）").classes("text-sm font-bold mt-4 pl-1")
+            recent_table(_take("recent", _recent_view), "番剧",
                          on_row_click=lambda row: row.get("detail_id") and open_detail(row["detail_id"]))
 
         @ui.refreshable
@@ -892,18 +963,24 @@ def anime_page(t: str = ""):
                                                  for a in qi],
                                remember)
 
-        def _refresh_overview(charts):
+        def _refresh_overview(charts, only_changed=False):
             # 刷新仪表盘：head(计数)+tail(种子状态/qB实时)恒刷；charts(图表)仅 charts=True 时刷。
             # 定时器传 charts=False → 不重建环图，保住悬停/图例翻页等交互态。
+            # only_changed（定时器传）：head / tail 各自和上一次建出来时的数据比，没变就不重建（见 _changed）。
             _ov_snap.clear()          # 本轮取最新数据，下面三个面板共用这一份
             try:
-                overview_head.refresh()
+                ov = _overview()
+                if not only_changed or _changed("head", ov):
+                    overview_head.refresh()
                 if charts:            # 用户操作之后：横幅与图表一起刷（定时器两者都不碰，见 alerts_panel）
                     alerts_panel.refresh()
                     charts_panel.refresh()
-                overview_tail.refresh()
+                if not only_changed or _changed("tail", _tail_sig(ov)):
+                    overview_tail.refresh()
             finally:
                 _ov_snap.clear()      # 出了本轮就作废，避免下次读到陈旧快照
+                _live_snap.pop("head", None)
+                _live_snap.pop("tail", None)
 
         # 用户操作（确认/忽略/绑定/补齐…）之后每个 tab 要刷新的面板。
         _TAB_REFRESH = {
@@ -951,9 +1028,15 @@ def anime_page(t: str = ""):
             真库快照上整页构建 127ms）。
             """
             if tab == "overview":
-                _refresh_overview(charts=False)   # 30s 定时器不碰图表，环图交互态不被打断
-                inflight_panel.refresh()
-                recent_panel.refresh()
+                # 30s 定时器不碰图表，环图交互态不被打断；四块各自和上一轮比，数据没变就不重建（见 _changed）
+                _refresh_overview(charts=False, only_changed=True)
+                try:
+                    if _changed("inflight", _inflight_view()):
+                        inflight_panel.refresh()
+                    if _changed("recent", _recent_view()):
+                        recent_panel.refresh()
+                finally:
+                    _live_snap.clear()
 
         def refresh_timer():
             # 30s 定时器：只刷『当前可见 tab』的实时区，隐藏 tab 不动（省 CPU、消除每 30s 的周期性卡顿）。
@@ -1103,6 +1186,35 @@ def anime_page(t: str = ""):
                 alerts_panel.refresh()
             return h
 
+        def _mva_keep(f, keep):
+            """mva 的两个按钮：keep="anime" 忽略剧场版那条（M1）/ keep="movie" 忽略番剧那条（M2）。都不调 qB、不删文件。
+            处理完把这条提示按处理后的事实收进已读：番剧被忽略时订阅位变了，用旧事实收的话它会立刻『复活』。"""
+            async def h():
+                if keep == "anime":
+                    ok = await confirm("忽略剧场版这条？",
+                                       f"剧场版《{f['m_name']}》没下的版本不再下。番剧这边不动，已下的文件不动。",
+                                       ok_label="忽略剧场版", ok_icon="block", ok_color="primary")
+                else:
+                    k = anime.downloaded_counts([f["anime_id"]]).get(f["anime_id"], 0)
+                    ok = await confirm("忽略番剧这条？",
+                                       f"番剧『{f['a_name']}』没下的集不再下。已经下了的 {k} 个文件不动"
+                                       "（剧场版那边可能用的就是同一个文件）；确实要删，到『已忽略』里这部番的卡片上删。",
+                                       ok_label="忽略番剧", ok_icon="block", ok_color="primary")
+                if not ok:
+                    return
+                if keep == "anime":
+                    from core import movies
+                    movies.reject_movie(f["movie_id"])
+                else:
+                    anime.reject_anime(f["anime_id"])
+                for g in alerts.scan():
+                    if g["ident"] == f["ident"]:
+                        alerts.ack(g["ident"], g["kind"], g["fact"], g["text"])
+                ui.notify("已忽略剧场版那条" if keep == "anime" else "已忽略番剧那条", type="positive")
+                alerts_panel.refresh()
+                refresh_all()
+            return h
+
         def _lock_two(anime_id, src, other):
             async def h():
                 if await lock_two_numbering(anime_id, src, other):
@@ -1149,11 +1261,11 @@ def anime_page(t: str = ""):
                             ui.badge(alerts.KINDS.get(r["kind"], r["kind"])).props("color=blue-grey")
                             # 两句都是【此刻算出来的事实】，不写"已解决"——程序判不出用户是修好了还是删了
                             ui.badge("现在仍然成立" if r["state"] == "fresh" else "现在已经不成立了"
-                                     ).props("color=blue-grey" if r["state"] == "fresh" else "color=green")
+                                     ).props("outline color=amber" if r["state"] == "fresh" else "color=green")
                             ui.space()
                             ui.button("取消已读", icon="undo",
                                       on_click=_unack(r["ident"])).props("flat dense").classes("btn-sm")
-                        ui.label(r["summary"] or "—").classes("text-sm break-all")
+                        ui.label((r["summary"] or "—").replace("**", "")).classes("text-sm break-all")   # 旧快照里有字面 **，只在显示时去掉
                         ui.label(f"标记于 {r['at'].strftime('%Y-%m-%d %H:%M')}").classes(
                             "text-xs text-gray-500")
                 with ui.row().classes("items-center gap-3 w-full mt-1"):
@@ -1505,7 +1617,8 @@ def anime_page(t: str = ""):
                                 "或还在缓冲窗口里" if _have < _seen else
                                 # 进度分子按 HAVE_STATUSES 数、含 stalled：停滞的集算"交给 qB 了"，不能说都到手了
                                 ("。都到手了" if not bad else "。集号都交给 qB 了，但其中有失败/停滞的，见左上角"))))
-                progress = (f"{_have}/{_den}", _c, _tip)
+                # 超出时写明 bgm 的总集数：满格的 14/14 红着没有解释，用户会当成缺集或失败
+                progress = (f"{_have}/{_den}·bgm {_tot}" if _over else f"{_have}/{_den}", _c, _tip)
             return cover_box(a.cover_url, dim=dim,
                              top_left=[status, fin],
                              top_right=[rating_spec(a.rating), (sl, "purple", None) if sl else None],

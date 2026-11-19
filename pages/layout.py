@@ -373,6 +373,10 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
     番名下再压一行灰色原始种子名（长名换行、完整显示）；<1024px 换成『时间 · 来源 + 状态徽标』那一行；
     状态列渲染成彩色徽标（含 qB 实时态）。行带 more 时再加一行灰字（番剧侧并进这一行的同集其它版本）。
     番剧表与剧场版共用。on_row_click(row) 非空时，番名可点开详情（传回整行 dict）。"""
+    # 本页每一行状态都一样（剧场版新入库几十条全是『可下载』）时，状态列是 50 个一模一样的蓝块：
+    # 收成表头里的一句话，列里不再重复；手机上状态仍在番名格那一行（该行 lt-md，不受影响）
+    _sts = {r.get("status") for r in rows}
+    _uniform = len(rows) > 1 and len(_sts) == 1
     tbl = ui.table(
         columns=[
             # 窄屏隐去时间/来源/状态三列，只留番名列。【用 Quasar 的 gt-sm，不用 hidden md:table-cell】(r37) Quasar 的
@@ -385,7 +389,8 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
             {"name": "name", "label": name_label, "field": "name", "align": "left"},
             {"name": "src", "label": "来源", "field": "src", "align": "left",
              "classes": "gt-sm", "headerClasses": "gt-sm"},
-            {"name": "status", "label": "状态", "field": "status", "align": "left",
+            {"name": "status", "label": f"状态（全部：{next(iter(_sts))}）" if _uniform else "状态",
+             "field": "status", "align": "left",
              "classes": "gt-sm", "headerClasses": "gt-sm"},
         ],
         rows=rows, row_key="id",
@@ -428,6 +433,9 @@ def recent_table(rows, name_label: str, on_row_click=None) -> None:
     ''')
     if on_row_click:
         tbl.on("opendetail", lambda e: on_row_click(e.args))
+    if _uniform:    # 状态已写在表头，列里留空（不删列：行里将来出现别的状态时列照常工作）
+        tbl.add_slot("body-cell-status", "<q-td :props=\"props\"></q-td>")
+        return
     tbl.add_slot("body-cell-status", r'''
         <q-td :props="props">
             <q-badge :color="props.row.status_color || 'blue-grey'" :label="props.row.status" />
@@ -479,21 +487,23 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                 # 一个引号就能闭合 src 属性、往 <img> 上挂任意属性（onerror=… 即 XSS）。
                 # 这里仍用原生 img 而不是 ui.image：本列要的是"高定死、宽随比例"，q-img 做不到。
                 ui.html(f'<img src="{escape(cover_url, quote=True)}" '
-                        f'style="height:18.5rem;width:auto" class="rounded">').classes("shrink-0 w-fit")
+                        f'style="width:auto" class="rounded meta-cover">').classes("shrink-0 w-fit")
             # 中列：两列 kv 网格 + bgm 链接。self-stretch 让本列撑到封面等高，bgm 链接 mt-auto 贴底
             with ui.column().classes("gap-1 grow min-w-0 self-stretch"):
-                with ui.grid(columns=2).classes("w-full gap-x-8 gap-y-1 items-baseline").style(
-                        "grid-template-columns:auto minmax(0,1fr)"):
+                # .kv-grid：窄屏一对（字段名+值）一行，≥1024px 并成两对一行，高度减半（见 _HEAD_BASE_CSS）
+                with ui.element("div").classes("kv-grid w-full gap-x-8 gap-y-1 items-baseline"):
                     for pair in kv_pairs:
                         if pair is None:                 # 分隔行：留一点空当，把非 bgm 字段隔开
                             ui.element("div").style("height:0.4rem")
                             ui.element("div")
                             continue
                         kk, vv = pair
+                        if vv in (None, ""):             # bgm 没给的字段整行不出，不留一排『—』
+                            continue
                         # 左侧字段名＝说明文（gray-400），右侧的值是【正文】——正文不着灰，
                         # 用默认前景色。全站只保留两档灰，见 warn_banner 的说明。
                         ui.label(kk).classes("text-sm text-gray-400")
-                        ui.label(str(vv) if vv not in (None, "") else "—").classes("text-sm")
+                        ui.label(str(vv)).classes("text-sm")
                 if bangumi_id:  # bgm 链接：mt-auto 贴到中列底部；kv 顶满时被顶着往下走
                     ui.link(f"bgm.tv/subject/{bangumi_id}",
                             f"https://bgm.tv/subject/{bangumi_id}").props(
@@ -508,11 +518,11 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                         ui.label(_lab).classes("text-xs text-gray-400")
         if summary:
             ui.separator()
-            # 简介是正文，不着灰。默认收成 3 行（中日两份全文会把下载控制行和分集表推出首屏），点一下展开 / 收起。
-            # 不设长度阈值：短简介本来不到 3 行。body.refresh() 之后回到收起状态
-            _sum = ui.label(summary).classes("text-sm whitespace-pre-wrap line-clamp-3 cursor-pointer")
+            # 简介是正文，不着灰。默认收成 2 行（全文会把下载控制行和分集表推出首屏），点一下展开 / 收起。
+            # 不设长度阈值：短简介本来不到 2 行。body.refresh() 之后回到收起状态
+            _sum = ui.label(summary).classes("text-sm whitespace-pre-wrap line-clamp-2 cursor-pointer")
             _sum.tooltip("点一下展开 / 收起全文")
-            _sum.on("click", lambda: _sum.classes(toggle="line-clamp-3"))
+            _sum.on("click", lambda: _sum.classes(toggle="line-clamp-2"))
 
 
 def name_of(a) -> str:
@@ -994,7 +1004,25 @@ _HEAD_BASE_CSS = (
     ":root{--nicegui-default-padding:.5rem}"
     ".kpi-group{grid-template-columns:repeat(var(--kpi-m,2),minmax(0,1fr))}.kpi-group>.q-card{gap:.25rem}"
     ".q-tab{padding:0 4px}"
+    # 行内按钮（.btn-sm，全站 dense 的那批）手指够不着：27px 高、删除键紧挨着『下载』。手机上抬到 40px 触控尺寸；
+    # 桌面不变。min-width 一并抬，纯图标键（删除）才不会是 27 宽的窄条
+    ".q-btn.btn-sm:not(.q-btn--round){min-height:40px;min-width:40px}"
+    # 详情弹窗默认左右各留 24px，内容只剩 342px；收到 8px
+    ".q-dialog__inner--minimized{padding:8px}"
+    # 顶栏/保存/下载这几个白色圆形图标键是 34px，拇指点汉堡容易偏；抬到 42px（Quasar 非 dense 的圆键尺寸）
+    ".q-btn--round.q-btn--dense.text-white{min-width:42px;min-height:42px}"
     "}"
+    # 详情元信息卡的字段网格：窄屏一对一行；≥1024px 两对一行（五行放下十个字段），封面同时收矮一档，
+    # 否则封面高度（18.5rem）仍把卡撑得和原来一样高。窄屏封面维持原大小。
+    ".kv-grid{display:grid;grid-template-columns:auto minmax(0,1fr)}"
+    ".meta-cover{height:18.5rem}"
+    "@media(min-width:1024px){.kv-grid{grid-template-columns:auto minmax(0,1fr) auto minmax(0,1fr)}"
+    ".meta-cover{height:13rem}}"
+    # 订阅源页：白名单与关键词两个输入框，≥1024px 并排
+    ".pair-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:.5rem 1rem}"
+    "@media(min-width:1024px){.pair-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}"
+    # 种子来源环图：手机上图例挪到环图下面，要多留一块高度
+    ".src-donut{height:220px}@media(max-width:480px){.src-donut{height:340px}}"
     # warn_banner 的多按钮组：≥640px（Tailwind sm，与它那组 sm:flex-row 同一断点）左右排时封顶宽度，
     # 按钮多了在组内折行。用 min(22rem,50%)：只写 22rem 的话 640~760px 的窗口里正文会被压到两百像素以下。
     # <640px 时按钮已经落到文字下面，不需要封顶。
@@ -1357,7 +1385,12 @@ def frame(active: str = ""):
             with ui.row().classes("items-center gap-2 mr-2 sm:mr-6 brand-center"):
                 ui.icon("live_tv").classes("text-2xl").style("color:oklch(70.7% 0.165 254.624)")  # blue-400
                 ui.label(config.SITE_NAME or "AutoRSS").classes("text-lg font-bold max-sm:hidden").style(
-                    f"color:{text_token('ink-soft')};letter-spacing:.5px")   # 站名用柔和前景；窄屏隐去，只留居中图标
+                    f"color:{text_token('ink-soft')};letter-spacing:.5px")   # 站名用柔和前景；窄屏隐去，换成当前页名
+                # 手机上顶栏只剩图标时，番剧页和剧场版页长得一模一样；页名跟在图标后面，一眼知道在哪
+                _here = next((lb for k, lb, _p in NAV if k == active), "")
+                if _here:
+                    ui.label(_here).classes("text-base font-bold sm:hidden").style(
+                        f"color:{text_token('ink-soft')}")
             # 桌面端(≥1024px)：内联导航，绝对定位在顶栏水平居中（不受左侧品牌/右侧按钮宽度影响）。
             # w-max 必须有：绝对元素 left-1/2 的收缩宽度只有父宽 50%，不锁 max-content 会被压缩、把每个项文字挤成两行。
             # flex-nowrap + whitespace-nowrap 双保险，行不换、字不折。

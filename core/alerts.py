@@ -50,7 +50,8 @@ log = logging.getLogger("autorss")
 # 各类的键与人话名。加一类要同时在 `_BUILD` 里给出判据与构造式（产出 ident/fact/text），
 # 下面 `scan()` 的断言会逼着你补齐。
 KINDS = {"dup": "同一部番被拆成两条", "mva": "番剧与剧场版重号", "wrb": "绑定看着不对",
-         "ign": "超期忽略但还在更新", "rer": "同号新集被当成旧集", "two": "两套集号同时在下"}
+         "ign": "超期忽略但还在更新", "rer": "同号新集被当成旧集", "two": "两套集号同时在下",
+         "lag": "锁定源落后"}
 
 
 def _tag(row_id, created_at) -> str:
@@ -111,6 +112,8 @@ def _mva(m: dict) -> dict:
                  "而 qB 只收一次：两条记录都会显示『已交付』，文件却只落在其中一个目录。"
                  "到番剧表打开这一条点『忽略本番』（剧场版那条留着），或确认它确实是电视版。"),
         "open": [m["a"]],              # 番剧表那条（要点『忽略本番』的是它），不是剧场版的 m["m"]
+        # 仪表盘上『留番剧，忽略剧场版』/『留剧场版，忽略番剧』两个按钮要的（不进 ident / fact）
+        "anime_id": m["a"], "movie_id": m["m"], "a_name": m.get("a_name"), "m_name": m.get("m_name"),
     }
 
 
@@ -130,10 +133,9 @@ def _wrb(w: dict) -> dict:
         "text": (f"『{w['name']}』(#{w['id']}，bgm {w['bgm']}，第 {w['season']} 季·{tot})"
                  f" 下面有 {w['bad']} 条种子的集号不可能属于所绑的这一季"
                  + (f"（如第 {eps} 集）" if eps else "")
-                 + "——多半是 bgm 绑错了季。去详情页核对绑定；"
-                 "或者那批种子本就属于别的季，在详情页把它们标为『不属于本季』（文件不动，标完这条提示自然消失；"
-                 "别删：删掉会被当成这一集不要了，照样挡着）。"
-                 "在这之前，它们会一直占着集去重、挡住真正的本季集。"),
+                 + "——多半是 bgm 绑错了季。去详情页核对绑定；或者那批种子本就属于别的季："
+                 + _anime.WRB_CLEANUP_HINT
+                 + "标记不动文件，标完这条提示自然消失；在这之前，它们会一直占着集去重、挡住真正的本季集。"),
         "open": [w["id"]],
     }
 
@@ -164,6 +166,17 @@ def _ign(g: dict) -> dict:
 
 def _rer(g: dict) -> dict:
     eps = ign_eps_text(g["eps"])
+    off = g.get("off_lock") or {}
+    if off:
+        # 锁了源、新来的又不是锁定组：标完旧行，这几集也不会自动下（flush 只下锁定组），不能再说"照常自动下"
+        _off_eps = sorted({e for v in off.values() for e in v})
+        after = ("就把旧的那几条标为『不属于本季』（文件不动，标完这条提示自然消失；"
+                 "别删：删掉会被当成这一集不要了，照样挡着）。"
+                 f"这部番锁定了『{g['pref']}』，标完后新来的『{'、'.join(off)}』第 {ign_eps_text(_off_eps)} 集"
+                 "不会自动下，标记时可以顺带下载。旧的那几条上没有『不属于本季』按钮，就在新来的那几条上")
+    else:
+        after = ("就把旧的那几条标为『不属于本季』（文件不动，标完这几集照常自动下、这条提示自然消失；"
+                 "别删：删掉会被当成这一集不要了，照样挡着）；旧的那几条上没有这个按钮，就在新来的那几条上")
     return {
         "kind": "rer",
         "ident": f"rer:{_tag(g['id'], g['born'])}",
@@ -172,9 +185,7 @@ def _rer(g: dict) -> dict:
         "text": (f"『{g['name']}』(#{g['id']}) 第 {eps} 集新来的种子（{'、'.join(g['groups'])}）"
                  f"比已经下好的那份晚了 {config.ANIME_RERELEASE_WEEKS} 周以上 —— 多半是新一季用季内编号、"
                  "标题又没写第几季，被当成了已下过的旧集，这几集不会下。去详情页看一眼：真是新一季，"
-                 "就把旧的那几条标为『不属于本季』（文件不动，标完这几集照常自动下、这条提示自然消失；"
-                 "别删：删掉会被当成这一集不要了，照样挡着）；旧的那几条上没有这个按钮，就在新来的那几条上"
-                 "逐条点『下载』。只是很晚的重发版（比如 BD 版）就不用管。"),
+                 + after + "逐条点『下载』。只是很晚的重发版（比如 BD 版）就不用管。"),
         "open": [g["id"]],
     }
 
@@ -198,12 +209,30 @@ def _two(g: dict) -> dict:
     }
 
 
+def _lag(g: dict) -> dict:
+    fb = config.ANIME_LOCK_FALLBACK_DAYS
+    tail = ((_anime.lock_fallback_blocked_text(g["why"]) if g["why"] else
+             f"锁定组停更满 {fb} 天、核对无误的会自动用别的组补一份") + "。" if fb > 0 else "")
+    return {
+        "kind": "lag",
+        "ident": f"lag:{_tag(g['id'], g['born'])}",
+        # 进指纹的只有锁的是哪个组：别的组每周来一集、锁定组跟上一两集都是常态，不该让人重新点『知道了』；
+        # 锁定组追上了这条自然消失，改锁了别的组才是新事实。集号、被挡原因都不进（原因里有"有源在失败"这种一轮内的瞬态）
+        "fact": "lock=" + (g["lock"] or "").replace(";", ",").replace("=", "-"),
+        "text": (f"『{g['name']}』(#{g['id']}) 锁定的下载源『{g['lock']}』停在第 {g['lock_max']} 集，"
+                 f"{'、'.join(g['groups'])} 已经发了第 {_anime.ep_ranges(g['eps'])} 集，这几集一集都没下。"
+                 f"{tail}去详情页可以『只补这几集』（用别的组补上、不改锁），或『改回按优先级』。"),
+        "open": [g["id"]],
+    }
+
+
 _BUILD = {"dup": (_anime.suspect_duplicate_anime, _dup),
           "mva": (_anime.suspect_movie_as_anime, _mva),
           "wrb": (_anime.suspect_wrong_binding, _wrb),
           "ign": (_anime.suspect_ignored_airing, _ign),
           "rer": (_anime.suspect_rerelease_collision, _rer),
-          "two": (_anime.suspect_two_numberings, _two)}
+          "two": (_anime.suspect_two_numberings, _two),
+          "lag": (_anime.suspect_lock_lag, _lag)}
 
 
 def scan() -> list[dict]:
@@ -216,7 +245,7 @@ def scan() -> list[dict]:
     """
     assert set(_BUILD) == set(KINDS), "加了一类却没给全 判据/构造式/人话名"
     out = []
-    for kind in ("dup", "mva", "wrb", "ign", "rer", "two"):
+    for kind in ("dup", "mva", "wrb", "ign", "rer", "two", "lag"):
         find, build = _BUILD[kind]
         for raw in find():
             out.append(build(raw))
@@ -278,7 +307,7 @@ def view() -> dict:
 FACT_LABEL = {"abgm": "左边那条绑的 bgm", "bbgm": "右边那条绑的 bgm",
               "ast": "左边那条的订阅状态", "bst": "右边那条的订阅状态",
               "bgm": "绑的 bgm", "season": "季号", "eps": "出问题的集号", "st": "订阅状态",
-              "imp": "是不是别的季的集被分到了这条", "pair": "两套编号的组"}
+              "imp": "是不是别的季的集被分到了这条", "pair": "两套编号的组", "lock": "锁定的下载源"}
 _BITS_CN = {"00": "待确认", "01": "超期忽略", "10": "追番中", "11": "已忽略"}
 
 

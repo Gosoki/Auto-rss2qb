@@ -822,7 +822,7 @@ def movies_page(t: str = ""):
             chips.append(("版本数", k["versions"], "blue-grey", "全部版本数（各状态之和）"))
             with ui.row().classes("gap-2 flex-wrap pl-1 items-center"):
                 for label, val, color, tip in chips:
-                    b = ui.badge(f"{label} {val}").props(f"color={color}")
+                    b = ui.badge(f"{label} {val}").props(f"color={color if val else 'grey'}")   # 零值不上语义色
                     if tip:
                         b.tooltip(tip)
             # ── 下载状态 ──（qB 实时态，独立成区；与番剧页同款：后台轮询之外可点『立刻刷新』手动拉一次）
@@ -853,8 +853,9 @@ def movies_page(t: str = ""):
                 ui.label("采集状态").classes("text-sm font-bold")
                 ui.label("后台采集与识别").classes("text-xs text-gray-400")
             with ui.row().classes("gap-2 flex-wrap pl-1"):
+                # 剧场版扫描默认关闭，暂停不用红（红色留给真出错）
                 ui.badge("扫描开启" if config.MOVIE_SCAN_ENABLED else "扫描暂停").props(
-                    f"color={'green' if config.MOVIE_SCAN_ENABLED else 'red'}").tooltip(
+                    f"color={'green' if config.MOVIE_SCAN_ENABLED else 'orange'}").tooltip(
                     "后台是否定期扫 Mikan 剧场版/OVA 桶（『订阅源』页切换）")
                 ui.badge(f"识别 {k['matched']}/{k['total']}").props("color=blue").tooltip(
                     "已匹配到 bgm 的 / 全部")

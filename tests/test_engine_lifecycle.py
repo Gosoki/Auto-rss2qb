@@ -1024,6 +1024,8 @@ _STRADDLERS = {
         "relocate_anime":                 "in_flight",     # 真正跨 await 的在 engine.relocate
         # (r37) 锁源缺集『只补这几集』、补齐挑定别的组后的下发、批量重识别末尾统一判一次下齐
         "_download_locked_out_inner":     "in_flight",
+        # (r41) 清理重复/别季文件：复核 → 一次 qB → 逐条走 _delete_anime_torrent_inner
+        "_cleanup_execute_inner":         "in_flight",
         "_download_new_rows":             "caller:_backfill_source_inner",
         "_reenrich_scope_inner":          "lock:_enrich_lock",
         "_refresh_meta_due_inner":        "lock:_enrich_lock",   # 每收录 N 集刷一次 bgm 资料

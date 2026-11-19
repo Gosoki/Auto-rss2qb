@@ -442,12 +442,16 @@ def test_every_number_matches_the_dashboard(clean_tables, quiet, cfg):
     assert ov["kpi"]["confirm"] == len(pend)
 
     assert line2.startswith(f"等你处理：待确认 {len(pend)} 部（"), line2
-    assert sum(f"{A.display_of(a)}·{A.confirm_reason_text(a.confirm_reason)[0]}" in line2 for a in pend) == 2
-    assert " 等）" in line2, "待确认超过 2 部要写『等』"
+    # 待确认按原因合并，不逐部重复标签
+    for r in {A.confirm_reason_text(a.confirm_reason)[0] for a in pend}:
+        n = sum(A.confirm_reason_text(a.confirm_reason)[0] == r for a in pend)
+        assert f"{r} {n}" in line2, (r, line2)
+    assert "·" not in line2
     for frag in (f"待识别 {ov['kpi']['fail']} 部", f"缺集 {ov['kpi']['gaps']} 部", f"锁定源落后 {len(lag)} 部",
                  f"失败/异常 {fails} 条", f"未读提示 {len(live)} 条", "剧场版新版本 2 个",
                  f"RSS 断档 {len(health.gaps())} 段"):
         assert frag in line2, (frag, line2)
+    assert f"未读提示 {len(live)} 条（" in line2 and D._ALERT_SHORT[live[0]["kind"]] in line2, line2
     assert line3 == "系统：正常"
 
 
@@ -534,7 +538,7 @@ def test_longest_todo_line_is_not_clipped(clean_tables, quiet, monkeypatch):
     monkeypatch.setattr(A, "pending_confirm", lambda: [_P() for _ in range(9999)])
     monkeypatch.setattr(A, "display_of", lambda a: a.display_name)
     monkeypatch.setattr(A, "locked_out_episodes", lambda _: list(range(9999)))
-    monkeypatch.setattr(alerts, "view", lambda: {"live": list(range(9999))})
+    monkeypatch.setattr(alerts, "view", lambda: {"live": [{"kind": k} for k in list(alerts.KINDS) * 1667]})
     monkeypatch.setattr(health, "gaps", lambda: list(range(9999)))
     now = datetime.now()
     line2 = D.digest_text(now - timedelta(hours=24), now).split("\n")[1]

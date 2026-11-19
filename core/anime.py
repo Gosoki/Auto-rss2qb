@@ -26,6 +26,7 @@ from services import enrich, fetch
 from services.notify import (cooldown_active as notify_cooldown_active,
                              enabled as notify_enabled, event as notify_event,
                              state as notify_state)
+from services.notify import QB_DOWN_TEXT, QB_UP_TEXT
 from sources.parse import (candidate_names, extract_episode_abs, kw_match, parse_title, parse_version, quarter_of,
                            quarter_sort_key,
                            search_query_names, season_from_name, strip_season)
@@ -1850,7 +1851,7 @@ async def qb_precheck() -> bool:
     global _qb_down_rounds
     alive = await engine.qb.reachable()
     await notify_state("qb_down", not alive,
-                       "qB 连不上，暂停放行下载（种子留在待下）", "qB 恢复，继续交付")
+                       QB_DOWN_TEXT, QB_UP_TEXT)
     # 【只在翻转时记 WARNING】(r37) 以前每轮一行，断网 30 小时记了 213 次。之后每 12 轮记一行 INFO。
     if not alive:
         _qb_down_rounds += 1
@@ -2163,7 +2164,46 @@ def expected_aired(a, today=None) -> int | None:
     return max(0, min(t, weeks + 1 - max(0, config.ANIME_GAP_SLACK_WEEKS)))
 
 
-def missing_episodes(a, seen, today=None, end_ep: int | None = None, tail_from: date | None = None) -> list:
+def _bracket_holes(src_eps: dict, seen) -> set:
+    """绝对编号续作中间少的那几集：同一个组（同 source）发过 k−1 与 k+1，而库里任何组都没有第 k 集。
+    src_eps：{组名: 这个组见过的正集号集合}，调用方按与 seen 同一个口径过滤好（正片、不是别季）。
+    只认这一种最稳的形状（宁漏不误）：两侧不是同一个组、只有一侧、连缺两集都不算 —— 那些分不清是
+    两套编号混着来还是真缺。"""
+    out = set()
+    for eps in src_eps.values():
+        out |= {k + 1 for k in eps if k + 2 in eps and k + 1 not in seen}
+    return out
+
+
+def _episode_holes(wins: dict, sets: dict) -> dict:
+    """{番 id: _bracket_holes 的结果}，给 episode_gaps 传进 missing_episodes 的 holes。
+    只查绝对编号形状（max(seen) 超出总集数、min(seen) > 1、集号不连续）的番，没有就不发 SQL。
+    行过滤用 _counts_as_seen，与 seen 出自同一批行。"""
+    cand = {}
+    for aid, a in wins.items():
+        seen = sets.get(aid, (set(), set()))[1]
+        if seen and max(seen) > (a.total_episodes or 0) and min(seen) > 1 and max(seen) - min(seen) + 1 != len(seen):
+            cand[aid] = a
+    if not cand:
+        return {}
+    with get_session() as s:
+        rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.status,
+                                  AnimeTorrent.release_time, AnimeTorrent.foreign_season, AnimeTorrent.source).where(
+            AnimeTorrent.anime_id.in_(list(cand)), AnimeTorrent.episode >= 1)))
+    by: dict = {}
+    for aid, ep, status, rel, foreign, src in rows:
+        if src and _counts_as_seen(cand[aid], ep, status, rel, foreign):
+            by.setdefault(aid, {}).setdefault(src, set()).add(int(ep))
+    out = {}
+    for aid, src_eps in by.items():
+        h = _bracket_holes(src_eps, sets[aid][1])
+        if h:
+            out[aid] = h
+    return out
+
+
+def missing_episodes(a, seen, today=None, end_ep: int | None = None, tail_from: date | None = None,
+                     holes=None) -> list:
     """追番中的番：按开播日推算【应已播出】、库里却【一条种子都没见过】的正集号（升序）；没有缺口返回 []。
 
     为什么需要它：列表上的『已下/可下』只数库里见过的集，从没进过库的集它看不见——
@@ -2190,7 +2230,9 @@ def missing_episodes(a, seen, today=None, end_ep: int | None = None, tail_from: 
     绝对号 lo−1 因采集晚开没收到）时，hi 是按本季第 len(seen)+缺头集数 集的排期发的，上限比原值少缺头集数，
     季末那条缺集提示就晚报这么多周 —— 只会推迟/漏报、不会误报，有意不改。提前发布时取原值，所以只会更保守；
     只砍 hi 之后的尾巴，中间的洞照报。锚点用 release_time 不用 created_at：补齐/回填进来的旧集 created_at 是今天，
-    用它会把真缺口压掉几周。休播超过宽限的那几周里（还没恢复）提示照样会出——分不清休播还是断更。"""
+    用它会把真缺口压掉几周。休播超过宽限的那几周里（还没恢复）提示照样会出——分不清休播还是断更。
+    holes：_bracket_holes 给的"同一个组前后两集都发了、中间这一集谁都没有"的集号。只用在绝对编号分支：
+    集号除了这几个洞之外是连续的，才把洞报为缺集（真库 #8 见过 13~23、25，第 24 集 RSS 断档没进过库）。"""
     if a is None or not a.confirmed or a.rejected or not seen:
         return []
     e = expected_aired(a, today)
@@ -2200,14 +2242,18 @@ def missing_episodes(a, seen, today=None, end_ep: int | None = None, tail_from: 
     lo, hi = min(seen), max(seen)
     tail_max = (None if tail_from is None
                 else hi + ((today or datetime.now().date()) - tail_from).days // 7 - slack)
-    if hi > (a.total_episodes or 0) and lo > 1 and hi - lo + 1 == len(seen):
+    holes = {k for k in (holes or ()) if lo < k < hi and k not in seen}
+    if hi > (a.total_episodes or 0) and lo > 1 and hi - lo + 1 == len(seen) + len(holes):
         # 【绝对编号】(r37 后续) ANi 等组的续作沿用全系列连续编号：Re:Zero 第四季后半 bgm 记 8 集，库里是 12~18。
         # 判不出"第几集"对应哪个号，只能数个数：集号连续、见过的集数比应播集数少 → 缺的算在末尾。
         # 真库上它正好漏了终集第 19 集（9 月底停机那半个月滚出了 RSS），而下面那道"集号超出总集数不判"的闸
         # 让它一声不吭。集号不连续（两套编号混着来）的照旧不判；字幕组打了 [END] 的以它为准。
-        if len(seen) >= e or (end_ep and end_ep <= hi):
-            return []
-        return [k for k in range(hi + 1, hi + 1 + e - len(seen)) if tail_max is None or k <= tail_max]
+        # 中间的洞只认 holes（同一个组前后两集都发了）；尾巴按 lo~hi 的跨度数，洞已经单独报了、不再算进尾巴。
+        gap = sorted(k for k in holes if not end_ep or k <= end_ep)
+        span = hi - lo + 1
+        if span >= e or (end_ep and end_ep <= hi):
+            return gap
+        return gap + [k for k in range(hi + 1, hi + 1 + e - span) if tail_max is None or k <= tail_max]
     # 超出总集数的集号：多（≥ _OVER_EPS_MEANS_TWO_NUMBERINGS 个）是两套编号混着来，判不了；只有一两个、
     # 集号又从 1 开始的，是 bgm 少记了一集（12 集的番实际 13 集）—— 以前这里一律不判，第 13 集一进库，
     # 这部番前面缺的第 5 集也跟着不报了（r38）。
@@ -2255,11 +2301,22 @@ def suspect_rerelease_collision() -> list[dict]:
     for aid, ep, st, rt, src in rows:
         h = first_have.get((aid, ep))
         if st in ("pending", "skipped") and rt is not None and h is not None and rt - h >= timedelta(weeks=weeks):
-            g = hits.setdefault(aid, {"eps": set(), "groups": set()})
-            g["eps"].add(int(ep) if float(ep).is_integer() else ep)
+            g = hits.setdefault(aid, {"eps": set(), "groups": set(), "by": {}})
+            e = int(ep) if float(ep).is_integer() else ep
+            g["eps"].add(e)
             g["groups"].add(src or "?")
+            g["by"].setdefault(src or "", set()).add(e)
     return [{"id": aid, "born": animes[aid].created_at, "name": display_of(animes[aid]),
-             "eps": sorted(v["eps"]), "groups": sorted(v["groups"])} for aid, v in sorted(hits.items())]
+             "eps": sorted(v["eps"]), "groups": sorted(v["groups"]),
+             **_rer_lock_view(animes[aid].pref_source or "", v["by"])} for aid, v in sorted(hits.items())]
+
+
+def _rer_lock_view(pref: str, by: dict) -> dict:
+    """给提示文案用（不进指纹）：锁了源时，新来的集里【没有锁定组版本】的那几集 —— 标完旧行它们也不会自动下。
+    {pref, off_lock: {组: [集号…]}}；没锁源或锁定组都有新版本时 off_lock 为空。"""
+    lock_eps = by.get(pref, set()) if pref else set()
+    off = {(k or "?"): sorted(x - lock_eps) for k, x in sorted(by.items()) if pref and k != pref and x - lock_eps}
+    return {"pref": pref, "off_lock": off}
 
 
 def suspect_ignored_airing(days: int | None = None) -> list[dict]:
@@ -2363,22 +2420,23 @@ def _tail_anchors(wins: dict, his: dict) -> dict:
 
 
 def episode_gaps(animes, sets: dict | None = None) -> dict:
-    """{番 id: 缺的正集号列表}，只含有缺口的番。判据见 missing_episodes；最多三条 SQL。
+    """{番 id: 缺的正集号列表}，只含有缺口的番。判据见 missing_episodes；最多四条 SQL（绝对编号形状的番才多查一条中间的洞，见 _episode_holes）。
     sets：调用方已经取过的 _episode_sets 结果（progress_and_gaps 用），不给就自己取。"""
     if sets is None:
         sets = _episode_sets([a.id for a in animes])
+    by_id = {a.id: a for a in animes}
+    holes = _episode_holes(by_id, sets)
     out = {}
     for a in animes:
-        miss = missing_episodes(a, sets.get(a.id, (set(), set()))[1])
+        miss = missing_episodes(a, sets.get(a.id, (set(), set()))[1], holes=holes.get(a.id))
         if miss:
             out[a.id] = miss
     ends: dict = {}
-    by_id = {a.id: a for a in animes}
     if out:
         ends = _end_marked_episodes(out)
         if ends:
             for aid, end in ends.items():
-                miss = missing_episodes(by_id[aid], sets[aid][1], end_ep=end)
+                miss = missing_episodes(by_id[aid], sets[aid][1], end_ep=end, holes=holes.get(aid))
                 if miss:
                     out[aid] = miss
                 else:
@@ -2389,7 +2447,8 @@ def episode_gaps(animes, sets: dict | None = None) -> dict:
     if his:
         anchors = _tail_anchors(by_id, his)
         for aid, d in anchors.items():
-            miss = missing_episodes(by_id[aid], sets[aid][1], end_ep=ends.get(aid), tail_from=d)
+            miss = missing_episodes(by_id[aid], sets[aid][1], end_ep=ends.get(aid), tail_from=d,
+                                    holes=holes.get(aid))
             if miss:
                 out[aid] = miss
             else:
@@ -2456,7 +2515,7 @@ def locked_out_episodes(animes, today=None, lag_days: int | None = None) -> dict
       · 番是追番中、锁了下载源；集是正集，且这一集一份都没下过（任何来源）；
       · 集号大于锁定源见过的最大集号（锁定源一直跟着发的番，别的组的旧集不算），或是锁定组中间跳过的集（_lock_hole）；
       · 首次入库的前后 ANIME_LOCK_SYNC_DAYS 天（默认 2）内锁定源没发过集号与它相差 > 2 的东西 —— 两个组用不同编号（季内号 / 绝对号）同步在发时，
-        大号那边每一集出现时锁定源也在发，不算；锁定源停了（碧蓝航线）或隔几周才发一集（相反的你和我：
+        大号那边每一集出现时锁定源也在发，不算（只认锁定组发的是季内号、即不超过总集数的那种）；锁定源停了（碧蓝航线）或隔几周才发一集（相反的你和我：
         喵萌 07-26 发第 13 集、09-07 才发第 14 集，ANi 早已发完）才算；中间跳过的集不看这一条；
       · 首次入库已超过 ANIME_LOCK_LAG_DAYS 天（锁定源只是晚几天发的，不该报）。
     本函数只报。锁定组停更满 ANIME_LOCK_FALLBACK_DAYS 天、再过一串核对闸的集，由 deliver_lock_fallback 自动用别的组
@@ -2500,13 +2559,18 @@ def locked_out_episodes(animes, today=None, lag_days: int | None = None) -> dict
                 first[k] = (r.created_at, set())
             first[k][1].add(r.source or "?")
         eps, groups = [], set()
+        total = locked[aid].total_episodes or 0
         for k, (at, srcs) in sorted(first.items()):
             # 【两套编号同步在发 → 不算落后】只在那段时间锁定组发的集号与 k 差得远（> 2，季内号 vs 绝对号）时豁免。
             # 差 1~2 是同一套编号、锁定组只是晚了（r38：锁定组一贯晚 6 天，它的第 11 集与别组第 12 集
             # 前后脚入库，以前被当成"同步"，终集就永远不报）。中间跳过的集（k < 锁定组最大集号）不豁免。
+            # 只认锁定组那一侧是季内号（le ≤ 总集数）的行：锁定组自己的集号已超出总集数，说明两边用的是
+            # 同一套全系列编号、它只是落后 3 集以上（真库 #8：喵萌 09-07/09-14 发 14、15，ANi 的 22、23
+            # 前后脚入库，以前被当成两套编号同步而漏报）。总集数未知时判不出哪边是季内号，照旧豁免（宁漏不误）。
             if k <= lock_max:
                 pass
-            elif any(abs(at - lt) <= sync and abs(k - le) > 2 for lt, le in lock_rows):
+            elif any(abs(at - lt) <= sync and abs(k - le) > 2 and (not total or le <= total)
+                     for lt, le in lock_rows):
                 continue
             if now - at < timedelta(days=lag):
                 continue
@@ -3258,7 +3322,8 @@ async def sweep_idle() -> int:
     stale.sort(key=lambda x: x[1], reverse=True)
     head = "、".join(f"{display_of(a)}({(now - last).days}天)" for a, last in stale[:3])
     more = f" 等 {len(stale)} 部" if len(stale) > 3 else ""
-    ok = await notify_event("idle", f"{days} 天没有新种子：{head}{more}")
+    ok = await notify_event("idle", f"{days} 天没有新种子：{head}{more}。一般等它更新即可；"
+                             "锁了源的番可以在详情页改回按优先级")
     if not ok:
         # 【没发出去就不记账】idle_notified_at 的唯一用途就是"这条已经说过了"。
         # 通知被限流/未订阅/没配 URL 而丢掉时还把它记上，等于把这批番的提醒永久吃掉一次
@@ -3304,15 +3369,35 @@ async def sweep_lock_lag() -> int:
             tail = ("。" + (lock_fallback_blocked_text(why) if why else f"满 {fb_days} 天且核对无误会自动用别的组补")
                     + "；如果锁定组其实发了（采集漏收），先点『自动补齐』"
                     + (f"（第 {ep_ranges(kw_miss)} 集别的组没有『{a.pref_keyword}』版本，不会自动补）" if kw_miss else "")
-                    + "。不想等就去详情页点『只补这几集』，或把下载源改回按优先级")
+                    + "；也可以把下载源改回按优先级")
         else:
-            tail = "、一集都不会下。去详情页点『只补这几集』，或把下载源改回按优先级"
-        msg = (f"{display_of(a)}：锁定的『{a.pref_source}』没有第 {ep_ranges(v['eps'])} 集"
-               f"（它最新到第 {v['lock_max']} 集），{'、'.join(v['groups'])} 有 ——"
-               f"{len(v['eps'])} 集被锁挡住{tail}")
+            tail = "。不点就一集都不会下；也可以把下载源改回按优先级"
+        # 结论和主要做法放最前：手机通知只显示前两行
+        msg = (f"{display_of(a)}：{len(v['eps'])} 集被锁挡住，去详情页点『只补这几集』。"
+               f"锁定的『{a.pref_source}』没有第 {ep_ranges(v['eps'])} 集"
+               f"（它最新到第 {v['lock_max']} 集），{'、'.join(v['groups'])} 有{tail}")
         if await notify_event("lock_lag", msg, key=f"{a.id}:{v['eps'][-1]}", cooldown=config.ALERT_REPEAT_DAYS * 86400):
             n += 1
     return n
+
+
+def suspect_lock_lag() -> list[dict]:
+    """仪表盘『锁定源落后』提示（core/alerts 的 lag 类）：判据就是 locked_out_episodes，取 sweep_lock_lag 同一批番。
+    只读、只报不改。兜底被番级闸挡住时带上 lock_fallback_preview 给的原因（与推送、详情页横幅同一口径）。
+    为什么推送之外还要这一条：推送地址没配时 lock_lag 一条也发不出去，仪表盘上只剩一个『锁源缺集』小标签，
+    真库 #8 的 17~23、25 集就这样挡了三个半月没人知道。
+    返回 [{id, born, name, lock, eps, groups, lock_max, why}]；why=None＝兜底没被挡住（或兜底关着）。"""
+    with get_session() as s:
+        animes = list(s.exec(select(Anime).options(_NO_SUMMARY).where(
+            Anime.pref_source.is_not(None), Anime.pref_source != "")))
+    lagging = locked_out_episodes(animes)
+    if not lagging:
+        return []
+    blocked = lock_fallback_preview()[1] if config.ANIME_LOCK_FALLBACK_DAYS > 0 else {}
+    return [{"id": a.id, "born": a.created_at, "name": display_of(a), "lock": a.pref_source,
+             "eps": lagging[a.id]["eps"], "groups": lagging[a.id]["groups"],
+             "lock_max": lagging[a.id]["lock_max"], "why": blocked.get(a.id)}
+            for a in sorted(animes, key=lambda x: x.id) if a.id in lagging]
 
 
 async def sweep_gaps() -> int:
@@ -3479,10 +3564,9 @@ async def sweep_alerts() -> dict:
         ok = await notify_event(
             "backlog",
             "有 %d 部番的 bgm 绑定看着不对（集号不可能属于所绑的那一季）：%s。"
-            "去详情页核对绑定；那批种子确实是别的季的，就在详情页把它们标为『不属于本季』"
-            "（文件不动；别删，删掉会被当成这一集不要了）" % (
+            "去详情页核对绑定；那批种子确实是别的季的：%s" % (
                 len(suspects), "、".join(f"#{x['id']}「{x['name']}」({x['bad']} 条)"
-                                        for x in suspects[:4])),
+                                        for x in suspects[:4]), WRB_CLEANUP_HINT),
             key=_wb_key, cooldown=six_h)
         # 【没发出去就不记账】(R36 体检) `notify_event` 返回 False 有四种含义（没送出去 / 未订阅 /
         # 被冷却 / 被限流），只有"没送出去"与"被限流"该下一轮重来 —— 与同文件 sweep_finished 的
@@ -3503,7 +3587,8 @@ async def sweep_alerts() -> dict:
         parts = ([f"qB 报错（磁盘满 / 目录不可写？）：{_some(qb_err)}"] if qb_err else []) + (
             [f"长期无进度（qB 里可能没源了）：{_some(idle)}"] if idle else [])
         await notify_event("stalled",
-                           f"{_two_sides(stalls, m_stalls, '条种子停滞')}：" + "；".join(parts),
+                           f"{_two_sides(stalls, m_stalls, '条种子停滞')}：" + "；".join(parts)
+                           + "。去仪表盘点『失败/异常』卡片，或进详情页对那一条点『下载』重试 / 删除",
                            key=_fingerprint(stall_ids), cooldown=six_h)
     # 待识别是状态型：积压【上穿】阈值时说一次，清空时再说一次。
     # ok 文案随实际条数生成：阈值下穿≠清零，6 部降到 4 部时说"已清空"是假话。
@@ -3590,7 +3675,7 @@ def auto_off_reasons(ids) -> dict:
     值域：『已忽略』/『待确认』/『已下齐·停订』。判序是 **rejected → not confirmed → finished**：
     超期忽略是 (rejected=1, confirmed=0) 两位同时成立，必须先判 rejected 才与详情页
     `not cur.confirmed and not cur.rejected → cur.rejected → cur.finished_at` 那三档对齐。
-    与 `pending_breakdown` 只在『已下齐·停订』这一档同源（那边没有『已忽略』档：被拒绝番的待下种子归『备用』）。
+    与 `pending_breakdown` 只在『已下齐·停订』这一档同源（那边的『已忽略番』一档另算：rejected 的番与孤儿行都归它）。
 
     【为什么需要它】`confirmed_anime_ids` 只回答"会不会下"，回答不了"为什么不下"。
     于是渲染侧只能把三种情况统统显示成『待确认』，并把用户指去『待确认』tab——
@@ -3685,8 +3770,6 @@ def two_numberings(anime_ids=None) -> dict:
     d ≥ T 与 D1 同口径（O ≥ T 时两套取值域才不相交）：字幕组同号落后几周的偏移远小于 T，挡在这里；
     O < T 的歧义段（如杀手旅店第二季 O=13/T=15）有意不报，那一段本来就按源各下一份。
     上一季的旧集整批补发，发布时间对不上绝对组的周更，挡在 ③。"""
-    days = config.ANIME_TWO_NUMBERING_DAYS
-    need = config.ANIME_TWO_NUMBERING_PAIRS
     with get_session() as s:
         q = select(Anime.id, Anime.total_episodes).where(
             *subscribed_where(), Anime.total_episodes > 0,
@@ -3709,25 +3792,34 @@ def two_numberings(anime_ids=None) -> dict:
         e = int(ep)
         if e not in d or rt < d[e]:
             d[e] = rt
-    win = timedelta(days=days)
     out: dict = {}
     for aid, srcs in by.items():
-        t = tot[aid]
-        best = None
-        for a_src, ea in srcs.items():
-            if min(ea) <= t:
-                continue
-            for b_src, eb in srcs.items():
-                if b_src == a_src or max(eb) > t:
-                    continue
-                for off in sorted({x - y for x in ea for y in eb if x - y >= t}):
-                    n = sum(1 for k, tk in eb.items() if k + off in ea and abs(ea[k + off] - tk) <= win)
-                    if n >= need and (best is None or n > best["pairs"]):
-                        best = {"abs_src": a_src, "abs_eps": sorted(ea), "in_src": b_src,
-                                "in_eps": sorted(eb), "offset": off, "pairs": n}
+        best = _best_offset(srcs, tot[aid])
         if best:
-            out[aid] = best
+            a_src, b_src, off, n = best
+            out[aid] = {"abs_src": a_src, "abs_eps": sorted(srcs[a_src]), "in_src": b_src,
+                        "in_eps": sorted(srcs[b_src]), "offset": off, "pairs": n}
     return out
+
+
+def _best_offset(rows_by_src: dict, t: int) -> tuple | None:
+    """two_numberings 判据的②③两条：{源: {整数集号: 最早发布时间}} 与总集数 t → (全系列组, 季内组, 偏移 d, 对上的集数)，
+    算不出返回 None。输入只该含①那一类行（已交付、非别季、整数集号、有发布时间）—— 由调用方筛。
+    【不看锁源】锁源过滤只在 two_numberings 里（它只报没锁的番）；清理与单条删除的文案恰恰要在锁了之后还能算出配对。"""
+    win = timedelta(days=config.ANIME_TWO_NUMBERING_DAYS)
+    need = config.ANIME_TWO_NUMBERING_PAIRS
+    best = None
+    for a_src, ea in rows_by_src.items():
+        if not ea or min(ea) <= t:
+            continue
+        for b_src, eb in rows_by_src.items():
+            if b_src == a_src or not eb or max(eb) > t:
+                continue
+            for off in sorted({x - y for x in ea for y in eb if x - y >= t}):
+                n = sum(1 for k, tk in eb.items() if k + off in ea and abs(ea[k + off] - tk) <= win)
+                if n >= need and (best is None or n > best[3]):
+                    best = (a_src, b_src, off, n)
+    return best
 
 
 def suspect_two_numberings() -> list[dict]:
@@ -3739,6 +3831,334 @@ def suspect_two_numberings() -> list[dict]:
         animes = {a.id: a for a in s.exec(select(Anime).options(_NO_SUMMARY).where(Anime.id.in_(list(hits))))}
     return [{"id": aid, "born": animes[aid].created_at, "name": display_of(animes[aid]), **h}
             for aid, h in sorted(hits.items()) if aid in animes]
+
+
+# ==== 清理下错的文件：两套集号的重复份 / 已标『不属于本季』的别季文件 ====
+# 只给人点的入口用（详情页横幅、『只下 X』确认框）。判据宁严勿宽：漏删只多占盘，删错是这一集盘上一份不剩。
+# 预览（只读、不碰 qB）→ 探测（一次 qB 查大小与留下那份的真实状态）→ 执行（新会话里逐条复核、只缩小不扩大）。
+# ep_dropped 一律由删除内核里现有的 _mark_user_deleted 写，这里不另写一份（E-73 不变）。
+
+# 『绑定看着不对』那批种子的处置顺序（仪表盘提示与巡检推送共用一句）：先标再删。没标就删，删除内核按『同集最后一份』
+# 写 ep_dropped，本季这一集就被当成不要了；标完再删，别季行 _is_last_copy 恒 False，本季不受影响。
+WRB_CLEANUP_HINT = ("先标『不属于本季』（或重绑）；标完到详情页点『看清单并清理』删文件，就不会影响本季。"
+                    "没标就删，会被当成本季这一集不要了。")
+_CLEANUP_DROP_STATUSES = ("sent", "stalled")     # downloading 是交付中的占位，两边都不碰
+_CLEANUP_NO_KEEPER = "另一套编号里没有这一集，删了就一份不剩"
+_CLEANUP_ONLY_COPY = "只有这一份"
+_CLEANUP_KEEPER_UNSURE = "留下那份在 qB 里查不到或没下完，没法确认文件还在，这一份先不删"
+_CLEANUP_DROP_GONE = "要删的这份 qB 里已经没有了，这里删不到文件，这一份先不删"
+
+
+def _int_ep(ep) -> int | None:
+    return int(ep) if ep is not None and ep >= 1 and float(ep).is_integer() else None
+
+
+def _two_offset(a, rows) -> tuple | None:
+    """这部番两套集号的 (全系列组, 季内组, d)：与 two_numberings 同一份输入筛选、同一个 _best_offset，但不看锁源。"""
+    if a is None or not a.total_episodes:
+        return None
+    by: dict = {}
+    for t in rows:
+        e = _int_ep(t.episode)
+        if e is None or t.status not in HAVE_STATUSES or t.foreign_season or t.release_time is None:
+            continue
+        d = by.setdefault(t.source or "", {})
+        if e not in d or t.release_time < d[e]:
+            d[e] = t.release_time
+    best = _best_offset(by, a.total_episodes)
+    return best[:3] if best else None
+
+
+def _two_keepers(rows, keep_src: str) -> dict:
+    """留下那份的候选：{集号: 行}。只认已下完（sent）、本季、未归档的 —— stalled / error / 已归档的文件在不在说不准，
+    拿它当"还剩一份"的依据就可能删掉最后一份。同集号多条取发布最早的一条（与配对用的发布时间同口径）。"""
+    out: dict = {}
+    far = datetime.max
+    for t in rows:
+        e = _int_ep(t.episode)
+        if (e is None or (t.source or "") != keep_src or t.status != "sent" or t.foreign_season
+                or t.archived_at is not None):
+            continue
+        if e not in out or (t.release_time or far) < (out[e].release_time or far):
+            out[e] = t
+    return out
+
+
+def _movie_hash_owners(s, hashes) -> dict:
+    """{info_hash: 剧场版名}：剧场版那边同一个种子还有任一行没删没排除。比 engine.hash_owned_elsewhere（只认已下）更严 ——
+    对面 pending 的话，它以后下的就是盘上这同一个文件，这边删了它就只剩一个空记录（D13）。"""
+    hashes = [h for h in hashes if h]
+    if not hashes:
+        return {}
+    return {h: (title or "?") for h, title in s.exec(
+        select(MovieTorrent.info_hash, func.coalesce(Movie.display_name, Movie.title))
+        .join(Movie, Movie.id == MovieTorrent.movie_id, isouter=True)
+        .where(MovieTorrent.info_hash.in_(hashes),
+               MovieTorrent.status.not_in(("deleted", "excluded")))).all()}
+
+
+def _cleanup_item(t, keeper=None, keep_src=None, checked=False, note=None) -> dict:
+    return {"drop_id": t.id, "drop_hash": t.info_hash, "drop_ep": _int_ep(t.episode) or t.episode,
+            "drop_src": t.source or "", "drop_title": t.raw_title or "", "drop_path": t.save_path or "",
+            "drop_archived": t.archived_at is not None,
+            "keep_id": keeper.id if keeper else None, "keep_hash": keeper.info_hash if keeper else None,
+            "keep_ep": _int_ep(keeper.episode) if keeper else None, "keep_src": keep_src if keeper else None,
+            "checked": checked, "note": note, "size": None, "locked": False}
+
+
+def _cleanup_plan(s, a, rows, kind: str, keep_src: str | None) -> dict:
+    """cleanup_preview 的判据本体（调用方给会话、番、该番全部行）。cleanup_execute 在新会话里复核用的也是它。"""
+    out = {"items": [], "skipped": [], "warn": [], "offset": None}
+    if a is None:
+        return out
+    owners = _movie_hash_owners(s, [t.info_hash for t in rows if t.status in _CLEANUP_DROP_STATUSES])
+
+    def _gate(t) -> bool:
+        if t.info_hash in owners:
+            out["skipped"].append({"row_id": t.id, "ep": _int_ep(t.episode) or t.episode, "src": t.source or "",
+                                   "reason": f"剧场版《{owners[t.info_hash]}》用的是同一个种子，删了那边就没文件了"})
+            return False
+        return True
+
+    if kind == "foreign":
+        for t in sorted(rows, key=lambda x: (x.episode or 0, x.id)):
+            if t.foreign_season and t.status in _CLEANUP_DROP_STATUSES and _gate(t):
+                out["items"].append(_cleanup_item(t))
+        return out
+    if kind != "two":
+        raise ValueError(kind)
+    pair = _two_offset(a, rows)
+    if pair is None:
+        return out
+    abs_src, in_src, d = pair
+    out["offset"] = d
+    keep = keep_src if keep_src is not None else (a.pref_source or "")
+    if keep not in (abs_src, in_src):
+        out["warn"].append("先选只下哪个组")
+        return out
+    drop_src = in_src if keep == abs_src else abs_src
+    drop_in = drop_src == in_src
+    total = a.total_episodes
+    keepers = _two_keepers(rows, keep)
+    win = timedelta(days=config.ANIME_TWO_NUMBERING_DAYS)
+    paired: set = set()
+    for t in sorted(rows, key=lambda x: (x.episode or 0, x.id)):
+        e = _int_ep(t.episode)
+        if (e is None or (t.source or "") != drop_src or t.status not in _CLEANUP_DROP_STATUSES
+                or t.foreign_season or (e > total if drop_in else e <= total)):
+            continue
+        if not _gate(t):
+            continue
+        k = keepers.get(e + d if drop_in else e - d)
+        if k is None:
+            out["skipped"].append({"row_id": t.id, "ep": e, "src": drop_src, "reason": _CLEANUP_NO_KEEPER})
+            continue
+        paired.add(k.id)
+        if t.release_time is None or k.release_time is None:
+            ok, note = False, "发布时间不全，可能不是同一集，默认不勾"
+        else:
+            gap = abs(t.release_time - k.release_time)
+            ok = gap <= win
+            note = None if ok else f"两份发布相差 {round(gap.total_seconds() / 86400)} 天，可能不是同一集，默认不勾"
+        out["items"].append(_cleanup_item(t, k, keep, ok, note))
+    # 留下那组里配不上对的：只有这一份，确认框「不删」区里列出来，让人看到哪些集不会动
+    for t in sorted(rows, key=lambda x: (x.episode or 0, x.id)):
+        e = _int_ep(t.episode)
+        if (e is not None and (t.source or "") == keep and t.status in _CLEANUP_DROP_STATUSES and not t.foreign_season
+                and (e > total if drop_in else e <= total) and t.id not in paired):
+            out["skipped"].append({"row_id": t.id, "ep": e, "src": keep, "reason": _CLEANUP_ONLY_COPY})
+    return out
+
+
+def cleanup_preview(anime_id: int, kind: str, keep_src: str | None = None) -> dict:
+    """要清理的文件清单（只读、同步、不碰 qB）。kind="two"：两套集号里『{另一组}』多出来的那份（每一份右边带留下的那份）；
+    kind="foreign"：已标『不属于本季』、还在盘上的别季文件（一律默认不勾 —— 那是别季正片，删了不可逆）。
+    keep_src 缺省取锁定组；没锁源又没给 → items 空、warn『先选只下哪个组』。
+    返回 {items, skipped, warn, offset}，item / skip 的字段见 _cleanup_item 与 _cleanup_plan。"""
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id))) if a else []
+        return _cleanup_plan(s, a, rows, kind, keep_src)
+
+
+def _cleanup_keeper_ok(info: dict, it: dict) -> str | None:
+    """留下那份在 qB 里确实下完、没报错、文件路径和要删的那份不重叠 —— 都满足才敢删另一份，返回 None。
+    不满足时返回卡在哪一边："drop"（要删的那份 qB 里没有 / 没有文件路径，比不了重叠）或 "keep"（留下那份核不过），
+    两种给人的原因不同：前者是删不到，后者是不敢删。"""
+    k = info.get((it.get("keep_hash") or "").lower())
+    dr = info.get((it.get("drop_hash") or "").lower())
+    dp = _norm_path((dr or {}).get("content_path") or "")
+    if not dp:
+        return "drop"
+    if not k or (k.get("progress") or 0) < 1 or k.get("state") in ("error", "missingFiles"):
+        return "keep"
+    kp = _norm_path(k.get("content_path") or "")
+    if not kp or kp == dp or kp.startswith(dp + "/") or dp.startswith(kp + "/"):
+        return "keep"
+    return None
+
+
+async def cleanup_probe(items: list) -> dict:
+    """确认框打开后填大小、核实留下那份（只读，一次 qB）。返回 {qb, items, warn}；items 是新的副本，不改入参。
+    qB 连不上：qb=False、大小留空、warn 一句，页面据此禁用删除按钮。"""
+    out = [dict(it) for it in items]
+    hashes = sorted({h.lower() for it in out for h in (it.get("drop_hash"), it.get("keep_hash")) if h})
+    info = await engine.qb.torrents_info(hashes) if hashes else {}
+    if info is None:
+        return {"qb": False, "items": out, "warn": ["qB 连不上，现在删不了"]}
+    for it in out:
+        dr = info.get((it.get("drop_hash") or "").lower())
+        it["drop_in_qb"] = dr is not None
+        it["size"] = dr.get("size") if dr else None
+        why = _cleanup_keeper_ok(info, it) if it.get("keep_id") is not None else None
+        if why:
+            it.update(checked=False, locked=True, note=_CLEANUP_DROP_GONE if why == "drop" else _CLEANUP_KEEPER_UNSURE)
+    return {"qb": True, "items": out, "warn": []}
+
+
+_CLEANUP_LOCK = asyncio.Lock()
+
+
+async def cleanup_execute(anime_id: int, kind: str, picks) -> dict:
+    """删掉勾选的那几份。picks: [(drop_id, drop_hash, keep_id|None, keep_hash|None), …]（预览里给的原样传回）。
+    返回 {deleted: [id], gone: [(id, 路径)], skipped: [(id, 原因)], failed: [(id, 原因)], bytes}。
+    页面入口：整段登记在途（读主键 → await qB → 按主键写），理由见 engine.in_flight。"""
+    # 串行：两个标签页先后执行（一边留 ANi、另一边改锁后留 Nix）时，后一次的第①步复核要看到前一次写下的结果，
+    # 否则两边都以为对方那份还在，同一集两套编号都被删掉
+    async with _CLEANUP_LOCK:
+        with engine.in_flight("清理重复/别季文件"):
+            return await _cleanup_execute_inner(anime_id, kind, picks)
+
+
+async def _cleanup_execute_inner(anime_id: int, kind: str, picks) -> dict:
+    res = {"deleted": [], "gone": [], "skipped": [], "failed": [], "bytes": 0}
+    changed = "预览后状态变了"
+    # ① 只缩小不扩大：在新会话里按预览同一份判据重算，传进来的每一对必须原样出现在重算结果里
+    #    （状态、hash、别季标记、所属番、配对关系、留下那份未归档、剧场版共种子闸都在判据里）
+    ok: list = []
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id))) if a else []
+        by_id = {t.id: t for t in rows}
+        plans: dict = {}
+        for p in picks:
+            drop_id, drop_hash, keep_id, keep_hash = (list(p) + [None] * 4)[:4]
+            if (kind == "foreign") != (keep_id is None) or kind not in ("two", "foreign"):
+                res["skipped"].append((drop_id, changed))
+                continue
+            keep_src = None
+            if kind == "two":
+                # 留下的必须是此刻锁定的组（D4：没锁源不清理；『只下 X』框是先锁再删）
+                k = by_id.get(keep_id)
+                if k is None or (k.source or "") != (a.pref_source or "") or not a.pref_source:
+                    res["skipped"].append((drop_id, changed))
+                    continue
+                keep_src = k.source or ""
+            if keep_src not in plans:
+                plans[keep_src] = {it["drop_id"]: it for it in _cleanup_plan(s, a, rows, kind, keep_src)["items"]}
+            it = plans[keep_src].get(drop_id)
+            if (it is None or it["drop_hash"] != drop_hash or it["keep_id"] != keep_id
+                    or it["keep_hash"] != keep_hash):
+                res["skipped"].append((drop_id, changed))
+                continue
+            ok.append(it)
+    if not ok:
+        return res
+    # ② 一次 qB：连不上就一行不写
+    hashes = sorted({h.lower() for it in ok for h in (it["drop_hash"], it["keep_hash"]) if h})
+    info = await engine.qb.torrents_info(hashes)
+    if info is None:
+        res["failed"] += [(it["drop_id"], "qB 连不上") for it in ok]
+        return res
+    for it in ok:
+        tag = (f"tid={it['drop_id']}「{it['drop_src']} 第{_ep_log(it['drop_ep'])}集」"
+               + (f" 留 tid={it['keep_id']}「{it['keep_src']} 第{it['keep_ep']}集」" if it["keep_id"] else ""))
+        # ③ 留下那份再核一次（qB 里下完、没报错、文件不重叠）
+        why = _cleanup_keeper_ok(info, it) if it["keep_id"] is not None else None
+        if why:
+            res["skipped"].append((it["drop_id"], "要删的这份 qB 里已经没有了，删不到文件" if why == "drop"
+                                   else "留下那份在 qB 里查不到或没下完"))
+            log.info("清理(%s) 删 %s 结果=skipped（%s）", kind, tag, "要删的那份不在 qB" if why == "drop" else "留下那份核不过")
+            continue
+        # ④ 逐条走单集删除的内核（downloading / 归档 / qB 里早没了 / qB 失败 各分支都在那里）
+        r = await _delete_anime_torrent_inner(it["drop_id"])
+        dq = info.get(it["drop_hash"].lower())
+        if r is True and (it["drop_archived"] or dq is None):
+            res["gone"].append((it["drop_id"], _gone_path(it)))
+            outcome = "gone"
+        elif r is True:
+            res["deleted"].append(it["drop_id"])
+            res["bytes"] += int((dq or {}).get("size") or 0)
+            outcome = "deleted"
+        elif r == "gone":
+            res["gone"].append((it["drop_id"], _gone_path(it)))
+            outcome = "gone"
+        else:
+            res["failed"].append((it["drop_id"], "qB 没删成，可以再点一次"))
+            outcome = "failed"
+        log.info("清理(%s) 删 %s 结果=%s", kind, tag, outcome)
+    return res
+
+
+def _gone_path(it: dict) -> str:
+    """qB 里早就没有的那份：文件可能还在盘上，给人一个能去找的路径（目录没记录时只给种子名）。"""
+    return f"{it['drop_path'].rstrip('/')}/{it['drop_title']}" if it["drop_path"] else it["drop_title"]
+
+
+def alias_keeper(torrent_id: int) -> dict | None:
+    """单条 🗑 换文案用（只读，不查 qB、不要求锁源）：这一行若是两套集号里的一份，另一套编号里对得上的那份
+    {keep_id, keep_src, keep_ep, ep（这一行自己的集号）}；算不出偏移、不在配对区、没有对得上的、或两份发布相差超出时间窗时 None。
+    只改说法，不改标记：删它照旧按 _is_last_copy 写 ep_dropped（E-73）。"""
+    with get_session() as s:
+        t = s.get(AnimeTorrent, torrent_id)
+        a = s.get(Anime, t.anime_id) if t is not None and t.anime_id else None
+        if a is None or t.foreign_season or _int_ep(t.episode) is None:
+            return None
+        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == a.id)))
+    pair = _two_offset(a, rows)
+    if pair is None:
+        return None
+    abs_src, in_src, d = pair
+    src, e = t.source or "", _int_ep(t.episode)
+    if src == in_src and e <= a.total_episodes:
+        keep, target = abs_src, e + d
+    elif src == abs_src and e > a.total_episodes:
+        keep, target = in_src, e - d
+    else:
+        return None
+    k = _two_keepers(rows, keep).get(target)
+    if (k is None or t.release_time is None or k.release_time is None
+            or abs(t.release_time - k.release_time) > timedelta(days=config.ANIME_TWO_NUMBERING_DAYS)):
+        return None
+    return {"keep_id": k.id, "keep_src": keep, "keep_ep": target, "ep": e}
+
+
+def locked_freed_candidates(anime_id: int, tids) -> dict:
+    """锁了源的番，把 tids 标成『不属于本季』之后：被让出来的集号里，没有任何一份有着落、而待下的又没有锁定组版本的
+    —— 这几集标完不会自动下（flush 只下锁定组），又不进锁源缺集（集号不大于锁定组最新集、也不是空洞）、不进缺集
+    （见过待下的）：无提示的漏集。返回 {集号: [{id, source, title}…]}（按自动下载挑版本的同一个排序，第一条是默认勾选项）；
+    没锁源或每集都会自己下 → {}。看着像别季旧集（foreign_season_suspect）的不当候选：默认勾上它就是把前一季又下一遍。"""
+    tids = set(tids or ())
+    with get_session() as s:
+        a = s.get(Anime, anime_id)
+        if a is None or not a.pref_source or not tids:
+            return {}
+        rows = list(s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == anime_id)))
+    lock = a.pref_source
+    freed = {t.episode for t in rows if t.id in tids and t.episode is not None and t.episode >= 1}
+    out: dict = {}
+    for e in sorted(freed):
+        rest = [t for t in rows if t.episode == e and t.id not in tids]
+        if any(_covered(t) for t in rest):
+            continue
+        dl = [t for t in rest if t.status in ("pending", "error", "skipped") and not t.foreign_season]
+        if not dl or any((t.source or "") == lock for t in dl):
+            continue
+        cands = [t for t in dl if not foreign_season_suspect(a, t)]
+        if cands:
+            out[e] = [{"id": t.id, "source": t.source or "", "title": t.raw_title or ""}
+                      for t in engine.pick_order(cands, None, prefer_fresh=True)]
+    return out
 
 
 def list_episodes(anime_id: int) -> list[AnimeTorrent]:
@@ -4712,14 +5132,16 @@ def pending_breakdown() -> dict:
               两类都【最先判】：否则会掉进『备用项』，而那张卡的说明是『同集已有更优版本』，纯属误导。
     · 将下载 = 已确认番·本集首选（download_plan 会挑中，会自动下；只有正集会被标）
     · 备用   = 已确认番·同集已有更优版本，或该集已人工删除（E-73，不会自动下），或标了『不属于本季』（E-77 C，
-              不会自动下）；含已拒绝番/孤儿的残留
+              不会自动下）
+    · 已忽略番 = 番已忽略（rejected）或已不存在（孤儿）的残留：以前归『备用项』，真库占了那一档的约四分之一，
+              而那张卡说的是"同集已有更优版本"，对它们不成立
     · 待确认 = 番还没确认（要点确认才下）；集号 -2 的已归入『未知』，不重复计
     · 已下齐·停订 = 番已按 bgm 总集数下齐且开了停订（不会自动下）——【必须单列】，否则它们会掉进『备用项』，
               而那张卡的说明是"同集已有更优版本"，纯属误导。
     · 锁源缺集 = 已确认番锁了下载源，这条来自别的组、集号在锁定源最大集号之后、这一集一份都没下过 ——
               不是"有更优版本"，而是被锁挡住、一份都不会下（r37 #2：碧蓝航线 6~12 集以前就叫『备用项』）。
               也收被版本关键词挡住的集（keyword_blocked_episodes，锁了源时只算锁定组的行）：同样一份都不会下。
-    七者之和 = 待下总数。复用批量 download_plan_for_ids，仅几条查询、只在仪表盘打开时算。"""
+    八者之和 = 待下总数。复用批量 download_plan_for_ids，仅几条查询、只在仪表盘打开时算。"""
     with get_session() as s:
         conf = {aid: (c, fin, lock) for aid, c, fin, lock in s.exec(
             select(Anime.id, Anime.confirmed, Anime.finished_at, Anime.pref_source)
@@ -4746,7 +5168,7 @@ def pending_breakdown() -> dict:
     lock_max = {aid: max(v) for aid, v in lock_eps.items()}
     plan = download_plan_for_ids({aid for aid, (c, _, _) in conf.items() if c})
     sw = single_work_ids()
-    will = backup = unconfirmed = unknown = special = finished = locked = 0
+    will = backup = unconfirmed = unknown = special = finished = locked = ignored = 0
     unsub = config.ANIME_FINISH_UNSUB
     for tid, aid, ep, src, foreign in pend:
         row = conf.get(aid)
@@ -4757,7 +5179,7 @@ def pending_breakdown() -> dict:
             else:                # 与点开的列表(unknown_episode_rows)同一个判据，卡片数=列表条数。
                 unknown += 1
         elif row is None:        # 番已拒绝/孤儿 → 不会自动下
-            backup += 1
+            ignored += 1
         elif not c:              # 番未确认
             unconfirmed += 1
         elif unsub and row[1] is not None:   # 已完结且开了停订
@@ -4772,7 +5194,8 @@ def pending_breakdown() -> dict:
         else:                    # 已确认·非首选（同集有更优）
             backup += 1
     return {"will": will, "backup": backup, "unconfirmed": unconfirmed,
-            "unknown": unknown, "special": special, "finished": finished, "locked": locked}
+            "unknown": unknown, "special": special, "finished": finished, "locked": locked,
+            "ignored": ignored}
 
 
 def ep_ranges(eps) -> str:
@@ -5950,11 +6373,16 @@ async def _backfill_source_inner(anime_id: int, name_filter: bool = False,
     # 最多补 ANIME_BACKFILL_EXTRA_EPS 集（默认 4，0=不补搜）、只用前两个搜索名，免得请求数翻几倍。
     # 占槽的别季行（_slot_impostor，r39 A6）不算见过：第三季的 9..12 被第一季旧行占着时也要补搜。只会多搜几集，不改入库判据。
     # 标了『不属于本季』的（E-77 C）同样不算见过（与 _counts_as_seen 同口径）。
-    seen_eps = {int(t.episode) for t in rows if t.episode and t.episode >= 1 and float(t.episode).is_integer()
-                and not t.foreign_season and not _slot_impostor(a, t)}
+    seen_rows = [t for t in rows if t.episode and t.episode >= 1 and float(t.episode).is_integer()
+                 and not t.foreign_season and not _slot_impostor(a, t)]
+    seen_eps = {int(t.episode) for t in seen_rows}
+    src_eps: dict = {}       # 绝对编号续作中间的洞（_bracket_holes），与缺集提示同一个形状
+    for t in seen_rows:
+        if t.source:
+            src_eps.setdefault(t.source, set()).add(int(t.episode))
     # 后台补缺（only_eps）只补搜它要的那几集：别的缺集搜到了也一定被条目闸挡掉，额度会挤掉排在后面的真缺集
     extra = (sorted(only_eps) if only_eps is not None
-             else missing_episodes(a, seen_eps))[:config.ANIME_BACKFILL_EXTRA_EPS]
+             else missing_episodes(a, seen_eps, holes=_bracket_holes(src_eps, seen_eps)))[:config.ANIME_BACKFILL_EXTRA_EPS]
     if extra:
         more = [_fetch_one(site_, f"{q} {e:02d}") for site_ in search_sites for q in queries[:2] for e in extra]
         for items in await asyncio.gather(*more):

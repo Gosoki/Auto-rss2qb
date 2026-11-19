@@ -281,13 +281,16 @@ def _reident_dlg(user):
 
 
 @pytest.mark.nicegui_main_file(_MAIN)
-async def test_reident_scope_dialog_survives_the_timer_rebuild(user: User, clean_tables):
+async def test_reident_scope_dialog_survives_the_timer_rebuild(user: User, clean_tables, monkeypatch):
     await user.open("/?t=overview")
     trigger = _button(user, "刷新资料")
     _click(user, trigger)
     dlg = _reident_dlg(user)
     assert dlg.value, "点『刷新资料』没打开范围选择"
 
+    # (R41 perf-1) 定时器只在数据变了时才重建 overview_tail：让『上次采集』这格变一下，逼它重建
+    import sys
+    monkeypatch.setattr(sys.modules["pages.anime"], "poll_stale", lambda *a, **k: True)
     _tick(user)
     assert await _until(lambda: trigger.is_deleted), "前提：定时器确实重建了 overview_tail"
     assert dlg.value and not dlg.is_deleted, "定时器重建 overview_tail 把范围选择收掉了"

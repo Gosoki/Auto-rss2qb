@@ -218,7 +218,11 @@ async def test_detail_banner_locks_only_after_confirm(user, clean_tables, monkey
 
     async def fake_confirm(title, note, **kw):
         asked.append((title, note)); return ok
+
+    async def fake_lock(title, note, *a, **kw):   # (r41) 有可顺便清理的重复份时走带勾选项的确认框
+        return await fake_confirm(title, note), []
     monkeypatch.setattr(D, "confirm", fake_confirm)
+    monkeypatch.setattr(D, "_lock_dialog", fake_lock)
     await user.open(f"/detail/{aid}")
     await user.should_see("两套集号同时在下")
     assert not [e for e in _live(user, ui.label) if "集号超出 bgm 记载" in (e.text or "")], \
@@ -242,7 +246,11 @@ async def test_dashboard_banner_locks_and_disappears(user, clean_tables, monkeyp
 
     async def yes(title, note, **kw):
         return True
+
+    async def yes_lock(*a, **kw):
+        return True, []
     monkeypatch.setattr(D, "confirm", yes)
+    monkeypatch.setattr(D, "_lock_dialog", yes_lock)
     await user.open("/?t=overview")
     await user.should_see("两套集号同时在下")
     btn = next(b for b in _live(user, ui.button) if b.text == "只下 ANi")
@@ -264,7 +272,11 @@ async def test_dashboard_groups_several_hits_into_one_card(user, clean_tables, m
 
     async def yes(title, note, **kw):
         return True
+
+    async def yes_lock(*a, **kw):
+        return True, []
     monkeypatch.setattr(D, "confirm", yes)
+    monkeypatch.setattr(D, "_lock_dialog", yes_lock)
     await user.open("/?t=overview")
     await user.should_see("2 部番两套集号同时在下")
     heads = [e for e in _live(user, ui.label) if "两套集号同时在下" in (e.text or "")]

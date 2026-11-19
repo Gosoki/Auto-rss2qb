@@ -84,21 +84,23 @@ async def probe_feed(site: str, feed: str, subgroups: str, title_filter: str) ->
 
 def render_sources() -> None:
     """把源管理 UI 渲染进当前容器（由调用方套 frame）。"""
-    ui.label("每个组 = 一个 feed（nyaa 用户名或完整 RSS URL）+ 两道可选过滤 + 策略 + 优先级；改完下一轮采集生效。"
-             "同一个 feed 可以建多个组（比如按『简日』『繁日』分开、给不同优先级），每轮只抓一次。").classes(
-        "text-xs text-gray-400")
-    # 『只有人工审核的组在发的』而不是『人工审核＝新番先进待确认』：入库路径里有自动升确认，
-    # 自动下载的组后来也发了同一部番，会把它转成在追
-    ui.label("优先级：数字越大越优先，同一集多个组都有时只下最高的那一份。"
-             "策略只在一部【新番】第一次出现时起作用：自动下载的组发现的直接开追；"
-             "只有人工审核的组在发的，先进『待确认』等你点。已经在追的番，哪个组的种子都参与择优。").classes(
-        "text-xs text-gray-400")
-    # 与上面那段功能对等（都是本页开头的介绍），灰度必须一样 —— 早先一段 gray-400、
-    # 一段 gray-500，同一页开头连着两段两种灰。全站到底该分几级见 docs/DECISIONS.md E-37。
-    ui.label("① 字幕组白名单：只比对 []/【】 里的组名。 "
-             "② 标题关键词：比对整条标题（如按语言 繁日/简日）。 "
-             "一栏里用逗号写多个，命中任意一个就算（包含即算、不分大小写）；两栏都填要同时满足。").classes(
-        "text-xs text-gray-400 mb-2")
+    # 三段说明折进一个默认收起的『规则说明』：7 组卡片的页面里，开头三段小字把首屏占掉一大块
+    with ui.expansion("规则说明", icon="info").classes("w-full"):
+        ui.label("每个组 = 一个 feed（nyaa 用户名或完整 RSS URL）+ 两道可选过滤 + 策略 + 优先级；改完下一轮采集生效。"
+                 "同一个 feed 可以建多个组（比如按『简日』『繁日』分开、给不同优先级），每轮只抓一次。").classes(
+            "text-xs text-gray-400")
+        # 『只有人工审核的组在发的』而不是『人工审核＝新番先进待确认』：入库路径里有自动升确认，
+        # 自动下载的组后来也发了同一部番，会把它转成在追
+        ui.label("优先级：数字越大越优先，同一集多个组都有时只下最高的那一份。"
+                 "策略只在一部【新番】第一次出现时起作用：自动下载的组发现的直接开追；"
+                 "只有人工审核的组在发的，先进『待确认』等你点。已经在追的番，哪个组的种子都参与择优。").classes(
+            "text-xs text-gray-400")
+        # 与上面那段功能对等（都是本页开头的介绍），灰度必须一样 —— 早先一段 gray-400、
+        # 一段 gray-500，同一页开头连着两段两种灰。全站到底该分几级见 docs/DECISIONS.md E-37。
+        ui.label("① 字幕组白名单：只比对 []/【】 里的组名。 "
+                 "② 标题关键词：比对整条标题（如按语言 繁日/简日）。 "
+                 "一栏里用逗号写多个，命中任意一个就算（包含即算、不分大小写）；两栏都填要同时满足。").classes(
+            "text-xs text-gray-400 mb-2")
 
     # 【不用 @ui.refreshable 整页重建】(r39 U11) 以前整张列表连同底下的添加表单是一个 refreshable，
     # 保存/添加/删除任一组都 refresh 整块：别的组卡片上【没点保存】的改动、底下半填的新组表单，
@@ -131,8 +133,9 @@ def render_sources() -> None:
                 priority = ui.number("优先级", value=g.priority, format="%d").classes("w-32")
                 enabled = ui.switch("启用", value=g.enabled)
             feed = ui.input("feed（用户名 或 完整 RSS URL）", value=g.feed).classes("w-full")
-            subgroups = ui.input("字幕组白名单（空=全部）", value=g.subgroups).classes("w-full")
-            tfilter = ui.input("标题关键词（空=不限）", value=g.title_filter).classes("w-full")
+            with ui.element("div").classes("pair-grid w-full"):    # ≥1024px 白名单与关键词并排
+                subgroups = ui.input("字幕组白名单（空=全部）", value=g.subgroups).classes("w-full")
+                tfilter = ui.input("标题关键词（空=不限）", value=g.title_filter).classes("w-full")
             with ui.row().classes("gap-2 items-center"):
                 save_btn = ui.button("保存", icon="save").props("unelevated color=primary")
                 ui.button("删除", icon="delete",
@@ -245,8 +248,9 @@ def render_sources() -> None:
             n_policy = ui.select(POLICY_OPTS, value="auto", label="策略").classes("w-32")
             n_priority = ui.number("优先级", value=50, format="%d").classes("w-32")
         n_feed = ui.input("feed（用户名 或 完整 RSS URL）").classes("w-full")
-        n_subgroups = ui.input("字幕组白名单（空=全部）").classes("w-full")
-        n_tfilter = ui.input("标题关键词（空=不限）").classes("w-full")
+        with ui.element("div").classes("pair-grid w-full"):
+            n_subgroups = ui.input("字幕组白名单（空=全部）").classes("w-full")
+            n_tfilter = ui.input("标题关键词（空=不限）").classes("w-full")
         with ui.row().classes("gap-2 items-center"):
             ui.button("添加", icon="add",
                       on_click=_add(n_name, n_site, n_policy, n_priority, n_feed, n_subgroups, n_tfilter)
