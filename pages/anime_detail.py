@@ -1020,7 +1020,9 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
         for t in eps:
             ep_txt = ep_label(t.episode, _single)
             _sp = engine.is_special_ep(t.episode, _single)
-            with ui.column().classes("w-full gap-0 py-0.5").style(
+            # 不留顶部内边距：第一行按钮（27px）比文字高，文字居中后上方已经空出约 4px；再加内边距，
+            # 文字上方的空白就是下方的两倍，看着像行里多了一条空
+            with ui.column().classes("w-full gap-0 pb-1").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
                 # 第一行：集号 · 字幕组 · 时间 同一行居中（天然竖直齐平），状态/按钮整簇推到最右
                 with ui.row().classes("items-center gap-x-3 gap-y-1 w-full text-sm flex-wrap"):
@@ -1235,7 +1237,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                          else "已归档：文件还在盘上，点这里把这一条重新交回 qB" if t.archived_at
                                          else "强制下这一条到文件夹（无视去重/优先级）")
                 # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
-                with ui.row().classes("items-start gap-3 w-full text-sm no-wrap -mt-0.5"):
+                with ui.row().classes("items-start gap-3 w-full text-sm no-wrap"):
                     ui.label(ep_txt).classes("shrink-0").style("visibility:hidden")
                     # 原名默认只占一行（手机上 3 行 × 几十条种子把弹窗拉到 5000px+），点一下展开全文
                     _raw = ui.label(t.raw_title or "—").classes(
