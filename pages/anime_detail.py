@@ -1014,10 +1014,13 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             return 1 if (t.id in plan or t.status == "error") else 2
         # 只在相邻的同集号内重排（list_episodes 已按集号排好），不跨集；covered / _dropped 是集合，不受顺序影响
         eps = [t for _, g in itertools.groupby(eps, key=lambda t: t.episode) for t in sorted(g, key=_rank)]
+        # 『非本季 / 撤销』那一格只在这部番至少有一行用得到时才留（各行照旧对齐）；一行都用不到就整列不要，免得每行空一块
+        _fs_col = any(t.foreign_season or (t.status != "downloading" and anime.foreign_season_suspect(cur, t))
+                      for t in eps)
         for t in eps:
             ep_txt = ep_label(t.episode, _single)
             _sp = engine.is_special_ep(t.episode, _single)
-            with ui.column().classes("w-full gap-0 py-1").style(
+            with ui.column().classes("w-full gap-0 py-0.5").style(
                     "border-bottom:1px solid rgba(255,255,255,.08)"):
                 # 第一行：集号 · 字幕组 · 时间 同一行居中（天然竖直齐平），状态/按钮整簇推到最右
                 with ui.row().classes("items-center gap-x-3 gap-y-1 w-full text-sm flex-wrap"):
@@ -1180,12 +1183,14 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                            "后台不会下这一条；要它就点右边『下载』")
                         ui.space()
                         # 别用 ui.column：测试按最近的 ui.column 认种子行。三格宽度固定（见 layout.py 的 .ep-acts），空格也要占位
-                        with ui.element("div").classes("ep-acts"):
+                        with ui.element("div").classes("ep-acts" if _fs_col else "ep-acts ep-acts-2"):
                             # 格1「非本季」：『不属于本季』/『撤销』二选一常驻在这一格。放最左：这一格多数行是空的，空在中间不显眼，
                             # 『下载』才能贴住行尾、跟上面的保存路径右缘对齐。手机上看不到气泡，标上之前确认框会说清是什么。
                             # (E-77 C)『不属于本季』只由这里（和缺集横幅上的批量按钮）产生，后台永不自动打。
                             # 只对看着像别季的正集给按钮（判据见 anime.foreign_season_suspect）。交付中的不给（set_foreign_season 也不改它）：等它落定。
-                            if t.foreign_season:
+                            if not _fs_col:
+                                pass
+                            elif t.foreign_season:
                                 ui.button("撤销", icon="undo", on_click=_set_foreign(t.id, False, t.episode)).props(
                                     "flat dense color=primary").classes("btn-sm").tooltip(
                                     "撤销『不属于本季』：这一条重新占用本季这一集的位置")
@@ -1230,7 +1235,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                          else "已归档：文件还在盘上，点这里把这一条重新交回 qB" if t.archived_at
                                          else "强制下这一条到文件夹（无视去重/优先级）")
                 # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
-                with ui.row().classes("items-start gap-3 w-full text-sm no-wrap"):
+                with ui.row().classes("items-start gap-3 w-full text-sm no-wrap -mt-0.5"):
                     ui.label(ep_txt).classes("shrink-0").style("visibility:hidden")
                     # 原名默认只占一行（手机上 3 行 × 几十条种子把弹窗拉到 5000px+），点一下展开全文
                     _raw = ui.label(t.raw_title or "—").classes(

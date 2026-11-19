@@ -1071,6 +1071,8 @@ _HEAD_BASE_CSS = (
     # 手机档见上面 599 那块
     ".ep-acts{display:grid;grid-template-columns:4.5rem 3.75rem 3.75rem;align-items:center;justify-items:end;"
     "column-gap:.25rem;flex:none}"
+    # 整部番一行都用不到『非本季 / 撤销』时只留两格（处置 / 下载）
+    ".ep-acts.ep-acts-2{grid-template-columns:3.75rem 3.75rem}"
     # 详情页的两组常驻按钮（顶部管理行、下载区）：桌面按自然宽度排一行；手机档见上面 599 那块
     ".act-grid{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem}"
     # 数字输入：隐去浏览器原生上下箭头，统一成纯输入框

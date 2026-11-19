@@ -181,3 +181,22 @@ def test_ep_acts_css_is_a_fixed_grid():
     assert ".ep-acts{display:grid;grid-template-columns:" in layout._HEAD_BASE_CSS
     assert "grid-template-columns:repeat(3,minmax(0,1fr))" in layout._HEAD_BASE_CSS
     assert ".act-grid>.act-main{grid-column:1/-1}" in layout._HEAD_BASE_CSS
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_no_foreign_rows_drops_the_first_slot(user, clean_tables, cfg):
+    """(r43) 整部番一行都用不到『非本季 / 撤销』：每行只留两格（处置 / 下载），不空一块；各行仍是同样两格、对齐。"""
+    cfg(QB_ENABLED=True)
+    with clean_tables.get_session() as s:
+        aid = _anime(s).id
+        _row(s, aid, "甲", 1, "pending")
+        _row(s, aid, "乙", 2, "sent", save_path="/tmp/dl/x")
+        _row(s, aid, "丁", 3, "deleted")
+    await user.open(f"/detail/{aid}")
+    dls = _btns(user, "下载")
+    assert len(dls) == 3
+    for b in dls:
+        acts = _acts_of(b)
+        kids = _slots(acts)
+        assert "ep-acts-2" in acts.classes and len(kids) == 2 and kids[1] is b, "没有别季行时应只有两格"
+    assert ".ep-acts.ep-acts-2{grid-template-columns:" in __import__("pages.layout", fromlist=["x"])._HEAD_BASE_CSS
