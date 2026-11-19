@@ -147,20 +147,24 @@ async def test_numbering_conflict_turns_grey_once_a_source_is_locked(user, clean
         assert "已锁定『A』" in ls[0].text and "别的组的不会自动下" in ls[0].text, ls[0].text
 
 
-# ---------------------------------------------------------------- U2-3 简介默认收起
+# ---------------------------------------------------------------- U2-3 简介默认展开，开关收起（r43）
 
 @pytest.mark.nicegui_main_file(_MAIN)
-async def test_summary_is_clamped_and_toggles_on_click(user, clean_tables):
+async def test_summary_is_expanded_and_folds_by_toggle(user, clean_tables):
+    """简介默认全文展开；下面的『收起简介』开关收成 3 行、再点展开。点文字本身不收（选中复制时不误收），也不挂提示。"""
     summary = "第一段简介。\n[简介原文]\n日本語のあらすじ。\n第四行\n第五行"
     with clean_tables.get_session() as s:
         aid = _anime(s, summary=summary).id
     await user.open(f"/detail/{aid}")
     lab = next(e for e in _live(user, ui.label) if e.text == summary)
-    assert "line-clamp-2" in lab.classes, lab.classes
-    _fire(user, lab, "click")
-    await _until(lambda: "line-clamp-2" not in lab.classes, "点一下没有展开")
-    _fire(user, lab, "click")
-    await _until(lambda: "line-clamp-2" in lab.classes, "再点一下没有收起")
+    assert "line-clamp-3" not in lab.classes, lab.classes
+    assert not any(isinstance(c, ui.tooltip) for c in lab.default_slot.children)
+    assert not any(lis.type == "click" for lis in lab._event_listeners.values()), "点文字不该收起"
+    tg = next(b for b in _live(user, ui.button) if b.text == "收起简介")
+    _fire(user, tg, "click")
+    await _until(lambda: "line-clamp-3" in lab.classes and tg.text == "展开简介", "开关没有收起")
+    _fire(user, tg, "click")
+    await _until(lambda: "line-clamp-3" not in lab.classes and tg.text == "收起简介", "开关没有展开")
 
 
 # ---------------------------------------------------------------- U2-5 删除确认框说清是哪一行

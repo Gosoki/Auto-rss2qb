@@ -356,7 +356,7 @@ async def cleanup_dialog(anime_id: int, kind: str, keep_src: str | None = None, 
 
 
 def _keep_text(opts: dict) -> str:
-    """删除三选一里『以后自动补』那一项的说法（也用作删完的提示）：照 core.delete_options 给的事实说后台真的会做什么。"""
+    """删除确认框里"还要这一集、先不换"（keep）的说法（也用作删完的提示）：照 core.delete_options 给的事实说后台真的会做什么。"""
     lock, kw, nxt = opts["lock"], opts["kw"], opts["auto_next"]
     if not opts["sub"]:
         s = "这部番现在不在订阅中，后台不会自动下；要就在那一行点『下载』"
@@ -408,15 +408,26 @@ _CAND_FOLD = 5   # 候选多于这么多条时先收起，点『还有 N 条』�
 
 
 async def _ask_delete(opts: dict, label: str, raw: str, save_path: str):
-    """删的是这一集仅剩的一份时的确认框（E-81）：换一份 / 以后自动补 / 这一集不要了，选项与默认项全由
-    core.delete_options 定。返回 (mode, pick_id)；取消返回 None。模块级是为了让用例能直接打桩。"""
+    """删的是这一集仅剩的一份时的确认框（E-81）。顶层只问一件事：还要这一集 / 这一集不要了；
+    "还要"时有候选就列候选（换一份），后台不会自动下这些候选时末尾多一条"先不换"（以后自动补），
+    没候选就只说以后怎么补。底层仍是 swap / keep / drop 三种，选项与默认项全由 core.delete_options 定。
+    返回 (mode, pick_id)；取消返回 None。模块级是为了让用例能直接打桩。"""
     dlg = page_dialog()
     if dlg is None:
         return None
     arch = opts["archived"]
-    names = {"swap": "换一份：马上下载下面选中的那一份", "keep": _keep_text(opts), "drop": _drop_text(opts)}
-    cands = opts["cands"]
+    has_swap, has_keep = "swap" in opts["options"], "keep" in opts["options"]
+    cands = opts["cands"] if has_swap else []
     by_id = {c["id"]: c for c in cands}
+    keep_line = _keep_text(opts) if has_keep else ""
+
+    def _picks(n):
+        d = {c["id"]: _cand_text(c, opts["kw"]) for c in cands[:n]}
+        if has_keep:   # 等待项放候选末尾：少见的选择，不跟"换一份"并列抢注意力
+            # 只放短句：完整说法在选中它之后显示在下面，免得这一条比所有候选都长、又跟"换一份"抢注意力
+            d["keep"] = f"先不换，等『{opts['lock']}』以后再发" if opts["lock"] else "先不换，以后自动补"
+        return d
+
     with dlg, ui.card().classes("gap-2").style("max-width:min(92vw,40rem)"):
         ui.label(f"{label} 已归档，只能标记已删" if arch else f"删除 {label}？").classes("font-bold")
         second = (f"⚠️ 文件仍在（需你手动删）：{save_path or '（未记录路径，请到下载目录自行查找）'}\n"
@@ -425,47 +436,62 @@ async def _ask_delete(opts: dict, label: str, raw: str, save_path: str):
         ui.label(((raw + "\n") if raw else "") + second).classes("text-xs text-gray-400").style(
             "white-space:pre-line;word-break:break-all")
         ui.label("这是这一集仅剩的一份。删完之后：").classes("text-sm")
-        mode = ui.radio({k: names[k] for k in opts["options"]}, value=opts["default"]).props("dense").classes(
+        mode = ui.radio({"want": "还要这一集", "drop": _drop_text(opts)},
+                        value="drop" if opts["default"] == "drop" else "want").props("dense").classes(
             "text-sm del-radio")
-        # 准确说法以 sweep_finished 为准：不置 ep_dropped 时 coverage 少这一集，下一轮巡检撤销下齐（停订的番随之恢复订阅）
-        fin_note = ui.label("这部已判下齐：选这项，下一轮巡检会撤销下齐标记（这一集重新到手后再判回来）"
-                            + ("；撤销后它会恢复自动下载新集" if config.ANIME_FINISH_UNSUB else "")
-                            ).classes("text-xs text-amber-400")
         box = ui.column().classes("w-full gap-1 pl-6")
         with box:
-            ui.label("换成哪一份：").classes("text-xs text-gray-400")
-            short = {c["id"]: _cand_text(c, opts["kw"]) for c in cands[:_CAND_FOLD]}
-            pick = ui.radio(short, value=cands[0]["id"] if cands else None).props("dense").classes(
-                "text-xs break-all del-radio")
-            if len(cands) > _CAND_FOLD:
-                more = ui.button(f"还有 {len(cands) - _CAND_FOLD} 条").props("flat dense color=primary").classes(
-                    "btn-sm")
+            # 准确说法以 sweep_finished 为准：不置 ep_dropped 时 coverage 少这一集，下一轮巡检撤销下齐（停订的番随之恢复订阅）
+            fin_note = ui.label("这部已判下齐：下一轮巡检会撤销下齐标记（这一集重新到手后再判回来）"
+                                + ("；撤销后它会恢复自动下载新集" if config.ANIME_FINISH_UNSUB else "")
+                                ).classes("text-xs text-amber-400")
+            fin_note.set_visibility(opts["finished"])
+            pick = None
+            if has_swap:
+                ui.label("换哪一份（或先不换）：" if has_keep else "换哪一份：").classes("text-xs text-gray-400")
+                pick = ui.radio(_picks(_CAND_FOLD), value=cands[0]["id"]).props("dense").classes(
+                    "text-xs break-all del-radio")
+                if len(cands) > _CAND_FOLD:
+                    more = ui.button(f"还有 {len(cands) - _CAND_FOLD} 条").props("flat dense color=primary").classes(
+                        "btn-sm")
 
-                def _more():
-                    pick.set_options({c["id"]: _cand_text(c, opts["kw"]) for c in cands}, value=pick.value)
-                    more.set_visibility(False)
-                more.on_click(_more)
-            lock_note = ui.label("").classes("text-xs text-amber-400")
+                    def _more():
+                        pick.set_options(_picks(len(cands)), value=pick.value)
+                        more.set_visibility(False)
+                    more.on_click(_more)
+                lock_note = ui.label("").classes("text-xs text-amber-400")
+                wait_note = ui.label(keep_line).classes("text-xs text-gray-400")
+            else:
+                ui.label(keep_line).classes("text-xs text-gray-400")
+
+        def _ans():
+            if mode.value == "drop":
+                return "drop", None
+            if pick is None or pick.value == "keep":
+                return "keep", None
+            return "swap", pick.value
+
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("取消", on_click=lambda: dlg.submit(None)).props("flat")
             _c = "negative"
-            ok = ui.button("", on_click=lambda: dlg.submit((mode.value, pick.value if mode.value == "swap" else None))
-                           ).props(f"color={_c} unelevated")
+            ok = ui.button("", on_click=lambda: dlg.submit(_ans())).props(f"color={_c} unelevated")
 
     def _sync():
-        m = mode.value
-        box.set_visibility(m == "swap")
-        fin_note.set_visibility(opts["finished"] and m in ("swap", "keep"))
-        c = by_id.get(pick.value)
-        lock_note.text = (f"锁着『{opts['lock']}』：只这一集用『{c['source'] or '—'}』，锁不变"
-                          if m == "swap" and c and opts["lock"] and not c["lock_src"] else "")
-        lock_note.set_visibility(bool(lock_note.text))
+        m, pid = _ans()
+        box.set_visibility(mode.value == "want")
+        if pick is not None:
+            c = by_id.get(pid)
+            lock_note.text = (f"锁着『{opts['lock']}』：只这一集用『{c['source'] or '—'}』，锁不变"
+                              if c and opts["lock"] and not c["lock_src"] else "")
+            lock_note.set_visibility(bool(lock_note.text))
+            wait_note.set_visibility(pid == "keep")
         text, icon = _DEL_OK[m]
         ok.text = {"keep": "标记已删", "drop": "标记已删，不要这一集"}.get(m, text) if arch else text
         ok.props(f"icon={icon}")
 
     mode.on_value_change(lambda: _sync())
-    pick.on_value_change(lambda: _sync())
+    if pick is not None:
+        pick.on_value_change(lambda: _sync())
     _sync()
     try:
         return await wait_dialog(dlg)
@@ -651,7 +677,6 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
     if anime.get_anime(anime_id) is None:
         ui.label("番剧不存在").classes("text-gray-400 p-4")
         return
-    _ui: dict = {}   # body 每次重建时登记的控件（处理器在 body 外定义，要靠它拿到当前那一个）
 
     @ui.refreshable
     def body():
@@ -688,66 +713,26 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 ui.button(icon="close", on_click=on_close).props("flat round dense").classes(
                     "shrink-0")
 
-        # 操作栏：标题下、横幅上，一打开就看得见（元信息卡在手机上有一屏多高，放它下面要滚很远才找得到）。
-        # 常驻的只有主操作 + 下载该源 + 自动补齐；低频的收进 ⋯。手机上下载源与版本一行，其余一行
-        with ui.row().classes("items-center gap-x-2 gap-y-2 flex-wrap w-full"):
-            if sources:  # 下载源放最前：按优先级=多源兜底；选具体组=锁定，之后只下这个组
-                with ui.row().classes("items-center gap-2 no-wrap w-full sm:w-auto"):
-                    # 只改显示文字、键（写进 pref_source 的值）不变：锁定后框里写『只下 ANi』，光一个组名看不出这是锁定
-                    ui.select({k: (v if not k else f"只下 {v}")
-                               for k, v in source_options(sources, "下载源：按优先级·多源兜底").items()},
-                              value=(cur.pref_source or ""),
-                              on_change=_set_source).classes(
-                        "grow min-w-0 sm:grow-0 sm:min-w-52").tooltip(
-                        "『按优先级』= 多源自动挑、缺集用别的源兜底；"
-                        + (f"选某个组 = 锁定，之后只下这个组；它停更满 {config.ANIME_LOCK_FALLBACK_DAYS} 天、"
-                           "核对无误的缺集才自动用别的组补一份，其余缺集自己来点下载"
-                           if config.ANIME_LOCK_FALLBACK_DAYS > 0 else
-                           "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）"))
-                    _kwin = ui.input(value=(cur.pref_keyword or ""), label="版本",
-                                     placeholder="繁日/简日/1080p…").classes(
-                        "w-28 shrink-0").tooltip(
-                        "版本关键词：在『下载源』基础上，再只下种子原名含此词的版本（繁日/简日/画质等，大小写不敏感）。"
-                        "留空=不限；硬过滤、缺此版本的集不兜底。回车或点输入框外生效。")
-                    _kwin.on("blur", lambda: _set_keyword(_kwin.value, _kwin))
-                    _kwin.on("keydown.enter", lambda: _set_keyword(_kwin.value, _kwin))
+        # 管理行：标题下、横幅上，一打开就看得见（元信息卡在手机上有一屏多高，放它下面要滚很远才找得到）。
+        # 主操作在左，低频的三个常驻排在同一行（不收菜单：收起来就找不到）。.act-grid 手机上是等宽三列、
+        # 主操作独占第一行，不会有一个按钮孤零零掉到下一行
+        with ui.element("div").classes("act-grid"):
             if cur.rejected:
-                ui.button("恢复订阅", icon="undo", on_click=_restore).props("unelevated color=primary")
+                ui.button("恢复订阅", icon="undo", on_click=_restore).props(
+                    "unelevated color=primary").classes("act-main")
             elif not cur.confirmed:
-                ui.button("确认下载", on_click=_approve).props("unelevated color=primary")
+                ui.button("确认下载", on_click=_approve).props("unelevated color=primary").classes("act-main")
             if not cur.rejected and cur.finished_at:
                 ui.button("继续订阅", icon="autorenew", on_click=_resubscribe).props(
-                    "unelevated color=primary").tooltip(
+                    "unelevated color=primary").classes("act-main").tooltip(
                     "清掉『已下齐』标记并【不再自动判它下齐】。bgm 的总集数少记一集时用这个——"
                     "否则下一轮巡检立刻又会把它判回已下齐。")
-            _dln = ui.button("下载该源", icon="download", on_click=_download).props("flat")
-            _dln.set_enabled(config.QB_ENABLED)
-            _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
-                         else "按左边『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过。"
-                              "只下正集——特别篇/未知集要对准下面那一条点『下载』")
-            # 【与同一行的『下载该源』同档】这几个按钮是一组控制条，不是列表行。
-            # dense 在本项目的按钮语法里表示"行内"（＝12px，见 layout.py 的 .btn-sm），
-            # 写在这里会让同一行出现 14px 与 12px 两档。
-            _btn_bf_auto = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_auto).props(
-                "flat")
-            _btn_bf_auto.tooltip("去 nyaa/Mikan 按名搜『当前下载源』的种子补漏收（季度 + 番名过滤）。"
-                                 "在追的番补到就直接下（不打回待确认）；没在追的番照旧转『待确认』。")
-            # ⋯ 用纯图标：手机 358px 可用宽度里『下载该源 + 自动补齐 + 更多』带字就折行。
-            # 『补齐该源』收在这里、不与『自动补齐』并排：它对在追的番会打回待确认、暂停自动下，
-            # 手机上看不到气泡，多点一下比摆在手边更不容易误点
-            # 不挂气泡：菜单是往下弹的，悬停气泡正好盖住第一项
-            _more = ui.button(icon="more_horiz").props("flat color=grey")
-            _ui["more"] = _more   # 『重新识别』要跑很久，菜单点完就关，转圈挂在 ⋯ 上（见 _enrich）
-            with _more, ui.menu().props("auto-close"), ui.element("div").classes("menu-acts flex flex-col p-1"):
-                _btn_bf_loose = ui.button("补齐该源", icon="playlist_add", on_click=_backfill_loose).props(
-                    "flat color=grey")
-                _btn_bf_loose.tooltip("同『自动补齐』，但不做番名过滤、搜得更宽，由你人工审核：入库后转『待确认』，"
-                                      "点『确认下载』才下。自动补齐搜不到、或提示有条目没收时再用。")
-                ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat")
-                ui.button("编辑季度", icon="event", on_click=_edit_quarter).props("flat").tooltip(
-                    "手动改归档季度（bgm 定错/无放送日时兜底）。改后可把已下文件移到新目录。")
-                if not cur.rejected:
-                    ui.button("忽略本番", icon="block", on_click=_reject).props("flat color=grey")
+            # 与主操作同一行、同 14px（不写 dense：dense 在本项目表示行内 12px，同一行会出两档字号）
+            ui.button("重新识别", icon="refresh", on_click=_enrich).props("flat")
+            ui.button("编辑季度", icon="event", on_click=_edit_quarter).props("flat").tooltip(
+                "手动改归档季度（bgm 定错/无放送日时兜底）。改后可把已下文件移到新目录。")
+            if not cur.rejected:
+                ui.button("忽略本番", icon="block", on_click=_reject).props("flat color=grey")
 
         # 【缺集】按开播日推算应已播出、库里却一条种子都没有的集（判据见 core.anime.missing_episodes）
         _miss = anime.episode_gaps([cur]).get(cur.id) or []
@@ -888,6 +873,49 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
             ("来源", " · ".join(sources) or "—"),
         ], cur.bangumi_id, cur.summary, rating=cur.rating)
 
+        # 下载区：元信息卡下、分集列表上——挑源、补漏都是对着下面的分集做的。
+        # 桌面一行（下载源 + 版本在左，三个按钮在右）；手机上下载源与版本一行，三个按钮等宽一行
+        with ui.card().classes("w-full gap-2"):
+            ui.label("下载").classes("text-sm font-bold")
+            # justify-between + 折行：窄的弹窗（平板 / 小窗口）里按钮组掉到第二行时从左缘起，跟下载源对齐
+            with ui.row().classes("items-center justify-between gap-2 w-full"):
+                if sources:  # 按优先级=多源兜底；选具体组=锁定，之后只下这个组
+                    with ui.row().classes("items-center gap-2 no-wrap w-full sm:w-auto"):
+                        # 只改显示文字、键（写进 pref_source 的值）不变：锁定后框里写『只下 ANi』，光一个组名看不出这是锁定
+                        ui.select({k: (v if not k else f"只下 {v}")
+                                   for k, v in source_options(sources, "下载源：按优先级·多源兜底").items()},
+                                  value=(cur.pref_source or ""),
+                                  on_change=_set_source).classes(
+                            "grow min-w-0 sm:grow-0 sm:min-w-52").tooltip(
+                            "『按优先级』= 多源自动挑、缺集用别的源兜底；"
+                            + (f"选某个组 = 锁定，之后只下这个组；它停更满 {config.ANIME_LOCK_FALLBACK_DAYS} 天、"
+                               "核对无误的缺集才自动用别的组补一份，其余缺集自己来点下载"
+                               if config.ANIME_LOCK_FALLBACK_DAYS > 0 else
+                               "选某个组 = 锁定，之后只下这个组，它缺的集不兜底（自己来点下载）"))
+                        _kwin = ui.input(value=(cur.pref_keyword or ""), label="版本",
+                                         placeholder="繁日/简日/1080p…").classes(
+                            "w-28 shrink-0").tooltip(
+                            "版本关键词：在『下载源』基础上，再只下种子原名含此词的版本（繁日/简日/画质等，大小写不敏感）。"
+                            "留空=不限；硬过滤、缺此版本的集不兜底。回车或点输入框外生效。")
+                        _kwin.on("blur", lambda: _set_keyword(_kwin.value, _kwin))
+                        _kwin.on("keydown.enter", lambda: _set_keyword(_kwin.value, _kwin))
+                # 三个按钮同为 14px 的 flat（不写 dense，理由同管理行）
+                with ui.element("div").classes("act-grid"):
+                    _dln = ui.button("下载该源", icon="download", on_click=_download).props("flat")
+                    _dln.set_enabled(config.QB_ENABLED)
+                    _dln.tooltip("qB 未启用，去设置页开启后可下载" if not config.QB_ENABLED
+                                 else "按『下载源』下：锁了某源→下该源缺的每一集；『按优先级』→每集下应下的那份，已下的跳过。"
+                                      "只下正集——特别篇/未知集要对准下面那一条点『下载』")
+                    _btn_bf_auto = ui.button("自动补齐", icon="auto_awesome", on_click=_backfill_auto).props(
+                        "flat")
+                    _btn_bf_auto.tooltip("去 nyaa/Mikan 按名搜『当前下载源』的种子补漏收（季度 + 番名过滤）。"
+                                         "在追的番补到就直接下（不打回待确认）；没在追的番照旧转『待确认』。")
+                    # 『补齐该源』排最后、降灰：它对在追的番会打回待确认、暂停自动下，与『自动补齐』拉开一档
+                    _btn_bf_loose = ui.button("补齐该源", icon="playlist_add", on_click=_backfill_loose).props(
+                        "flat color=grey")
+                    _btn_bf_loose.tooltip("同『自动补齐』，但不做番名过滤、搜得更宽，由你人工审核：入库后转『待确认』，"
+                                          "点『确认下载』才下。自动补齐搜不到、或提示有条目没收时再用。")
+
         ep_section()   # 分集区单独可刷新（改版本关键词只刷它），理由见 ep_section
         if on_close:   # 手机上分集表两三屏长、最新一集在最底、X 在最顶：看完就地能关（桌面不出）
             with ui.row().classes("w-full justify-end sm:hidden"):
@@ -1006,12 +1034,12 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                     if t.lock_fallback:   # 锁定源停更时后台替你补的那一份（E-74）：让人事后找得到、删得掉
                         ui.badge("兜底").props("color=teal outline").tooltip(
                             "锁定的组停更了一阵，后台用这个组给这一集补了一份。锁定组以后补发这一集会再自动下它的版本；"
-                            "这一份不会自动删，不要了点右边删除；删除时可以选：换一份 / 以后自动补 / 不要这一集")
+                            "这一份不会自动删，不要了点右边删除；删除时可以选：还要这一集（换一份或等以后补）/ 这一集不要了")
                     if t.foreign_season:   # (E-77 C) 用户标的：别的季的，不占本季的集号
                         ui.badge("不属于本季").props("color=grey").tooltip(
                             "你标过：这一条是别的季的。它不占本季这一集的位置（本季那一集照常自动下），"
                             "文件不动、还在原目录；后台不会自动下它、不会拿它做修正版替换，搬迁时也不会清它的状态。"
-                            "标错了点右边 ⋯ 里的『撤销』")
+                            "标错了点右边的『撤销』")
                     ui.label(engine.torrent_time(t)).classes(
                         "shrink-0 text-gray-500 text-xs")                 # 次要：时间(12px)
                     # 右簇：徽标 + 固定三格操作。手机上整簇独占第二行（徽标靠左、按钮靠右），桌面贴右；行内只有这一处会折行。
@@ -1140,7 +1168,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                 (f"{t.fail_reason}；" if t.fail_reason else "")
                                 + "半成品文件在下载目录里。停滞集不会自动重下/换源："
                                   "要重试点右边『下载』；要换源：在同集别的版本那一行点『下载』；"
-                                  "点『删除』时可以选：换一份 / 以后自动补 / 不要这一集")
+                                  "点『删除』时可以选：还要这一集（换一份或等以后补）/ 这一集不要了")
                         else:  # 无 qB 实时态：刚交付未同步→下载中；其余(已下完/跳过/已删/已排除)按状态
                             # 【严重度色取公共表】写死 blue-grey 会让同一条 stalled/error 在仪表盘是
                             # 橙红、在详情页是中性灰——而两边渲染的是同一列 status。
@@ -1185,23 +1213,19 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                                          else "已经在下载或已经下好了，不用再点" if _in_qb
                                          else "已归档：文件还在盘上，点这里把这一条重新交回 qB" if t.archived_at
                                          else "强制下这一条到文件夹（无视去重/优先级）")
-                            # 格3「⋯」：『不属于本季』/『撤销』只在少数行出现，常驻会把那一行的徽标往左推，收进菜单。
+                            # 格3「别季」：『不属于本季』/『撤销』二选一常驻在这一格。格宽固定、没有时空格占位，
+                            # 徽标右缘照样对齐；字只写两个（同前两格的宽度），手机上看不到气泡，标上之前确认框会说清是什么。
                             # (E-77 C)『不属于本季』只由这里（和缺集横幅上的批量按钮）产生，后台永不自动打。
                             # 只对看着像别季的正集给按钮（判据见 anime.foreign_season_suspect）。交付中的不给（set_foreign_season 也不改它）：等它落定。
-                            # 菜单里仍用 ui.button（不用 menu_item）：按钮角色词表不变
-                            _fs_undo = bool(t.foreign_season)
-                            if _fs_undo or (t.status != "downloading" and anime.foreign_season_suspect(cur, t)):
-                                _mb = ui.button(icon="more_vert").props("flat dense color=grey").classes("btn-sm")
-                                with _mb, ui.menu().props("auto-close"), ui.element("div").classes("menu-acts flex flex-col p-1"):
-                                    if _fs_undo:
-                                        ui.button("撤销", icon="undo", on_click=_set_foreign(t.id, False, t.episode)).props(
-                                            "flat dense color=primary").classes("btn-sm").tooltip(
-                                            "撤销『不属于本季』：这一条重新占用本季这一集的位置")
-                                    else:
-                                        ui.button("不属于本季", icon="playlist_remove",
-                                                  on_click=_set_foreign(t.id, True, t.episode)).props(
-                                            "flat dense color=grey").classes("btn-sm").tooltip(
-                                            "这一条是别的季的（同集号的旧正片）：标记后不再占用本季这一集的位置，文件不动，可撤销")
+                            if t.foreign_season:
+                                ui.button("撤销", icon="undo", on_click=_set_foreign(t.id, False, t.episode)).props(
+                                    "flat dense color=primary").classes("btn-sm").tooltip(
+                                    "撤销『不属于本季』：这一条重新占用本季这一集的位置")
+                            elif t.status != "downloading" and anime.foreign_season_suspect(cur, t):
+                                ui.button("非本季", icon="playlist_remove",
+                                          on_click=_set_foreign(t.id, True, t.episode)).props(
+                                    "flat dense color=grey").classes("btn-sm").tooltip(
+                                    "不属于本季：这一条是别的季的（同集号的旧正片），标记后不再占用本季这一集的位置，文件不动，可撤销")
                             else:
                                 ui.element("div")
                 # 第二行：种子原名（次要，同时间灰）——隐形『第N集』占位精确对齐字幕组（任意集号宽度都准）
@@ -1290,8 +1314,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                       type="positive" if ok else "warning")
             if ok:
                 await maybe_relocate_anime(anime_id, old_path, _after)
-        # 按钮在操作栏的 ⋯ 菜单里、点完菜单就关：转圈挂在 ⋯ 上才看得见
-        await busy_action(_ui.get("more") or e.sender, f"enrich:{anime_id}", _go, fail="识别失败")
+        await busy_action(e.sender, f"enrich:{anime_id}", _go, fail="识别失败")
 
     async def _bind():
         dlg = page_dialog()
@@ -1617,7 +1640,7 @@ def render_anime_detail(anime_id: int, refresh_outer=None, on_close=None) -> Non
                 return
             arch = opts["archived"]
             if opts["kind"] == "last":
-                # (E-81) 这一集仅剩的一份：换一份 / 以后自动补 / 这一集不要了，由人选
+                # (E-81) 这一集仅剩的一份：还要（换一份 / 以后自动补）/ 这一集不要了，由人选
                 ans = await _ask_delete(opts, label, raw, save_path)
                 if ans is None:
                     return

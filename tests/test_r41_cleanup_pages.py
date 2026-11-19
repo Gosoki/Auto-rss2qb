@@ -204,7 +204,7 @@ async def test_mark_foreign_when_locked_offers_download(user, clean_tables, cfg,
         return True
     monkeypatch.setattr(A, "download_anime_torrent", fake_dl)
     await user.open(f"/detail/{aid}")
-    _click(user, _btn(user, "不属于本季")[0])
+    _click(user, _btn(user, "非本季")[0])
     r2 = ("这部番锁定了『喵萌奶茶屋』，标完后第 6 集没有锁定组的版本，不会自动下。"
           "下面勾着的会在标完后立刻下载；不勾就要你以后自己点『下载』。")
     await _until(lambda: r2 in _labels(user), "确认框里没有 R2")

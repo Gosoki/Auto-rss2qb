@@ -1,4 +1,5 @@
-"""(r42 E-81) 详情页单集 🗑 的三选一确认框：选项与默认项照 core.delete_options，确认后调对的入口、传对的 drop。
+"""(r42 E-81) 详情页单集 🗑 的确认框（顶层两项：还要这一集 / 这一集不要了；"还要"下面列候选或说以后怎么补）：
+选项与默认项照 core.delete_options，确认后调对的入口、传对的 drop。
 
 写法同 test_r40_ui_detail：打开真详情页、按浏览器方式投递点击，core 的删除 / 换一份入口一律打桩只记参数。
 """
@@ -78,8 +79,9 @@ def _del_btn(user, tag):
 async def _open_dialog(user, aid, tag):
     await user.open(f"/detail/{aid}")
     _fire(user, _del_btn(user, tag), "click")
-    await _until(lambda: len(_live(user, ui.radio)) >= 1, "点删除没有弹三选一框")
-    mode, pick = _live(user, ui.radio)[:2]
+    await _until(lambda: len(_live(user, ui.radio)) >= 1, "点删除没有弹确认框")
+    radios = _live(user, ui.radio)
+    mode, pick = radios[0], (radios[1] if len(radios) > 1 else None)
     ok = next(b for b in _live(user, ui.button) if (b.props.get("color") == "negative"
                                                    and "unelevated" in b.props))
     cancel = [b for b in _live(user, ui.button) if b.text == "取消"][-1]
@@ -104,10 +106,10 @@ async def test_swap_is_default_and_confirm_calls_delete_and_replace(user, clean_
     aid, t, mk, ne, tag = _shape(clean_tables, pref_source="ANi")
     calls = _stub_core(monkeypatch, D)
     mode, pick, ok, _ = await _open_dialog(user, aid, tag)
-    assert list(mode.options) == ["swap", "keep", "drop"], mode.options
-    assert mode.value == "swap" and ok.text == "删除并下载"
-    assert list(pick.options) == [mk, ne] and pick.value == mk
-    assert "只等『ANi』以后再发这一集" in mode.options["keep"], mode.options["keep"]
+    assert list(mode.options) == ["want", "drop"], mode.options
+    assert mode.value == "want" and ok.text == "删除并下载"
+    assert list(pick.options) == [mk, ne, "keep"] and pick.value == mk, "锁源时后台不会自动下别组：候选末尾多一条等待项"
+    assert pick.options["keep"] == "先不换，等『ANi』以后再发", "等待项只放短句，完整说法选中后才出现"
     await user.should_see("锁着『ANi』：只这一集用『Mikan』，锁不变")
     _fire(user, ok, "click")
     await _until(lambda: calls, "确认后没有调换一份")
@@ -120,8 +122,8 @@ async def test_keep_and_drop_pass_the_right_drop_flag(user, clean_tables, cfg, m
     cfg(ANIME_FINISH_UNSUB=False)
     aid, t, *_rest, tag = _shape(clean_tables, pref_source="ANi")
     calls = _stub_core(monkeypatch, D)
-    mode, _, ok, _ = await _open_dialog(user, aid, tag)
-    mode.value = "keep"
+    mode, pick, ok, _ = await _open_dialog(user, aid, tag)
+    pick.value = "keep"
     await _until(lambda: ok.text == "删除文件", ok.text)
     _fire(user, ok, "click")
     await _until(lambda: calls, "确认后没有删")
@@ -134,8 +136,9 @@ async def test_drop_choice_drops(user, clean_tables, cfg, monkeypatch):
     cfg(ANIME_FINISH_UNSUB=False)
     aid, t, *_rest, tag = _shape(clean_tables)
     calls = _stub_core(monkeypatch, D)
-    mode, _, ok, _ = await _open_dialog(user, aid, tag)
-    assert list(mode.options) == ["swap", "drop"], "没锁源、后台下一轮会自动补：不重复给『以后自动补』"
+    mode, pick, ok, _ = await _open_dialog(user, aid, tag)
+    assert list(mode.options) == ["want", "drop"]
+    assert "keep" not in pick.options, "没锁源、后台下一轮会自动补：不重复给等待项"
     mode.value = "drop"
     await _until(lambda: ok.text == "删除，不要这一集", ok.text)
     _fire(user, ok, "click")
@@ -150,12 +153,51 @@ async def test_archived_has_no_swap(user, clean_tables, cfg, monkeypatch):
     with clean_tables.get_session() as s:
         aid = _anime(s)
         n = next(_n)
-        _row(s, aid, "ANi", 3, status="sent", archived_at=OLD, raw_title=f"[ANi] 某番 - 03 #{n}arc")
+        t = _row(s, aid, "ANi", 3, status="sent", archived_at=OLD, raw_title=f"[ANi] 某番 - 03 #{n}arc")
         _row(s, aid, "Mikan", 3)
-    _stub_core(monkeypatch, D)
-    mode, _, ok, _ = await _open_dialog(user, aid, f"{n}arc")
-    assert "swap" not in mode.options and mode.value == "keep"
+    calls = _stub_core(monkeypatch, D)
+    mode, pick, ok, _ = await _open_dialog(user, aid, f"{n}arc")
+    assert pick is None and mode.value == "want", "已归档不给换一份：不列候选"
     assert ok.text == "标记已删"
+    await user.should_see("核对文件名再删——同名的就是新下的那份")
+    _fire(user, ok, "click")
+    await _until(lambda: calls, "确认后没有删")
+    assert calls == [("delete", t, False)]
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_no_candidate_shows_one_line_and_keeps(user, clean_tables, cfg, monkeypatch):
+    from pages import anime_detail as D
+    cfg(ANIME_FINISH_UNSUB=False)
+    with clean_tables.get_session() as s:
+        aid = _anime(s)
+        n = next(_n)
+        t = _row(s, aid, "ANi", 3, status="sent", raw_title=f"[ANi] 某番 - 03 #{n}one")
+    calls = _stub_core(monkeypatch, D)
+    mode, pick, ok, _ = await _open_dialog(user, aid, f"{n}one")
+    assert pick is None and mode.value == "want" and ok.text == "删除文件"
+    await user.should_see("以后有别的版本进来再自动下（现在库里没有别的版本）")
+    _fire(user, ok, "click")
+    await _until(lambda: calls, "确认后没有删")
+    assert calls == [("delete", t, False)]
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
+async def test_more_candidates_keeps_wait_item_last(user, clean_tables, cfg, monkeypatch):
+    from pages import anime_detail as D
+    cfg(ANIME_FINISH_UNSUB=False)
+    with clean_tables.get_session() as s:
+        aid = _anime(s, pref_source="ANi")
+        n = next(_n)
+        _row(s, aid, "ANi", 3, status="sent", raw_title=f"[ANi] 某番 - 03 #{n}many")
+        ids = [_row(s, aid, f"G{i}", 3) for i in range(D._CAND_FOLD + 2)]
+    _stub_core(monkeypatch, D)
+    mode, pick, ok, _ = await _open_dialog(user, aid, f"{n}many")
+    assert len(pick.options) == D._CAND_FOLD + 1 and list(pick.options)[-1] == "keep"
+    more = next(b for b in _live(user, ui.button) if b.text.startswith("还有"))
+    _fire(user, more, "click")
+    await _until(lambda: len(pick.options) == len(ids) + 1, "展开后候选没补全")
+    assert list(pick.options)[-1] == "keep" and set(list(pick.options)[:-1]) == set(ids)
 
 
 @pytest.mark.nicegui_main_file(_MAIN)
@@ -232,10 +274,12 @@ async def test_finished_defaults_to_drop_and_warns_on_keep_swap(user, clean_tabl
     _stub_core(monkeypatch, D)
     mode, pick, ok, _ = await _open_dialog(user, aid, tag)
     assert "del-radio" in mode.classes and "del-radio" in pick.classes
-    assert mode.value == "drop" and "swap" in mode.options
+    assert mode.value == "drop" and pick.value == mk
 
-    def note():
-        return [lb for lb in _live(user, ui.label) if "这部已判下齐" in lb.text]
-    assert note() and not note()[0].visible, "选『不要了』时不提撤销下齐"
-    mode.value = "swap"
-    await _until(lambda: note()[0].visible, "选换一份没提会撤销下齐")
+    def shown():
+        lb = [lb for lb in _live(user, ui.label) if "这部已判下齐" in lb.text]
+        assert lb
+        return lb[0].visible and all(a.visible for a in lb[0].ancestors())
+    assert not shown(), "选『不要了』时不提撤销下齐"
+    mode.value = "want"
+    await _until(shown, "选还要这一集没提会撤销下齐")

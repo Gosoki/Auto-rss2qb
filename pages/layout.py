@@ -490,7 +490,6 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                         f'style="width:auto" class="rounded meta-cover">').classes("shrink-0 w-fit")
             # 中列：两列 kv 网格 + bgm 链接。self-stretch 让本列撑到封面等高，bgm 链接 mt-auto 贴底
             with ui.column().classes("gap-1 grow min-w-0 self-stretch"):
-                # .kv-grid：窄屏一对（字段名+值）一行，≥1024px 并成两对一行，高度减半（见 _HEAD_BASE_CSS）
                 with ui.element("div").classes("kv-grid w-full gap-x-8 gap-y-1 items-baseline"):
                     for pair in kv_pairs:
                         if pair is None:                 # 分隔行：留一点空当，把非 bgm 字段隔开
@@ -518,11 +517,14 @@ def meta_card(cover_url, kv_pairs, bangumi_id, summary, rating=None) -> None:
                         ui.label(_lab).classes("text-xs text-gray-400")
         if summary:
             ui.separator()
-            # 简介是正文，不着灰。默认收成 2 行（全文会把下载控制行和分集表推出首屏），点一下展开 / 收起。
-            # 不设长度阈值：短简介本来不到 2 行。body.refresh() 之后回到收起状态
-            _sum = ui.label(summary).classes("text-sm whitespace-pre-wrap line-clamp-2 cursor-pointer")
-            _sum.tooltip("点一下展开 / 收起全文")
-            _sum.on("click", lambda: _sum.classes(toggle="line-clamp-2"))
+            # 简介是正文，不着灰。默认全文展开；嫌长就点下面的开关收成 3 行。只认开关、不认点文字：
+            # 选中复制简介时不会误收起。body.refresh() 之后回到展开
+            _sum = ui.label(summary).classes("text-sm whitespace-pre-wrap")
+
+            def _fold():
+                _sum.classes(toggle="line-clamp-3")
+                _tg.text = "展开简介" if "line-clamp-3" in _sum.classes else "收起简介"
+            _tg = ui.button("收起简介", on_click=_fold).props("flat dense color=primary").classes("btn-sm self-start")
 
 
 def name_of(a) -> str:
@@ -1001,26 +1003,31 @@ _HEAD_BASE_CSS = (
     #   放得下时 Quasar 会把 tab 均分铺满，内边距只决定"多窄还放得下"。再加第七个 tab 就放不下了，
     #   那时给 ui.tabs() 加 mobile-arrows（tests/test_r40_ui_dash.py 按 _TABS_DEF 算着这笔账）。
     "@media(max-width:599px){"
+    # 元信息卡封面：手机竖排时独占一行，比桌面矮一档（写成 img. 多一档优先级，基础规则排在这块后面）
+    "img.meta-cover{height:18.5rem}"
     ":root{--nicegui-default-padding:.5rem}"
     ".kpi-group{grid-template-columns:repeat(var(--kpi-m,2),minmax(0,1fr))}.kpi-group>.q-card{gap:.25rem}"
     ".q-tab{padding:0 4px}"
     # 行内按钮（.btn-sm，全站 dense 的那批）手指够不着：27px 高、删除键紧挨着『下载』。手机上抬到 40px 触控尺寸；
     # 桌面不变。min-width 一并抬，纯图标键（删除）才不会是 27 宽的窄条
     ".q-btn.btn-sm:not(.q-btn--round){min-height:40px;min-width:40px}"
-    # 详情页种子行的三格（.ep-acts）：按钮抬到 40px 后第三格（⋯）跟着放宽，格间距拉开，删除键别紧挨着『下载』。
+    # 详情页种子行的三格（.ep-acts）：按钮抬到 40px 后格间距拉开，删除键别紧挨着『下载』。
     # 写成 div.ep-acts 多一档优先级：基础规则排在这块后面，同优先级会被它盖回去
-    "div.ep-acts{grid-template-columns:3.75rem 3.75rem 2.5rem;column-gap:.75rem}"
+    "div.ep-acts{column-gap:.75rem}"
+    # 详情页两组常驻按钮（.act-grid）：等宽三列，主操作（.act-main）独占第一行，三个次级按钮各占一格，
+    # 不会有一个孤零零折到下一行、横坐标错开。一格约 110px，按钮默认的 16px 内边距 + 12px 图标间距
+    # 放不下"图标 + 四个字"，只在这里收窄。div. 前缀理由同上
+    "div.act-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%}"
+    ".act-grid>.act-main{grid-column:1/-1}.act-grid>.q-btn{padding-left:6px;padding-right:6px}"
+    ".act-grid .q-btn .on-left{margin-right:6px}"
     # 详情弹窗默认左右各留 24px，内容只剩 342px；收到 8px
     ".q-dialog__inner--minimized{padding:8px}"
     # 顶栏/保存/下载这几个白色圆形图标键是 34px，拇指点汉堡容易偏；抬到 42px（Quasar 非 dense 的圆键尺寸）
     ".q-btn--round.q-btn--dense.text-white{min-width:42px;min-height:42px}"
     "}"
-    # 详情元信息卡的字段网格：窄屏一对一行；≥1024px 两对一行（五行放下十个字段），封面同时收矮一档，
-    # 否则封面高度（18.5rem）仍把卡撑得和原来一样高。窄屏封面维持原大小。
+    # 详情元信息卡：字段一对一行；封面桌面 20rem、手机 18.5rem（手机竖排时封面独占一行，太高会把下面推太远）
     ".kv-grid{display:grid;grid-template-columns:auto minmax(0,1fr)}"
-    ".meta-cover{height:18.5rem}"
-    "@media(min-width:1024px){.kv-grid{grid-template-columns:auto minmax(0,1fr) auto minmax(0,1fr)}"
-    ".meta-cover{height:13rem}}"
+    ".meta-cover{height:20rem}"
     # 订阅源页：白名单与关键词两个输入框，≥1024px 并排
     ".pair-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:.5rem 1rem}"
     "@media(min-width:1024px){.pair-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}"
@@ -1030,13 +1037,13 @@ _HEAD_BASE_CSS = (
     # 按钮多了在组内折行。用 min(22rem,50%)：只写 22rem 的话 640~760px 的窗口里正文会被压到两百像素以下。
     # <640px 时按钮已经落到文字下面，不需要封顶。
     "@media(min-width:640px){.warn-acts{max-width:min(22rem,50%)}}"
-    # 详情页种子行右侧的固定三格操作（处置 / 下载 / ⋯）：格子宽度不随这一行有哪些按钮变，
-    # 各行『下载』与状态徽标的右缘才对得齐。3.75rem 放得下最宽的『排除』『下载』『恢复』（约 57px）。
+    # 详情页种子行右侧的固定三格操作（处置 / 下载 / 别季）：格子宽度不随这一行有哪些按钮变，
+    # 各行『下载』与状态徽标的右缘才对得齐。前两格 3.75rem 放得下"图标 + 两个字"（约 57px），第三格 4.5rem 放"图标 + 非本季"。
     # 手机档见上面 599 那块
-    ".ep-acts{display:grid;grid-template-columns:3.75rem 3.75rem 2.25rem;align-items:center;justify-items:end;"
+    ".ep-acts{display:grid;grid-template-columns:3.75rem 3.75rem 4.5rem;align-items:center;justify-items:end;"
     "column-gap:.25rem;flex:none}"
-    # ⋯ 菜单里的按钮左对齐（不往 props 里写 align：会生成按钮角色词表里没有的新组合）
-    ".menu-acts .q-btn__content{justify-content:flex-start}"
+    # 详情页的两组常驻按钮（顶部管理行、下载区）：桌面按自然宽度排一行；手机档见上面 599 那块
+    ".act-grid{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem}"
     # 数字输入：隐去浏览器原生上下箭头，统一成纯输入框
     "input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button"
     "{-webkit-appearance:none;margin:0}input[type=number]{-moz-appearance:textfield}"

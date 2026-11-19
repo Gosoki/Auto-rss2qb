@@ -177,7 +177,7 @@ def test_undo_leaves_a_skipped_row_alone_when_the_episode_is_covered(clean_table
 @pytest.mark.nicegui_main_file("tests/render_detail_main.py")
 @pytest.mark.parametrize("label,n_marked", [("连同这 2 条一起标", 3), ("只标这一条", 1), ("取消", 0)])
 async def test_detail_page_lists_same_episode_siblings_before_marking(user, clean_tables, cfg, label, n_marked):
-    """点『不属于本季』：确认框列出同集另外两条旧行的标题；三个按钮各走各的（取消一条都不标）。
+    """点行上的『别季』（标为不属于本季）：确认框列出同集另外两条旧行的标题；三个按钮各走各的（取消一条都不标）。
     三条都看着像别季的，点哪一条都列另外两条。"""
     from nicegui import ui
     from nicegui.testing.user_interaction import UserInteraction
@@ -185,7 +185,7 @@ async def test_detail_page_lists_same_episode_siblings_before_marking(user, clea
     d = date.today() - timedelta(weeks=7)
     aid, ids = _shape(clean_tables, d)
     await user.open(f"/detail/{aid}")
-    btns = [b for b in user.find(kind=ui.button, content="不属于本季").elements if b.text == "不属于本季"]
+    btns = [b for b in user.find(kind=ui.button, content="非本季").elements if b.text == "非本季"]
     assert len(btns) == 3
     UserInteraction(user, {btns[0]}, None).click()
     await user.should_see("让出的位置上还有 2 条看着也像别的季的")

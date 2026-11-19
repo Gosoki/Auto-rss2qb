@@ -500,13 +500,13 @@ def test_relocate_notice_for_foreign_kept_has_no_cleanup_wording(monkeypatch):
 @pytest.mark.nicegui_main_file("tests/render_detail_main.py")
 async def test_detail_page_shows_badge_undo_and_the_bulk_button(user, clean_tables, cfg):
     """#6 本季 9..12 从没进过库：横幅上有『把占槽的 12 条旧种子标为不属于本季』；标完之后每条别季行有灰色徽标和『撤销』，
-    横幅里的这个按钮消失。没标的别季行（季号不同）有『不属于本季』按钮。"""
+    横幅里的这个按钮消失。没标的别季行（季号不同）有『非本季』按钮（标为不属于本季）。"""
     from nicegui import ui
     cfg(ANIME_GAP_SLACK_WEEKS=2, ANIME_GAP_MAX_EPISODES=100)
     aid, _ = _six(clean_tables, tail=None)
     await user.open(f"/detail/{aid}")
     await user.should_see("把占槽的 12 条旧种子标为不属于本季")
-    assert [b for b in user.find(kind=ui.button, content="不属于本季").elements if b.text == "不属于本季"]
+    assert [b for b in user.find(kind=ui.button, content="非本季").elements if b.text == "非本季"]
 
     A.mark_slot_impostors_foreign(aid)
     await user.open(f"/detail/{aid}")
