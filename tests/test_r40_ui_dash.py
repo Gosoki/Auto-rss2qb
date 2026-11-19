@@ -175,6 +175,28 @@ async def test_banner_layout_with_none_one_and_many_buttons(user: User, clean_ta
 
 
 @pytest.mark.nicegui_main_file(_MAIN)
+async def test_long_banners_show_brief_and_fold_full_text(user: User, clean_tables, cfg, monkeypatch):
+    """(R42) rer / mva 横幅只放短句，完整说明折进『完整说明』；two 只有一部时它的 brief 不带处置说明，照旧显示全文。"""
+    from core import alerts
+    cfg(QB_ENABLED=False)
+    _fake_findings(monkeypatch)
+    two = {"id": 61, "born": _T0, "name": "双号番", "abs_src": "甲组", "in_src": "乙组",
+           "abs_eps": [13, 14], "in_eps": [1, 2], "offset": 12}
+    monkeypatch.setitem(alerts._BUILD, "two", (lambda: [two], alerts._BUILD["two"][1]))
+    found = {f["kind"]: f for f in alerts.scan()}
+    await user.open("/?t=overview")
+    labels = [str(lb.text) for lb in _live(user, ui.label)]
+    exps = _live(user, ui.expansion)
+    for kind in ("rer", "mva"):
+        f = found[kind]
+        assert len(f["brief"]) < len(f["text"]) / 2, kind
+        assert f["brief"] in labels, f"{kind} 横幅没放短句"
+        (box,) = [e for e in exps if any(isinstance(d, ui.label) and d.text == f["text"] for d in e.descendants())]
+        assert box.text == "完整说明" and box.value is False, "完整说明默认折起"
+    assert found["two"]["text"] in labels and found["two"]["brief"] not in labels
+
+
+@pytest.mark.nicegui_main_file(_MAIN)
 async def test_each_dup_button_opens_its_own_show(user: User, clean_tables, cfg, monkeypatch):
     """dup 横幅的两个『打开 #id』按钮各开各的：按钮在循环里建，回调要按值绑住 id，
     晚绑定的话两个按钮都会打开最后那一部。"""

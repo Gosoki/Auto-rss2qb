@@ -431,10 +431,11 @@ def test_every_number_matches_the_dashboard(clean_tables, quiet, cfg):
     ov = A.overview()
     pend = A.pending_confirm()
     with clean_tables.get_session() as s:
-        locked = list(s.exec(select(Anime).where(Anime.pref_source.is_not(None), Anime.pref_source != "")))
         subs = list(s.exec(select(Anime).where(*A.subscribed_where())))
-    lag = A.locked_out_episodes(locked)
     live = alerts.view()["live"]
+    # 锁定源落后按仪表盘那一类提示数（过集数门槛），单列，不再算进未读提示
+    lag = [f for f in live if f["kind"] == "lag"]
+    live = [f for f in live if f["kind"] != "lag"]
     fails = ov["status"]["error"] + ov["status"]["stalled"]
     # 前提：每一项都非 0，否则"数字一致"会因为那一项根本没写出来而空过
     assert len(pend) and ov["kpi"]["fail"] and ov["kpi"]["gaps"] and lag and fails and live and health.gaps()
@@ -453,6 +454,22 @@ def test_every_number_matches_the_dashboard(clean_tables, quiet, cfg):
         assert frag in line2, (frag, line2)
     assert f"未读提示 {len(live)} 条（" in line2 and D._ALERT_SHORT[live[0]["kind"]] in line2, line2
     assert line3 == "系统：正常"
+
+
+def test_lock_lag_under_threshold_not_in_digest(clean_tables, quiet, cfg):
+    """锁定源只落后 1 集：仪表盘按集数门槛不报，日报也不报（以前日报自己数、不过门槛）。"""
+    cfg(ANIME_LOCK_LAG_EPS=2)
+    now = datetime.now()
+    with clean_tables.get_session() as s:
+        lk = _anime(s, display_name="锁番", total_episodes=12, pref_source="喵萌")
+        for e in range(1, 5):
+            _row(s, lk, e, "skipped" if e <= 3 else "pending", now - timedelta(days=60 - 7 * e))
+        for e in range(1, 4):
+            _row(s, lk, e, "sent", now - timedelta(days=60 - 7 * e - 1), src="喵萌")
+        s.commit()
+        assert A.locked_out_episodes([s.get(Anime, lk)]), "前提：判据上确实落后 1 集"
+    line2 = D.digest_text(now - timedelta(hours=24), now).split("\n")[1]
+    assert "锁定源落后" not in line2 and "未读提示" not in line2, line2
 
 
 def test_line1_counts_regular_episodes_only_and_says_days(clean_tables, quiet):

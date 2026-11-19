@@ -219,6 +219,29 @@ def test_lock_lag_alert_disappears_once_lock_catches_up(clean_tables, env):
     assert _lag() == []
 
 
+def test_lock_lag_alert_revives_when_lagging_again_after_catch_up(clean_tables, env):
+    """标已读时被挡的那批集后来都下上了（提示消失），之后同一个锁定组又落后：现在挡着的全是标已读之后才入库的，是新事实。"""
+    with clean_tables.get_session() as s:
+        aid = _shape8(s)
+    (f,) = _lag()
+    alerts.ack(f["ident"], f["kind"], f["fact"], f["text"])
+    with clean_tables.get_session() as s:
+        row = s.exec(select(AlertAck).where(AlertAck.ident == f["ident"])).one()
+        row.created_at = _d(30)
+        s.add(row)
+        s.commit()
+        assert _lag() == [], "前提：只是标了已读，那批集还挡着，不复活"
+        for ep in range(17, 26):
+            _row(s, aid, LOCK, ep, "sent", _d(28))
+    assert _lag() == [], "锁定组追上了，提示消失"
+    with clean_tables.get_session() as s:
+        _row(s, aid, "ANi", 26, "pending", _d(20))
+        _row(s, aid, "ANi", 27, "pending", _d(13))
+    (f2,) = _lag()
+    assert f2["fact"] == f["fact"], "指纹没变，复活靠的是 since"
+    assert f2["revived"] and f2["revived"]["changed"][0][0] == "被挡住的集"
+
+
 def test_lock_lag_alert_off_when_lag_days_zero(clean_tables, env):
     env(ANIME_LOCK_LAG_DAYS=0)
     with clean_tables.get_session() as s:

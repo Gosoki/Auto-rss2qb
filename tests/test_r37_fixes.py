@@ -87,7 +87,7 @@ def test_stopped_lock_source_is_reported(clean_tables, cfg):
         aid = _lib(s, "喵萌奶茶屋", rows)
         a = s.get(Anime, aid)
     got = A.locked_out_episodes([a], today=datetime(2026, 10, 19))
-    assert got == {aid: {"eps": [6, 7, 8], "groups": ["ANi"], "lock_max": 5}}, got
+    assert got == {aid: {"eps": [6, 7, 8], "groups": ["ANi"], "lock_max": 5, "since": t0 + timedelta(days=35)}}, got
 
 
 def test_two_numberings_in_step_are_not_reported(clean_tables, cfg):

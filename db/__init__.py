@@ -447,7 +447,7 @@ _NOT_A_CONNECTION_ERROR = (
     "no such table", "no such column", "has no column",      # SQLite schema
     "unknown column", "doesn't exist", "unknown table",      # MySQL schema
     "database is locked", "database table is locked",        # SQLite 瞬时锁竞争
-    "lock wait timeout",                                     # MySQL 瞬时锁竞争
+    "lock wait timeout", "deadlock found",                   # MySQL 瞬时锁竞争（1205 / 1213）
 )
 
 

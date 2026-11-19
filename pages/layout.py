@@ -469,7 +469,7 @@ def finished_tip(a, resub_hint: str) -> str:
     """『已下齐』徽标的悬停说明，详情页与番剧卡片共用。停订与否由全局开关决定，所以必须说清
     【当前这台机器上】它意味着什么，否则用户看到"已下齐"无从判断后台还会不会继续下。
     【叫"下齐"不叫"完结"】系统确认不了一部番真的播完了，判据只是"按 bgm 总集数，1~N 集都在手"。
-    resub_hint：在当前位置怎么找到『继续订阅』（详情页就在右边、卡片上要进详情页）。"""
+    resub_hint：在当前位置怎么找到『继续订阅』（详情页就在标题下方、卡片上要进详情页）。"""
     return (f"按 bgm 总集数，1~{a.total_episodes} 集全部到手（判定于 {a.finished_at.strftime('%Y-%m-%d %H:%M')}）。"
             + (f"已停止自动下新集——若这部番其实还没完（bgm 的总集数少记了），{resub_hint}。"
                if config.ANIME_FINISH_UNSUB
@@ -1007,6 +1007,9 @@ _HEAD_BASE_CSS = (
     # 行内按钮（.btn-sm，全站 dense 的那批）手指够不着：27px 高、删除键紧挨着『下载』。手机上抬到 40px 触控尺寸；
     # 桌面不变。min-width 一并抬，纯图标键（删除）才不会是 27 宽的窄条
     ".q-btn.btn-sm:not(.q-btn--round){min-height:40px;min-width:40px}"
+    # 详情页种子行的三格（.ep-acts）：按钮抬到 40px 后第三格（⋯）跟着放宽，格间距拉开，删除键别紧挨着『下载』。
+    # 写成 div.ep-acts 多一档优先级：基础规则排在这块后面，同优先级会被它盖回去
+    "div.ep-acts{grid-template-columns:3.75rem 3.75rem 2.5rem;column-gap:.75rem}"
     # 详情弹窗默认左右各留 24px，内容只剩 342px；收到 8px
     ".q-dialog__inner--minimized{padding:8px}"
     # 顶栏/保存/下载这几个白色圆形图标键是 34px，拇指点汉堡容易偏；抬到 42px（Quasar 非 dense 的圆键尺寸）
@@ -1027,6 +1030,13 @@ _HEAD_BASE_CSS = (
     # 按钮多了在组内折行。用 min(22rem,50%)：只写 22rem 的话 640~760px 的窗口里正文会被压到两百像素以下。
     # <640px 时按钮已经落到文字下面，不需要封顶。
     "@media(min-width:640px){.warn-acts{max-width:min(22rem,50%)}}"
+    # 详情页种子行右侧的固定三格操作（处置 / 下载 / ⋯）：格子宽度不随这一行有哪些按钮变，
+    # 各行『下载』与状态徽标的右缘才对得齐。3.75rem 放得下最宽的『排除』『下载』『恢复』（约 57px）。
+    # 手机档见上面 599 那块
+    ".ep-acts{display:grid;grid-template-columns:3.75rem 3.75rem 2.25rem;align-items:center;justify-items:end;"
+    "column-gap:.25rem;flex:none}"
+    # ⋯ 菜单里的按钮左对齐（不往 props 里写 align：会生成按钮角色词表里没有的新组合）
+    ".menu-acts .q-btn__content{justify-content:flex-start}"
     # 数字输入：隐去浏览器原生上下箭头，统一成纯输入框
     "input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button"
     "{-webkit-appearance:none;margin:0}input[type=number]{-moz-appearance:textfield}"
@@ -1065,6 +1075,9 @@ _HEAD_BASE_CSS = (
     # 元素既有的圆角，不需要我们指定。
     "a:focus-visible,.q-btn:focus-visible,.jitem:focus-visible{outline:2px solid "
     "oklch(70.7% 0.165 254.624);outline-offset:2px}"
+    # 删除确认框的单选：选项文字常折成两三行，Quasar 默认把圆圈竖向居中，看着像挂在两行中间；顶对齐 + 选项间留点缝
+    ".del-radio .q-radio{align-items:flex-start}"
+    ".del-radio>div+div{margin-top:4px}"
     "</style>")
 # 全站徽标统一配色：Tailwind 色板映射到 .q-badge。放 @layer overrides 才能压过 Quasar 的 .bg-* !important。
 # 封面卡片网格（番剧表/待确认/已忽略/剧场版共用）：按容器宽度自动排列数（桌面多列、手机至少 2 列）。

@@ -371,6 +371,7 @@ def test_the_two_sqlite_paths_share_one_factory():
     ("(pymysql.err.OperationalError) (1054, \"Unknown column 'x' in 'field list'\")", False),
     ("(pymysql.err.ProgrammingError) (1146, \"Table 'a.b' doesn't exist\")", False),
     ("(pymysql.err.OperationalError) (1205, 'Lock wait timeout exceeded')", False),
+    ("(pymysql.err.OperationalError) (1213, 'Deadlock found when trying to get lock; try restarting transaction')", False),
     ("(pymysql.err.OperationalError) (2003, \"Can't connect to MySQL server\")", True),
     ("(pymysql.err.OperationalError) (2006, 'MySQL server has gone away')", True),
     ("(pymysql.err.InterfaceError) (0, '')", True),
@@ -1026,6 +1027,8 @@ _STRADDLERS = {
         "_download_locked_out_inner":     "in_flight",
         # (r41) 清理重复/别季文件：复核 → 一次 qB → 逐条走 _delete_anime_torrent_inner
         "_cleanup_execute_inner":         "in_flight",
+        # (r42 E-81) 删除确认框选『换一份』：await 删 → 按主键复核选中那条 → await 交付 → 读失败原因
+        "_delete_and_replace_inner":      "in_flight",
         "_download_new_rows":             "caller:_backfill_source_inner",
         "_reenrich_scope_inner":          "lock:_enrich_lock",
         "_refresh_meta_due_inner":        "lock:_enrich_lock",   # 每收录 N 集刷一次 bgm 资料

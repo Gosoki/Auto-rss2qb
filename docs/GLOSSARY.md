@@ -345,7 +345,7 @@ E-19 立的原则、E-3 把最后一条分叉（"从 qB 消失"）补齐。**已
 
 | 词 | 指什么 |
 |---|---|
-| **该集已删（`AnimeTorrent.ep_dropped`）** | 用户删除这一行时，它是同集（同番同集号、**不分源**，粗键）最后一份 ⇒ 这一集用户不要了。只对 `status=deleted` 的行有意义；只删重复份的 deleted 行 `ep_dropped=0`，不挡自动补回。统一判据 `core.anime._covered` / `_COVERED_SQL`：HAVE，或 deleted 且 ep_dropped —— flush、即时同集闸、补下、计划、补齐、换源兜底复活、恢复订阅、单部作品、锁源缺集统计全部共用。force 照常可下，force 成功清掉同集的标记。特别篇/未知集（-1/-2）不当成"同一集"（单部作品除外）。界面：pending 行灰色徽标『该集已删·不自动下』。见 E-73。与 `HANDLED_STATUSES`（"下过没有"）区分。 |
+| **该集已删（`AnimeTorrent.ep_dropped`）** | 用户删除这一行时，它是同集（同番同集号、**不分源**，粗键）最后一份 ⇒ 这一集用户不要了。单集 🗑 删最后一份时由用户在确认框里三选一（E-81）：『换一份』（先删后马上下选中的同组候选）/『以后自动补』都不置，并把同组 skipped 放回待下；只有『这一集不要了』才置（两套集号时默认此项，否则默认前两者之一）；cleanup 等不经确认框的入口照旧置。只对 `status=deleted` 的行有意义；只删重复份的 deleted 行 `ep_dropped=0`，不挡自动补回。统一判据 `core.anime._covered` / `_COVERED_SQL`：HAVE，或 deleted 且 ep_dropped —— flush、即时同集闸、补下、计划、补齐、换源兜底复活、恢复订阅、单部作品、锁源缺集统计全部共用。force 照常可下，force 成功清掉同集的标记。特别篇/未知集（-1/-2）不当成"同一集"（单部作品除外）。界面：pending 行灰色徽标『该集已删·不自动下』。见 E-73。与 `HANDLED_STATUSES`（"下过没有"）区分。 |
 | **『兜底』的三种意思，别互相替换** | ① **多源兜底**：下载源选『按优先级』时缺集用别的源补，是常态。② **换源兜底**：`_revive_orphaned_skipped`，胜出源事后转 error 时把同集被压成 skipped 的兄弟放回 pending。③ **锁定源停更兜底**（E-74）：锁了源的番，锁定组停更满 `ANIME_LOCK_FALLBACK_DAYS` 天、核对无误的集用别的组补一份，那一行记 `lock_fallback=True`、详情页『兜底』徽标、推送事件 `lock_fallback`。 |
 | **A 步 / B 步（`deliver_lock_fallback` 内部）** | B 步＝兜底本身（`lock_fallback_plan`）；A 步＝锁定组补发后用 force 补下它的版本（`_lock_catchup_plan`），每轮先跑 A 步。设成 0 只停 B 步。 |
 | **排除锁定组的那一集** | 用户在详情页把锁定组某集那一行『排除』＝这一集处理过了：锁源落后不报、B 步不补、锁源缺集也不列（四处 `lock_eps` 不分状态，口径同 E-73『该集已删不报』、E-74 B 步 handled 含 excluded）。别的组的这一集被锁挡着不会自动下，排除成功的提示当场说清要手点那一行的『下载』。 |

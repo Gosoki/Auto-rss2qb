@@ -176,22 +176,22 @@ async def test_anime_delete_confirm_names_the_clicked_row(user, clean_tables, mo
         _row(s, aid, "喵萌", 3, status="sent", raw="[喵萌] 某番 - 03 原名三", archived_at=arch)
     asked = []
 
-    async def fake_confirm(title, note, **kw):
-        asked.append((title, note)); return False
+    # (r42 E-81) 这一集仅剩的一份走三选一框 _ask_delete；框第一行就是传进去的 raw（见 test_r42_delete_page）
+    async def fake_ask(opts, label, raw, save_path):
+        asked.append((label, raw)); return None
 
     async def boom(*a, **k):
         raise AssertionError("用户没点确定，却删了")
-    monkeypatch.setattr(D, "confirm", fake_confirm)
+    monkeypatch.setattr(D, "_ask_delete", fake_ask)
     monkeypatch.setattr(D.anime, "delete_anime_torrent", boom)
     await user.open(f"/detail/{aid}")
     dels = [b for b in _live(user, ui.button) if b.props.get("icon") == "delete_forever"]
     btn = next(b for b in dels if "原名三" in _row_text(_row_of(b)))
     _fire(user, btn, "click")
     await _until(lambda: asked, "点删除没有弹确认框")
-    title, note = asked[0]
+    title, raw = asked[0]
     assert "第3集" in title and "喵萌" in title and "第2集" not in title, title
-    assert note.splitlines()[0] == "[喵萌] 某番 - 03 原名三", note
-    assert "原名二" not in note, note
+    assert raw == "[喵萌] 某番 - 03 原名三", raw
 
 
 @pytest.mark.nicegui_main_file(_MAIN)

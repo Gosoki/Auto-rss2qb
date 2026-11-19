@@ -4,7 +4,7 @@
 待确认、待识别、仪表盘提示这几类待办又本来就没有即时推送（逐条推会刷屏）。每天固定发一条，
 哪天没收到就说明推送或程序出了问题。
 
-【取数一律调仪表盘 / 巡检现成的函数】anime.overview / pending_confirm / locked_out_episodes、alerts.view、
+【取数一律调仪表盘 / 巡检现成的函数】anime.overview / pending_confirm、alerts.view、
 health.*。摘要里的数字因此与仪表盘卡片对得上，改判据时也只有一处要改。只有两项是这里自己查的：
 "这段时间新下的集"与"这段时间新入库、等你去点的剧场版版本"——仪表盘上没有按时间窗算的这两个数。
 """
@@ -92,9 +92,6 @@ def digest_text(since: datetime, now: datetime) -> str:
         new_mv = s.exec(select(func.count()).select_from(MovieTorrent).where(
             MovieTorrent.created_at >= since, MovieTorrent.created_at <= now,
             MovieTorrent.status == "pending")).one()
-        # 与巡检 sweep_lock_lag 取同一批番（锁了下载源的），追番中等条件由 locked_out_episodes 自己判
-        locked = list(s.exec(select(Anime).options(anime._NO_SUMMARY).where(
-            Anime.pref_source.is_not(None), Anime.pref_source != "")))
     n_eps = sum(len(v) for v in got.values())
     if got:
         line1 = (f"近 {span}约下了 {n_eps} 集（{len(got)} 部）："
@@ -104,8 +101,11 @@ def digest_text(since: datetime, now: datetime) -> str:
 
     ov = anime.overview()                 # 仪表盘 KPI 卡片背后的同一份数
     pend = anime.pending_confirm()
-    lag = anime.locked_out_episodes(locked)
     live = alerts.view()["live"]
+    # 锁定源落后取仪表盘提示里那一类：过了集数门槛、认『知道了』，与仪表盘同口径；
+    # 单列一项，不再算进未读提示（否则同一件事数两遍，还会被挤进"等"字里看不见）
+    lag = [f for f in live if f["kind"] == "lag"]
+    other = [f for f in live if f["kind"] != "lag"]
     gaps = health.gaps()                  # 全站横幅上那条『RSS 断档』，点了『知道了』才清
     todo = []
     if pend:
@@ -118,10 +118,10 @@ def digest_text(since: datetime, now: datetime) -> str:
     for label, n, unit in (("待识别", ov["kpi"]["fail"], "部"), ("缺集", ov["kpi"]["gaps"], "部"),
                            ("锁定源落后", len(lag), "部"),
                            ("失败/异常", ov["status"]["error"] + ov["status"]["stalled"], "条"),
-                           ("未读提示", len(live), "条"), ("剧场版新版本", new_mv, "个"),
+                           ("未读提示", len(other), "条"), ("剧场版新版本", new_mv, "个"),
                            ("RSS 断档", len(gaps), "段")):
         if n:
-            todo.append(f"{label} {n} {unit}" + (_alert_kinds(live) if label == "未读提示" else ""))
+            todo.append(f"{label} {n} {unit}" + (_alert_kinds(other) if label == "未读提示" else ""))
     line2 = ("等你处理：" + "、".join(todo)) if todo else "没有要你处理的事"
 
     # 别的模块后来加的健康判据（推送通道连续失败、后台协程退出）有就带上，没有就不提

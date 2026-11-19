@@ -98,22 +98,48 @@ def _is_last_copy(s, t) -> bool:
         AnimeTorrent.status.in_(HAVE_STATUSES))).first() is None
 
 
-def _mark_user_deleted(s, t) -> None:
+def _mark_user_deleted(s, t, drop: bool = True) -> None:
     """用户删除一行：置 deleted，并记下它是不是该集最后一份（ep_dropped）。调用方负责 commit。
 
+    drop=False（E-81）：用户在确认框里选了"换一份 / 以后自动补"——这一集还要，只是不要这一份：不置 ep_dropped，
+    并把同组被集去重压成 skipped 的兄弟放回待下（否则 skipped 永远不复活，"以后自动补"就是空话）。
     单集删走它；整部番删文件（_delete_anime_files_inner）按同一判据另写：要先整批置 deleted 再逐行判，理由见那里。修正版退旧版（_retire_old_versions）不走：那是程序删的，
     同组新版已经在盘上，不是"用户不要这一集"。"""
     t.status = "deleted"
-    t.ep_dropped = _is_last_copy(s, t)
+    t.ep_dropped = drop and _is_last_copy(s, t)
     s.add(t)
+    if not drop:
+        _requeue_skipped_siblings(s, t)
 
 
-def _user_delete_row(torrent_id: int) -> None:
+def _requeue_skipped_siblings(s, t) -> int:
+    """不置 ep_dropped 的删除之后：t 同组（dedup_key，歧义段带源）、非别季的 skipped 兄弟放回 pending，
+    前提是这一组此刻没有 _covered 行（还有一份在盘上就不必补）。口径同 restore_anime。返回放回条数。
+    别季的行（标了的，和 _slot_impostor 认得出的）、普通番的特别篇 / 未知集不放：前者删它与本季这一集无关，
+    后者彼此不是"同一集"、后台也不自动下。"""
+    if t.foreign_season:
+        return 0
+    a, grp = _swap_group(s, t)
+    if a is None or t.episode is None or (t.episode < 0 and not engine.is_single_work(a.platform, a.total_episodes)):
+        return 0
+    if any(_covered(r) for r in grp):
+        return 0
+    n = 0
+    for r in grp:
+        # 占槽的别季旧集（还没标）不放回，与 _release_freed_slots 同口径：放回去 flush 可能正好挑中它，前一季的内容又占了本季这一集
+        if r.status == "skipped" and not r.foreign_season and not _slot_impostor(a, r):
+            r.status = "pending"
+            s.add(r)
+            n += 1
+    return n
+
+
+def _user_delete_row(torrent_id: int, drop: bool = True) -> None:
     """按 id 开一个会话走 _mark_user_deleted —— 单集删除 await 之后的三个分支用（"最后一份"按写库那一刻的库状态算）。"""
     with get_session() as s:
         t = s.get(AnimeTorrent, torrent_id)
         if t is not None:
-            _mark_user_deleted(s, t)
+            _mark_user_deleted(s, t, drop)
             s.commit()
 
 
@@ -2505,7 +2531,7 @@ def _lock_blocks(ep, lock_eps, lock_max) -> bool:
 
 
 def locked_out_episodes(animes, today=None, lag_days: int | None = None) -> dict:
-    """锁定源落后：{番 id: {"eps": [集号…], "groups": [组名…], "lock_max": 锁定源最大集号}}。(r37 #2)
+    """锁定源落后：{番 id: {"eps": [集号…], "groups": [组名…], "lock_max": 锁定源最大集号, "since": 这些集里最早的首次入库时刻}}。(r37 #2)
 
     锁了下载源的番，锁定源停更/断更之后，别的组的后续集照常入库，却因为锁而一集都不下 ——
     缺集提示看不见它（库里有种子），断更提醒也不响（别的源一直在进），仪表盘还把它们算成『备用项』。
@@ -2558,7 +2584,7 @@ def locked_out_episodes(animes, today=None, lag_days: int | None = None) -> dict
             if k not in first or r.created_at < first[k][0]:
                 first[k] = (r.created_at, set())
             first[k][1].add(r.source or "?")
-        eps, groups = [], set()
+        eps, groups, since = [], set(), None
         total = locked[aid].total_episodes or 0
         for k, (at, srcs) in sorted(first.items()):
             # 【两套编号同步在发 → 不算落后】只在那段时间锁定组发的集号与 k 差得远（> 2，季内号 vs 绝对号）时豁免。
@@ -2576,8 +2602,9 @@ def locked_out_episodes(animes, today=None, lag_days: int | None = None) -> dict
                 continue
             eps.append(k)
             groups |= srcs
+            since = at if since is None else min(since, at)
         if eps:
-            out[aid] = {"eps": eps, "groups": sorted(groups), "lock_max": int(lock_max)}
+            out[aid] = {"eps": eps, "groups": sorted(groups), "lock_max": int(lock_max), "since": since}
     return out
 
 
@@ -2848,7 +2875,11 @@ def episode_coverage(anime_ids) -> dict:
     sent 只表示【已交给 qB】，downloading/stalled 更是明摆着没下完。
     qb_progress >= 1.0 是本项目已有的"真下完"信号（归档条件用的就是它），
     且在两种跟踪模式下都成立（关跟踪时 settle_sent 直接写 1.0），不是新发明的口径。
-    deleted 不算（用户特意删掉的不该算"已有"；"该集已删"(E-73) 也不算 —— 它会让下齐的番撤销完结，见 E-73 待定项）。
+    "该集已删"（deleted 且 ep_dropped，E-73）算到手（E-75 B）：那一集是用户看完删掉、明说不要了的，
+    不算的话删掉看过的最后一集就会撤销完结、以后再也判不回来，还被推回断更巡检。
+    只删了其中一份（ep_dropped=0）的 deleted 不算，那一集的到手与否看留下的那份。
+    【该集已删只在 1..T 内算】(总集数未知时一条不算) 超界的已删行多是另一套编号（绝对编号）的旧行：
+    清理掉那套编号后它们还留着 ep_dropped，算进来会让 _coverage_has_two_numberings 一直认为有两套编号，番永远判不了下齐。
 
     【为什么不用 dedup_key】歧义段的键带上了源，同一个集号会按源拆成多份，拿它计数会虚高、
     把没下完的番判成完结。这里要回答的是"第 k 集到手了没"，就该按集号去重。
@@ -2866,14 +2897,15 @@ def episode_coverage(anime_ids) -> dict:
         return {}
     with get_session() as s:
         rows = list(s.exec(select(AnimeTorrent.anime_id, AnimeTorrent.episode, AnimeTorrent.release_time,
-                                  AnimeTorrent.foreign_season, Anime.total_episodes, Anime.air_date)
+                                  AnimeTorrent.foreign_season, Anime.total_episodes, Anime.air_date,
+                                  AnimeTorrent.status)
                            .join(Anime, Anime.id == AnimeTorrent.anime_id, isouter=True).where(
             AnimeTorrent.anime_id.in_(ids),
-            AnimeTorrent.status.in_(HAVE_STATUSES),
-            AnimeTorrent.qb_progress >= 1.0,
+            or_(and_(AnimeTorrent.status.in_(HAVE_STATUSES), AnimeTorrent.qb_progress >= 1.0),
+                and_(AnimeTorrent.status == "deleted", AnimeTorrent.ep_dropped == True)),  # noqa: E712
             AnimeTorrent.episode >= 1)))
     out: dict = {}
-    for aid, ep, rel, foreign, total, air in rows:
+    for aid, ep, rel, foreign, total, air, st in rows:
         # 小数集（11.5 插入话）不计：bgm 的 total_episodes 不含它，计进去会让 12 集番
         # "凑够 12 个集号"却其实缺一整集。整数判断放 Python 侧：SQLite 的 floor()
         # 要编译期开关才有，不可移植。
@@ -2881,6 +2913,8 @@ def episode_coverage(anime_ids) -> dict:
             continue
         if foreign and ep <= (total or 0):
             continue          # 标了不属于本季、落在 1..T 内：不计（超界的照旧计，理由见上）
+        if st == "deleted" and not (total and ep <= total):
+            continue          # 该集已删只在 1..T 内算到手（理由见上）
         if not _slot_impostor(_AnimeWin(total, air), _EpRow(ep, rel)):
             out.setdefault(aid, set()).add(int(ep))
     return out
@@ -3393,7 +3427,7 @@ def suspect_lock_lag() -> list[dict]:
     只读、只报不改。兜底被番级闸挡住时带上 lock_fallback_preview 给的原因（与推送、详情页横幅同一口径）。
     为什么推送之外还要这一条：推送地址没配时 lock_lag 一条也发不出去，仪表盘上只剩一个『锁源缺集』小标签，
     真库 #8 的 17~23、25 集就这样挡了三个半月没人知道。
-    返回 [{id, born, name, lock, eps, groups, lock_max, why}]；why=None＝兜底没被挡住（或兜底关着）。"""
+    返回 [{id, born, name, lock, eps, groups, lock_max, since, why}]；why=None＝兜底没被挡住（或兜底关着）。"""
     with get_session() as s:
         animes = list(s.exec(select(Anime).options(_NO_SUMMARY).where(
             Anime.pref_source.is_not(None), Anime.pref_source != "")))
@@ -3403,7 +3437,7 @@ def suspect_lock_lag() -> list[dict]:
     blocked = lock_fallback_preview()[1] if config.ANIME_LOCK_FALLBACK_DAYS > 0 else {}
     return [{"id": a.id, "born": a.created_at, "name": display_of(a), "lock": a.pref_source,
              "eps": lagging[a.id]["eps"], "groups": lagging[a.id]["groups"],
-             "lock_max": lagging[a.id]["lock_max"], "why": blocked.get(a.id)}
+             "lock_max": lagging[a.id]["lock_max"], "since": lagging[a.id]["since"], "why": blocked.get(a.id)}
             for a in sorted(animes, key=lambda x: x.id) if a.id in lagging]
 
 
@@ -3845,10 +3879,10 @@ def suspect_two_numberings() -> list[dict]:
 # 预览（只读、不碰 qB）→ 探测（一次 qB 查大小与留下那份的真实状态）→ 执行（新会话里逐条复核、只缩小不扩大）。
 # ep_dropped 一律由删除内核里现有的 _mark_user_deleted 写，这里不另写一份（E-73 不变）。
 
-# 『绑定看着不对』那批种子的处置顺序（仪表盘提示与巡检推送共用一句）：先标再删。没标就删，删除内核按『同集最后一份』
-# 写 ep_dropped，本季这一集就被当成不要了；标完再删，别季行 _is_last_copy 恒 False，本季不受影响。
+# 『绑定看着不对』那批种子的处置顺序（仪表盘提示与巡检推送共用一句）：先标再删。没标就删，是同集最后一份时要在三选一里
+# 选对（选了不要了就写 ep_dropped，本季这一集被挡住），整部番删文件更是一律写；标完再删，别季行 _is_last_copy 恒 False，本季不受影响。
 WRB_CLEANUP_HINT = ("先标『不属于本季』（或重绑）；标完到详情页点『看清单并清理』删文件，就不会影响本季。"
-                    "没标就删，会被当成本季这一集不要了。")
+                    "没标就删的话，删时选了『这一集不要了』（或整部番删文件），本季这一集就会被挡住。")
 _CLEANUP_DROP_STATUSES = ("sent", "stalled")     # downloading 是交付中的占位，两边都不碰
 _CLEANUP_NO_KEEPER = "另一套编号里没有这一集，删了就一份不剩"
 _CLEANUP_ONLY_COPY = "只有这一份"
@@ -5961,7 +5995,7 @@ async def deliver_lock_fallback(qb_alive: bool | None = None, new_gaps: list | N
                      p["name"], p["lock"], p["days"], ep_ranges(list(got)), groups)
             msg = (f"{p['name']}：锁定的『{p['lock']}』已 {p['days']} 天没新东西，第 {ep_ranges(list(got))} 集改用 "
                    f"{groups} 各补一份。锁定组以后发了这几集会再自动下它的版本（多一份，兜底那份可到详情页删）。"
-                   "锁定组补发之前别删：删了等于这一集不要了，它的版本也不会再自动下")
+                   "锁定组补发之前删兜底那份，这一集就一份都没有了；删时选了『这一集不要了』，它的版本也不会再自动下")
             if p["kw_missed"]:
                 msg += f"；第 {ep_ranges(p['kw_missed'])} 集别的组没有『{p['kw']}』版本，没补（继续提醒）"
             await notify_event("lock_fallback", msg)
@@ -6848,19 +6882,20 @@ async def relocate_anime(anime_id: int, old_path: str | None = None) -> dict:
                                      anime_save_path(anime_id), old_path, noun="集")
 
 
-async def delete_anime_torrent(torrent_id: int) -> bool | str:
+async def delete_anime_torrent(torrent_id: int, drop: bool = True) -> bool | str:
     """页面入口：整段登记在途，理由见 `engine.in_flight`。(R33 对抗审计补：读主键 → await qb.delete → 按主键写 deleted)"""
     with engine.in_flight("删除单集文件"):
-        return await _delete_anime_torrent_inner(torrent_id)
+        return await _delete_anime_torrent_inner(torrent_id, drop)
 
 
-async def _delete_anime_torrent_inner(torrent_id: int) -> bool | str:
+async def _delete_anime_torrent_inner(torrent_id: int, drop: bool = True) -> bool | str:
     """删除单条种子在 qB 里的文件（走 qB 接口），标记为 deleted。详情页按集删用。
 
     deleted 是用户主动删除的终态，被删的这一条不会自己回来（区别于集去重落选、可复活的 skipped）。
     【删 = 这一集不要了】(E-73) 四个落 deleted 的分支都走 _mark_user_deleted：删的若是同集最后一份，
     置 ep_dropped，任何自动路径都不再为这一集下别的版本；同集还留着别的份时只删这一份
-    （留下那份以后死了，后台照常补）。页面确认框用 delete_drops_episode 预先说清是哪一种。
+    （留下那份以后死了，后台照常补）。drop=False 时不置（E-81：用户在确认框里选了换一份 / 以后自动补，
+    见 _mark_user_deleted）；默认 True 给 cleanup 等不经三选一的入口。页面确认框用 delete_options 预先说清是哪一种。
     若同一 hash 剧场版管线还在用，则只脱手本行、不删 qB/文件，免得毁了对面。
 
     已归档(archived_at)的：种子早已从 qB 移除，qB 代删不到文件 → 只落 deleted 终态，
@@ -6878,12 +6913,12 @@ async def _delete_anime_torrent_inner(torrent_id: int) -> bool | str:
             return False  # stalled 也允许删；downloading 是交付中的占位，见上
         h = t.info_hash
         if t.archived_at is not None:      # 已归档：不在 qB，删不到文件，只改状态
-            _mark_user_deleted(s, t)
+            _mark_user_deleted(s, t, drop)
             s.commit()
             log.info("删除已归档条目（仅标记，文件留在 %s）- torrent=%s", t.save_path or "?", torrent_id)
             return True
     if engine.hash_owned_elsewhere(h, MovieTorrent):
-        _user_delete_row(torrent_id)  # 剧场版侧还持有同一种子 → 只脱手，不删文件
+        _user_delete_row(torrent_id, drop)  # 剧场版侧还持有同一种子 → 只脱手，不删文件
         return True
     # 【先问 qB 在不在】(r38) qB 对不认识的 hash 也回成功：种子早被人在 qB 里手动移除（没标归档）时，
     # 以前这里说"已删除该集文件"，盘上的文件其实没动。不在了就只改状态，返回 "gone" 让页面如实说。
@@ -6891,14 +6926,142 @@ async def _delete_anime_torrent_inner(torrent_id: int) -> bool | str:
     if info is None:
         return False
     if h not in info:
-        _user_delete_row(torrent_id)
+        _user_delete_row(torrent_id, drop)
         log.info("删除（单集）- torrent=%s 已不在 qB 里，只标记已删，文件没动", torrent_id)
         return "gone"
     if not await engine.qb.delete([h], delete_files=True):
         return False
-    _user_delete_row(torrent_id)   # 用户主动删除：终态（区别于集去重的 skipped）；最后一份则该集已删（E-73）
+    _user_delete_row(torrent_id, drop)   # 用户主动删除：终态（区别于集去重的 skipped）；最后一份则该集已删（E-73）
     log.info("删除文件（单集）- torrent=%s", torrent_id)
     return True
+
+
+# ==== 单集删除三选一（E-81，扩展 E-73）====
+# 删的是这一集最后一份时，由用户在确认框里选：换一份（马上下选中的那条）/ 以后自动补（不置 ep_dropped）/
+# 这一集不要了（置 ep_dropped，即 E-73 原义）。默认项不置 ep_dropped（漏集致命、多下不致命），也不会多删任何一行。
+_SWAP_STATUSES = ("pending", "error", "skipped")   # 换一份的候选：还没下过、用户也没排除/删过的
+
+
+def _swap_group(s, t):
+    """t 同番同集、同 dedup_key 组（歧义段带源）的其它行 + 该番。只读。"""
+    a = s.get(Anime, t.anime_id) if t.anime_id else None
+    if a is None:
+        return None, []
+    amb = ambiguous_range(a)
+    key = dedup_key(amb, 0, t.episode, t.source)
+    rows = [r for r in s.exec(select(AnimeTorrent).where(
+        AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.episode == t.episode, AnimeTorrent.id != t.id))
+        if dedup_key(amb, 0, r.episode, r.source) == key]
+    return a, rows
+
+
+def delete_options(torrent_id: int) -> dict | None:
+    """单集删除确认框要的全部事实（只读，不查 qB）。行不存在、不在 HAVE、或正在交付（downloading）时 None。
+
+    kind：foreign（标了不属于本季）/ special（普通番的特别篇、未知集）/ dup（同集还有别的一份，_is_last_copy 为假）
+    / last（这一集仅剩的一份，只有它给三选一）。页面按 kind 分支，别按已渲染的行自己数（与 delete_drops_episode 同理）。
+    cands：同组可换的候选（pending/error/skipped，去掉别季和看着像别季的 foreign_season_suspect），按"锁定组在前、其余组在后，组内同后台挑选口径"排，
+    有关键词时命中的再往前；不排除同组（用户换版本两种都有），打 same_src 标签。
+    auto_next：选"以后自动补"后，下一轮后台会挑哪条（与 flush 同口径：订阅中、锁源精确相等、关键词、到点）；
+    单部作品一律 None（它走 deliver_single_works，另有开关）。
+    options / default：swap（有候选且没归档）、keep（没有 swap 或后台不会自动补）、drop（一直有）；
+    默认 alias→drop（内容在另一套编号里还留着，默认补会再下一份重复）、判过下齐（finished）→drop、有 swap→swap、否则 keep。
+    lock_blocked：锁了源、而锁定组没发过这一集（_lock_blocks），选 keep 后它会进锁源缺集提醒 / 停更兜底。"""
+    with get_session() as s:
+        t = s.get(AnimeTorrent, torrent_id)
+        if t is None or t.status not in HAVE_STATUSES or t.status == "downloading":
+            return None
+        a = s.get(Anime, t.anime_id) if t.anime_id else None
+        single = bool(a) and engine.is_single_work(a.platform, a.total_episodes)
+        # 判过下齐、这一集在 1..T 内：不置 ep_dropped 的删法会让 episode_coverage 少这一集，下一轮 sweep_finished 撤销下齐
+        # （finish_optout 的番它不碰，所以不算）
+        fin = (bool(a) and a.finished_at is not None and not a.finish_optout
+               and t.episode is not None and 1 <= t.episode <= (a.total_episodes or 0))
+        out = {"archived": t.archived_at is not None, "lock": (a.pref_source if a else "") or "",
+               "kw": (a.pref_keyword if a else "") or "", "src": t.source or "", "fallback": bool(t.lock_fallback),
+               "single": single, "sub": is_subscribed(a), "alias": None, "cands": [], "auto_next": None,
+               "options": [], "default": None, "finished": fin, "lock_blocked": False}
+        if t.foreign_season:
+            return {**out, "kind": "foreign"}
+        if t.episode is not None and t.episode < 0 and not single:
+            return {**out, "kind": "special"}
+        if not _is_last_copy(s, t):
+            return {**out, "kind": "dup"}
+        a, grp = _swap_group(s, t)
+        lock = out["lock"]
+        if lock and t.episode is not None and t.episode > 0:
+            # 与 locked_out_episodes 同口径：锁定组非别季行的集号（含这条被删的行，删了它 lock_eps 也照算）
+            lock_eps = set(s.exec(select(AnimeTorrent.episode).where(
+                AnimeTorrent.anime_id == t.anime_id, AnimeTorrent.source == lock, AnimeTorrent.episode >= 1,
+                AnimeTorrent.foreign_season == False)).all())   # noqa: E712
+            out["lock_blocked"] = _lock_blocks(t.episode, lock_eps, max(lock_eps, default=0))
+    kw = out["kw"]
+    # 看着像别季的旧集不当候选：换上它、或让后台自动补上它，本季这一集照样是错内容
+    rows = [r for r in grp if r.status in _SWAP_STATUSES and not r.foreign_season and not foreign_season_suspect(a, r)]
+    # 不能直接 pick_order(rows, lock)：带 pref 时它只返回锁定组那几条，别组的候选就丢了
+    order = (engine.pick_order([r for r in rows if lock and (r.source or "") == lock], None, prefer_fresh=True)
+             + engine.pick_order([r for r in rows if not (lock and (r.source or "") == lock)], None, prefer_fresh=True))
+    if kw:
+        order.sort(key=lambda r: not _kw_match(kw, r.raw_title))
+    now = datetime.now()
+    nxt = None
+    if out["sub"] and not single and auto_downloadable_ep(t.episode):
+        nxt = next((r for r in order
+                    if ((r.status == "pending" and _retry_ready(r, now)) or r.status == "skipped")
+                    and (not lock or (r.source or "") == lock) and (not kw or _kw_match(kw, r.raw_title))), None)
+    out["cands"] = [{"id": r.id, "source": r.source or "", "title": r.raw_title or "", "status": r.status,
+                     "retry_count": r.retry_count or 0, "same_src": (r.source or "") == (t.source or ""),
+                     "lock_src": bool(lock) and (r.source or "") == lock,
+                     "kw_ok": not kw or _kw_match(kw, r.raw_title)} for r in order]
+    out["auto_next"] = {"id": nxt.id, "source": nxt.source or "", "title": nxt.raw_title or ""} if nxt else None
+    out["alias"] = alias_keeper(torrent_id)
+    swap = bool(order) and not out["archived"]
+    out["options"] = (["swap"] if swap else []) + (["keep"] if not swap or nxt is None else []) + ["drop"]
+    # 判过下齐：默认不置 ep_dropped 的话会撤销下齐，那是用户多半没想到的副作用，默认改成不要了
+    out["default"] = "drop" if out["alias"] or fin else "swap" if swap else "keep"
+    return {**out, "kind": "last"}
+
+
+async def delete_and_replace(torrent_id: int, pick_id: int) -> dict:
+    """页面入口（删除确认框选『换一份』）：整段登记在途，理由见 `engine.in_flight`；
+    换源下载那步本身另登记 delivering（嵌套写法同 download_locked_out）。"""
+    with engine.in_flight("删除并换一份"):
+        return await _delete_and_replace_inner(torrent_id, pick_id)
+
+
+async def _delete_and_replace_inner(torrent_id: int, pick_id: int) -> dict:
+    """先删（不置 ep_dropped）后下。返回 {deleted: False|True|"gone", picked: "skip"|"stale"|True|False|None, reason}。
+
+    【先删后下】同组 v2 文件名相同时，先下后删会让删旧种子连新文件一起删掉（_retire_old_versions 为此专设 same_file 闸）；
+    删不成（qB 没连上）就整个收手，不下新的。删成了下失败：这一集没置 ep_dropped，同组 skipped 已放回待下，不会悄悄漏。
+    两次 await 之间 flush 可能已经补上一份 / 选中的那条状态变了 → _replace_pick_ok 判 stale，不再下第二份。"""
+    r = await _delete_anime_torrent_inner(torrent_id, drop=False)
+    if not r:
+        return {"deleted": False, "picked": "skip", "reason": ""}
+    if not _replace_pick_ok(torrent_id, pick_id):
+        return {"deleted": r, "picked": "stale", "reason": ""}
+    ok = await download_anime_torrent(pick_id, force=True)   # 用户指定的这一条：越过锁定源 / 关键词，同在那一行点『下载』
+    reason = ""
+    if not ok:
+        with get_session() as s:
+            p = s.get(AnimeTorrent, pick_id)
+            reason = (p.fail_reason if p else "") or ""
+    return {"deleted": r, "picked": ok, "reason": reason}
+
+
+def _replace_pick_ok(torrent_id: int, pick_id: int) -> bool:
+    """删完之后（await 之后按主键重读）选中的那条还该不该下：存在、与被删行同番同 dedup_key 组、不是别季、
+    状态仍是 pending/error/skipped（不是交付中、没被别的路径下掉），
+    且这一组此刻没有 _covered 行（flush 刚好抢先补上了就不再下第二份）。页面传来的 id 不可信，这里全部复核。"""
+    with get_session() as s:
+        t = s.get(AnimeTorrent, torrent_id)
+        p = s.get(AnimeTorrent, pick_id)
+        if t is None or p is None or p.id == t.id or p.foreign_season or p.status not in _SWAP_STATUSES:
+            return False
+        _, grp = _swap_group(s, t)
+        if all(r.id != p.id for r in grp):
+            return False
+        return not any(_covered(r) for r in grp)
 
 
 async def delete_anime_files(anime_id: int) -> dict:

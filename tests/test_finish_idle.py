@@ -89,6 +89,19 @@ def test_deleted_does_not_count_as_in_hand(clean_tables, make):
     assert A.is_finished(_a(clean_tables, aid), A.episode_coverage([aid]).get(aid, set())) is False
 
 
+def test_episode_dropped_counts_as_in_hand(clean_tables, make):
+    """(E-75 B) 删的是那一集的最后一份（ep_dropped，"该集已删"）：用户看完不要了，算到手，下齐的番不因此撤销完结。
+    只删了其中一份（ep_dropped=0）的仍不算，见上一条。"""
+    aid = make(2, [(1, "sent"), (2, "deleted")])
+    with clean_tables.get_session() as s:
+        t = s.exec(select(AnimeTorrent).where(AnimeTorrent.anime_id == aid, AnimeTorrent.episode == 2)).one()
+        t.ep_dropped = True
+        s.add(t)
+        s.commit()
+    assert A.episode_coverage([aid])[aid] == {1, 2}
+    assert A.is_finished(_a(clean_tables, aid), A.episode_coverage([aid]).get(aid, set())) is True
+
+
 def test_pending_does_not_count(clean_tables, make):
     """待下不是"到手"。"""
     aid = make(2, [(1, "sent"), (2, "pending")])

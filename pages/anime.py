@@ -300,7 +300,10 @@ def anime_page(t: str = ""):
                 _lk = _a.get("lock") or []
                 _acts += [(f"只下 {src}", "lock", _lock_two(_ids[0], src, _lk[1 - j]))
                           for j, src in enumerate(_lk)]
-                _banner_with_ack_tip(_pre + _a["text"], _acts + [("知道了", "inbox", _ack_alert(_a))])
+                # 长说明（rer 约 270 字、mva 约 190 字）在手机上占十几行：横幅只放短句，完整说明折起来。
+                # two 只有一部时也走这里，但它的 brief 是给合并卡片里的行用的、不带处置说明，所以不用它
+                _brief = _a.get("brief") if _a["kind"] in ("rer", "mva") else None
+                _banner_with_ack_tip(_pre + (_brief or _a["text"]), _acts + [("知道了", "inbox", _ack_alert(_a))])
                 if _a["kind"] == "mva":
                     # 两边各留一条的两种处置（D9：只忽略、不删文件，两边可能共用同一个种子）。手机上各占一行全宽
                     with ui.row().classes("w-full gap-2 pl-8 -mt-1 flex-col sm:flex-row"):
@@ -308,6 +311,12 @@ def anime_page(t: str = ""):
                             "flat dense").classes("btn-sm w-full sm:w-auto")
                         ui.button("留剧场版，忽略番剧", icon="tv_off", on_click=_mva_keep(_a, "movie")).props(
                             "flat dense").classes("btn-sm w-full sm:w-auto")
+                if _brief:   # 放在 mva 两个按钮之后：短句说的是"用下面两个按钮"
+                    # 左边一条横幅同色（amber-400）的竖线 + 下边距：看得出它挂在上面那条横幅下，不和下一条横幅粘在一起
+                    with ui.expansion("完整说明").classes(
+                            "self-stretch ml-8 -mt-1 mb-2 text-sm text-gray-400").style(
+                            "border-left:2px solid rgba(251,191,36,.45)"):
+                        ui.label(_a["text"]).classes("text-sm whitespace-pre-line")
 
             # 【首屏只数仍成立的】已不成立的已读记录不需要任何动作，常年挂在首屏只是噪音；
             # 但也不自动删（理由见 core/alerts.drop_gone：ign/rer 这类发现会消失又回来，留着的记录挡住横幅复活）。

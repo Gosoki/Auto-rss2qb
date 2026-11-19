@@ -533,3 +533,20 @@ def test_best_offset_extracted_without_behavior_change(clean_tables):
     h = A.two_numberings()[aid]
     assert (h["abs_src"], h["in_src"], h["offset"], h["pairs"]) == ("ANi", "Nix-Raws", 12, 11)
     assert A._best_offset({"A": {13: W0}, "B": {}}, 12) is None
+
+
+def test_c2_in_season_keeper_finishes_after_cleanup(clean_tables, qb):
+    """(r42 C2) #27 形状留季内组：清理后 ANi 13–23 是该集已删的超界行。它们只在 1..T 内才算到手，
+    否则 _coverage_has_two_numberings 一直以为还有两套编号，这部番永远判不了下齐。"""
+    from core import anime as A
+    with clean_tables.get_session() as s:
+        aid, ani, nix, _ = _p27(s, lock="Nix-Raws")
+        n12 = _row(s, aid, "Nix-Raws", 12, W0 + timedelta(weeks=11, hours=8))
+    for tid in [*ani.values(), *nix.values(), n12]:
+        _set(clean_tables, tid, qb_progress=1.0)
+    pv = A.cleanup_preview(aid, "two")
+    res = _run(A.cleanup_execute(aid, "two", _picks(pv["items"])))
+    assert len(res["deleted"]) == 11 and all(_get(clean_tables, t).ep_dropped for t in ani.values())
+    cov = A.episode_coverage([aid])[aid]
+    assert cov == set(range(1, 13))
+    assert A.is_finished(A.get_anime(aid), cov)

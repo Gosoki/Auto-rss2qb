@@ -163,19 +163,22 @@ async def test_single_delete_uses_alias_wording(user, clean_tables, qb, cfg, mon
         aid, ani, nix, _ = _p27(s)
     asked = []
 
-    async def yes(title, note, **kw):
-        asked.append(note)
-        return True
-    monkeypatch.setattr(D, "confirm", yes)
+    # (r42 E-81) 这一集仅剩的一份走三选一框；两套集号时默认『只删这一份』，说法换成另一套编号里留着的那份
+    async def pick_default(opts, label, raw, save_path):
+        asked.append(opts)
+        return opts["default"], None
+    monkeypatch.setattr(D, "_ask_delete", pick_default)
     await user.open(f"/detail/{aid}")
-    def _row_texts(b):
-        return {str(c.text) for c in next(b.ancestors()).default_slot.children if isinstance(c, ui.label)}
+    def _row_texts(b):   # 🗑 所在那一条种子行（最近的 ui.column）里的全部文字
+        col = next(a for a in b.ancestors() if isinstance(a, ui.column))
+        return {str(c.text) for c in col.descendants() if isinstance(c, ui.label)}
     first = next(b for b in _live(user, ui.button) if b.props.get("icon") == "delete_forever"
                  and {"第1集", "Nix-Raws"} <= _row_texts(b))
     _click(user, first)
     await _until(lambda: asked, "没弹确认框")
-    assert ("这一集另有一份留着：『ANi』第 13 集（两套编号，内容相同）。"
-            "删掉后程序不再按「第 1 集」这个号补下别的版本。") in asked[0], asked
+    assert asked[0]["default"] == "drop", asked[0]
+    assert ("只删这一份：这一集另有『ANi』第 13 集那份（两套编号，内容相同），"
+            "程序不再按「第 1 集」补下") == D._drop_text(asked[0])
     await user.should_see("已删除该集文件；这一集还有『ANi』第 13 集那份。", retries=20)
     t = _get(clean_tables, nix[1])
     assert t.status == "deleted" and t.ep_dropped, "标记照旧写 1（E-73 不变）"

@@ -7,7 +7,7 @@ from core import alerts
 from db.models import Anime, AnimeTorrent, Movie, MovieTorrent
 
 W1 = ("先标『不属于本季』（或重绑）；标完到详情页点『看清单并清理』删文件，就不会影响本季。"
-      "没标就删，会被当成本季这一集不要了。")
+      "没标就删的话，删时选了『这一集不要了』（或整部番删文件），本季这一集就会被挡住。")
 
 
 def _wrb(db):
@@ -73,7 +73,7 @@ def test_r1_rer_text_depends_on_lock(clean_tables, cfg, pref):
     if pref:
         assert r1 in f[0]["text"] and "标完这几集照常自动下" not in f[0]["text"], f[0]["text"]
         # R1 之后紧跟『这个按钮』会被读成『顺带下载』，按钮要点名
-        assert "旧的那几条上没有『不属于本季』按钮，就在新来的那几条上逐条点『下载』。" in f[0]["text"]
+        assert "『不属于本季』在那一行右边的 ⋯ 里；旧的那几条右边没有 ⋯ 的，就在新来的那几条上逐条点『下载』。" in f[0]["text"]
         assert "这个按钮" not in f[0]["text"]
     else:
         assert "标完这几集照常自动下" in f[0]["text"] and "锁定了" not in f[0]["text"], f[0]["text"]
